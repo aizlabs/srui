@@ -215,10 +215,12 @@ pub const SYSTEM_CPU: MetricDefinition = MetricDefinition {
                      column's 100% is one CPU. guest and guest_nice are already counted in user \
                      and nice and are not added again, and fields after steal are not read. \
                      iowait may decrease between two reads (K1), so idle and iowait are \
-                     differenced as one sum. A first read is warming up; counters that went \
-                     backwards, did not advance, or were read over a different number of cpuN \
-                     lines leave no interval and are published as unavailable, never as zero \
-                     and never as a spike.",
+                     differenced as one sum. The share is always measured between two \
+                     consecutive successful reads: a first read, and the first read after one \
+                     that failed, is warming up, so an outage is never averaged into a current \
+                     figure; counters that went backwards, did not advance, or were read over a \
+                     different number of cpuN lines leave no interval and are published as \
+                     unavailable, never as zero and never as a spike.",
 };
 
 /// Memory in use on the host (PX-007).
@@ -271,18 +273,25 @@ pub const LOAD_AVERAGE: MetricDefinition = MetricDefinition {
                      it.",
 };
 
-/// How many processes the last successful scan listed (PX-007).
+/// How many processes the last successful scan listed (PX-007), with the only
+/// scope srtop can state for that count: what this reader can see in the
+/// scanned root.
 pub const PROCESS_COUNT: MetricDefinition = MetricDefinition {
     id: "system.process_count",
-    label: "Processes",
+    label: "Processes visible to this reader",
     unit: "processes",
-    source: "The scan's own record list: the numeric directories of the scanned root, one per \
-             process (thread group), never one per thread",
+    source: "The scan's own record list: the numeric directories of the scanned root that this \
+             reader can see, one per process (thread group), never one per thread",
     interpretation: "The records the last successful scan listed and read, with the records \
                      it could not read and the entries beyond its record limit counted \
                      separately, in the status line's own words; a process that ended during \
-                     the scan is not counted. No filter exists yet, so the count is the whole \
-                     source.",
+                     the scan is not counted. The count is bounded by what this reader can see, \
+                     not by the host: its PID namespace hides every process outside it, and a \
+                     procfs mounted with hidepid=invisible (2), as systemd's \
+                     ProtectProc=invisible does, or hidepid=ptraceable (4), hides other \
+                     users' or unptraceable processes without any error, so a complete scan \
+                     is complete over this view only. srtop detects neither, and applies no \
+                     filter of its own.",
 };
 
 /// When the figures on screen were sampled (PX-007).
@@ -711,9 +720,15 @@ mod tests {
         assert!(UPTIME.source.contains("/proc/uptime"));
         assert!(LOAD_AVERAGE.source.contains("/proc/loadavg"));
         assert!(LOAD_AVERAGE.interpretation.contains("Not a percentage"));
+        assert!(PROCESS_COUNT.label.contains("visible to this reader"));
+        assert!(PROCESS_COUNT.interpretation.contains("PID namespace"));
+        assert!(PROCESS_COUNT.interpretation.contains("hidepid"));
         assert!(PROCESS_COUNT
             .interpretation
-            .contains("No filter exists yet"));
+            .contains("applies no filter of its own"));
+        assert!(SYSTEM_CPU
+            .interpretation
+            .contains("two consecutive successful reads"));
         assert!(SAMPLE_TIME.interpretation.contains("UTC"));
         assert!(SAMPLE_TIME.interpretation.contains("transport loss"));
     }

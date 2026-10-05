@@ -305,7 +305,7 @@ struct ProcessExplorerShellTests {
         "Swap: none configured",
         "Load average (1, 5, 15 min): 0.52, 0.58, 0.59",
         "Uptime: 3 days, 4 h 05 min",
-        "Processes: 3 listed · complete scan · unfiltered",
+        "Processes visible to this reader: 3 listed · complete scan · no srtop filter",
         "Last successful sample: 2027-01-15 08:00:00 UTC (server clock) · source: fake-processes-v1",
     ]
     private static let unsampledSummary = [
@@ -314,7 +314,7 @@ struct ProcessExplorerShellTests {
         "Swap: Not sampled",
         "Load average (1, 5, 15 min): Not sampled",
         "Uptime: Not sampled",
-        "Processes: Not sampled",
+        "Processes visible to this reader: Not sampled",
         "No sample: process collection not started",
     ]
     /// The script's figures, the same on every step; only its freshness line moves.
@@ -324,7 +324,7 @@ struct ProcessExplorerShellTests {
         "Swap: 256.0 MiB used of 2.0 GiB (12.5% of total)",
         "Load average (1, 5, 15 min): 1.25, 1.00, 0.75",
         "Uptime: 1 day, 2 h 30 min",
-        "Processes: 3 listed · complete scan · unfiltered",
+        "Processes visible to this reader: 3 listed · complete scan · no srtop filter",
     ]
 
     @MainActor

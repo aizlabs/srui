@@ -41,9 +41,10 @@
 //! tree states its own and is deterministic on any host. Each file is read, and
 //! can fail, on its own. Overall CPU is a difference too, so the collector also
 //! keeps one baseline of the host's CPU counters, discarded when the boot
-//! changes. The sample time is taken on an injected [`WallClock`], so a
-//! fixture's sample time, which the freshness line publishes, is a fact of the
-//! test rather than of the moment it ran.
+//! changes or a read of `stat` fails: the figure is always measured between
+//! two consecutive successful reads. The sample time is taken on an injected
+//! [`WallClock`], so a fixture's sample time, which the freshness line
+//! publishes, is a fact of the test rather than of the moment it ran.
 use crate::source::{
     record_issue, BootId, CappedRecords, Completeness, CpuInterval, CpuUsage, CreationToken,
     DisplayName, EnumerationIssue, Figure, FigureGap, HostId, IssueScope, LoadAverages,
@@ -142,14 +143,18 @@ const STAT_CPU_FIELDS: usize = 8;
 /// The most fields a `cpu` line may carry before it is refused as not the
 /// kernel's: ten today, and room for any a later kernel appends.
 const MAX_STAT_CPU_FIELDS: usize = 64;
-/// The most of a `stat` file this scan reads to count the `cpuN` lines at its
-/// head — more than 8,000 lines of 256 bytes. The rest of the file, an `intr`
-/// line that grows with the interrupt count among it, is never read. A file
-/// whose `cpu` lines run past this keeps its share and reports no CPU count.
+/// The most `cpuN` lines of a `stat` file this scan parses to count them —
+/// more than 8,000 lines of 256 bytes. Parsing stops at the first other line,
+/// after at most [`MAX_STAT_CPU_LINE_BYTES`] of it. The file is read through an
+/// 8 KiB buffer, so less than one buffer past that point is copied out of the
+/// kernel, and the rest of it — an `intr` line that grows with the interrupt
+/// count among it — is neither parsed nor copied out (the kernel still renders
+/// the whole file when it is first read). A file whose `cpu` lines run past
+/// this keeps its share and reports no CPU count.
 const MAX_STAT_CPU_BYTES: u64 = 2 * 1024 * 1024;
-/// The longest `stat` line read as a candidate `cpu` line. The kernel's are
-/// ten counts of at most twenty digits; a longer line is read only this far,
-/// found not to be one, and left unread beyond.
+/// The longest `stat` line examined as a candidate `cpu` line. The kernel's
+/// are ten counts of at most twenty digits; a longer line is examined only this
+/// far and found not to be one.
 const MAX_STAT_CPU_LINE_BYTES: u64 = 4 * 1024;
 
 /// A monotonic clock, as elapsed time since an arbitrary fixed origin.
@@ -491,7 +496,7 @@ pub struct ProcFsSource {
     /// The PID namespace the baselines were sampled under, as last observed.
     cpu_namespace: Option<PidNamespaceId>,
     /// The host's CPU counters at the last read of the root's `stat` (PX-007),
-    /// discarded when the boot changes.
+    /// if that read succeeded; discarded when the boot changes or a read fails.
     system_baseline: Option<SystemCpuCounters>,
     /// The clock that stamps each sample's time (PX-007).
     wall_clock: Arc<dyn WallClock>,
@@ -1117,6 +1122,11 @@ impl ProcFsSource {
     /// is read on its own and any of them can be missing while the others are
     /// published; none of them degrades [`Completeness`], which is about the
     /// record list.
+    ///
+    /// Overall CPU is always measured between two consecutive successful reads
+    /// of `stat`. A read that fails, or reads no counter, discards the baseline,
+    /// so the next readable read warms up: measuring from a read before the
+    /// failure would publish the average of a whole outage as the current figure.
     fn system_sample(&mut self) -> SystemSample {
         let unread = |error: io::Error| FigureGap::Unread(reason_for(&error));
         let cpu = match read_stat_cpu(&self.root.join("stat")) {
@@ -1125,10 +1135,14 @@ impl ProcFsSource {
                 self.system_baseline = Some(keep);
                 cpu
             }
-            // Read no counter: the baseline stays, so the next readable read
-            // measures across this scan.
-            Ok(None) => SystemCpu::Missing(FigureGap::Unusable),
-            Err(error) => SystemCpu::Missing(unread(error)),
+            Ok(None) => {
+                self.system_baseline = None;
+                SystemCpu::Missing(FigureGap::Unusable)
+            }
+            Err(error) => {
+                self.system_baseline = None;
+                SystemCpu::Missing(unread(error))
+            }
         };
         let (memory, swap) = match read_bounded(&self.root.join("meminfo")) {
             Ok(meminfo) => (parse_memory(&meminfo), parse_swap(&meminfo)),
@@ -1509,16 +1523,18 @@ fn resident_bytes(pages: Observed<u64>, page_size: &Observed<u64>) -> Observed<u
 ///
 /// The first line sums every CPU (`for_each_possible_cpu` in `show_stat`,
 /// fs/proc/stat.c); a `cpuN` line follows it for each CPU online
-/// (`for_each_online_cpu`), and those are counted. The read stops at the first
-/// line that is neither, so the rest of the file — an `intr` line that grows
-/// with the interrupt count among it — is never read, and it reads at most
-/// [`MAX_STAT_CPU_BYTES`]: a count that would need more is reported as unknown,
-/// never as the lines that happened to fit.
+/// (`for_each_online_cpu`), and those are counted. Parsing stops at the first
+/// line that is neither, after at most [`MAX_STAT_CPU_LINE_BYTES`] of it. The
+/// file is read through an 8 KiB buffer, so less than one buffer past that
+/// point is copied out, and the rest of it — an `intr` line that grows with the
+/// interrupt count among it — is neither parsed nor copied out. At most
+/// [`MAX_STAT_CPU_BYTES`] of `cpuN` lines are parsed: a count that would need
+/// more is reported as unknown, never as the lines that happened to fit.
 fn read_stat_cpu(path: &Path) -> io::Result<Option<SystemCpuCounters>> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut line = Vec::new();
-    // One line at a time, each read through its own bound: a line longer than
-    // any `cpu` line is not one, and is never read to its end.
+    // One line at a time, each through its own bound: a line longer than any
+    // `cpu` line is not one, and is examined no further than that bound.
     let mut next_line = |line: &mut Vec<u8>| {
         line.clear();
         (&mut reader)
@@ -2468,12 +2484,13 @@ mod tests {
     }
 
     #[test]
-    fn the_cpu_count_is_the_cpu_lines_and_the_rest_of_stat_is_never_read() {
+    fn the_cpu_count_is_the_cpu_lines_and_the_rest_of_stat_is_not_parsed() {
         let mut stat = b"cpu  100 20 30 400 50 6 7 8 0 0\n".to_vec();
         for cpu in 0..4 {
             stat.extend_from_slice(format!("cpu{cpu} 25 5 7 100 12 1 1 2 0 0\n").as_bytes());
         }
-        // An interrupt line far longer than any cpu line, as on a large host.
+        // An interrupt line far longer than any cpu line, as on a large host:
+        // examined only as far as it takes to see it is not a cpu line.
         stat.extend_from_slice(b"intr 1");
         stat.extend_from_slice(&b" 0".repeat(512 * 1024));
         stat.extend_from_slice(b"\nctxt 1\nbtime 2\n");

@@ -1246,8 +1246,9 @@ mod tests {
     use super::*;
     use crate::source::{
         CappedRecords, Completeness, CreationToken, DisplayName, EnumerationIssue,
-        FakeProcessSource, IssueScope, MissingReason, Observed, ProcessKey, ProcessRecord,
-        ScriptedFakeSource, SkippedRecords, FAKE_STATUS_TEXT, MAX_DISPLAY_NAME_CHARS,
+        FakeProcessSource, IssueScope, LoadAverages, MemoryFigures, MissingReason, Observed,
+        ProcessKey, ProcessRecord, ScriptedFakeSource, SkippedRecords, SwapFigures, SystemCpu,
+        SystemCpuInterval, SystemSample, FAKE_STATUS_TEXT, MAX_DISPLAY_NAME_CHARS,
     };
     use crate::MAX_SOURCE_STATUS_BYTES;
     use std::collections::BTreeSet;
@@ -1734,6 +1735,111 @@ mod tests {
             );
             snapshot
         }
+    }
+
+    /// A [`Host`] whose every scan states `.1` as its system-wide figures.
+    struct HostWith(Host, SystemSample);
+
+    impl ProcessSource for HostWith {
+        fn status_text(&self) -> &str {
+            FAKE_STATUS_TEXT
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            let mut snapshot = self.0.scan(0);
+            snapshot.system = self.1;
+            snapshot
+        }
+    }
+
+    /// Review round 1 (F1): the rows that fit at the snapshot ceiling are the
+    /// frame less its fixed allowances — the shell's, the status's and the
+    /// summary's 8 KiB — and so the same number of rows whatever the summary
+    /// says, from a summary with no figure at all to the widest one. Charging
+    /// the summary nothing, or its current length, publishes another number of
+    /// rows here. The snapshot a fresh client is sent still fits one frame.
+    #[test]
+    fn the_rows_at_the_ceiling_are_the_frame_less_the_fixed_allowances_whatever_the_summary() {
+        let widest = SystemSample {
+            cpu: SystemCpu::Measured(SystemCpuInterval {
+                busy: u64::MAX,
+                total: u64::MAX,
+                cpus: Some(u32::MAX),
+            }),
+            memory: Ok(MemoryFigures {
+                total: u64::MAX,
+                available: 1,
+            }),
+            swap: Ok(SwapFigures {
+                total: u64::MAX,
+                free: 1,
+            }),
+            uptime: Ok(u64::MAX),
+            load: Ok(LoadAverages {
+                one: u64::MAX,
+                five: u64::MAX,
+                fifteen: u64::MAX,
+            }),
+        };
+        let budget = MAX_TRANSACTION_PAYLOAD_BYTES
+            - (SNAPSHOT_SHELL_BYTES + STATUS_RESERVE_BYTES + SUMMARY_RESERVE_BYTES);
+        let mut published = Vec::new();
+        for system in [
+            SystemSample::not_provided(),
+            FakeProcessSource::system(),
+            widest,
+        ] {
+            let session = srui_sessiond::Session::mint();
+            let mut source = HostWith(Host::new(58_000, 48), system);
+            let (view, snapshot) = ProcessView::start(&session, &mut source).unwrap();
+            // Every row of this host costs the same, so the rows that fit are a
+            // function of the budget alone.
+            let cost = row_wire_bytes(&view.rows[0]);
+            assert!(view.rows.iter().all(|row| row_wire_bytes(row) == cost));
+            let (mut spent, mut fits) = (0usize, 0usize);
+            loop {
+                let opens = if fits.is_multiple_of(DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION) {
+                    SNAPSHOT_RANGE_BYTES
+                } else {
+                    0
+                };
+                if spent + cost + opens > budget {
+                    break;
+                }
+                spent += cost + opens;
+                fits += 1;
+            }
+            assert!(fits < snapshot.records.len(), "the ceiling must bind here");
+            assert_eq!(
+                view.row_count(),
+                fits,
+                "{system:?}: the rows that fit are the frame less the fixed allowances"
+            );
+            published.push(view.row_count());
+            if system == widest {
+                let hello = srui_protocol::ClientHello {
+                    core_version: "0.5.0".to_string(),
+                    profiles: vec!["org.srui.standard-widgets/1".to_string()],
+                    limits: None,
+                    client_instance_id: vec![1, 2, 3],
+                    client_metadata: Default::default(),
+                    known_resource_hashes: vec![],
+                };
+                let snapshot = session
+                    .bootstrap_fresh_client(&hello)
+                    .expect("a fresh client attaches")
+                    .snapshot
+                    .expect("a populated session sends a catch-up snapshot");
+                let frame = srui_protocol::framed_payload_len(&srui_protocol::SruiMessage {
+                    msg: Some(srui_protocol::srui_message::Msg::Transaction(snapshot)),
+                });
+                assert!(frame <= DEFAULT_MAX_FRAME_SIZE, "{frame}");
+            }
+        }
+        assert!(
+            published.windows(2).all(|pair| pair[0] == pair[1]),
+            "{published:?}: the summary's length moved the row budget"
+        );
     }
 
     impl ProcessSource for Host {

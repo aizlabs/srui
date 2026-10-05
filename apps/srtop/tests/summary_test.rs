@@ -131,7 +131,7 @@ fn the_summary_is_published_as_text_and_progress_and_nothing_else() {
     assert_eq!(text(&session, SWAP_TEXT), "Swap: none configured");
     assert_eq!(
         text(&session, PROCESSES_TEXT),
-        "Processes: 3 listed · complete scan · unfiltered"
+        "Processes visible to this reader: 3 listed · complete scan · no srtop filter"
     );
     assert_eq!(
         text(&session, FRESHNESS_TEXT),
@@ -219,8 +219,77 @@ fn only_the_summary_lines_that_changed_reach_the_wire() {
     assert!(!outcome.published(), "{outcome:?}");
 }
 
+/// Review round 1 (F2): one refresh plans its status first, then its summary,
+/// then its row operations, so a failing scan explains itself first and the
+/// summary of a scan is in place before any of its rows.
+#[test]
+fn a_refresh_publishes_its_status_then_its_summary_then_its_rows() {
+    let busier = {
+        let mut system = FakeProcessSource::system();
+        system.cpu = SystemCpu::Measured(SystemCpuInterval {
+            busy: 400,
+            total: 800,
+            cpus: Some(8),
+        });
+        system
+    };
+    // Process 4102 ended, the host got busier, and the source relabels itself:
+    // a row deletion, summary lines and the status all change on one tick.
+    let mut later = fake_with(busier);
+    later.records.remove(1);
+    let session = Session::mint();
+    let mut source = Script(vec![FakeProcessSource.snapshot(), later]);
+    let (mut view, _) = start_from_source(&session, &mut source).unwrap();
+    let snapshot = source.snapshot();
+    let outcome = view
+        .apply(&session, "Read-only · Relabelled fake snapshot", &snapshot)
+        .unwrap();
+    assert!(outcome.status_changed && outcome.summary > 0 && outcome.deleted == 1);
+    let ops = operations_since(&session, 1);
+    assert!(
+        matches!(
+            ops[0],
+            Operation::SetProperty {
+                id: STATUS,
+                property: TEXT,
+                ..
+            }
+        ),
+        "{ops:?}"
+    );
+    let summary_node = |id: &NodeId| LAYOUT.iter().any(|(node, _, _)| node == id);
+    let summary_ops: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| {
+            matches!(op, Operation::SetProperty { id, .. } | Operation::ClearProperty { id, .. }
+                if summary_node(id))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let first_row_operation = ops
+        .iter()
+        .position(|op| {
+            matches!(
+                op,
+                Operation::ModelInsert { .. }
+                    | Operation::ModelDelete { .. }
+                    | Operation::ModelUpdate { .. }
+            )
+        })
+        .expect("the refresh deletes a row");
+    assert!(!summary_ops.is_empty(), "{ops:?}");
+    assert!(
+        summary_ops
+            .iter()
+            .all(|&index| 0 < index && index < first_row_operation),
+        "the summary goes between the status and the rows: {ops:?}"
+    );
+}
+
 /// The process count follows each successful scan, in the status line's own
-/// numbers and words, and says what it counts: the whole source, unfiltered.
+/// numbers and words, and says what it counts: the processes this reader can
+/// see, with no filter of srtop's own.
 #[test]
 fn the_process_count_follows_each_scan_in_the_status_lines_words() {
     let mut degraded = FakeProcessSource.snapshot();
@@ -240,12 +309,12 @@ fn the_process_count_follows_each_scan_in_the_status_lines_words() {
     let (mut view, _) = start_from_source(&session, &mut source).unwrap();
     assert_eq!(
         text(&session, PROCESSES_TEXT),
-        "Processes: 3 listed · complete scan · unfiltered"
+        "Processes visible to this reader: 3 listed · complete scan · no srtop filter"
     );
     view.refresh(&session, &mut source).unwrap();
     assert_eq!(
         text(&session, PROCESSES_TEXT),
-        "Processes: 2 listed · 1 unreadable · incomplete scan · unfiltered"
+        "Processes visible to this reader: 2 listed · 1 unreadable · incomplete scan · no srtop filter"
     );
     assert!(
         text(&session, STATUS).contains("incomplete scan · 2 processes listed · 1 unreadable"),

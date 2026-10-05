@@ -239,6 +239,9 @@ impl ProcFixture {
 
 impl Drop for ProcFixture {
     fn drop(&mut self) {
+        // A test may have left the root unsearchable; it is still this test's
+        // to remove.
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
         let _ = fs::remove_dir_all(&self.0);
     }
 }
@@ -2205,8 +2208,10 @@ fn each_system_file_fails_on_its_own_and_never_degrades_the_record_list() {
 
 /// PX-007: overall CPU through the collector — warming up first, then measured;
 /// counters that went backwards or did not advance, or a different number of
-/// CPUs, interrupt it rather than publish a zero or a spike; an unreadable
-/// `stat` keeps the baseline, and a different boot discards it.
+/// CPUs, interrupt it rather than publish a zero or a spike; a `stat` that
+/// cannot be read or used, and a different boot, discard the baseline, so the
+/// figure is only ever measured between two consecutive successful reads
+/// (review round 1, W1).
 #[test]
 fn overall_cpu_is_warming_up_then_measured_and_never_a_spike() {
     let fixture = ProcFixture::new();
@@ -2222,36 +2227,151 @@ fn overall_cpu_is_warming_up_then_measured_and_never_a_spike() {
             cpus: Some(cpus),
         })
     };
-    let mut cpu = |busy, idle, cpus| {
+    fn cpu(
+        fixture: &ProcFixture,
+        source: &mut ProcFsSource,
+        busy: u64,
+        idle: u64,
+        cpus: usize,
+    ) -> SystemCpu {
         fixture.stat_cpu(busy, idle, cpus);
         source.snapshot().system.cpu
-    };
-    assert_eq!(cpu(1_000, 3_000, 4), SystemCpu::WarmingUp, "first read");
-    assert_eq!(cpu(1_100, 3_300, 4), measured(100, 400, 4));
+    }
+    let mut read = |busy, idle, cpus| cpu(&fixture, &mut source, busy, idle, cpus);
+    assert_eq!(read(1_000, 3_000, 4), SystemCpu::WarmingUp, "first read");
+    assert_eq!(read(1_100, 3_300, 4), measured(100, 400, 4));
     // Did not advance: no interval to divide by, and the next read is measured
     // from the same counters.
-    assert_eq!(cpu(1_100, 3_300, 4), SystemCpu::Interrupted);
-    assert_eq!(cpu(1_300, 3_500, 4), measured(200, 400, 4));
+    assert_eq!(read(1_100, 3_300, 4), SystemCpu::Interrupted);
+    assert_eq!(read(1_300, 3_500, 4), measured(200, 400, 4));
     // Went backwards: a reset, never a wrapped delta; measured again from it.
-    assert_eq!(cpu(50, 3_600, 4), SystemCpu::Interrupted);
-    assert_eq!(cpu(150, 3_900, 4), measured(100, 400, 4));
+    assert_eq!(read(50, 3_600, 4), SystemCpu::Interrupted);
+    assert_eq!(read(150, 3_900, 4), measured(100, 400, 4));
     // Counted over another number of CPUs: another denominator.
-    assert_eq!(cpu(250, 4_200, 8), SystemCpu::Interrupted);
-    assert_eq!(cpu(350, 4_500, 8), measured(100, 400, 8));
-    // An unreadable `stat` keeps the baseline for the next readable one.
+    assert_eq!(read(250, 4_200, 8), SystemCpu::Interrupted);
+    assert_eq!(read(350, 4_500, 8), measured(100, 400, 8));
+
+    // An unreadable `stat` discards the baseline: the next readable read warms
+    // up rather than measuring across the failed one.
     fs::remove_file(fixture.0.join("stat")).unwrap();
     assert_eq!(
         source.snapshot().system.cpu,
         SystemCpu::Missing(FigureGap::Unread(MissingReason::Unavailable))
     );
-    let mut cpu = |busy, idle, cpus| {
-        fixture.stat_cpu(busy, idle, cpus);
-        source.snapshot().system.cpu
-    };
-    assert_eq!(cpu(450, 4_800, 8), measured(100, 400, 8));
+    assert_eq!(
+        cpu(&fixture, &mut source, 450, 4_800, 8),
+        SystemCpu::WarmingUp
+    );
+    assert_eq!(
+        cpu(&fixture, &mut source, 550, 5_100, 8),
+        measured(100, 400, 8)
+    );
+    // So does a `stat` that holds no usable `cpu` line.
+    fixture.system_file("stat", b"intr 0\nctxt 0\n");
+    assert_eq!(
+        source.snapshot().system.cpu,
+        SystemCpu::Missing(FigureGap::Unusable)
+    );
+    assert_eq!(
+        cpu(&fixture, &mut source, 650, 5_400, 8),
+        SystemCpu::WarmingUp
+    );
+    assert_eq!(
+        cpu(&fixture, &mut source, 750, 5_700, 8),
+        measured(100, 400, 8)
+    );
     // A different boot restarts the counters: warming up, not a reset.
     fs::write(fixture.0.join("sys/kernel/random/boot_id"), "boot-b\n").unwrap();
-    assert_eq!(cpu(10, 20, 8), SystemCpu::WarmingUp);
+    assert_eq!(cpu(&fixture, &mut source, 10, 20, 8), SystemCpu::WarmingUp);
+}
+
+/// Review round 1 (W1): an outage that leaves `<root>/stat` unreadable — the
+/// root neither listable nor searchable — discards the overall-CPU baseline. The
+/// first readable read after it warms up, instead of publishing the average of
+/// the whole outage as the current figure under a fresh sample time, and the
+/// read after that measures only the interval between the two.
+#[test]
+fn an_outage_that_leaves_stat_unreadable_is_never_averaged_into_the_next_figure() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .process(10, b"worker", 500)
+        .host();
+    let mut source = fixture
+        .source()
+        .with_wall_clock(Arc::new(TickingWallClock::default()));
+    let session = srui_sessiond::Session::mint();
+    let (mut view, _) = srui_process_explorer::start_from_source(&session, &mut source).unwrap();
+    // One measured interval: 100 of 400 ticks busy on four CPUs.
+    fixture.stat_cpu(1_100, 3_300, 4);
+    view.refresh(&session, &mut source).unwrap();
+    assert_eq!(
+        summary_line(&session, summary::CPU_TEXT),
+        "Overall CPU (100% = all 4 logical CPUs): 25.0%"
+    );
+    // The outage: the root can be neither listed nor searched, for five ticks.
+    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o000)).unwrap();
+    let outcomes: Vec<_> = (0..5)
+        .map(|_| view.refresh(&session, &mut source))
+        .collect();
+    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+    assert!(summary_line(&session, summary::FRESHNESS_TEXT).starts_with("Collector error: "));
+    // An hour of four fully busy CPUs went by during the outage, and then the
+    // most recent second was completely idle.
+    let outage_busy = 4 * 100 * 3_600;
+    fixture.stat_cpu(1_100 + outage_busy, 3_300 + 400, 4);
+    view.refresh(&session, &mut source).unwrap();
+    // Not the hour's 99.9%: nothing was read in between, so there is no
+    // interval yet, and the line says so under the fresh sample's time.
+    assert_eq!(
+        summary_line(&session, summary::CPU_TEXT),
+        "Overall CPU (100% = all logical CPUs): Warming up"
+    );
+    assert_eq!(
+        summary_property(&session, summary::CPU_BAR, srui_sdk::VALUE),
+        None
+    );
+    assert!(summary_line(&session, summary::FRESHNESS_TEXT)
+        .starts_with("Last successful sample: 2027-01-15 08:00:07 UTC"));
+    // The next read is measured from that one alone: the idle second.
+    fixture.stat_cpu(1_100 + outage_busy, 3_300 + 800, 4);
+    view.refresh(&session, &mut source).unwrap();
+    assert_eq!(
+        summary_line(&session, summary::CPU_TEXT),
+        "Overall CPU (100% = all 4 logical CPUs): 0.0%"
+    );
+}
+
+/// Review round 1 (W1), the control: an outage that leaves `stat` readable — the
+/// root searchable but not listable — still reads the counters on every tick, so
+/// the figure after it is measured over the last interval only, between two
+/// consecutive successful reads.
+#[test]
+fn an_outage_that_leaves_stat_readable_measures_only_the_last_interval() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .process(10, b"worker", 500)
+        .host();
+    let mut source = fixture.source();
+    let session = srui_sessiond::Session::mint();
+    let (mut view, _) = srui_process_explorer::start_from_source(&session, &mut source).unwrap();
+    fixture.stat_cpu(1_100, 3_300, 4);
+    view.refresh(&session, &mut source).unwrap();
+    let outage_busy = 4 * 100 * 3_600;
+    fixture.stat_cpu(1_100 + outage_busy, 3_300, 4);
+    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o300)).unwrap();
+    let failed = view.refresh(&session, &mut source);
+    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(failed.is_ok(), "{failed:?}");
+    assert!(summary_line(&session, summary::FRESHNESS_TEXT).starts_with("Collector error: "));
+    fixture.stat_cpu(1_100 + outage_busy, 3_300 + 400, 4);
+    view.refresh(&session, &mut source).unwrap();
+    assert_eq!(
+        summary_line(&session, summary::CPU_TEXT),
+        "Overall CPU (100% = all 4 logical CPUs): 0.0%"
+    );
 }
 
 /// PX-007 through the publication path: a procfs sample is published as text
@@ -2294,7 +2414,8 @@ fn a_collector_error_keeps_the_last_procfs_sample_on_screen_until_a_scan_replace
         ),
         (
             summary::PROCESSES_TEXT,
-            "Processes: 1 listed · complete scan · unfiltered".to_string(),
+            "Processes visible to this reader: 1 listed · complete scan · no srtop filter"
+                .to_string(),
         ),
         (
             summary::FRESHNESS_TEXT,
@@ -2420,7 +2541,10 @@ fn a_live_source_without_a_process_filesystem_publishes_no_figure() {
         ),
         (summary::MEMORY_TEXT, "Memory: Not sampled"),
         (summary::SWAP_TEXT, "Swap: Not sampled"),
-        (summary::PROCESSES_TEXT, "Processes: Not sampled"),
+        (
+            summary::PROCESSES_TEXT,
+            "Processes visible to this reader: Not sampled",
+        ),
     ] {
         assert_eq!(summary_line(&session, node), text);
     }
@@ -3224,8 +3348,10 @@ mod live {
         assert!(line(summary::LOAD_TEXT).starts_with("Load average (1, 5, 15 min): "));
         let processes = line(summary::PROCESSES_TEXT);
         assert!(
-            processes.starts_with(&format!("Processes: {} listed · ", first.records.len()))
-                && processes.ends_with(" · unfiltered"),
+            processes.starts_with(&format!(
+                "Processes visible to this reader: {} listed · ",
+                first.records.len()
+            )) && processes.ends_with(" · no srtop filter"),
             "{processes}"
         );
         let freshness = line(summary::FRESHNESS_TEXT);

@@ -156,9 +156,11 @@ pub struct SystemCpuInterval {
 /// two samples (PX-007). None of the states but `Measured` is a quantity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SystemCpu {
-    /// Measured across one interval of the same boot.
+    /// Measured across one interval of the same boot, between two consecutive
+    /// successful reads.
     Measured(SystemCpuInterval),
-    /// The first read of this boot's counters: nothing to subtract yet.
+    /// The first read of this boot's counters, or the first after a read that
+    /// failed: nothing to subtract yet, and an outage is never averaged in.
     WarmingUp,
     /// The counters went backwards, did not advance at all, or were read over a
     /// different number of logical CPUs than the previous read: there is no

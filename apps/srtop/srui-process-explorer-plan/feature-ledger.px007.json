@@ -28,7 +28,7 @@
     },
     {
       "feature_id": "SRUI-PX007-002",
-      "feature": "Overall CPU is a share of all logical CPUs, labelled 'Overall CPU (100% = all N logical CPUs)' and never the process column's 'CPU (100% = 1 CPU)': the /proc/stat cpu line, busy = user + nice + system + irq + softirq + steal and idle = idle + iowait (guest and guest_nice already in user and nice), differenced between two reads and truncated to a tenth of a point; the cpuN lines are counted as the logical CPUs and nothing after them is read; a first read is warming up, counters that went backwards, did not advance or were read over a different CPU count are unavailable rather than zero or a spike, and a different boot restarts the baseline",
+      "feature": "Overall CPU is a share of all logical CPUs, labelled 'Overall CPU (100% = all N logical CPUs)' and never the process column's 'CPU (100% = 1 CPU)': the /proc/stat cpu line, busy = user + nice + system + irq + softirq + steal and idle = idle + iowait (guest and guest_nice already in user and nice), differenced between two consecutive successful reads and truncated to a tenth of a point; the cpuN lines are counted as the logical CPUs and parsing stops at the first other line; a first read, and the first read after one that failed or held no usable cpu line, is warming up, so an outage is never averaged into a current figure; counters that went backwards, did not advance or were read over a different CPU count are unavailable rather than zero or a spike, and a different boot restarts the baseline",
       "scope": "PX-007/live and fixture procfs roots, read through the scanned root/read-only",
       "source_refs": [
         "D1",
@@ -71,7 +71,7 @@
     },
     {
       "feature_id": "SRUI-PX007-005",
-      "feature": "The process count states its scope: the records the last successful scan listed, in the status line's own counts and words (unreadable, beyond the record limit, complete or incomplete scan), processes and never threads, and 'unfiltered' because no filter exists yet",
+      "feature": "The process count states the only scope srtop knows: 'Processes visible to this reader', the records the last successful scan listed, in the status line's own counts and words (unreadable, beyond the record limit, complete or incomplete scan), processes and never threads, with 'no srtop filter'; the view is bounded, without any error, by the reader's PID namespace and procfs mount options such as hidepid, which srtop does not detect, so a complete scan is never a claim about the whole host",
       "scope": "PX-007/all sources/read-only; filters are PX-010",
       "source_refs": [
         "D1",
@@ -98,7 +98,7 @@
     },
     {
       "feature_id": "SRUI-PX007-007",
-      "feature": "The summary is refreshed inside the existing refresh transactions as scalar SET_PROPERTY operations on the properties a client would see change and no others (and one CLEAR_PROPERTY only on the tick a bar loses its value, never a zero), so a source whose figures and sample time are constant, like the fake source, publishes nothing once synchronized; it is charged a fixed 8 KiB reserve against the catch-up snapshot, asserted against the widest summary on the protocol's encoder, never its current length",
+      "feature": "The summary is refreshed inside the existing refresh transactions as scalar SET_PROPERTY operations on the properties a client would see change and no others (and one CLEAR_PROPERTY only on the tick a bar loses its value, never a zero), so a source whose figures and sample time are constant, like the fake source, publishes nothing once synchronized; it is planned after the status and before the row operations of the same refresh, and charged a fixed 8 KiB reserve against the catch-up snapshot, asserted against the widest summary on the protocol's encoder and pinned at the row ceiling, never its current length",
       "scope": "PX-007/refresh and snapshot bounds; frame budgets of PX-004 and PX-004-G01 unchanged otherwise",
       "source_refs": [
         "D1",

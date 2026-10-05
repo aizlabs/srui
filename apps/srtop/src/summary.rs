@@ -476,8 +476,11 @@ fn uptime(uptime: &Result<u64, FigureGap>) -> Line {
     }
 }
 
-/// The process count, in the status line's own counts and words, and scoped:
-/// what the source listed, with no filter applied.
+/// The process count, in the status line's own counts and words, and scoped to
+/// what srtop can state: the processes this reader can see in the scanned root,
+/// which its PID namespace and the mount's visibility options (`hidepid`)
+/// bound without telling it, and no filter of srtop's own. A complete scan is
+/// complete over that view, never a claim about the whole host.
 fn processes(count: &ProcessCount) -> Line {
     let mut text = format!("{}: {} listed", metric::PROCESS_COUNT.label, count.listed);
     if count.unreadable > 0 {
@@ -491,7 +494,7 @@ fn processes(count: &ProcessCount) -> Line {
     } else {
         " · incomplete scan"
     });
-    text.push_str(" · unfiltered");
+    text.push_str(" · no srtop filter");
     Line::new(text, TextRole::Body)
 }
 
@@ -737,7 +740,7 @@ mod tests {
         assert_eq!(summary.uptime.text, "Uptime: 3 days, 4 h 05 min");
         assert_eq!(
             summary.processes.text,
-            "Processes: 3 listed · complete scan · unfiltered"
+            "Processes visible to this reader: 3 listed · complete scan · no srtop filter"
         );
         assert_eq!(
             summary.freshness.text,
@@ -1078,7 +1081,10 @@ mod tests {
             failed.cpu.text,
             "Overall CPU (100% = all logical CPUs): Not sampled"
         );
-        assert_eq!(failed.processes.text, "Processes: Not sampled");
+        assert_eq!(
+            failed.processes.text,
+            "Processes visible to this reader: Not sampled"
+        );
         assert_eq!(failed.memory_bar.tenths, None);
         // And the shell with no source at all says that.
         let empty = summarize(&State::NotStarted);
@@ -1126,23 +1132,37 @@ mod tests {
         };
         assert_eq!(
             count(3, 0, 0, true),
-            "Processes: 3 listed · complete scan · unfiltered"
+            "Processes visible to this reader: 3 listed · complete scan · no srtop filter"
         );
         assert_eq!(
             count(300, 12, 5, false),
-            "Processes: 300 listed · 12 unreadable · 5 beyond the record limit · incomplete \
-             scan · unfiltered"
+            "Processes visible to this reader: 300 listed · 12 unreadable · 5 beyond the \
+             record limit · incomplete scan · no srtop filter"
         );
         // Only identity was degraded: every listed record was read.
         assert_eq!(
             count(3, 0, 0, false),
-            "Processes: 3 listed · incomplete scan · unfiltered"
+            "Processes visible to this reader: 3 listed · incomplete scan · no srtop filter"
         );
         assert_eq!(
             count(0, 0, 0, true),
-            "Processes: 0 listed · complete scan · unfiltered",
+            "Processes visible to this reader: 0 listed · complete scan · no srtop filter",
             "an authoritative empty list is a real zero"
         );
+        // Review round 1 (W2): the count is scoped to this reader's view, which a
+        // PID namespace or hidepid narrows without any error, and never worded
+        // as if it were every process on the host.
+        for (listed, unreadable, capped, complete) in
+            [(3, 0, 0, true), (300, 12, 5, false), (0, 0, 0, true)]
+        {
+            let line = count(listed, unreadable, capped, complete);
+            assert!(
+                line.starts_with("Processes visible to this reader: "),
+                "{line}"
+            );
+            assert!(line.ends_with(" · no srtop filter"), "{line}");
+            assert!(!line.contains("unfiltered"), "{line}");
+        }
     }
 
     /// Every line and bar description fits its bound uncut, at its widest, so

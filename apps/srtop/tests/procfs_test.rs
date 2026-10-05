@@ -1739,13 +1739,13 @@ mod live {
     /// capped: fewer than four batches brings back the zero this guards against.
     fn worker_resident_bytes() -> usize {
         let pages = 4 * (2 * online_cpus().unwrap_or(FALLBACK_ONLINE_CPUS)).max(32);
-        (pages * own_page_size().unwrap_or(FALLBACK_PAGE_SIZE)).max(WORKER_RESIDENT_MIN)
+        (pages * own_auxv(AT_PAGESZ).unwrap_or(FALLBACK_PAGE_SIZE)).max(WORKER_RESIDENT_MIN)
     }
 
-    /// This process's page size: `AT_PAGESZ` in its own auxiliary vector, pairs
-    /// of native-endian words ending at `AT_NULL`, the layout `procfs` reads
-    /// from a mount's `self/auxv`.
-    fn own_page_size() -> Option<usize> {
+    /// The value of `wanted` in this process's own auxiliary vector: pairs of
+    /// native-endian words ending at `AT_NULL`, the layout `procfs` reads from a
+    /// mount's `self/auxv`.
+    fn own_auxv(wanted: u64) -> Option<usize> {
         let bytes = std::fs::read("/proc/self/auxv").ok()?;
         let word = std::mem::size_of::<usize>();
         let read = |slice: &[u8]| usize::from_ne_bytes(slice.try_into().expect("one word"));
@@ -1753,8 +1753,8 @@ mod live {
             .chunks_exact(2 * word)
             .map(|pair| (read(&pair[..word]) as u64, read(&pair[word..])))
             .take_while(|&(key, _)| key != AT_NULL)
-            .find(|&(key, _)| key == AT_PAGESZ)
-            .map(|(_, size)| size)
+            .find(|&(key, _)| key == wanted)
+            .map(|(_, value)| value)
     }
 
     /// How many CPUs the kernel has online, the count it sizes that batch by,
@@ -2069,78 +2069,140 @@ mod live {
         drop(block);
     }
 
-    /// PX-006 acceptance on a real host: a bounded worker this test owns, which
-    /// is runnable for the whole interval, reads as roughly one logical CPU, and
-    /// a sleeping one as roughly none. Both are first published as warming up.
+    /// PX-006 acceptance on a real host: the CPU share published for a bounded
+    /// worker this test owns, one runnable for the whole interval and one asleep,
+    /// is what the kernel's own counters say. Both are first published as warming
+    /// up.
     ///
-    /// Tolerances rather than exact values, because the scheduler is not a
-    /// contract: a loaded host may give the burner less than a full CPU, and
-    /// tick accounting has a resolution of one tick per `1 / CLK_TCK` seconds.
-    /// The upper bound is the one that cannot pass by accident — a
-    /// single-threaded process cannot use more than one CPU, so a reading well
-    /// above 100% is a measurement defect (a wall-clock divisor, a stale
-    /// baseline, a spike), not load.
+    /// Checked against ground truth this test reads itself, not against a fixed
+    /// band, because the scheduler is not a contract: a loaded host may give the
+    /// burner any share of a CPU. Each worker's `utime + stime` and an `Instant`
+    /// are read just before and just after each scan, so the counter srtop read
+    /// inside a scan, and the moment it read it, lie between them. The share it
+    /// publishes therefore lies between the smallest tick delta over the longest
+    /// interval and the largest delta over the shortest, less the tenth of a
+    /// point it truncates, whatever share the burner was given.
     #[test]
     fn a_test_owned_busy_worker_reads_about_one_cpu_and_a_sleeping_one_about_none() {
-        /// One tick of slack at USER_HZ 100 over the interval, plus the time a
-        /// scan takes, is far below this.
-        const UPPER_TENTHS: u64 = 1_150;
-        /// A single runnable thread on a host this suite runs on gets far more
-        /// than this; less means the interval or the counters are wrong.
-        const LOWER_TENTHS: u64 = 300;
-        /// A sleeping worker is woken by nothing in the interval.
-        const IDLE_TENTHS: u64 = 50;
         const INTERVAL: Duration = Duration::from_secs(2);
+        /// srtop publishes tenths of a point, truncated.
+        const TRUNCATION: f64 = 0.1;
+        /// Room for floating-point rounding in the bounds, far below a tenth.
+        const ROUNDING: f64 = 1e-6;
 
         let burner = Worker::burn();
         let sleeper = Worker::start();
+        let workers = [("burner", burner.pid()), ("sleeper", sleeper.pid())];
+        let pids = workers.map(|(_, pid)| pid);
         let mut source = ProcFsSource::live();
         let session = Session::mint();
+        let a = Counters::before(&pids);
         let (mut view, first) = start_from_source(&session, &mut source).unwrap();
+        let b = Counters::after(&pids);
         assert_eq!(cpu_for(&first, burner.pid()), CpuUsage::WarmingUp);
         assert_eq!(cpu_for(&first, sleeper.pid()), CpuUsage::WarmingUp);
         assert_eq!(published_cpu(&session, burner.pid()), "Warming up");
 
-        let started = Instant::now();
         std::thread::sleep(INTERVAL);
+        let c = Counters::before(&pids);
         let second = source.snapshot();
-        let wall = started.elapsed();
-        let burning = cpu_for(&second, burner.pid());
-        let sleeping = cpu_for(&second, sleeper.pid());
-        let tenths = |usage: CpuUsage| match usage {
-            CpuUsage::Measured(interval) => {
-                srui_process_explorer::metric::cpu_tenths_of_percent(&interval)
-                    .expect("a live interval is publishable")
-            }
-            other => panic!("a second live sample must be measured: {other:?}"),
+        let d = Counters::after(&pids);
+        // The rate srtop reads too: this process's own `AT_CLKTCK`.
+        let ticks_per_second = own_auxv(AT_CLKTCK).expect("a Linux process has AT_CLKTCK");
+        let (shortest, longest) = (c.at - b.at, d.at - a.at);
+        let share = |ticks: u64, over: Duration| {
+            ticks as f64 / ticks_per_second as f64 / over.as_secs_f64() * 100.0
         };
-        let (burning_tenths, sleeping_tenths) = (tenths(burning), tenths(sleeping));
+        let mut evidence = Vec::new();
+        let mut used = Vec::new();
+        for (index, (role, pid)) in workers.into_iter().enumerate() {
+            let CpuUsage::Measured(interval) = cpu_for(&second, pid) else {
+                panic!("a second live sample of the {role} must be measured")
+            };
+            let published = srui_process_explorer::metric::cpu_tenths_of_percent(&interval)
+                .expect("a live interval is publishable") as f64
+                / 10.0;
+            let fewest = c.ticks[index].saturating_sub(b.ticks[index]);
+            let most = d.ticks[index].saturating_sub(a.ticks[index]);
+            let (lower, upper) = (share(fewest, longest), share(most, shortest));
+            assert!(
+                lower - TRUNCATION - ROUNDING <= published && published <= upper + ROUNDING,
+                "the {role} was published at {published:.1}%, outside [{lower:.3}%, \
+                 {upper:.3}%]: {fewest}..{most} ticks at {ticks_per_second}/s over \
+                 {shortest:?}..{longest:?}"
+            );
+            assert_eq!(
+                interval.ticks_per_second, ticks_per_second as u64,
+                "srtop and this test read different clock tick rates"
+            );
+            evidence.push(format!(
+                "{role}_pid={pid} {role}={published:.1}% in [{lower:.3}%, {upper:.3}%] \
+                 {role}_ticks={fewest}..{most}"
+            ));
+            used.push(most);
+        }
+        // The one check that does not depend on the scheduler at all: the burner
+        // used more CPU than the sleeper did.
         assert!(
-            (LOWER_TENTHS..=UPPER_TENTHS).contains(&burning_tenths),
-            "a runnable single-threaded worker read {burning_tenths} tenths of a percent"
-        );
-        assert!(
-            sleeping_tenths <= IDLE_TENTHS,
-            "a sleeping worker read {sleeping_tenths} tenths of a percent"
+            used[0] > used[1],
+            "the burner used {} ticks and the sleeper {}",
+            used[0],
+            used[1]
         );
         let outcome = view.apply(&session, LIVE_STATUS_TEXT, &second).unwrap();
         assert!(outcome.updated >= 2, "{outcome:?}");
         assert_eq!(
             published_cpu(&session, burner.pid()),
-            srui_process_explorer::metric::cpu_cell(&burning)
+            srui_process_explorer::metric::cpu_cell(&cpu_for(&second, burner.pid()))
         );
         session.with_store(|store| assert_eq!(store.node_count(), 5));
         println!(
-            "PX-006 live evidence: burner_pid={} sleeper_pid={} wall={wall:?} \
-             burner={burning:?} burner_cell={:?} sleeper={sleeping:?} sleeper_cell={:?} \
-             records={} updated={}",
-            burner.pid(),
-            sleeper.pid(),
+            "PX-006 live evidence: clk_tck={ticks_per_second} {} interval={shortest:?}..{longest:?} \
+             burner_cell={:?} sleeper_cell={:?} records={} updated={}",
+            evidence.join(" "),
             published_cpu(&session, burner.pid()),
             published_cpu(&session, sleeper.pid()),
             second.records.len(),
             outcome.updated,
         );
+    }
+
+    /// Each worker's CPU counter, with the moment around it: the instant is read
+    /// before the counters in [`Counters::before`] and after them in
+    /// [`Counters::after`], so a pair of them brackets everything in between.
+    struct Counters {
+        at: Instant,
+        ticks: Vec<u64>,
+    }
+
+    impl Counters {
+        fn before(pids: &[u32]) -> Self {
+            let at = Instant::now();
+            Self {
+                at,
+                ticks: pids.iter().map(|&pid| cpu_ticks(pid)).collect(),
+            }
+        }
+
+        fn after(pids: &[u32]) -> Self {
+            let ticks = pids.iter().map(|&pid| cpu_ticks(pid)).collect();
+            Self {
+                at: Instant::now(),
+                ticks,
+            }
+        }
+    }
+
+    /// `utime + stime` of `pid`, fields 14 and 15 of `/proc/<pid>/stat`, read
+    /// here rather than through the collector this checks.
+    fn cpu_ticks(pid: u32) -> u64 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .expect("a test's own worker has a stat file");
+        let after_name = &stat[stat.rfind(')').expect("a stat line names its command") + 1..];
+        // Field 3 is the first after the name, so 14 and 15 are the 12th and 13th.
+        let fields: Vec<&str> = after_name.split_whitespace().collect();
+        fields[11].parse::<u64>().expect("utime is a count")
+            + fields[12].parse::<u64>().expect("stime is a count")
     }
 
     /// The CPU usage `snapshot` observed for `pid`.

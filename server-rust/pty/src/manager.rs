@@ -657,45 +657,48 @@ mod tests {
     fn natural_exit_reaps_the_child() {
         let manager = PTYManager::default();
         let id = NodeId::new(22);
+        // The child exits by itself, but only after a line of input, so the
+        // test sees it alive, and not reaped, first.
         manager
-            .spawn(id, echo_spec("printf 'SRUI_EXIT_OK'; exit 0", 32))
+            .spawn(
+                id,
+                echo_spec("read line; printf 'SRUI_EXIT_OK'; exit 0", 32),
+            )
             .unwrap();
         let pid = manager
             .process_id(id)
             .expect("spawned child must expose a pid");
+        assert!(!is_child_reaped(pid), "live child {pid} read as reaped");
+        manager.input(id, b"\n".to_vec()).unwrap();
         wait_for_output(&manager, id, b"SRUI_EXIT_OK");
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let mut reaped = false;
-        while std::time::Instant::now() < deadline {
-            if is_child_reaped(pid) {
-                reaped = true;
-                break;
-            }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !is_child_reaped(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child {pid} was not reaped by natural exit"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         manager.close(id).unwrap();
-        assert!(reaped, "child {pid} was not reaped by natural exit");
     }
+
+    /// Whether this process has no child `pid` any more: it was reaped, even if
+    /// another process holds the number now. A child that is still running, or
+    /// has exited but not been waited for, has not been reaped.
     fn is_child_reaped(pid: u32) -> bool {
         #[cfg(unix)]
         {
-            let res = unsafe { libc::kill(pid as libc::pid_t, 0) };
-            if res == -1 {
-                let err = std::io::Error::last_os_error().raw_os_error();
-                return err == Some(libc::ESRCH);
-            }
-            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-                if let Some(after) = stat.rsplit(')').next() {
-                    if let Some(state) = after
-                        .split_whitespace()
-                        .next()
-                        .and_then(|s| s.chars().next())
-                    {
-                        return state != 'Z';
-                    }
-                }
-            }
-            false
+            // WNOWAIT only peeks, so this check never reaps the child itself.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let res = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            res == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
         }
         #[cfg(not(unix))]
         {

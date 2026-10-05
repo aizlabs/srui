@@ -1046,28 +1046,88 @@ mod live {
     };
     use srui_sdk::{ItemId, Value};
     use srui_sessiond::Session;
+    use std::io::{BufRead, BufReader, Write};
     use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    /// A bounded, disposable worker owned by this test.
+    /// Set in a worker's environment, where it turns [`test_owned_worker`] from
+    /// a no-op into the worker's body.
+    const WORKER_ENV: &str = "SRTOP_LIVE_WORKER";
+    /// The libtest name of [`test_owned_worker`], the one test a worker runs.
+    const WORKER_TEST: &str = "live::test_owned_worker";
+    /// The name a worker gives itself, which a scan reads back from
+    /// `/proc/<pid>/stat`; the kernel keeps at most 15 bytes.
+    const WORKER_NAME: &str = "srtop-worker";
+    /// What a worker prints, followed by its PID, once it is ready to be scanned.
+    const WORKER_READY: &str = "srtop live worker ready: pid=";
+    /// Memory a worker writes and holds. The `rss` that `/proc/<pid>/stat`
+    /// reports leaves out per-CPU counter deltas of up to `max(32, 2 * CPUs)`
+    /// pages each, so a process that has touched little can read as holding
+    /// none; 8 MiB written by one thread is well past that slack.
+    const WORKER_RESIDENT_BYTES: usize = 8 * 1024 * 1024;
+    /// How long a worker lives if nothing ends it sooner.
+    const WORKER_LIFETIME: Duration = Duration::from_secs(60);
+    /// How long a test waits for its worker to report ready.
+    const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// A bounded, disposable worker process owned by this test: this test
+    /// binary, re-executed to run [`test_owned_worker`] alone.
+    ///
+    /// [`Worker::start`] returns once the worker says it is ready, because a
+    /// `/proc/<pid>` entry proves nothing: it exists as soon as the child does,
+    /// and `spawn` can return while the child is still inside `execve` with the
+    /// spawning thread's name, or has just begun running with too few pages for
+    /// the kernel's approximate count to show any.
     struct Worker(Child);
 
     impl Worker {
         fn start() -> Self {
-            let child = Command::new("/bin/sleep")
-                .arg("47")
+            let program = std::env::current_exe().expect("a test binary knows its own path");
+            let mut child = Command::new(program)
+                .args([
+                    "--exact",
+                    WORKER_TEST,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(WORKER_ENV, "1")
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
+                .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("the test owns this worker");
-            let worker = Self(child);
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !PathBuf::from(format!("/proc/{}/stat", worker.pid())).exists() {
-                assert!(Instant::now() < deadline, "worker never appeared in /proc");
-                std::thread::sleep(Duration::from_millis(10));
+            let stdout = child.stdout.take().expect("the worker's stdout is piped");
+            let mut worker = Self(child);
+            // Read on another thread so the wait below has a deadline. The thread
+            // drains the pipe until the worker ends, so the worker never blocks
+            // on output nobody reads.
+            let (sender, lines) = mpsc::channel();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    let _ = sender.send(line);
+                }
+            });
+            // libtest may already have begun the line with the test's name.
+            let ready = format!("{WORKER_READY}{}", worker.pid());
+            let deadline = Instant::now() + WORKER_READY_TIMEOUT;
+            let mut output = Vec::new();
+            loop {
+                match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(line) if line.ends_with(&ready) => return worker,
+                    Ok(line) => output.push(line),
+                    Err(cause) => {
+                        let _ = worker.0.kill();
+                        let status = worker.0.wait();
+                        panic!(
+                            "worker {} never reported ready ({cause:?}, waited up to \
+                             {WORKER_READY_TIMEOUT:?}); status {status:?}; output {output:?}",
+                            worker.pid()
+                        );
+                    }
+                }
             }
-            worker
         }
 
         fn pid(&self) -> u32 {
@@ -1080,6 +1140,40 @@ mod live {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+
+    /// The body of a [`Worker`]. Ignored, and a no-op unless [`WORKER_ENV`] is
+    /// set, so `--ignored` and `--include-ignored` runs stay harmless.
+    ///
+    /// A worker names itself and writes the memory it holds, and only then
+    /// reports ready. It sleeps until it is killed, and ends by itself after
+    /// [`WORKER_LIFETIME`] or once its parent is gone, so an orphan does not
+    /// outlive a crashed test for long.
+    #[test]
+    #[ignore = "the body of a test-owned worker process, which Worker::start runs"]
+    fn test_owned_worker() {
+        if std::env::var_os(WORKER_ENV).is_none() {
+            return;
+        }
+        // The parent does not read stderr; a failure reaches it on stdout.
+        std::panic::set_hook(Box::new(|panic| {
+            let _ = writeln!(std::io::stdout(), "srtop live worker failed: {panic}");
+        }));
+        let parent = std::os::unix::process::parent_id();
+        // Renames the thread-group leader, whichever thread writes it: the name
+        // `/proc/<pid>/stat` reports for the process.
+        std::fs::write("/proc/self/comm", WORKER_NAME).expect("a process may rename itself");
+        // Written, not merely allocated, so every page is resident.
+        let resident = std::hint::black_box(vec![1u8; WORKER_RESIDENT_BYTES]);
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "{WORKER_READY}{}", std::process::id()).expect("the test reads this");
+        stdout.flush().expect("the test reads this");
+        drop(stdout);
+        let started = Instant::now();
+        while started.elapsed() < WORKER_LIFETIME && std::os::unix::process::parent_id() == parent {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        drop(resident);
     }
 
     #[test]
@@ -1097,7 +1191,7 @@ mod live {
             .iter()
             .find(|record| record.key.pid == Observed::Known(pid))
             .expect("the owned worker must appear in a live snapshot");
-        assert_eq!(record.display_name.as_str(), "sleep");
+        assert_eq!(record.display_name.as_str(), WORKER_NAME);
         // A sleeping worker holds a real, readable amount of memory: a live
         // record's metric is a value, not an unread field (PX-005).
         let Observed::Known(resident) = record.resident else {
@@ -1202,7 +1296,7 @@ mod live {
             let Value::List(cells) = &worker_row.value else {
                 panic!("expected table cells")
             };
-            assert_eq!(cells[1], Value::String("sleep".into()));
+            assert_eq!(cells[1], Value::String(WORKER_NAME.into()));
             // Item IDs are session-allocated and opaque: the allocator hands out
             // 1..=count in projection order, whatever the PID values are.
             // Asserting that set keeps this meaningful in a PID namespace with
@@ -1261,7 +1355,7 @@ mod live {
             panic!("expected table cells")
         };
         assert_eq!(cells[0], Value::UnsignedInt(u64::from(pid)));
-        assert_eq!(cells[1], Value::String("sleep".into()));
+        assert_eq!(cells[1], Value::String(WORKER_NAME.into()));
         // The shell was built once and is refreshed in place.
         session.with_store(|store| assert_eq!(store.node_count(), 5));
         assert!(session.current_revision() > before);

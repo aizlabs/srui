@@ -31,9 +31,9 @@ struct CounterSocketIntegrationTests {
         guard FileManager.default.fileExists(atPath: counterBinary.path) else { return }
 
         // Deliberately *not* pre-created: the server must build the private parent itself.
-        let runtimeDirectory = URL(fileURLWithPath: "/tmp/srui-counter-private-\(UUID().uuidString)")
+        let runtimeDirectory = try TestFixtureDirectory.reserve(prefix: "srui-counter-private")
         let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
-        defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
+        defer { TestFixtureDirectory.release(runtimeDirectory) }
 
         let server = Process()
         server.executableURL = counterBinary
@@ -78,16 +78,9 @@ struct CounterSocketIntegrationTests {
             return
         }
 
-        let tempDir = URL(fileURLWithPath: "/tmp/srui-counter-test-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: false)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: tempDir.path
-        )
+        let tempDir = try TestFixtureDirectory.make(prefix: "srui-counter-test")
+        defer { TestFixtureDirectory.release(tempDir) }
         let socketPath = tempDir.appendingPathComponent("counter.sock").path
-        defer {
-            try? FileManager.default.removeItem(at: tempDir)
-        }
 
         let server = Process()
         server.executableURL = counterBinary
@@ -122,6 +115,7 @@ struct CounterSocketIntegrationTests {
         let textID = NodeId(2)
         let buttonID = NodeId(4)
         try await AsyncTestSupport.eventually(
+            timeout: .roundTrip,
             description: "initial counter render reaches Count: 0"
         ) {
             guard let field = renderer.registry.handle(for: textID)?.view as? NSTextField else {
@@ -138,6 +132,7 @@ struct CounterSocketIntegrationTests {
                 timeoutSeconds: 5
             )
             try await AsyncTestSupport.eventually(
+                timeout: .roundTrip,
                 description: "counter render reaches Count: \(cycle)"
             ) {
                 guard let field = renderer.registry.handle(for: textID)?.view as? NSTextField else {
@@ -158,18 +153,8 @@ struct CounterSocketIntegrationTests {
     @Test("Fresh HELLO against a seeded counter session applies the catch-up snapshot")
     @MainActor
     func helloCatchUpSnapshotOverUnixSocket() async throws {
-        let runtimeDirectory = URL(
-            fileURLWithPath: "/tmp/srui-counter-hello-\(UUID().uuidString)"
-        )
-        try FileManager.default.createDirectory(
-            at: runtimeDirectory,
-            withIntermediateDirectories: false
-        )
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: runtimeDirectory.path
-        )
-        defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
+        let runtimeDirectory = try TestFixtureDirectory.make(prefix: "srui-counter-hello")
+        defer { TestFixtureDirectory.release(runtimeDirectory) }
         let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
         let repoRoot = Self.repositoryRoot()
         let counterBinary = repoRoot
@@ -192,7 +177,6 @@ struct CounterSocketIntegrationTests {
                 server.terminate()
             }
             server.waitUntilExit()
-            try? FileManager.default.removeItem(atPath: socketPath)
         }
 
         try await Self.waitForSocket(at: socketPath, timeoutSeconds: 10)
@@ -210,7 +194,7 @@ struct CounterSocketIntegrationTests {
 
         try await controller.start()
         try await Self.waitForRevision(applier, expected: Revision(1), timeoutSeconds: 5)
-        try await AsyncTestSupport.eventually(description: "HELLO catch-up enables event dispatch") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "HELLO catch-up enables event dispatch") {
             controller.isEventDispatchEnabled
         }
 
@@ -220,6 +204,7 @@ struct CounterSocketIntegrationTests {
         _ = try await controller.sendActivate(nodeId: buttonID)
         try await Self.waitForRevision(applier, expected: Revision(2), timeoutSeconds: 5)
         try await AsyncTestSupport.eventually(
+            timeout: .roundTrip,
             description: "HELLO catch-up counter render reaches Count: 1"
         ) {
             guard let field = renderer.registry.handle(for: textID)?.view as? NSTextField else {
@@ -239,18 +224,8 @@ struct CounterSocketIntegrationTests {
     @Test("Connection fails cleanly at handshake time when server requires an unsupported profile (§4 inv. 13)")
     @MainActor
     func mismatchedRequiredProfileFailsAtHandshake() async throws {
-        let runtimeDirectory = URL(
-            fileURLWithPath: "/tmp/srui-counter-mismatch-\(UUID().uuidString)"
-        )
-        try FileManager.default.createDirectory(
-            at: runtimeDirectory,
-            withIntermediateDirectories: false
-        )
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: runtimeDirectory.path
-        )
-        defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
+        let runtimeDirectory = try TestFixtureDirectory.make(prefix: "srui-counter-mismatch")
+        defer { TestFixtureDirectory.release(runtimeDirectory) }
         let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
         let repoRoot = Self.repositoryRoot()
         let counterBinary = repoRoot
@@ -273,7 +248,6 @@ struct CounterSocketIntegrationTests {
                 server.terminate()
             }
             server.waitUntilExit()
-            try? FileManager.default.removeItem(atPath: socketPath)
         }
 
         try await Self.waitForSocket(at: socketPath, timeoutSeconds: 10)
@@ -295,7 +269,7 @@ struct CounterSocketIntegrationTests {
 
         try await controller.start()
 
-        try await AsyncTestSupport.eventually(description: "handshake failure on profile mismatch against live server") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "handshake failure on profile mismatch against live server") {
             controller.isDiverged && (failurePromise.load() != nil || !controller.isHandshakeComplete)
         }
         #expect(!controller.isHandshakeComplete)
@@ -307,18 +281,8 @@ struct CounterSocketIntegrationTests {
     @Test("Image fixture delivers a committed resource that paints the Image node (§14)")
     @MainActor
     func imageFixtureCommitsAndPaintsImageView() async throws {
-        let runtimeDirectory = URL(
-            fileURLWithPath: "/tmp/srui-counter-image-\(UUID().uuidString)"
-        )
-        try FileManager.default.createDirectory(
-            at: runtimeDirectory,
-            withIntermediateDirectories: false
-        )
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: runtimeDirectory.path
-        )
-        defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
+        let runtimeDirectory = try TestFixtureDirectory.make(prefix: "srui-counter-image")
+        defer { TestFixtureDirectory.release(runtimeDirectory) }
         let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
         let repoRoot = Self.repositoryRoot()
         let counterBinary = repoRoot
@@ -345,7 +309,6 @@ struct CounterSocketIntegrationTests {
                 server.terminate()
             }
             server.waitUntilExit()
-            try? FileManager.default.removeItem(atPath: socketPath)
         }
 
         try await Self.waitForSocket(at: socketPath, timeoutSeconds: 10)
@@ -374,7 +337,7 @@ struct CounterSocketIntegrationTests {
             in: resourceCache,
             timeoutSeconds: 10
         )
-        try await AsyncTestSupport.eventually(description: "renderer retains committed image") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "renderer retains committed image") {
             renderer.resolveResourceImage(pendingHash) != nil
         }
 
@@ -395,18 +358,8 @@ struct CounterSocketIntegrationTests {
     @Test("Corrupted resource chunk is dropped; session and placeholder survive (§14)")
     @MainActor
     func corruptedResourceChunkKeepsPlaceholderAndSession() async throws {
-        let runtimeDirectory = URL(
-            fileURLWithPath: "/tmp/srui-counter-image-corrupt-\(UUID().uuidString)"
-        )
-        try FileManager.default.createDirectory(
-            at: runtimeDirectory,
-            withIntermediateDirectories: false
-        )
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: runtimeDirectory.path
-        )
-        defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
+        let runtimeDirectory = try TestFixtureDirectory.make(prefix: "srui-counter-corrupt")
+        defer { TestFixtureDirectory.release(runtimeDirectory) }
         let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
         let repoRoot = Self.repositoryRoot()
         let counterBinary = repoRoot
@@ -433,7 +386,6 @@ struct CounterSocketIntegrationTests {
                 server.terminate()
             }
             server.waitUntilExit()
-            try? FileManager.default.removeItem(atPath: socketPath)
         }
 
         try await Self.waitForSocket(at: socketPath, timeoutSeconds: 10)
@@ -473,7 +425,7 @@ struct CounterSocketIntegrationTests {
         if let button = renderer.registry.allHandles.first(where: { $0.nodeType == .button }) {
             let before = applier.lastAppliedRevision
             _ = try await controller.sendActivate(nodeId: button.nodeID)
-            try await AsyncTestSupport.eventually(description: "post-corruption activate advances revision") {
+            try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "post-corruption activate advances revision") {
                 applier.lastAppliedRevision > before
             }
         }

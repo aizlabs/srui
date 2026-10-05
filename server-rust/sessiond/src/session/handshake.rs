@@ -14,13 +14,13 @@ use std::collections::{HashMap, HashSet};
 use crate::outbound::OutboundReceiver;
 use srui_protocol::{
     ClientHello, ClientLimits, ClientResume, ServerResumeOk, ServerResyncRequired, ServerWelcome,
-    SessionContinuity, Transaction, MAX_TERMINAL_RESUME_MAP_ENTRIES,
+    SessionContinuity, SnapshotFramePlan, Transaction, MAX_TERMINAL_RESUME_MAP_ENTRIES,
 };
 use srui_semantic_tree::{CapabilitySet, Profile, ResourceHash, SemanticStore};
 
 use super::terminal::TerminalAttach;
 
-use super::snapshot::export_snapshot_transaction;
+use super::snapshot::{export_snapshot_transaction, plan_snapshot_delivery};
 use super::{Session, SessionError};
 
 /// Core protocol version this build speaks (§15).
@@ -57,6 +57,9 @@ pub struct FreshClientBootstrap {
     pub welcome: ServerWelcome,
     /// Catch-up snapshot transaction for populated sessions, or `None` if revision is 0 (§18).
     pub snapshot: Option<Transaction>,
+    /// How [`Self::snapshot`] is split across envelopes; `welcome.snapshot_parts` announces it
+    /// (PX-004-G01 extension; §26). One envelope when there is no snapshot.
+    pub snapshot_frames: SnapshotFramePlan,
     /// Bounded outbound receiver capturing every subsequent transaction committed to the session (§20.2).
     pub transactions: OutboundReceiver,
     /// Whether this client negotiated `org.srui.terminal/1`.
@@ -70,6 +73,9 @@ pub struct FreshClientBootstrap {
 pub struct ResumeClientBootstrap {
     /// Replay or resync catch-up collected under the same lock as [`Self::transactions`].
     pub outcome: ResumeOutcome,
+    /// How a [`ResumeOutcome::Resync`] snapshot is split across envelopes;
+    /// `resync_msg.snapshot_parts` announces it (PX-004-G01 extension; §26). One envelope for a replay.
+    pub snapshot_frames: SnapshotFramePlan,
     /// Bounded outbound receiver capturing every subsequent transaction committed to the session (§20.2).
     pub transactions: OutboundReceiver,
     /// Whether this resume re-advertised and negotiated `org.srui.terminal/1`.
@@ -270,6 +276,8 @@ fn negotiate_hello(
         initial_revision,
         extension_namespaces: inner.extension_namespaces.clone(),
         limits: Some(limits),
+        // Set once the catch-up snapshot has been measured (PX-004-G01 extension; §26).
+        snapshot_parts: 0,
     };
 
     let store_clone = if initial_revision > 0 {
@@ -466,19 +474,32 @@ impl Session {
 
         loop {
             let mut inner_guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-            let (welcome, store_clone, terminal_negotiated) = negotiate_hello(&inner_guard, hello)?;
+            let (mut welcome, store_clone, terminal_negotiated) =
+                negotiate_hello(&inner_guard, hello)?;
+            let server_max_frame_size = welcome.limits.map_or(0, |limits| limits.max_frame_size);
+            // Export and measure together: an undeliverable snapshot is refused here, before any
+            // subscription or frame write (§18, §26).
+            let mut export_and_plan = |store: &SemanticStore| {
+                export_snapshot(store)
+                    .and_then(|snapshot| {
+                        let plan = plan_snapshot_delivery(
+                            &snapshot,
+                            server_max_frame_size,
+                            hello.limits.as_ref(),
+                        )?;
+                        Ok((snapshot, plan))
+                    })
+                    .inspect_err(|error| {
+                        tracing::error!(%error, "refusing to send an undeliverable catch-up snapshot");
+                    })
+            };
 
             let snapshot = if optimistic_attempts >= MAX_OPTIMISTIC_SNAPSHOT_EXPORT_ATTEMPTS {
                 // Sustained commits cannot starve the synchronous handshake forever. This rare
                 // fallback serializes the immutable clone while holding SessionInner, preserving
                 // the no-gap boundary and still exporting before any subscriber is replaced.
                 match store_clone {
-                    Some(store) => Some(export_snapshot(&store).inspect_err(|error| {
-                        tracing::error!(
-                            %error,
-                            "refusing to send an unrepresentable catch-up snapshot"
-                        );
-                    })?),
+                    Some(store) => Some(export_and_plan(&store)?),
                     None => None,
                 }
             } else {
@@ -487,12 +508,7 @@ impl Session {
                 // Normal path: full-store serialization leaves commits, events, and text edits
                 // available while the immutable staging clone is exported.
                 let snapshot_result = match store_clone {
-                    Some(store) => export_snapshot(&store).map(Some).inspect_err(|error| {
-                        tracing::error!(
-                            %error,
-                            "refusing to send an unrepresentable catch-up snapshot"
-                        );
-                    }),
+                    Some(store) => export_and_plan(&store).map(Some),
                     None => Ok(None),
                 };
 
@@ -504,6 +520,11 @@ impl Session {
                 }
                 snapshot_result?
             };
+            let (snapshot, snapshot_frames) = match snapshot {
+                Some((snapshot, plan)) => (Some(snapshot), plan),
+                None => (None, SnapshotFramePlan::single(0)),
+            };
+            welcome.snapshot_parts = snapshot_frames.announced_parts();
 
             before_subscribe
                 .take()
@@ -532,6 +553,7 @@ impl Session {
             return Ok(FreshClientBootstrap {
                 welcome,
                 snapshot,
+                snapshot_frames,
                 transactions,
                 terminal_negotiated,
                 terminal,
@@ -586,6 +608,7 @@ impl Session {
                 session_id: String,
                 snapshot_revision: u64,
                 snapshot_transaction: Transaction,
+                snapshot_frames: SnapshotFramePlan,
                 continuity: SessionContinuity,
                 reason: String,
                 last_processed_event_seq: u64,
@@ -658,31 +681,37 @@ impl Session {
 
             let snapshot_revision = inner_guard.store.revision().get();
             let store_snapshot = inner_guard.store.clone_staging();
+            let server_max_frame_size = inner_guard.limits.max_frame_size;
+            // Export and measure together: an undeliverable snapshot is refused here, before any
+            // cancellation, subscription, or frame write (§18, §26).
+            let mut export_and_plan = |store: &SemanticStore| {
+                export_snapshot(store)
+                    .and_then(|snapshot| {
+                        let plan = plan_snapshot_delivery(
+                            &snapshot,
+                            server_max_frame_size,
+                            resume.limits.as_ref(),
+                        )?;
+                        Ok((snapshot, plan))
+                    })
+                    .inspect_err(|error| {
+                        tracing::error!(%error, "refusing to send an undeliverable resync snapshot");
+                    })
+            };
 
-            let (inner_guard, snapshot_transaction) =
+            let (inner_guard, (snapshot_transaction, snapshot_frames)) =
                 if optimistic_attempts >= MAX_OPTIMISTIC_SNAPSHOT_EXPORT_ATTEMPTS {
                     // Bounded fallback: guarantee handshake progress under continuous commits. Export
                     // still precedes cancellation and subscription, so failure has no side effects.
-                    let snapshot_transaction =
-                        export_snapshot(&store_snapshot).inspect_err(|error| {
-                            tracing::error!(
-                                %error,
-                                "refusing to send an unrepresentable resync snapshot"
-                            );
-                        })?;
+                    let exported = export_and_plan(&store_snapshot)?;
                     // The cause can become less severe while the outbound stale marker is
                     // cleared, but the already-selected full resync remains safe. Do not restart
                     // the fallback and serialize the full store without a bound.
-                    (inner_guard, snapshot_transaction)
+                    (inner_guard, exported)
                 } else {
                     drop(inner_guard);
 
-                    let snapshot_result = export_snapshot(&store_snapshot).inspect_err(|error| {
-                        tracing::error!(
-                            %error,
-                            "refusing to send an unrepresentable resync snapshot"
-                        );
-                    });
+                    let snapshot_result = export_and_plan(&store_snapshot);
 
                     let inner_guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
                     if inner_guard.store.revision().get() != snapshot_revision
@@ -724,6 +753,7 @@ impl Session {
                 session_id: inner_guard.session_id.clone(),
                 snapshot_revision,
                 snapshot_transaction,
+                snapshot_frames,
                 continuity: cause.continuity(),
                 reason: cause.reason().to_string(),
                 last_processed_event_seq,
@@ -779,18 +809,22 @@ impl Session {
 
         let terminal = self.attach_terminals(&resume.terminal_stream_offsets, replaced)?;
 
-        let outcome = match plan {
+        let (outcome, snapshot_frames) = match plan {
             ResumePlan::Replay {
                 welcome_msg,
                 replayed,
-            } => ResumeOutcome::Replay {
-                welcome_msg,
-                replayed,
-            },
+            } => (
+                ResumeOutcome::Replay {
+                    welcome_msg,
+                    replayed,
+                },
+                SnapshotFramePlan::single(0),
+            ),
             ResumePlan::Resync {
                 session_id,
                 snapshot_revision,
                 snapshot_transaction,
+                snapshot_frames,
                 continuity,
                 reason,
                 last_processed_event_seq,
@@ -799,24 +833,29 @@ impl Session {
                 optional_profiles,
                 extension_namespaces,
                 pending_text_edit_cancellation: _,
-            } => ResumeOutcome::Resync {
-                resync_msg: ServerResyncRequired {
-                    session_id,
-                    snapshot_revision,
-                    reason,
-                    continuity: continuity as i32,
-                    last_processed_event_seq,
-                    discarded_text_edits,
-                    required_profiles,
-                    optional_profiles,
-                    extension_namespaces,
+            } => (
+                ResumeOutcome::Resync {
+                    resync_msg: ServerResyncRequired {
+                        session_id,
+                        snapshot_revision,
+                        reason,
+                        continuity: continuity as i32,
+                        last_processed_event_seq,
+                        discarded_text_edits,
+                        required_profiles,
+                        optional_profiles,
+                        extension_namespaces,
+                        snapshot_parts: snapshot_frames.announced_parts(),
+                    },
+                    snapshot_transaction,
                 },
-                snapshot_transaction,
-            },
+                snapshot_frames,
+            ),
         };
 
         Ok(ResumeClientBootstrap {
             outcome,
+            snapshot_frames,
             transactions,
             terminal_negotiated,
             terminal,

@@ -84,6 +84,38 @@ pub enum Observed<T> {
     Missing(MissingReason),
 }
 
+/// CPU time one process instance was scheduled for across one measured
+/// interval: the counter delta in the kernel's own clock ticks, the tick rate
+/// that converts it to seconds, and the monotonic time between the two samples
+/// (PX-006). Stored exactly; [`crate::metric::cpu_cell`] turns it into text once,
+/// at projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CpuInterval {
+    /// `utime + stime` now, less the same counter at the previous sample.
+    pub ticks: u64,
+    /// Clock ticks per second of the kernel that counted them.
+    pub ticks_per_second: u64,
+    /// Monotonic time between the two samples; never a wall-clock difference.
+    pub elapsed: Duration,
+}
+
+/// A process instance's CPU usage, which only exists *between* two samples.
+///
+/// Not an [`Observed`], because it has a state `Observed` cannot say: a process
+/// seen once is not unreadable, it simply has no interval yet. Neither that
+/// state nor an unread one is ever a measured zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CpuUsage {
+    /// Measured across one interval of the same process instance.
+    Measured(CpuInterval),
+    /// The first sample of this process instance — a new process, or a new
+    /// instance under a reused PID — so there is nothing to subtract yet.
+    WarmingUp,
+    /// No interval could be measured: the counters or tick rate were unread or
+    /// denied, a counter went backwards, or the interval did not advance.
+    Missing(MissingReason),
+}
+
 /// Longest display name published to the UI, in characters.
 pub const MAX_DISPLAY_NAME_CHARS: usize = 128;
 /// Shown when a record's name sanitizes to nothing.
@@ -249,6 +281,10 @@ pub struct ProcessRecord {
     /// unread. Per-field unavailability is therefore not a [`Completeness`]
     /// degradation, which is about whether the record *list* is authoritative.
     pub resident: Observed<u64>,
+    /// CPU usage since this source's previous sample of the same process
+    /// instance ([`crate::metric::CPU_USAGE`]); per field like `resident`, and
+    /// never a [`Completeness`] degradation.
+    pub cpu: CpuUsage,
 }
 
 /// What part of the scan could not be observed.
@@ -643,24 +679,36 @@ impl ProcessSource for FakeProcessSource {
             source: SourceId(Self::SOURCE.into()),
             sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
             records: vec![
-                // A value whose fraction is truncated rather than rounded.
+                // A value whose fraction is truncated rather than rounded, and a
+                // multithreaded process using two and a half logical CPUs.
                 ProcessRecord {
                     key: Self::key("worker-a", Observed::Known(4101)),
                     display_name: "worker".into(),
                     resident: Observed::Known(1_234_567),
+                    cpu: CpuUsage::Measured(CpuInterval {
+                        ticks: 250,
+                        ticks_per_second: 100,
+                        elapsed: Duration::from_secs(1),
+                    }),
                 },
-                // A known zero, which must survive as one.
+                // Known zeros, which must survive as zeros.
                 ProcessRecord {
                     key: Self::key("worker-b", Observed::Known(4102)),
                     display_name: "worker".into(),
                     resident: Observed::Known(0),
+                    cpu: CpuUsage::Measured(CpuInterval {
+                        ticks: 0,
+                        ticks_per_second: 100,
+                        elapsed: Duration::from_secs(1),
+                    }),
                 },
-                // Both fields unread, for different reasons: the states are
-                // per field, not per record.
+                // Every field unread or not yet measurable, for different
+                // reasons: the states are per field, not per record.
                 ProcessRecord {
                     key: Self::key("helper", Observed::Missing(MissingReason::Unavailable)),
                     display_name: "helper".into(),
                     resident: Observed::Missing(MissingReason::Denied),
+                    cpu: CpuUsage::WarmingUp,
                 },
             ],
             vanished: 0,
@@ -726,37 +774,75 @@ impl ScriptedFakeSource {
     /// metric that moved on every step would make the two identical steps
     /// different and hide the "an unchanged snapshot publishes nothing" case the
     /// script exists to cover.
-    fn record(token: &str, pid: u32, name: &str, resident: Observed<u64>) -> ProcessRecord {
+    ///
+    /// The CPU value is fixed per process for the same reason: a scripted step
+    /// is a fixture, not a sample, and it states each CPU state once.
+    fn record(
+        token: &str,
+        pid: u32,
+        name: &str,
+        resident: Observed<u64>,
+        cpu: CpuUsage,
+    ) -> ProcessRecord {
         ProcessRecord {
             key: Self::key(token, pid),
             display_name: name.into(),
             resident,
+            cpu,
         }
     }
 
     /// The records and completeness of one step, independent of the sample time.
     pub fn script(step: usize) -> (Vec<ProcessRecord>, Completeness) {
-        let worker_a = || Self::record("worker-a", 4101, "worker", Observed::Known(2_097_152));
+        let one_second = |ticks| {
+            CpuUsage::Measured(CpuInterval {
+                ticks,
+                ticks_per_second: 100,
+                elapsed: Duration::from_secs(1),
+            })
+        };
+        let worker_a = || {
+            Self::record(
+                "worker-a",
+                4101,
+                "worker",
+                Observed::Known(2_097_152),
+                one_second(50),
+            )
+        };
         let helper = |name: &str| {
             Self::record(
                 "helper",
                 4103,
                 name,
                 Observed::Missing(MissingReason::Unavailable),
+                CpuUsage::Missing(MissingReason::Unavailable),
             )
         };
         let settled = || {
             vec![
                 worker_a(),
                 helper("helper-tool"),
-                Self::record("builder", 4104, "builder", Observed::Known(5_368_709_120)),
+                Self::record(
+                    "builder",
+                    4104,
+                    "builder",
+                    Observed::Known(5_368_709_120),
+                    CpuUsage::WarmingUp,
+                ),
             ]
         };
         match step % Self::STEPS {
             0 | 1 => (
                 vec![
                     worker_a(),
-                    Self::record("worker-b", 4102, "worker", Observed::Known(1023)),
+                    Self::record(
+                        "worker-b",
+                        4102,
+                        "worker",
+                        Observed::Known(1023),
+                        one_second(0),
+                    ),
                     helper("helper"),
                 ],
                 Completeness::Complete,

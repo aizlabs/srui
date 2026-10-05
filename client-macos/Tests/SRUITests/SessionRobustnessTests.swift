@@ -14,10 +14,13 @@
 
 import Testing
 import Foundation
+import Accessibility
 import AppKit
 import SemanticModel
 import Protocol
-import Session
+// `@testable` only for `interactionWillEnterOutboxForTesting`, the suspension-point hook that
+// makes the §7.7 re-authorization race deterministic instead of timing-dependent.
+@testable import Session
 import TransportSSH
 import RendererAppKit
 
@@ -56,8 +59,14 @@ struct SessionRobustnessTests {
         return try SRUIFraming.encodeFramed(msg)
     }
 
+    /// Polls `condition` until it holds or the budget expires.
+    ///
+    /// The budget is `AsyncTestSupport.roundTripSeconds`, not this suite's original two seconds:
+    /// several of these conditions are satisfied by a *different task* making progress, and a
+    /// deadline is only an upper bound, so raising it weakens no assertion and costs no wall time
+    /// on a healthy run. See the constant for the failure that justified it.
     private static func waitUntil(
-        timeout: TimeInterval = 2.0,
+        timeout: TimeInterval = AsyncTestSupport.roundTripSeconds,
         _ condition: @Sendable () async -> Bool
     ) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
@@ -250,6 +259,7 @@ struct SessionRobustnessTests {
         try await serverTransport.send(data: try Self.framed(mountTx))
         #expect(await Self.waitUntil { applier.lastAppliedRevision == Revision(1) })
         try await AsyncTestSupport.eventually(
+            timeout: .roundTrip,
             description: "revision 1 button render completes"
         ) {
             renderer.registry.handle(for: buttonID) != nil
@@ -282,6 +292,124 @@ struct SessionRobustnessTests {
 
         let observed = try await Self.firstEventObservedRevision(in: serverStream)
         #expect(observed == Revision(1))
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
+    /// The companion the test above had to give up. It needs its racing commit to leave the node
+    /// *activatable*, so it relabels rather than disabling, and the `nodeDisabled` branch its
+    /// comment documents stopped being exercised anywhere in this suite.
+    ///
+    /// `SessionController` re-authorizes a queued action against a fresh snapshot after every
+    /// suspension, so a revision that withdraws `enabled` between the click and outbox admission
+    /// must reject the click — silently, because §7.7 deliberately does not report that rejection
+    /// (`shouldReportNativeSemanticActionError`) — and the rejection must cost nothing.
+    ///
+    /// "Costs nothing" is asserted as `event_seq`, which is the invariant this code path actually
+    /// guarantees: `EventOutbox` advances `currentEventSeq` only inside `allocateAndSend`, which a
+    /// rejection never reaches, so the next legitimate event must still be sequence 1. `edit_seq`
+    /// is *not* the applicable invariant here — it is the text-editing lane's per-node watermark
+    /// (`EditSeq`, owned by `TextEditingSession`), and an ACTIVATE on a button neither allocates
+    /// nor advances one; this fixture has no editor at all.
+    @Test("A click disabled by a racing revision is rejected without burning an event_seq")
+    @MainActor
+    func racingDisablementRejectsClickWithoutConsumingASequence() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let outbox = EventOutbox()
+        let controller = SessionController(
+            transport: clientTransport,
+            applier: applier,
+            outbox: outbox,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+        let serverStream = serverTransport.receiveStream()
+        try await controller.start()
+
+        try await serverTransport.send(data: try Self.framedWelcome())
+
+        let buttonID = NodeId(4)
+        let sentinelID = NodeId(5)
+        let mountTx = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [
+                .createNode(id: NodeId(1), nodeType: .surface),
+                .createNode(
+                    id: buttonID,
+                    nodeType: .button,
+                    parentID: NodeId(1),
+                    properties: [Property(property: .label, value: .string("Increment"))]
+                ),
+                .createNode(
+                    id: sentinelID,
+                    nodeType: .button,
+                    parentID: NodeId(1),
+                    properties: [Property(property: .label, value: .string("Sentinel"))]
+                ),
+            ]
+        )
+        try await serverTransport.send(data: try Self.framed(mountTx))
+        try await AsyncTestSupport.eventually(
+            timeout: .roundTrip,
+            description: "revision 1 buttons render"
+        ) {
+            renderer.registry.handle(for: buttonID) != nil
+                && renderer.registry.handle(for: sentinelID) != nil
+        }
+
+        let inspector = controller.makeSemanticInspector()
+        // The user clicks while looking at revision 1, where the affordance is live.
+        let clicked = try #require(inspector.find(role: .button, label: "Increment"))
+        #expect(clicked.observedRevision == Revision(1))
+
+        // Commits the disabling revision at the one instant that matters: the suspension point
+        // immediately before the queued action is re-authorized against current state.
+        controller.interactionWillEnterOutboxForTesting = { [applier] in
+            _ = applier.apply(
+                baseRevision: Revision(1),
+                operations: [
+                    .setProperty(id: buttonID, property: .enabled, value: .bool(false)),
+                ]
+            )
+        }
+
+        do {
+            _ = try await clicked.activate()
+            Issue.record("a click re-authorized against a disabling revision must be rejected")
+        } catch SemanticAutomationError.nodeDisabled(let nodeID) {
+            #expect(nodeID == buttonID)
+        } catch {
+            Issue.record("Expected nodeDisabled, got \(error)")
+        }
+        controller.interactionWillEnterOutboxForTesting = nil
+
+        // The rejection consumed no sequence: the window is still empty, so the next event is 1.
+        #expect(await outbox.eventSeq == 0)
+        #expect(await outbox.lastAckedEventSeq == 0)
+        // And it mutated nothing beyond the revision the server itself committed.
+        #expect(applier.lastAppliedRevision == Revision(2))
+        #expect(applier.store.node(for: buttonID)?.getProperty(.enabled) == .bool(false))
+        #expect(
+            applier.store.node(for: buttonID)?.getProperty(.label) == .string("Increment")
+        )
+        #expect(applier.store.node(for: sentinelID)?.getProperty(.enabled) == nil)
+
+        // A still-enabled sibling claims sequence 1, which the rejected click would have burned.
+        let sentinel = try #require(inspector.find(role: .button, label: "Sentinel"))
+        #expect(sentinel.observedRevision == Revision(2))
+        let sentinelEvent = try await sentinel.activate()
+        #expect(sentinelEvent.eventSeq == 1)
+        #expect(sentinelEvent.nodeId == sentinelID)
+        #expect(await outbox.eventSeq == 1)
+
+        // The first EVENT the server ever sees is the sentinel's, observed at revision 2. The
+        // revision-1 click never reached the wire.
+        let observed = try await Self.firstEventObservedRevision(in: serverStream)
+        #expect(observed == Revision(2))
 
         await controller.stop()
         await serverTransport.close()
@@ -709,8 +837,13 @@ struct SessionRobustnessTests {
 
     @Test("A closed socket transport refuses to silently reconnect")
     func closedTransportRefusesToReconnect() async throws {
+        // Reserved rather than created: nothing must ever bind here. Registering it anyway means
+        // that if a future regression did make the transport create the path, the fixture is still
+        // removed instead of becoming another /tmp leftover.
+        let fixture = try TestFixtureDirectory.reserve(prefix: "srui-never-bound")
+        defer { TestFixtureDirectory.release(fixture) }
         let transport = UnixSocketTransport(
-            socketPath: "/tmp/srui-never-bound-\(UUID().uuidString).sock"
+            socketPath: fixture.appendingPathComponent("never-bound.sock").path
         )
         await transport.close()
 

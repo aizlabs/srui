@@ -14,18 +14,30 @@
 //! records it read and could not use, and the entries it listed but never read
 //! (PX-003, PX-004). A scan that would have to name more than a ledger holds
 //! reports itself unenumerable rather than growing a set per scan.
+//!
+//! CPU usage (PX-006) is the one thing a single scan cannot measure: it is a
+//! difference between two samples of the same process instance. The source is
+//! therefore a persistent collector — the refresh loop keeps one instance for
+//! its whole life — and it retains one counter baseline per record it last
+//! published, keyed by PID *and* creation token, so a reused PID is a new
+//! instance and never inherits another process's counters. The interval is
+//! measured on an injected [`MonotonicClock`], never on the wall clock that
+//! stamps [`SnapshotTime`], so a wall-clock jump cannot stretch or shrink it.
 use crate::source::{
-    record_issue, BootId, CappedRecords, Completeness, CreationToken, DisplayName,
-    EnumerationIssue, HostId, IssueScope, MissingReason, Observed, PidNamespaceId, ProcessKey,
-    ProcessRecord, ProcessSnapshot, ProcessSource, SkippedRecords, SnapshotTime, SourceId,
+    record_issue, BootId, CappedRecords, Completeness, CpuInterval, CpuUsage, CreationToken,
+    DisplayName, EnumerationIssue, HostId, IssueScope, MissingReason, Observed, PidNamespaceId,
+    ProcessKey, ProcessRecord, ProcessSnapshot, ProcessSource, SkippedRecords, SnapshotTime,
+    SourceId,
 };
 use srui_semantic_tree::DEFAULT_MAX_CACHED_ITEMS_PER_MODEL;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 /// The real Linux process filesystem.
 pub const DEFAULT_PROC_ROOT: &str = "/proc";
@@ -75,6 +87,136 @@ const AT_NULL: u64 = 0;
 const MAX_PAGE_SIZE: u64 = 1 << 30;
 /// Smallest page size this scan will believe.
 const MIN_PAGE_SIZE: u64 = 512;
+/// `/proc/<pid>/stat` field 14 (`utime`, user-mode clock ticks) and field 15
+/// (`stime`, kernel-mode clock ticks) are the 12th and 13th fields after `comm`
+/// (K1, `proc_pid_stat(5)`). Neither is a ptrace-gated field, so an unprivileged
+/// scan reads real values rather than the zero the kernel substitutes for those.
+const UTIME_FIELD_AFTER_COMM: usize = 11;
+const STIME_FIELD_AFTER_COMM: usize = 12;
+/// `AT_CLKTCK`: the auxiliary-vector entry carrying the frequency `times(2)`
+/// counts at — the clock ticks `utime` and `stime` are measured in, and what
+/// glibc's `sysconf(_SC_CLK_TCK)` answers from (`getauxval(3)`). Read from the
+/// scanned mount's own `self/auxv` exactly as [`AT_PAGESZ`] is.
+const AT_CLKTCK: u64 = 17;
+/// Largest tick rate this scan will believe. `USER_HZ` is 100 on nearly every
+/// Linux architecture and 1024 on a few; a megahertz is far above both and still
+/// refuses a value that would turn tick counts into nonsense.
+const MAX_CLOCK_TICKS_PER_SECOND: u64 = 1_000_000;
+
+/// A monotonic clock, as elapsed time since an arbitrary fixed origin.
+///
+/// The CPU interval is measured on this and nothing else. It is injected so a
+/// test can state every interval exactly — including the zero and backwards
+/// ones a real monotonic clock never produces — and so no wall-clock reading
+/// can reach the divisor.
+pub trait MonotonicClock: Send + Sync + std::fmt::Debug {
+    fn now(&self) -> Duration;
+}
+
+/// [`Instant`]: `clock_gettime(CLOCK_MONOTONIC)` on Linux. Like `utime` and
+/// `stime`, it does not advance while the host is suspended, so a suspend does
+/// not dilute the interval with time no process could have been scheduled in.
+#[derive(Debug)]
+pub struct SystemMonotonicClock {
+    origin: Instant,
+}
+
+impl Default for SystemMonotonicClock {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl MonotonicClock for SystemMonotonicClock {
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+}
+
+/// One process instance's CPU counter at one sample, kept until the next scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuBaseline {
+    /// `utime + stime`, in the kernel's clock ticks.
+    pub ticks: u64,
+    /// When it was read, on the source's [`MonotonicClock`].
+    pub at: Duration,
+}
+
+/// The CPU usage between `previous` and `current` samples of the same process
+/// instance, and the baseline the next scan should subtract from.
+///
+/// Every case that cannot be a real measurement is reported as such, never as a
+/// zero or a spike:
+///
+/// * an unknown tick rate makes every interval unmeasurable, so the reason the
+///   rate is missing is published from the first sample on;
+/// * no previous sample of this instance is [`CpuUsage::WarmingUp`];
+/// * an interval that did not advance is unavailable, and the *older* baseline
+///   is kept so the next scan measures across a real interval;
+/// * a clock that went backwards, or a counter that went backwards (a reset), is
+///   unavailable, and the current sample becomes the new baseline.
+pub fn sample_cpu(
+    previous: Option<&CpuBaseline>,
+    current: CpuBaseline,
+    ticks_per_second: &Observed<u64>,
+) -> (CpuUsage, CpuBaseline) {
+    let (usage, keep) = interval_since(previous, current);
+    // The baseline is kept the same way whatever the rate, because the counter
+    // itself was read; but without a rate no interval is a percentage, and the
+    // reason the rate is missing is what every scan publishes.
+    match (usage, ticks_per_second) {
+        (_, Observed::Missing(reason)) => (CpuUsage::Missing(*reason), keep),
+        (Ok((ticks, elapsed)), Observed::Known(rate)) => (
+            CpuUsage::Measured(CpuInterval {
+                ticks,
+                ticks_per_second: *rate,
+                elapsed,
+            }),
+            keep,
+        ),
+        (Err(usage), Observed::Known(_)) => (usage, keep),
+    }
+}
+
+/// The counter delta and monotonic interval between two samples, or the state
+/// to publish instead, with the baseline the next scan should use.
+fn interval_since(
+    previous: Option<&CpuBaseline>,
+    current: CpuBaseline,
+) -> (Result<(u64, Duration), CpuUsage>, CpuBaseline) {
+    let unavailable = Err(CpuUsage::Missing(MissingReason::Unavailable));
+    let Some(previous) = previous else {
+        return (Err(CpuUsage::WarmingUp), current);
+    };
+    let elapsed = match current.at.checked_sub(previous.at) {
+        None => return (unavailable, current),
+        Some(Duration::ZERO) => return (unavailable, *previous),
+        Some(elapsed) => elapsed,
+    };
+    match current.ticks.checked_sub(previous.ticks) {
+        Some(ticks) => (Ok((ticks, elapsed)), current),
+        None => (unavailable, current),
+    }
+}
+
+/// Remembers a global identity component the CPU baselines were sampled under,
+/// and reports whether this scan observed a *different* one. A component this
+/// scan could not read is not a change — the processes did not move — but a
+/// different boot or PID namespace numbers different process instances, whose
+/// counters must never be subtracted from these.
+fn identity_changed<T: Clone + PartialEq>(
+    remembered: &mut Option<T>,
+    observed: &Observed<T>,
+) -> bool {
+    let Observed::Known(value) = observed else {
+        return false;
+    };
+    let changed = remembered.as_ref().is_some_and(|known| known != value);
+    *remembered = Some(value.clone());
+    changed
+}
 
 /// What a scanned root is, as far as an unprivileged scan can prove.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +245,16 @@ pub struct ProcFsSource {
     /// Whether the root names one fixed tree for the life of this source. A
     /// relative root that could not be anchored does not, and is never scanned.
     anchored: bool,
+    /// The clock CPU intervals are measured on.
+    clock: Arc<dyn MonotonicClock>,
+    /// One CPU baseline per record the previous scan published, keyed by PID and
+    /// creation token. Rebuilt on every scan from that scan's records, so it is
+    /// bounded by the record bound and forgets every process that ended.
+    cpu_baselines: HashMap<(u32, u64), CpuBaseline>,
+    /// The boot the baselines were sampled under, as last observed.
+    cpu_boot: Option<BootId>,
+    /// The PID namespace the baselines were sampled under, as last observed.
+    cpu_namespace: Option<PidNamespaceId>,
 }
 
 impl ProcFsSource {
@@ -148,6 +300,10 @@ impl ProcFsSource {
                 record_limit: MAX_RECORDS,
                 uncertain_limit: MAX_UNCERTAIN_PIDS,
                 anchored: false,
+                clock: Arc::new(SystemMonotonicClock::default()),
+                cpu_baselines: HashMap::new(),
+                cpu_boot: None,
+                cpu_namespace: None,
             };
         };
         let status = format!(
@@ -166,7 +322,25 @@ impl ProcFsSource {
             record_limit: MAX_RECORDS,
             uncertain_limit: MAX_UNCERTAIN_PIDS,
             anchored: true,
+            clock: Arc::new(SystemMonotonicClock::default()),
+            cpu_baselines: HashMap::new(),
+            cpu_boot: None,
+            cpu_namespace: None,
         }
+    }
+
+    /// Measures CPU intervals on `clock` instead of the system's monotonic
+    /// clock. Baselines already taken were measured on the old clock and are
+    /// discarded, so no interval spans two clocks.
+    pub fn with_clock(mut self, clock: Arc<dyn MonotonicClock>) -> Self {
+        self.clock = clock;
+        self.cpu_baselines.clear();
+        self
+    }
+
+    /// How many CPU baselines this source is holding for the next scan.
+    pub fn cpu_baselines(&self) -> usize {
+        self.cpu_baselines.len()
     }
 
     /// Bounds how many records one scan publishes. Entries beyond the bound are
@@ -199,9 +373,21 @@ impl ProcFsSource {
     /// unread instead of attributing this machine's page size to records that
     /// were never measured on it.
     fn page_size(&self) -> Observed<u64> {
+        self.auxv_entry(parse_page_size)
+    }
+
+    /// The clock-tick rate `utime` and `stime` are counted in, read from the
+    /// scanned mount's own `self/auxv` ([`AT_CLKTCK`]) for the same reasons as
+    /// [`Self::page_size`]: a fixture states its own, and a mount that states
+    /// none publishes no CPU value instead of borrowing this machine's rate.
+    fn clock_ticks(&self) -> Observed<u64> {
+        self.auxv_entry(parse_clock_ticks)
+    }
+
+    fn auxv_entry(&self, parse: fn(&[u8]) -> Option<u64>) -> Observed<u64> {
         match read_bounded(&self.root.join("self/auxv")) {
-            Ok(bytes) => match parse_page_size(&bytes) {
-                Some(size) => Observed::Known(size),
+            Ok(bytes) => match parse(&bytes) {
+                Some(value) => Observed::Known(value),
                 None => Observed::Missing(MissingReason::Unavailable),
             },
             Err(error) => Observed::Missing(reason_for(&error)),
@@ -440,13 +626,33 @@ impl ProcessSource for ProcFsSource {
         // rather than degrading `Completeness`, which is about whether the record
         // *list* is authoritative, not about one field of a record.
         let page_size = self.page_size();
+        // Likewise the tick rate the CPU counters are in.
+        let ticks_per_second = self.clock_ticks();
+        // Baselines taken under another boot or PID namespace count other
+        // process instances; none of them may be subtracted from this scan's.
+        // Both components are checked, so neither short-circuits the other's
+        // remembered value.
+        if identity_changed(&mut self.cpu_boot, &boot)
+            | identity_changed(&mut self.cpu_namespace, &pid_namespace)
+        {
+            self.cpu_baselines.clear();
+        }
+        // The CPU interval is measured per record, not per scan: each record's
+        // instant is taken on the monotonic clock the moment its own `stat`
+        // read returns (below). A scan reads records one after another, and a
+        // slow read — a stalled file, a host with tens of thousands of entries
+        // — would otherwise divide one process's read-to-read counter delta by
+        // a scan-start-to-scan-start interval it was never measured over.
+        let mut baselines = HashMap::with_capacity(self.cpu_baselines.len());
         let mut records = Vec::new();
         let entries = match std::fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(error) => {
                 // The whole scan failed: an empty list here is explicitly not
                 // an authoritative "no processes" answer, and the records it
-                // hides were never read, so none of them can be named.
+                // hides were never read, so none of them can be named. It read
+                // no counter either, so the baselines are left exactly as they
+                // were: the next good scan measures across this one.
                 skipped.mark_unenumerable();
                 record_issue(&mut issues, || EnumerationIssue {
                     scope: IssueScope::Root,
@@ -523,8 +729,10 @@ impl ProcessSource for ProcFsSource {
                         detail: format!("{pid}/stat: {error}"),
                     });
                 }
-                Ok(bytes) => match parse_stat(pid, &bytes) {
-                    None => {
+                // The instant is read before parsing, immediately after the
+                // counters were read, so it brackets exactly this record's read.
+                Ok(bytes) => match (self.clock.now(), parse_stat(pid, &bytes)) {
+                    (_, None) => {
                         skipped.record(pid);
                         record_issue(&mut issues, || EnumerationIssue {
                             scope: IssueScope::Process(pid),
@@ -532,18 +740,39 @@ impl ProcessSource for ProcFsSource {
                             detail: format!("{pid}/stat is not parsable for this PID"),
                         });
                     }
-                    Some(stat) => records.push(ProcessRecord {
-                        key: ProcessKey {
-                            source: self.source.clone(),
-                            host: host.clone(),
-                            boot: boot.clone(),
-                            pid_namespace: pid_namespace.clone(),
-                            pid: Observed::Known(pid),
-                            creation: CreationToken::LinuxBootTicks(stat.start_ticks),
-                        },
-                        display_name: stat.display_name,
-                        resident: resident_bytes(stat.resident_pages, &page_size),
-                    }),
+                    (read_at, Some(stat)) => {
+                        // The instance is the PID *and* its creation token: a
+                        // reused PID is a different key, so it warms up instead
+                        // of inheriting the counters of the process it replaced.
+                        let instance = (pid, stat.start_ticks);
+                        let cpu = match stat.cpu_ticks {
+                            Some(ticks) => {
+                                let (usage, keep) = sample_cpu(
+                                    self.cpu_baselines.get(&instance),
+                                    CpuBaseline { ticks, at: read_at },
+                                    &ticks_per_second,
+                                );
+                                baselines.insert(instance, keep);
+                                usage
+                            }
+                            // No counter, no baseline: the next readable sample
+                            // of this instance warms up again.
+                            None => CpuUsage::Missing(MissingReason::Unavailable),
+                        };
+                        records.push(ProcessRecord {
+                            key: ProcessKey {
+                                source: self.source.clone(),
+                                host: host.clone(),
+                                boot: boot.clone(),
+                                pid_namespace: pid_namespace.clone(),
+                                pid: Observed::Known(pid),
+                                creation: CreationToken::LinuxBootTicks(stat.start_ticks),
+                            },
+                            display_name: stat.display_name,
+                            resident: resident_bytes(stat.resident_pages, &page_size),
+                            cpu,
+                        });
+                    }
                 },
             }
         }
@@ -552,6 +781,9 @@ impl ProcessSource for ProcFsSource {
             Observed::Known(pid) => pid,
             Observed::Missing(_) => u32::MAX,
         });
+        // Only what this scan published is kept for the next one, so the map is
+        // bounded by the record bound and a process that ended is forgotten.
+        self.cpu_baselines = baselines;
         ProcessSnapshot {
             source: self.source.clone(),
             sampled_at,
@@ -729,10 +961,15 @@ pub struct StatFields {
     /// plain count, still names an identified process whose resident memory this
     /// scan could not read. It is reported unread rather than published as zero.
     pub resident_pages: Option<u64>,
+    /// Fields 14 and 15 summed: user plus kernel CPU time in clock ticks, when
+    /// both are plain counts and their sum fits. Optional for the same reason as
+    /// `resident_pages`: an unreadable counter is an unread metric, not a missing
+    /// process, and it is reported unread rather than as zero.
+    pub cpu_ticks: Option<u64>,
 }
 
-/// Parses `comm`, the creation token and the resident page count out of one
-/// `/proc/<pid>/stat` line.
+/// Parses `comm`, the creation token, the resident page count and the CPU
+/// counters out of one `/proc/<pid>/stat` line.
 ///
 /// `comm` is raw bytes wrapped in parentheses and may itself contain spaces,
 /// parentheses, control characters and invalid UTF-8 (K1). Fields are therefore
@@ -748,39 +985,40 @@ pub fn parse_stat(pid: u32, bytes: &[u8]) -> Option<StatFields> {
     if parse_pid(trim_ascii(&bytes[..open])) != Some(pid) {
         return None;
     }
-    let mut fields = bytes[close + 1..]
+    let fields: Vec<&[u8]> = bytes[close + 1..]
         .split(u8::is_ascii_whitespace)
-        .filter(|field| !field.is_empty());
-    let start_ticks = std::str::from_utf8(fields.nth(STARTTIME_FIELD_AFTER_COMM)?)
-        .ok()?
-        .parse::<u64>()
-        .ok()?;
-    // Counted from the field after the start time, which the line above consumed.
-    let resident_pages = fields
-        .nth(RSS_FIELD_AFTER_COMM - STARTTIME_FIELD_AFTER_COMM - 1)
-        .and_then(|field| std::str::from_utf8(field).ok())
-        // `rss` is printed as a signed long (K1). A negative count is not a
-        // number of pages, so it is unread rather than reinterpreted.
-        .and_then(|field| field.parse::<u64>().ok());
+        .filter(|field| !field.is_empty())
+        .take(RSS_FIELD_AFTER_COMM + 1)
+        .collect();
+    // Every field read here is an unsigned count. `rss` is printed as a signed
+    // long (K1): a negative count is not a number of pages, so it is unread
+    // rather than reinterpreted, and the same holds for any non-numeric field.
+    let count = |index: usize| {
+        fields
+            .get(index)
+            .and_then(|field| std::str::from_utf8(field).ok())
+            .and_then(|field| field.parse::<u64>().ok())
+    };
+    let start_ticks = count(STARTTIME_FIELD_AFTER_COMM)?;
+    let resident_pages = count(RSS_FIELD_AFTER_COMM);
+    let cpu_ticks = count(UTIME_FIELD_AFTER_COMM)
+        .zip(count(STIME_FIELD_AFTER_COMM))
+        .and_then(|(user, system)| user.checked_add(system));
     Some(StatFields {
         display_name: DisplayName::sanitize(&bytes[open + 1..close]),
         start_ticks,
         resident_pages,
+        cpu_ticks,
     })
 }
 
-/// The page size an auxiliary vector reports, if it reports a believable one.
+/// The value of `wanted` in an auxiliary vector, if the vector carries one.
 ///
 /// The vector is pairs of native-endian `unsigned long` words, terminated by
 /// [`AT_NULL`] (K1). The word size is this target's pointer width, so a 32-bit
 /// build reads the 32-bit vector a 32-bit kernel writes. A trailing partial word
 /// ends the walk: half a word is not a value.
-///
-/// A value that is not a power of two, or is outside [`MIN_PAGE_SIZE`] ..=
-/// [`MAX_PAGE_SIZE`], is refused rather than used. Multiplying a page count by a
-/// wrong page size would publish a confident, wrong byte count for every process
-/// on the host, which is worse than reporting the metric unread.
-fn parse_page_size(bytes: &[u8]) -> Option<u64> {
+fn auxv_value(bytes: &[u8], wanted: u64) -> Option<u64> {
     let word = std::mem::size_of::<usize>();
     for pair in bytes.chunks_exact(word * 2) {
         let read = |slice: &[u8]| {
@@ -792,14 +1030,30 @@ fn parse_page_size(bytes: &[u8]) -> Option<u64> {
         if key == AT_NULL {
             return None;
         }
-        if key != AT_PAGESZ {
-            continue;
+        if key == wanted {
+            return Some(read(&pair[word..]));
         }
-        let value = read(&pair[word..]);
-        return (value.is_power_of_two() && (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&value))
-            .then_some(value);
     }
     None
+}
+
+/// The page size an auxiliary vector reports, if it reports a believable one.
+///
+/// A value that is not a power of two, or is outside [`MIN_PAGE_SIZE`] ..=
+/// [`MAX_PAGE_SIZE`], is refused rather than used. Multiplying a page count by a
+/// wrong page size would publish a confident, wrong byte count for every process
+/// on the host, which is worse than reporting the metric unread.
+fn parse_page_size(bytes: &[u8]) -> Option<u64> {
+    auxv_value(bytes, AT_PAGESZ)
+        .filter(|value| value.is_power_of_two() && (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(value))
+}
+
+/// The clock-tick rate an auxiliary vector reports, if it reports a believable
+/// one: at least one tick per second and at most
+/// [`MAX_CLOCK_TICKS_PER_SECOND`]. Zero would divide by nothing, and a wrong
+/// rate would publish a confident, wrong percentage for every process.
+fn parse_clock_ticks(bytes: &[u8]) -> Option<u64> {
+    auxv_value(bytes, AT_CLKTCK).filter(|rate| (1..=MAX_CLOCK_TICKS_PER_SECOND).contains(rate))
 }
 
 /// A record's resident memory in bytes, or why this scan could not state it.
@@ -839,6 +1093,160 @@ mod tests {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
+    fn at(seconds: u64, ticks: u64) -> CpuBaseline {
+        CpuBaseline {
+            ticks,
+            at: Duration::from_secs(seconds),
+        }
+    }
+
+    const HZ: Observed<u64> = Observed::Known(100);
+
+    #[test]
+    fn a_first_sample_warms_up_and_becomes_the_baseline() {
+        let (usage, keep) = sample_cpu(None, at(5, 900), &HZ);
+        assert_eq!(usage, CpuUsage::WarmingUp);
+        assert_eq!(keep, at(5, 900));
+        // With no tick rate there will never be an interval to publish, so the
+        // reason is published from the first sample on rather than a warm-up
+        // that never ends.
+        for reason in [MissingReason::Denied, MissingReason::Unavailable] {
+            let (usage, keep) = sample_cpu(None, at(5, 900), &Observed::Missing(reason));
+            assert_eq!(usage, CpuUsage::Missing(reason));
+            assert_eq!(keep, at(5, 900), "the counter was still read");
+        }
+    }
+
+    #[test]
+    fn an_interval_is_the_counter_delta_over_the_monotonic_delta() {
+        let (usage, keep) = sample_cpu(Some(&at(10, 1_000)), at(12, 1_100), &HZ);
+        assert_eq!(
+            usage,
+            CpuUsage::Measured(CpuInterval {
+                ticks: 100,
+                ticks_per_second: 100,
+                elapsed: Duration::from_secs(2),
+            })
+        );
+        assert_eq!(keep, at(12, 1_100));
+        assert_eq!(crate::metric::cpu_cell(&usage), "50.0%");
+    }
+
+    #[test]
+    fn no_interval_is_published_where_none_was_measured() {
+        let unavailable = CpuUsage::Missing(MissingReason::Unavailable);
+        // The clock did not advance: no divisor. The older baseline is kept, so
+        // the next scan measures across a real interval instead of warming up.
+        let (usage, keep) = sample_cpu(Some(&at(10, 1_000)), at(10, 1_050), &HZ);
+        assert_eq!((usage, keep), (unavailable, at(10, 1_000)));
+        // The clock went backwards, which a real monotonic clock never does:
+        // the old baseline belongs to a timeline that no longer applies.
+        let (usage, keep) = sample_cpu(Some(&at(10, 1_000)), at(9, 1_050), &HZ);
+        assert_eq!((usage, keep), (unavailable, at(9, 1_050)));
+        // The counter went backwards: a reset, never a huge unsigned delta.
+        let (usage, keep) = sample_cpu(Some(&at(10, 1_000)), at(11, 10), &HZ);
+        assert_eq!((usage, keep), (unavailable, at(11, 10)));
+        // A tick rate lost after the baseline was taken: the reason, not a value.
+        let (usage, keep) = sample_cpu(
+            Some(&at(10, 1_000)),
+            at(11, 1_010),
+            &Observed::Missing(MissingReason::Denied),
+        );
+        assert_eq!(
+            (usage, keep),
+            (CpuUsage::Missing(MissingReason::Denied), at(11, 1_010))
+        );
+    }
+
+    #[test]
+    fn only_a_different_observed_boot_or_namespace_invalidates_baselines() {
+        let mut remembered = None;
+        assert!(!identity_changed(
+            &mut remembered,
+            &Observed::Known(BootId("a".into()))
+        ));
+        assert!(!identity_changed(
+            &mut remembered,
+            &Observed::Known(BootId("a".into()))
+        ));
+        // An unreadable boot ID is not a reboot.
+        assert!(!identity_changed(
+            &mut remembered,
+            &Observed::Missing(MissingReason::Unavailable)
+        ));
+        assert_eq!(remembered, Some(BootId("a".into())));
+        assert!(identity_changed(
+            &mut remembered,
+            &Observed::Known(BootId("b".into()))
+        ));
+        assert_eq!(remembered, Some(BootId("b".into())));
+    }
+
+    #[test]
+    fn the_tick_rate_is_read_from_the_auxiliary_vector_and_refused_when_implausible() {
+        let vector = |entries: &[(u64, u64)]| {
+            let mut bytes = Vec::new();
+            for (key, value) in entries {
+                bytes.extend_from_slice(&(*key as usize).to_ne_bytes());
+                bytes.extend_from_slice(&(*value as usize).to_ne_bytes());
+            }
+            bytes
+        };
+        assert_eq!(
+            parse_clock_ticks(&vector(&[
+                (AT_PAGESZ, 4096),
+                (AT_CLKTCK, 100),
+                (AT_NULL, 0)
+            ])),
+            Some(100)
+        );
+        assert_eq!(
+            parse_clock_ticks(&vector(&[(AT_CLKTCK, 1024), (AT_NULL, 0)])),
+            Some(1024)
+        );
+        for refused in [
+            vector(&[(AT_CLKTCK, 0), (AT_NULL, 0)]),
+            vector(&[(AT_CLKTCK, MAX_CLOCK_TICKS_PER_SECOND + 1), (AT_NULL, 0)]),
+            vector(&[(AT_NULL, 0), (AT_CLKTCK, 100)]),
+            vector(&[(AT_PAGESZ, 4096), (AT_NULL, 0)]),
+            Vec::new(),
+        ] {
+            assert_eq!(parse_clock_ticks(&refused), None);
+        }
+        // The page size is still found beside it.
+        assert_eq!(
+            parse_page_size(&vector(&[
+                (AT_CLKTCK, 100),
+                (AT_PAGESZ, 4096),
+                (AT_NULL, 0)
+            ])),
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn cpu_counters_are_fields_14_and_15_and_an_unreadable_one_is_unread() {
+        let line = |utime: &str, stime: &str| {
+            let mut fields: Vec<String> = (4..=21).map(|field| field.to_string()).collect();
+            fields[14 - 4] = utime.into();
+            fields[15 - 4] = stime.into();
+            format!("7 (a) b) S {} 900 4096 3 0\n", fields.join(" "))
+        };
+        let parsed = parse_stat(7, line("30", "12").as_bytes()).unwrap();
+        assert_eq!(parsed.cpu_ticks, Some(42));
+        assert_eq!(parsed.start_ticks, 900);
+        assert_eq!(parsed.resident_pages, Some(3));
+        for (utime, stime) in [("-1", "2"), ("x", "2"), ("2", "-5")] {
+            let parsed = parse_stat(7, line(utime, stime).as_bytes()).unwrap();
+            assert_eq!(parsed.cpu_ticks, None, "{utime} {stime}");
+            // The identity and the other metric are untouched by it.
+            assert_eq!(parsed.start_ticks, 900);
+            assert_eq!(parsed.resident_pages, Some(3));
+        }
+        let overflowing = format!("{}", u64::MAX);
+        let parsed = parse_stat(7, line(&overflowing, "1").as_bytes()).unwrap();
+        assert_eq!(parsed.cpu_ticks, None, "an overflowing sum is not wrapped");
+    }
     #[test]
     fn an_unnameable_namespace_withholds_the_hostname_rather_than_labelling_it_unknown() {
         let tag = "uts:[4026531838]".to_string();
@@ -917,9 +1325,8 @@ mod tests {
             root: PathBuf::from("proc"),
             source: SourceId("procfs-unanchored:proc".into()),
             status: "unanchored".into(),
-            record_limit: MAX_RECORDS,
-            uncertain_limit: MAX_UNCERTAIN_PIDS,
             anchored: false,
+            ..ProcFsSource::rooted(PathBuf::from("proc"), String::new())
         };
         let snapshot = unanchored.snapshot();
         assert!(snapshot.records.is_empty());

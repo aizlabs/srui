@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-004-G01",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Generic runtime and protocol delivery of catch-up and resync snapshots larger than one §26 frame; no app-specific snapshot path, no raised frame limit, no new transport or retry stack, no change to srtop's published-row ceiling",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX004G01-001",
+      "feature": "A snapshot whose single envelope would exceed the frame limit is delivered as consecutive 0 -> snapshot_revision Transaction envelopes announced by ServerWelcome/ServerResyncRequired.snapshot_parts and bounded by the client's ClientLimits.max_snapshot_parts; a snapshot that fits one frame keeps the legacy single-envelope bytes and a legacy client is never sent a split",
+      "scope": "PX-004-G01/sessiond fresh handshake and resync, srui-protocol framing; all SRUI applications",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-004-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-004-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX004G01-002",
+      "feature": "Both replicas stage the announced envelopes and apply them as one snapshot after the last, so no partially applied snapshot is visible; a foreign, mismatched or empty envelope, an announcement above the advertised bound, or a staged total above max_transaction_operations fails the session, and the Rust and Swift replicas replay the same suite-8 vectors to identical results",
+      "scope": "PX-004-G01/Rust SnapshotAssembler, Swift SnapshotAssembler and SessionController; §32 suite 8 vectors",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-004-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-004-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX004G01-003",
+      "feature": "The server measures the encoded snapshot before any frame is written; one that cannot be delivered (operation bound, an operation larger than a frame, or more envelopes than the client stages) is refused at handshake with ServerHandshakeRefused SNAPSHOT_UNDELIVERABLE and a typed SessionError, and the Swift client reports it as SessionFailure.handshakeRefused instead of a silent detach loop",
+      "scope": "PX-004-G01/sessiond handshake and resync, Swift SessionController",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-004-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-004-G01.md"
+      ]
+    }
+  ]
+}

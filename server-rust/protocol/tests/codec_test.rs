@@ -115,6 +115,7 @@ async fn test_async_codec_roundtrip() {
             core_version: "0.5.0".to_string(),
             profiles: vec!["core".to_string(), "widgets.standard".to_string()],
             limits: Some(ClientLimits {
+                max_snapshot_parts: 0,
                 max_frame_size: 16 * 1024 * 1024,
                 max_transaction_operations: 10_000,
                 max_tree_depth: 128,

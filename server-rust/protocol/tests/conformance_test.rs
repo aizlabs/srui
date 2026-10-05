@@ -793,6 +793,150 @@ fn test_terminal_envelope_conformance() {
     }
 }
 
+/// Authored twins of the snapshot-framing vectors written by `generate_fixtures` (PX-004-G01 extension; §26).
+fn create_authored_snapshot_framing_vectors() -> [(&'static str, SruiMessage); 4] {
+    let standard = || ExtensionNamespaceMapping {
+        extension_uri: "org.srui.standard-widgets".to_string(),
+        namespace_id: 0,
+    };
+    [
+        (
+            "golden_snapshot_parts_client_hello",
+            SruiMessage {
+                msg: Some(srui_message::Msg::ClientHello(ClientHello {
+                    core_version: "0.5.0".to_string(),
+                    profiles: vec!["org.srui.standard-widgets/1".to_string()],
+                    limits: Some(ClientLimits {
+                        max_frame_size: 16_777_216,
+                        max_snapshot_parts: 16,
+                        ..ClientLimits::default()
+                    }),
+                    client_instance_id: b"c17".to_vec(),
+                    client_metadata: Default::default(),
+                    known_resource_hashes: vec![],
+                })),
+            },
+        ),
+        (
+            "golden_snapshot_parts_welcome",
+            SruiMessage {
+                msg: Some(srui_message::Msg::ServerWelcome(ServerWelcome {
+                    core_version: "0.5.0".to_string(),
+                    required_profiles: vec!["org.srui.standard-widgets/1".to_string()],
+                    optional_profiles: vec![],
+                    session_id: "abc".to_string(),
+                    initial_revision: 17,
+                    extension_namespaces: vec![standard()],
+                    limits: None,
+                    snapshot_parts: 2,
+                })),
+            },
+        ),
+        (
+            "golden_snapshot_parts_resync_required",
+            SruiMessage {
+                msg: Some(srui_message::Msg::ServerResyncRequired(
+                    ServerResyncRequired {
+                        session_id: "abc".to_string(),
+                        snapshot_revision: 2210,
+                        reason: "journal_gap".to_string(),
+                        continuity: SessionContinuity::SameSession as i32,
+                        last_processed_event_seq: 593,
+                        discarded_text_edits: vec![],
+                        required_profiles: vec!["org.srui.standard-widgets/1".to_string()],
+                        optional_profiles: vec![],
+                        extension_namespaces: vec![standard()],
+                        snapshot_parts: 3,
+                    },
+                )),
+            },
+        ),
+        (
+            "golden_handshake_refused",
+            SruiMessage {
+                msg: Some(srui_message::Msg::ServerHandshakeRefused(
+                    ServerHandshakeRefused {
+                        reason: HandshakeRefusalReason::SnapshotUndeliverable as i32,
+                        detail: "snapshot needs 2 envelopes; client stages at most 1".to_string(),
+                    },
+                )),
+            },
+        ),
+    ]
+}
+
+/// PX-004-G01 snapshot framing (§26): decode, encode-from-scratch and roundtrip are bit-identical, and the
+/// decoded framing fields match `expected.json`.
+#[test]
+fn test_snapshot_framing_envelope_conformance() {
+    for (name, authored) in create_authored_snapshot_framing_vectors() {
+        assert_framed_vector(name, authored);
+    }
+
+    let (vectors_dir, spec) = load_expected_spec();
+    let decode = |name: &str| -> SruiMessage {
+        let file = spec["vectors"][name]["file"].as_str().unwrap();
+        decode_framed(&fs::read(vectors_dir.join(file)).unwrap()).unwrap()
+    };
+    let expected = |name: &str| &spec["vectors"][name]["expected"];
+
+    match decode("golden_snapshot_parts_client_hello").msg {
+        Some(srui_message::Msg::ClientHello(hello)) => {
+            let limits = hello.limits.expect("limits");
+            let want = &expected("golden_snapshot_parts_client_hello")["limits"];
+            assert_eq!(
+                u64::from(limits.max_snapshot_parts),
+                want["max_snapshot_parts"].as_u64().unwrap()
+            );
+            assert_eq!(
+                u64::from(limits.max_frame_size),
+                want["max_frame_size"].as_u64().unwrap()
+            );
+        }
+        other => panic!("expected ClientHello, got {other:?}"),
+    }
+    match decode("golden_snapshot_parts_welcome").msg {
+        Some(srui_message::Msg::ServerWelcome(welcome)) => {
+            let want = expected("golden_snapshot_parts_welcome");
+            assert_eq!(
+                welcome.initial_revision,
+                want["initial_revision"].as_u64().unwrap()
+            );
+            assert_eq!(
+                u64::from(welcome.snapshot_parts),
+                want["snapshot_parts"].as_u64().unwrap()
+            );
+        }
+        other => panic!("expected ServerWelcome, got {other:?}"),
+    }
+    match decode("golden_snapshot_parts_resync_required").msg {
+        Some(srui_message::Msg::ServerResyncRequired(resync)) => {
+            let want = expected("golden_snapshot_parts_resync_required");
+            assert_eq!(
+                resync.snapshot_revision,
+                want["snapshot_revision"].as_u64().unwrap()
+            );
+            assert_eq!(
+                u64::from(resync.snapshot_parts),
+                want["snapshot_parts"].as_u64().unwrap()
+            );
+            assert_eq!(
+                i64::from(resync.continuity),
+                want["continuity"].as_i64().unwrap()
+            );
+        }
+        other => panic!("expected ServerResyncRequired, got {other:?}"),
+    }
+    match decode("golden_handshake_refused").msg {
+        Some(srui_message::Msg::ServerHandshakeRefused(refusal)) => {
+            let want = expected("golden_handshake_refused");
+            assert_eq!(i64::from(refusal.reason), want["reason"].as_i64().unwrap());
+            assert_eq!(refusal.detail, want["detail"].as_str().unwrap());
+        }
+        other => panic!("expected ServerHandshakeRefused, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_decode_golden_text_edit_event_against_expected_json() {
     let (vectors_dir, spec) = load_expected_spec();

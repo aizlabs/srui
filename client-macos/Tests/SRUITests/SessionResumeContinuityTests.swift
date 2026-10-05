@@ -440,7 +440,7 @@ struct SessionResumeContinuityTests {
         welcome.serverWelcome.initialRevision = 0
         try await freshServer.send(data: SRUIFraming.encodeFramed(welcome))
 
-        try await AsyncTestSupport.eventually(description: "fresh HELLO handshake") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "fresh HELLO handshake") {
             freshController.sessionId == "fresh-session"
         }
 
@@ -1010,7 +1010,7 @@ struct SessionResumeContinuityTests {
         helloMessage.clientHello = hello
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(helloMessage))
 
-        try await AsyncTestSupport.eventually(description: "unanswered resume failure") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "unanswered resume failure") {
             controller.isDiverged
         }
         #expect(controller.sessionId == "replaced-incarnation")

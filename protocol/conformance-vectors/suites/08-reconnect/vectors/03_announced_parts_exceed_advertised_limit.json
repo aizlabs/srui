@@ -1,0 +1,25 @@
+{
+  "name": "announced_parts_exceed_advertised_limit",
+  "description": "A decision announcing more envelopes than ClientLimits.max_snapshot_parts is refused before any envelope is staged (size bound).",
+  "spec_sections": [
+    "§12.1",
+    "§18",
+    "§26",
+    "§32.8"
+  ],
+  "client_limits": {
+    "max_snapshot_parts": 4,
+    "max_transaction_operations": 10000
+  },
+  "decision": {
+    "snapshot_revision": 7,
+    "snapshot_parts": 5
+  },
+  "envelopes": [],
+  "expected_outcome": {
+    "status": "rejected",
+    "error": "parts_exceed_limit",
+    "at_envelope": null,
+    "replica_unchanged": true
+  }
+}

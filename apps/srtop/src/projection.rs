@@ -1,6 +1,6 @@
 //! Server-side row projection and session-local item allocation
 //! (§§6.2, 8; PX-002 rows, PX-003 process-instance keys, PX-004 refresh,
-//! PX-005 metric cells).
+//! PX-005 and PX-006 metric cells).
 use crate::metric;
 use crate::source::{BootId, HostId, Observed, PidNamespaceId, ProcessKey, ProcessSnapshot};
 use srui_sdk::{ItemId, Value};
@@ -182,6 +182,10 @@ impl SessionItemIds {
                         // value stays an exact integer, and the client renders
                         // what this produced rather than scaling a unit itself.
                         Value::String(metric::bytes_cell(&record.resident)),
+                        // Likewise for CPU: the stored interval stays exact, and
+                        // the warming-up and unread states are words, not zeros
+                        // (PX-006).
+                        Value::String(metric::cpu_cell(&record.cpu)),
                     ]),
                 })
             })
@@ -379,15 +383,16 @@ mod tests {
         // beside a denied metric. No pair of them is the same state, and no
         // unread value is published as a quantity.
         for (row, expected) in rows.iter().zip([
-            (Value::UnsignedInt(0), "1.1 MiB"),
-            (Value::String("Denied".into()), "0 B"),
-            (Value::String("Unavailable".into()), "Denied"),
+            (Value::UnsignedInt(0), "1.1 MiB", "250.0%"),
+            (Value::String("Denied".into()), "0 B", "0.0%"),
+            (Value::String("Unavailable".into()), "Denied", "Warming up"),
         ]) {
             let Value::List(cells) = &row.value else {
                 panic!("expected table cells")
             };
             assert_eq!(cells[0], expected.0);
             assert_eq!(cells[2], Value::String(expected.1.into()));
+            assert_eq!(cells[3], Value::String(expected.2.into()));
         }
     }
 

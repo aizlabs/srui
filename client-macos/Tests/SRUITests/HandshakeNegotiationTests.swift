@@ -65,7 +65,7 @@ struct HandshakeNegotiationTests {
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
 
         // 3. Client receives ServerWelcome and completes handshake
-        try await AsyncTestSupport.eventually(description: "handshake completion") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "handshake completion") {
             controller.isHandshakeComplete
         }
         #expect(controller.negotiatedCapabilities == [Profile.standardWidgetsV1, Profile.terminalV1])
@@ -107,7 +107,7 @@ struct HandshakeNegotiationTests {
         welcomeMessage.serverWelcome = welcome
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
 
-        try await AsyncTestSupport.eventually(description: "standard-only handshake completion") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "standard-only handshake completion") {
             controller.isHandshakeComplete
         }
         #expect(controller.negotiatedCapabilities == [Profile.standardWidgetsV1])
@@ -138,7 +138,7 @@ struct HandshakeNegotiationTests {
         welcomeMessage.serverWelcome = welcome
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
 
-        try await AsyncTestSupport.eventually(description: "missing Terminal mapping rejected") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "missing Terminal mapping rejected") {
             controller.isDiverged && failurePromise.load() != nil
         }
         #expect(!controller.isHandshakeComplete)
@@ -190,7 +190,7 @@ struct HandshakeNegotiationTests {
         welcomeMsg.serverWelcome = welcome
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
 
-        try await AsyncTestSupport.eventually(description: "core version refusal") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "core version refusal") {
             controller.isDiverged && failurePromise.load() != nil
         }
         #expect(!controller.isHandshakeComplete)
@@ -227,7 +227,7 @@ struct HandshakeNegotiationTests {
         welcomeMsg.serverWelcome = welcome
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
 
-        try await AsyncTestSupport.eventually(description: "handshake completion") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "handshake completion") {
             controller.isHandshakeComplete
         }
         #expect(!controller.isDiverged)
@@ -274,7 +274,7 @@ struct HandshakeNegotiationTests {
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
 
         // 3. Client must fail with protocol violation, stop tracking, and close transport
-        try await AsyncTestSupport.eventually(description: "handshake failure on profile mismatch") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "handshake failure on profile mismatch") {
             controller.isDiverged && failurePromise.load() != nil
         }
         #expect(!controller.isHandshakeComplete)
@@ -316,7 +316,7 @@ struct HandshakeNegotiationTests {
         txMsg.transaction = tx.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(txMsg))
 
-        try await AsyncTestSupport.eventually(description: "rejection of premature transaction") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "rejection of premature transaction") {
             controller.isDiverged && failurePromise.load() != nil
         }
         #expect(!controller.isHandshakeComplete)
@@ -357,7 +357,7 @@ struct HandshakeNegotiationTests {
         msg1.serverWelcome = welcome
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(msg1))
 
-        try await AsyncTestSupport.eventually(description: "initial handshake") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "initial handshake") {
             controller.isHandshakeComplete
         }
 
@@ -366,7 +366,7 @@ struct HandshakeNegotiationTests {
         msg2.serverWelcome = welcome
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(msg2))
 
-        try await AsyncTestSupport.eventually(description: "rejection of duplicate welcome") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "rejection of duplicate welcome") {
             controller.isDiverged && failurePromise.load() != nil
         }
 
@@ -413,7 +413,7 @@ struct HandshakeNegotiationTests {
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
 
         // 3. Client must fail because terminal was required by client
-        try await AsyncTestSupport.eventually(description: "client required profile mismatch") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "client required profile mismatch") {
             controller.isDiverged && failurePromise.load() != nil
         }
         #expect(!controller.isHandshakeComplete)
@@ -466,7 +466,7 @@ struct HandshakeNegotiationTests {
         helloMsg.clientHello = hello
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(helloMsg))
 
-        try await AsyncTestSupport.eventually(description: "rejection of client message from server") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "rejection of client message from server") {
             controller.isDiverged && failurePromise.load() != nil
         }
 
@@ -506,7 +506,7 @@ struct HandshakeNegotiationTests {
         welcomeMsg.serverWelcome = welcome
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
 
-        try await AsyncTestSupport.eventually(description: "handshake completion") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "handshake completion") {
             controller.isHandshakeComplete
         }
 
@@ -520,7 +520,7 @@ struct HandshakeNegotiationTests {
         requestMsg.clientModelRangeRequest = request
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(requestMsg))
 
-        try await AsyncTestSupport.eventually(description: "rejection of client range request from server") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "rejection of client range request from server") {
             controller.isDiverged && failurePromise.load() != nil
         }
 
@@ -557,7 +557,7 @@ struct HandshakeNegotiationTests {
         resumeMsg.serverResumeOk = resumeOk
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(resumeMsg))
 
-        try await AsyncTestSupport.eventually(description: "unsolicited RESUME_OK rejected") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "unsolicited RESUME_OK rejected") {
             controller.isDiverged && failurePromise.load() != nil
         }
         #expect(controller.isHandshakeComplete == false)
@@ -598,7 +598,7 @@ struct HandshakeNegotiationTests {
         welcomeMsg.serverWelcome = welcome
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
 
-        try await AsyncTestSupport.eventually(description: "malformed required profiles fail closed") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "malformed required profiles fail closed") {
             controller.isDiverged && failurePromise.load() != nil
         }
         #expect(controller.isHandshakeComplete == false)
@@ -662,7 +662,7 @@ struct HandshakeNegotiationTests {
         resumeMsg.serverResumeOk = resumeOk
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(resumeMsg))
 
-        try await AsyncTestSupport.eventually(description: "resume handshake completion") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "resume handshake completion") {
             controller.isHandshakeComplete
         }
         #expect(controller.negotiatedCapabilities == offered)
@@ -699,7 +699,7 @@ struct HandshakeNegotiationTests {
         resumeMsg.serverResumeOk = resumeOk
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(resumeMsg))
 
-        try await AsyncTestSupport.eventually(description: "stray RESUME_OK rejected") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "stray RESUME_OK rejected") {
             controller.isDiverged && failurePromise.load() != nil
         }
 
@@ -725,7 +725,7 @@ struct HandshakeNegotiationTests {
         welcomeMsg.serverWelcome = welcome
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
 
-        try await AsyncTestSupport.eventually(description: "handshake complete while awaiting snapshot") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "handshake complete while awaiting snapshot") {
             controller.isHandshakeComplete
         }
         #expect(applier.lastAppliedRevision == .initial)
@@ -739,7 +739,7 @@ struct HandshakeNegotiationTests {
         snapshotMsg.transaction = snapshot.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(snapshotMsg))
 
-        try await AsyncTestSupport.eventually(description: "hello catch-up snapshot applied") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "hello catch-up snapshot applied") {
             applier.lastAppliedRevision == Revision(1) && controller.isEventDispatchEnabled
         }
         #expect(controller.isDiverged == false)

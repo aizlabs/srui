@@ -74,9 +74,8 @@ struct SSHTransportDescriptorOwnershipTests {
 
     @Test("close() releases every pipe it opened and stops both reader threads")
     func closeReleasesEveryPipeItOpened() async throws {
-        let tempDir = URL(fileURLWithPath: "/tmp/srui-fd-\(UUID().uuidString.prefix(8))")
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let tempDir = try TestFixtureDirectory.make(prefix: "srui-fd")
+        defer { TestFixtureDirectory.release(tempDir) }
 
         let configuration = try stubConfiguration(in: tempDir)
         let before = openPipeInodes()
@@ -106,9 +105,8 @@ struct SSHTransportDescriptorOwnershipTests {
 
     @Test("repeated connect/close cycles do not accumulate pipes")
     func repeatedCyclesDoNotAccumulatePipes() async throws {
-        let tempDir = URL(fileURLWithPath: "/tmp/srui-fd-\(UUID().uuidString.prefix(8))")
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let tempDir = try TestFixtureDirectory.make(prefix: "srui-fd")
+        defer { TestFixtureDirectory.release(tempDir) }
 
         let configuration = try stubConfiguration(in: tempDir)
 

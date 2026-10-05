@@ -17,7 +17,11 @@ struct CodingAgentFallbackSocketTests {
     @Test("Base client renders fallback, terminal, actions, and TEXT_EDIT over Unix socket")
     @MainActor
     func baseClientRunsCompleteCodingAgentComposition() async throws {
-        let socketPath = "/tmp/srui-coding-agent-\(UUID().uuidString).sock"
+        // The demo writes a `<socket>.lock` sibling, so the fixture has to be a directory: a
+        // teardown that unlinks only the socket path leaves that lock file in /tmp forever.
+        let fixture = try TestFixtureDirectory.make(prefix: "srui-coding-agent")
+        defer { TestFixtureDirectory.release(fixture) }
+        let socketPath = fixture.appendingPathComponent("coding-agent.sock").path
         let binary = Self.repositoryRoot()
             .appendingPathComponent("examples/coding-agent-demo/target/debug/coding-agent-demo")
         try #require(
@@ -34,7 +38,6 @@ struct CodingAgentFallbackSocketTests {
         defer {
             if server.isRunning { server.terminate() }
             server.waitUntilExit()
-            try? FileManager.default.removeItem(atPath: socketPath)
         }
         try await Self.waitForSocket(at: socketPath)
 
@@ -50,7 +53,7 @@ struct CodingAgentFallbackSocketTests {
         controller.attachRenderer(renderer)
         try await controller.start()
         try await Self.waitForRevision(applier, expected: Revision(3))
-        try await AsyncTestSupport.eventually(description: "coding-agent snapshot rendered") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "coding-agent snapshot rendered") {
             renderer.registry.handle(for: NodeId(18)) != nil
         }
         // The catch-up snapshot mounts the native tree *before* the session releases the snapshot
@@ -177,7 +180,7 @@ struct CodingAgentFallbackSocketTests {
         )
         _ = try await semanticApprove.activate()
         try await Self.waitForRevision(applier, expected: Revision(4))
-        try await AsyncTestSupport.eventually(description: "approval rendered") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "approval rendered") {
             let conversation = (renderer.registry.view(for: NodeId(9)) as? NSScrollView)?
                 .documentView as? NSTextView
             return conversation?.string.contains("approved") == true

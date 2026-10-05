@@ -1064,10 +1064,14 @@ mod live {
     const WORKER_READY: &str = "srtop live worker ready: pid=";
     /// The least memory a worker writes and holds; see [`worker_resident_bytes`].
     const WORKER_RESIDENT_MIN: usize = 8 * 1024 * 1024;
-    /// The largest base page size Linux uses (64 KiB, on arm64).
-    const LARGEST_PAGE: usize = 64 * 1024;
+    /// Page size assumed when this process cannot read its own auxiliary
+    /// vector: the smallest Linux uses. Guessing too small shows up as the zero
+    /// resident size the live test asserts against; guessing 64 KiB on a 4 KiB
+    /// host writes sixteen times what the counter needs, which a memory-limited
+    /// host answers by killing the worker before it reports ready.
+    const FALLBACK_PAGE_SIZE: usize = 4096;
     /// CPUs assumed online when the kernel's list cannot be read: many, so a
-    /// worker errs toward writing too much memory rather than too little.
+    /// worker errs toward writing more pages rather than fewer.
     const FALLBACK_ONLINE_CPUS: usize = 256;
     /// How long a worker lives if nothing ends it sooner.
     const WORKER_LIFETIME: Duration = Duration::from_secs(60);
@@ -1208,11 +1212,27 @@ mod live {
     /// How much memory a worker writes and holds, so that the `rss` in
     /// `/proc/<pid>/stat` cannot read as zero. That field leaves out per-CPU
     /// counter deltas smaller than the kernel's batch, `max(32, 2 * online
-    /// CPUs)` pages, so one thread writing four batches of the largest page
-    /// size has at least three counted. Never less than [`WORKER_RESIDENT_MIN`].
+    /// CPUs)` pages, so one thread writing four batches of its own pages has at
+    /// least three counted. Never less than [`WORKER_RESIDENT_MIN`], and not
+    /// capped: fewer than four batches brings back the zero this guards against.
     fn worker_resident_bytes() -> usize {
-        let cpus = online_cpus().unwrap_or(FALLBACK_ONLINE_CPUS);
-        (4 * (2 * cpus).max(32) * LARGEST_PAGE).max(WORKER_RESIDENT_MIN)
+        let pages = 4 * (2 * online_cpus().unwrap_or(FALLBACK_ONLINE_CPUS)).max(32);
+        (pages * own_page_size().unwrap_or(FALLBACK_PAGE_SIZE)).max(WORKER_RESIDENT_MIN)
+    }
+
+    /// This process's page size: `AT_PAGESZ` in its own auxiliary vector, pairs
+    /// of native-endian words ending at `AT_NULL`, the layout `procfs` reads
+    /// from a mount's `self/auxv`.
+    fn own_page_size() -> Option<usize> {
+        let bytes = std::fs::read("/proc/self/auxv").ok()?;
+        let word = std::mem::size_of::<usize>();
+        let read = |slice: &[u8]| usize::from_ne_bytes(slice.try_into().expect("one word"));
+        bytes
+            .chunks_exact(2 * word)
+            .map(|pair| (read(&pair[..word]) as u64, read(&pair[word..])))
+            .take_while(|&(key, _)| key != AT_NULL)
+            .find(|&(key, _)| key == AT_PAGESZ)
+            .map(|(_, size)| size)
     }
 
     /// How many CPUs the kernel has online, the count it sizes that batch by,

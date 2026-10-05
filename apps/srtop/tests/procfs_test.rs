@@ -1185,6 +1185,88 @@ fn cpu_usage_is_counter_ticks_over_the_injected_monotonic_interval() {
     assert!(wall < Duration::from_secs(1), "{wall:?}");
 }
 
+/// A monotonic clock that advances one second on every reading: a stand-in for
+/// a scan whose records are read one after another, each read taking time.
+#[derive(Debug, Default)]
+struct SteppingClock(Mutex<u64>);
+
+impl MonotonicClock for SteppingClock {
+    fn now(&self) -> Duration {
+        let mut seconds = self.0.lock().unwrap();
+        *seconds += 1;
+        Duration::from_secs(*seconds)
+    }
+}
+
+/// PX-006 review round 1 (B1): each record's interval is its *own* read-to-read
+/// interval, taken when its `stat` read returns — never one scan-start instant
+/// stamped on every record. With one second passing per read, two records read
+/// in each of two scans are each measured across the reads that separate their
+/// own samples. Directory order is not fixed, so the assertion is on the sum:
+/// read-to-read intervals total four seconds whatever the order (2 + 2, or 3 +
+/// 1), while a per-scan instant would divide both by one second and publish
+/// 200% for each single-threaded process.
+#[test]
+fn each_record_is_measured_over_its_own_read_to_read_interval() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .clock_ticks(100)
+        .cpu(10, b"a", 500, "0", "0")
+        .cpu(20, b"b", 600, "0", "0");
+    let clock = Arc::new(SteppingClock::default());
+    let mut source = fixture.source().with_clock(clock.clone());
+    assert_eq!(cpu_of(&source.snapshot()), vec![CpuUsage::WarmingUp; 2]);
+    fixture
+        .cpu(10, b"a", 500, "200", "0")
+        .cpu(20, b"b", 600, "200", "0");
+    let second = source.snapshot();
+    let elapsed: Vec<Duration> = cpu_of(&second)
+        .into_iter()
+        .map(|usage| match usage {
+            CpuUsage::Measured(interval) => {
+                assert_eq!(interval.ticks, 200);
+                interval.elapsed
+            }
+            other => panic!("a second sample is measured: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        elapsed.iter().sum::<Duration>(),
+        Duration::from_secs(4),
+        "{elapsed:?}: each record must be measured read-to-read"
+    );
+    assert!(elapsed
+        .iter()
+        .all(|interval| *interval >= Duration::from_secs(1)));
+    // The clock is read once per record read, and never for the scan as a whole.
+    assert_eq!(*clock.0.lock().unwrap(), 4);
+}
+
+/// PX-006 review round 1 (W2): start ticks are numbered per PID namespace as
+/// well as per boot. A namespace that comes back different discards every
+/// baseline; one the scan merely could not read discards nothing.
+#[test]
+fn a_different_pid_namespace_discards_every_baseline_and_an_unreadable_one_does_not() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .clock_ticks(100)
+        .cpu(10, b"worker", 500, "100", "0");
+    let link = fixture.0.join("self/ns/pid");
+    let (mut source, clock) = clocked(&fixture);
+    clock.set(1);
+    source.snapshot();
+    fs::remove_file(&link).unwrap();
+    fixture.cpu(10, b"worker", 500, "150", "0");
+    clock.set(2);
+    assert_eq!(cpu_of(&source.snapshot()), vec![measured(50, 1)]);
+    std::os::unix::fs::symlink("pid:[4026531999]", &link).unwrap();
+    fixture.cpu(10, b"worker", 500, "200", "0");
+    clock.set(3);
+    assert_eq!(cpu_of(&source.snapshot()), vec![CpuUsage::WarmingUp]);
+}
+
 /// PX-006: a reused PID with a new creation token is another process instance.
 /// It warms up rather than inheriting — and subtracting — the counters of the
 /// process it replaced, which would be a reset or a spike.

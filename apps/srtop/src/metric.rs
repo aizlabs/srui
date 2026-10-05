@@ -336,6 +336,20 @@ mod tests {
         }
     }
 
+    /// PX-006 review round 1 (W3): at the shortest refresh interval one clock
+    /// tick is a large share of the interval. At 100 Hz over 50 ms a tick is 20
+    /// percentage points, so a fully busy thread honestly reads 80%, 100% or
+    /// 120% depending on where tick boundaries fell. This pins the arithmetic;
+    /// the quantization is documented, not smoothed.
+    #[test]
+    fn a_short_interval_is_quantized_by_the_tick_rate() {
+        use std::time::Duration;
+        let fifty = Duration::from_millis(50);
+        for (ticks, expected) in [(0, "0.0%"), (4, "80.0%"), (5, "100.0%"), (6, "120.0%")] {
+            assert_eq!(cpu_cell(&interval(ticks, 100, fifty)), expected);
+        }
+    }
+
     #[test]
     fn an_interval_that_cannot_be_divided_by_is_unavailable_rather_than_a_spike() {
         use std::time::Duration;

@@ -637,10 +637,12 @@ impl ProcessSource for ProcFsSource {
         {
             self.cpu_baselines.clear();
         }
-        // One instant per scan, on the monotonic clock only, taken immediately
-        // before the records are read. Every record of this scan is measured
-        // against it, so the interval is the same for every row.
-        let now = self.clock.now();
+        // The CPU interval is measured per record, not per scan: each record's
+        // instant is taken on the monotonic clock the moment its own `stat`
+        // read returns (below). A scan reads records one after another, and a
+        // slow read — a stalled file, a host with tens of thousands of entries
+        // — would otherwise divide one process's read-to-read counter delta by
+        // a scan-start-to-scan-start interval it was never measured over.
         let mut baselines = HashMap::with_capacity(self.cpu_baselines.len());
         let mut records = Vec::new();
         let entries = match std::fs::read_dir(&self.root) {
@@ -727,8 +729,10 @@ impl ProcessSource for ProcFsSource {
                         detail: format!("{pid}/stat: {error}"),
                     });
                 }
-                Ok(bytes) => match parse_stat(pid, &bytes) {
-                    None => {
+                // The instant is read before parsing, immediately after the
+                // counters were read, so it brackets exactly this record's read.
+                Ok(bytes) => match (self.clock.now(), parse_stat(pid, &bytes)) {
+                    (_, None) => {
                         skipped.record(pid);
                         record_issue(&mut issues, || EnumerationIssue {
                             scope: IssueScope::Process(pid),
@@ -736,7 +740,7 @@ impl ProcessSource for ProcFsSource {
                             detail: format!("{pid}/stat is not parsable for this PID"),
                         });
                     }
-                    Some(stat) => {
+                    (read_at, Some(stat)) => {
                         // The instance is the PID *and* its creation token: a
                         // reused PID is a different key, so it warms up instead
                         // of inheriting the counters of the process it replaced.
@@ -745,7 +749,7 @@ impl ProcessSource for ProcFsSource {
                             Some(ticks) => {
                                 let (usage, keep) = sample_cpu(
                                     self.cpu_baselines.get(&instance),
-                                    CpuBaseline { ticks, at: now },
+                                    CpuBaseline { ticks, at: read_at },
                                     &ticks_per_second,
                                 );
                                 baselines.insert(instance, keep);

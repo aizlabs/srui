@@ -1,0 +1,16 @@
+# PX-008 op/byte trace: devbox srtop --live-source --refresh-interval-ms 1000 behind srui-ssh-bridge; worker r0-worker started 0.228758959 seconds after connecting
+# Every framed SRUI message the unchanged generic client received, split from a copy of its
+# byte stream by a pass-through test transport. Visual evidence only, not semantic
+# conformance (D1 §32). Bytes are frame sizes on the wire: varint prefix plus payload.
+#  t(ms)    bytes  class    message                revisions  operations
+     139      130  control  ServerWelcome          -          -
+     139     1621  ui       Transaction            0->15      CREATE_MODELx1 MODEL_RESET_RANGEx1 CREATE_NODEx19
+    1021      585  ui       Transaction            15->16     SET_PROPERTYx5 MODEL_INSERTx1 MODEL_UPDATEx1
+    2021      387  ui       Transaction            16->17     SET_PROPERTYx4 MODEL_UPDATEx1
+    3020      478  ui       Transaction            17->18     SET_PROPERTYx8 MODEL_UPDATEx1
+    4021      420  ui       Transaction            18->19     SET_PROPERTYx7 MODEL_UPDATEx1
+    5023      461  ui       Transaction            19->20     SET_PROPERTYx7 MODEL_UPDATEx1
+    6027      494  ui       Transaction            20->21     SET_PROPERTYx8 MODEL_UPDATEx1
+    7026      173  ui       Transaction            21->22     SET_PROPERTYx1 MODEL_UPDATEx1
+    8026      449  ui       Transaction            22->23     SET_PROPERTYx6 MODEL_DELETEx1 MODEL_UPDATEx1
+# totals: 10 frames / 5198 B; control 1 frames / 130 B; ui 9 frames / 5068 B

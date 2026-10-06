@@ -1,0 +1,9 @@
+# PX-008 op/byte trace: srtop --fake-source --refresh-interval-ms 50 --smoke-fixture over a real localhost sshd and srui-ssh-bridge; frozen window of 3.1954645 seconds after synchronization, then the SIGUSR1 canary
+# Every framed SRUI message the unchanged generic client received, split from a copy of its
+# byte stream by a pass-through test transport. Visual evidence only, not semantic
+# conformance (D1 §32). Bytes are frame sizes on the wire: varint prefix plus payload.
+#  t(ms)    bytes  class    message                revisions  operations
+      58      130  control  ServerWelcome          -          -
+      58     1597  ui       Transaction            0->1       CREATE_MODELx1 MODEL_RESET_RANGEx1 CREATE_NODEx19
+    3315      103  ui       Transaction            1->2       SET_PROPERTYx2
+# totals: 3 frames / 1830 B; control 1 frames / 130 B; ui 2 frames / 1700 B

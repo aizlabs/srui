@@ -1,6 +1,11 @@
-//! PX-008, the R0 release gate: a repeatable audit that keeps srtop from gaining a
-//! way to signal or reconfigure a process (D1 §4 invariants 1 and 18, §7.7, §24;
-//! D2 T21). It runs on every `cargo test`, so it constrains every later change.
+//! PX-008, the R0 release gate: a repeatable audit against srtop gaining a way to
+//! signal or reconfigure a process (D1 §4 invariants 1 and 18, §7.7, §24; D2
+//! T21). It runs on every `cargo test`, so it constrains every later change.
+//!
+//! It is a tripwire against introducing process control by accident, read from
+//! tokens: it rejects the classes of construct listed here, each backed by a
+//! self-test below. It is not a proof against deliberate evasion; a construct it
+//! does not recognise passes it.
 //!
 //! Three checks:
 //!
@@ -12,38 +17,49 @@
 //!   target-specific dependency, rename, `links`, `[patch]` or `[replace]`, no
 //!   build script, and the library and binary are compiled from `src/`.
 //! * **Sources, as Rust tokens.** Every `.rs` file under `src/` is read, and no
-//!   symbolic link may stand there; with `#[path]` and `include!` refused below,
-//!   that is every file the library and the binary compile. Each file is
-//!   tokenized with proc-macro2, so comments, string, raw-string, byte-string
-//!   and character literals can neither hide code nor be mistaken for it, and
-//!   an item or statement gated by `#[cfg(test)]` is set aside token-exactly
-//!   (`cfg(test)` exactly; any other cfg is read). The production tokens may not
-//!   name: process creation or control (`Command`, `Child`, `kill`, `ptrace`,
-//!   `setpriority`, `sched_setaffinity`, `setrlimit`, …); FFI, assembly, raw
-//!   system calls or dynamic loading (`unsafe`, `extern`, `asm!`, `libc`,
-//!   `nix`, `syscall`, `dlopen`, …); outbound sockets (`UnixStream`,
-//!   `TcpStream`, `UdpSocket`, `connect`); the runtime's PTY facility (`pty`,
-//!   `TerminalSpec`, …); or any handler for client input (`Session::on` in
-//!   method or path form, `on_result`, `on_text_edit`, a model range
-//!   provider). Files are opened only through an allowlist — `File::open` and
-//!   the `std::fs` read functions srtop uses — and every way to obtain an
-//!   `OpenOptions` (the only write, append, create or truncate builder) is
-//!   refused: `OpenOptions`, `File::options`, `.options()`, any other `File::`
-//!   or `fs::` item, a grouped, glob or renamed import of one, a type alias of
-//!   `File`. `#[path]`, `#[link]`-style attributes and `include!` are refused.
-//!   The only signal API is receiving SIGINT, SIGTERM and the `--smoke-fixture`
-//!   SIGUSR1.
+//!   symbolic link may stand there. Each file is tokenized with proc-macro2, so
+//!   comments, string, raw-string, byte-string and character literals can
+//!   neither hide code nor be mistaken for it, and an item or statement gated by
+//!   `#[cfg(test)]` is set aside token-exactly (`cfg(test)` exactly; any other
+//!   cfg is read). The production tokens may not name: process creation or
+//!   control (`Command`, `Child`, `kill`, `ptrace`, `setpriority`,
+//!   `sched_setaffinity`, `setrlimit`, …); FFI, assembly, raw system calls or
+//!   dynamic loading (`unsafe`, `extern`, `asm!`, `libc`, `nix`, `syscall`,
+//!   `dlopen`, …); outbound sockets (`UnixStream`, `TcpStream`, `UdpSocket`,
+//!   `connect`); the runtime's PTY facility (`pty`, `TerminalSpec`, …); any
+//!   handler for client input (`Session::on` in method or path form,
+//!   `on_result`, `on_text_edit`, a model range provider); `include`, called or
+//!   renamed; or a macro definition (`macro_rules!`), whose expansion can
+//!   assemble tokens this audit never sees together. Attributes come from an
+//!   allowlist — `doc`, `derive` of the standard derives, `cfg`, `must_use`, the
+//!   lint levels, `inline` and `tokio::main` — and `cfg_attr` is read through,
+//!   at any depth, so `#[path]`, `#[link]`, `#[export_name]` or `#[no_mangle]`
+//!   is refused bare or wrapped. Files are opened only through an allowlist —
+//!   `File::open` and the `std::fs` read functions srtop uses — and the ways to
+//!   obtain an `OpenOptions` (the only write, append, create or truncate
+//!   builder) that these rules know are refused: `OpenOptions`, `File::options`,
+//!   `.options()`, any other `File::` or `fs::` item, a grouped, glob or renamed
+//!   import of one, a type alias of `File`. A file's write, resize and
+//!   permission methods are refused as methods and as paths
+//!   (`std::io::Write::write_all(&mut f, ..)`).
+//!   The only signal API is receiving SIGINT, SIGTERM and the
+//!   `--smoke-fixture` SIGUSR1.
 //! * **Binary imports.** `nm` lists the symbols the built `srtop` imports. None
 //!   may create a process, deliver a targeted signal other than `kill`, trace a
 //!   process, or change one's priority, affinity, limits, group or session. The
 //!   binary does import `kill`, `waitpid` and `waitid` (and `syscall` on Linux);
 //!   this check does not establish which code reaches them.
 //!
-//! What none of this can see is listed in the R0 release record: code inside the
-//! allowed dependencies beyond the symbols they import, the arguments of a raw
-//! system call a dependency makes, a release build, Cargo configuration outside
-//! the package (`.cargo/config.toml`, `RUSTFLAGS`), and what another program
-//! does to the same processes.
+//! What none of this can see is listed in the R0 release record: any construct
+//! the token audit does not recognise — among them a write through a `File`
+//! handle by `write!` or a generic writer such as `io::copy`, which tokens cannot
+//! tell from formatting into a `String` (inert while the only open allowed is
+//! read-only); code that procedural macros or the dependencies' own macros
+//! generate; code inside the allowed dependencies beyond the symbols they
+//! import; the arguments of a raw system call a dependency makes; any binary but
+//! the debug build `cargo test` links; Cargo configuration outside the package
+//! (`.cargo/config.toml`, `RUSTFLAGS`); and what another program does to the
+//! same processes.
 use proc_macro2::{Delimiter, Spacing, TokenStream, TokenTree};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -69,6 +85,12 @@ const FORBIDDEN_IDENTS: &[(&str, &str)] = &[
     ("dlopen", "dynamic loading"),
     ("dlsym", "dynamic loading"),
     ("libloading", "dynamic loading"),
+    // a macro definition: its expansion can assemble tokens this audit never
+    // sees together (`$h[path = ".."]` from `#`, `std::fs::$f` from `write`)
+    (
+        "macro_rules",
+        "defines a macro, whose expansion the audit cannot read",
+    ),
     // creating, replacing or controlling a process
     ("Command", "spawns or configures a child process"),
     ("CommandExt", "spawns or replaces a process"),
@@ -134,16 +156,22 @@ const FORBIDDEN_IDENTS: &[(&str, &str)] = &[
 ];
 
 /// Methods production code may not call: the `OpenOptions` builder and the
-/// writes, resizes and permission changes of an open file. `append`, `truncate`
-/// and `create` are also `OpenOptions` builders, but srtop calls them on vectors
-/// and SDK builders; they are reachable on an `OpenOptions` only after one of the
-/// refused ways to obtain it.
+/// writes, resizes and permission changes of an open file, as a method
+/// (`file.write_all(..)`) or as a path (`std::io::Write::write_all(&mut file,
+/// ..)`, called or taken as a value; a macro such as `std::write!` is not one).
+/// `append`, `truncate` and `create` are also `OpenOptions` builders, but srtop
+/// calls them on vectors and SDK builders; they are reachable on an
+/// `OpenOptions` only after one of the refused ways to obtain it. A write
+/// through a `File` by `write!` or a generic writer (`io::copy`) is not seen:
+/// tokens cannot tell a `File` from a `String`, and the only open allowed is
+/// read-only.
 const FORBIDDEN_METHODS: &[&str] = &[
     "options",
     "write",
     "write_all",
     "write_at",
     "write_vectored",
+    "write_fmt",
     "set_len",
     "set_permissions",
     "set_times",
@@ -166,14 +194,40 @@ const FILE_ALLOWED: &[&str] = &["open"];
 /// The signals `main` may receive. Sending one needs `kill` or `libc`.
 const RECEIVED_SIGNALS: &[&str] = &["interrupt", "terminate", "user_defined1"];
 
-/// Attributes that relocate code or link native symbols.
-const FORBIDDEN_ATTRIBUTES: &[&str] = &[
-    "path",
-    "link",
-    "link_name",
-    "link_section",
-    "no_mangle",
-    "export_name",
+/// The attributes production code may carry, by path; every other one is
+/// refused: `path`, `link`, `link_name`, `link_section`, `no_mangle`,
+/// `export_name`, `used`, `unsafe(..)`, crate-level attributes, and every
+/// attribute macro but `tokio::main`. srtop's production code carries `doc` (its
+/// doc comments), `derive`, `must_use` and `tokio::main`; `cfg`, the lint levels
+/// and `inline` change nothing it could use to reach a process. `cfg_attr` is
+/// read through: every attribute it applies, at any depth, must be allowed too.
+const ALLOWED_ATTRIBUTES: &[&str] = &[
+    "doc",
+    "derive",
+    "must_use",
+    "tokio::main",
+    "cfg",
+    "cfg_attr",
+    "allow",
+    "expect",
+    "warn",
+    "deny",
+    "forbid",
+    "inline",
+];
+
+/// The derives production code may use: the standard library's, which
+/// implement only the trait they name.
+const ALLOWED_DERIVES: &[&str] = &[
+    "Clone",
+    "Copy",
+    "Debug",
+    "Default",
+    "Eq",
+    "Hash",
+    "Ord",
+    "PartialEq",
+    "PartialOrd",
 ];
 
 /// The package's declared dependencies, by real package name.
@@ -455,6 +509,85 @@ fn contains_ident(level: &[Tok], names: &[&str]) -> bool {
     })
 }
 
+/// An attribute's path (`doc`, `tokio::main`) and where its arguments start. The
+/// path is empty when the attribute does not start with an identifier, as
+/// `#[$name = ".."]` in a macro body.
+fn attribute_path(attribute: &[Tok]) -> (String, usize) {
+    let mut path = Vec::new();
+    let mut k = 0;
+    while let Some(Tok::Ident(name, _, _)) = attribute.get(k) {
+        path.push(name.as_str());
+        k += 1;
+        if is_path_sep(attribute.get(k)) && matches!(attribute.get(k + 1), Some(Tok::Ident(..))) {
+            k += 1;
+        } else {
+            break;
+        }
+    }
+    (path.join("::"), k)
+}
+
+/// One attribute, the inside of `#[..]` or `#![..]`, against the allowlist. A
+/// `cfg_attr` is read through at any depth: every attribute it applies must be
+/// allowed too, so `#[cfg_attr(unix, path = "..")]` is refused as `#[path]` is.
+fn check_attribute(
+    attribute: &[Tok],
+    line: usize,
+    applied_by_cfg_attr: bool,
+    report: &mut dyn FnMut(usize, &str, String),
+) {
+    let (path, start) = attribute_path(attribute);
+    let context = if applied_by_cfg_attr {
+        " (applied by `cfg_attr`)"
+    } else {
+        ""
+    };
+    if !ALLOWED_ATTRIBUTES.contains(&path.as_str()) {
+        let shown = if path.is_empty() { ".." } else { &path };
+        report(
+            line,
+            "attribute",
+            format!("`#[{shown}]`{context} is not an allowed attribute"),
+        );
+        return;
+    }
+    let list = match &attribute[start..] {
+        [Tok::Group(Delimiter::Parenthesis, list, _)] => Some(list.as_slice()),
+        _ => None,
+    };
+    let comma = |tok: &Tok| matches!(tok, Tok::Punct(',', _));
+    match (path.as_str(), list) {
+        // `cfg_attr(predicate, attribute, ..)`: every attribute after the predicate
+        ("cfg_attr", Some(list)) => {
+            for applied in list.split(comma).skip(1) {
+                if !applied.is_empty() {
+                    check_attribute(applied, line, true, report);
+                }
+            }
+        }
+        ("derive", Some(list)) => {
+            for derive in list.split(comma) {
+                match derive {
+                    [] => {}
+                    [Tok::Ident(name, _, _)] if ALLOWED_DERIVES.contains(&name.as_str()) => {}
+                    _ => report(
+                        line,
+                        "attribute",
+                        format!(
+                            "`derive({})`{context} is not a standard derive",
+                            ident(derive.first()).unwrap_or("..")
+                        ),
+                    ),
+                }
+            }
+        }
+        ("cfg_attr" | "derive", None) => {
+            report(line, "attribute", format!("a malformed `{path}`{context}"))
+        }
+        _ => {}
+    }
+}
+
 fn scan(level: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
     for (i, tok) in level.iter().enumerate() {
         let prev = i.checked_sub(1).and_then(|p| level.get(p));
@@ -466,17 +599,31 @@ fn scan(level: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
                 if let Some((_, why)) = FORBIDDEN_IDENTS.iter().find(|(word, _)| word == name) {
                     report(line, "ident", format!("`{name}`: {why}"));
                 }
-                // `.name(` or `.name::<T>(`
-                if is_punct(prev, '.')
-                    && FORBIDDEN_METHODS.contains(&name.as_str())
-                    && (matches!(next, Some(Tok::Group(Delimiter::Parenthesis, ..)))
-                        || is_path_sep(next))
-                {
-                    report(
-                        line,
-                        "method",
-                        format!("`.{name}(..)` writes or opens for writing"),
-                    );
+                // `.name(` or `.name::<T>(`, and the path form in any position
+                // (`std::io::Write::write_all(&mut file, ..)`, or taken as a
+                // value) but a macro (`std::write!`); `fs::` and `File::` paths
+                // have their own rules below
+                if FORBIDDEN_METHODS.contains(&name.as_str()) {
+                    let owner = i.checked_sub(2).and_then(|p| ident(level.get(p)));
+                    if is_punct(prev, '.')
+                        && (matches!(next, Some(Tok::Group(Delimiter::Parenthesis, ..)))
+                            || is_path_sep(next))
+                    {
+                        report(
+                            line,
+                            "method",
+                            format!("`.{name}(..)` writes or opens for writing"),
+                        );
+                    } else if is_path_sep(prev)
+                        && !is_punct(next, '!')
+                        && !matches!(owner, Some("fs" | "File"))
+                    {
+                        report(
+                            line,
+                            "method",
+                            format!("`::{name}` writes or opens for writing"),
+                        );
+                    }
                 }
                 match name.as_str() {
                     // `x.on(..)` and `Session::on(&session, ..)`: a client event handler
@@ -543,10 +690,11 @@ fn scan(level: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
                             report(line, "type-alias", "a type alias of a file type".into());
                         }
                     }
-                    "include" if is_punct(next, '!') => report(
+                    // `include!`, and `include` imported under another name
+                    "include" => report(
                         line,
                         "include",
-                        "`include!` brings in code from elsewhere".into(),
+                        "`include` brings in code from elsewhere".into(),
                     ),
                     _ => {}
                 }
@@ -554,11 +702,7 @@ fn scan(level: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
             Tok::Punct('#', line) => {
                 let attribute = if is_punct(next, '!') { after } else { next };
                 if let Some(Tok::Group(Delimiter::Bracket, inner, _)) = attribute {
-                    if let Some(name) = ident(inner.first()) {
-                        if FORBIDDEN_ATTRIBUTES.contains(&name) {
-                            report(*line, "attribute", format!("`#[{name}]`"));
-                        }
-                    }
+                    check_attribute(inner, *line, false, report);
                 }
             }
             Tok::Group(_, inner, _) => scan(inner, report),
@@ -596,6 +740,34 @@ fn signal_receivers(source: &str) -> usize {
     count(&production(&lower(
         TokenStream::from_str(source).expect("a source that tokenizes"),
     )))
+}
+
+/// The paths of the attributes the production tokens of one source file carry.
+fn production_attributes(source: &str, paths: &mut BTreeSet<String>) {
+    fn walk(level: &[Tok], paths: &mut BTreeSet<String>) {
+        for (i, tok) in level.iter().enumerate() {
+            match tok {
+                Tok::Punct('#', _) => {
+                    let at = if is_punct(level.get(i + 1), '!') {
+                        i + 2
+                    } else {
+                        i + 1
+                    };
+                    if let Some(Tok::Group(Delimiter::Bracket, attribute, _)) = level.get(at) {
+                        paths.insert(attribute_path(attribute).0);
+                    }
+                }
+                Tok::Group(_, inner, _) => walk(inner, paths),
+                _ => {}
+            }
+        }
+    }
+    walk(
+        &production(&lower(
+            TokenStream::from_str(source).expect("a source that tokenizes"),
+        )),
+        paths,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -927,10 +1099,11 @@ fn reported(snippet: &str, rule: &str) -> bool {
         .any(|violation| violation.contains(&format!("[{rule}]")))
 }
 
-/// Every construct the source audit exists for is reported, including each one
-/// that got past the first version of this test (review probes P1–P7, verifier
-/// mutants N1–N8); look-alikes srtop really uses are not; comments and literals
-/// of every kind neither hide code nor count as code.
+/// Each construct listed here is reported under its rule, including each one that
+/// got past an earlier version of this test (review probes P1–P7, verifier
+/// mutants N1–N8, round-two findings V2-1 and V2-2); look-alikes srtop really
+/// uses are not, its attributes among them; comments and literals of every kind
+/// neither hide code nor count as code.
 #[test]
 fn the_source_audit_reports_every_known_bypass() {
     let bypasses: &[(&str, &str, &str)] = &[
@@ -968,6 +1141,31 @@ fn the_source_audit_reports_every_known_bypass() {
         ("fs renamed in a group", "use std::{fs as filesystem, io};", "fs"),
         ("file write_all", "handle.write_all(b\"1\")?;", "method"),
         ("file set_len", "handle.set_len(0)?;", "method"),
+        // the same methods as paths: called (UFCS) or taken as a value (V2-2)
+        (
+            "V2-2 UFCS write_all",
+            "let mut f = std::fs::File::open(p)?;\nstd::io::Write::write_all(&mut f, b\"HACKED\")?;",
+            "method",
+        ),
+        ("UFCS write", "Write::write(&mut f, b\"1\")?;", "method"),
+        (
+            "qualified UFCS",
+            "<std::fs::File as std::io::Write>::write_all(&mut f, b\"1\")?;",
+            "method",
+        ),
+        ("write_all as a value", "let w = std::io::Write::write_all;", "method"),
+        ("write_fmt", "f.write_fmt(format_args!(\"1\"))?;", "method"),
+        (
+            "UFCS write_fmt",
+            "io::Write::write_fmt(&mut f, format_args!(\"1\"))?;",
+            "method",
+        ),
+        (
+            "UFCS write_at",
+            "std::os::unix::fs::FileExt::write_at(&f, b\"1\", 0)?;",
+            "method",
+        ),
+        ("UFCS set_len", "std::fs::File::set_len(&f, 0)?;", "file"),
         // `//` inside a string literal no longer cuts the line (P2, P2b)
         (
             "P2 // in a string",
@@ -999,6 +1197,70 @@ fn the_source_audit_reports_every_known_bypass() {
         ("include!", "include!(\"../outside.rs\");", "include"),
         ("#[link]", "#[link(name = \"c\")]\nextern \"C\" {}", "attribute"),
         ("#[no_mangle]", "#[no_mangle]\npub fn kill_hook() {}", "attribute"),
+        // any attribute outside the allowlist, also where `cfg_attr` applies it (V2-1)
+        (
+            "V2-1 cfg_attr(not(test), path)",
+            "#[cfg_attr(not(test), path = \"../evil.rs\")]\nmod evil;",
+            "attribute",
+        ),
+        (
+            "V2-1 cfg_attr(unix, path)",
+            "#[cfg_attr(unix, path = \"../evil.rs\")]\nmod evil;",
+            "attribute",
+        ),
+        (
+            "nested cfg_attr",
+            "#[cfg_attr(unix, cfg_attr(not(test), path = \"../evil.rs\"))]\nmod evil;",
+            "attribute",
+        ),
+        (
+            "cfg_attr path after an allowed attribute",
+            "#[cfg_attr(unix, allow(dead_code), path = \"../evil.rs\")]\nmod evil;",
+            "attribute",
+        ),
+        (
+            "cfg_attr link",
+            "#[cfg_attr(unix, link(name = \"c\"))]\nextern \"C\" {}",
+            "attribute",
+        ),
+        (
+            "cfg_attr export_name",
+            "#[cfg_attr(unix, export_name = \"kill\")]\npub fn hook() {}",
+            "attribute",
+        ),
+        (
+            "cfg_attr no_mangle",
+            "#[cfg_attr(unix, no_mangle)]\npub fn hook() {}",
+            "attribute",
+        ),
+        (
+            "cfg_attr link_section",
+            "#[cfg_attr(unix, link_section = \".init_array\")]\npub static HOOK: fn() = hook;",
+            "attribute",
+        ),
+        ("inner cfg_attr", "#![cfg_attr(not(test), no_main)]", "attribute"),
+        ("#[unsafe(no_mangle)]", "#[unsafe(no_mangle)]\npub fn hook() {}", "attribute"),
+        ("#[used]", "#[used]\nstatic HOOK: u8 = 0;", "attribute"),
+        ("an attribute macro", "#[evil::rewrite]\nfn f() {}", "attribute"),
+        ("a derive macro", "#[derive(Debug, Spawner)]\nstruct S;", "attribute"),
+        ("an assembled attribute", "#[$name = \"../evil.rs\"]\nmod evil;", "attribute"),
+        ("a malformed cfg_attr", "#[cfg_attr]\nmod m {}", "attribute"),
+        // the same, assembled by a macro or brought in under another name
+        (
+            "a macro assembling an attribute",
+            "macro_rules! hashed { ($h:tt) => { $h[path = \"../evil.rs\"] mod evil; } }\nhashed!(#);",
+            "ident",
+        ),
+        (
+            "a macro assembling a path",
+            "macro_rules! call { ($f:ident) => { std::fs::$f(\"x\", \"y\") } }\ncall!(write);",
+            "ident",
+        ),
+        (
+            "include! renamed",
+            "use std::include as inc;\nconst CODE: &str = inc!(\"../outside.rs\");",
+            "include",
+        ),
         // a `#[cfg(test)]` inside a string literal gates nothing (P5)
         (
             "P5 cfg(test) in a string",
@@ -1103,6 +1365,18 @@ fn the_source_audit_reports_every_known_bypass() {
         "Surface::builder(1).label(\"Processes\").create(ui)?;",
         "pub type SkippedRecords = PidLedger;",
         "pub fn system() -> SystemSample { todo!() }",
+        "use std::fmt::Write as _;",
+        "let _ = std::write!(text, \"{x}\"); let _ = writeln!(text);",
+        // the attributes srtop's production code carries
+        "//! A crate doc.\n/// A doc.\n#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]\npub struct Row;",
+        "#[must_use]\npub fn kept() -> u8 { 0 }",
+        "#[must_use = \"the hook is removed as soon as this guard is dropped\"]\npub struct Guard;",
+        "#[tokio::main]\nasync fn main() {}",
+        // and other harmless ones, also where `cfg_attr` applies them
+        "#[cfg(target_os = \"linux\")]\nfn linux_only() {}",
+        "#[allow(clippy::too_many_lines)]\n#[expect(dead_code)]\n#[inline]\nfn f() {}",
+        "#[cfg_attr(test, derive(PartialOrd, Ord))]\n#[cfg_attr(unix, allow(dead_code), must_use)]\nstruct T;",
+        "#[cfg_attr(all(unix, not(test)), cfg_attr(target_os = \"linux\", inline))]\nfn g() {}",
     ] {
         assert_eq!(
             token_violations("innocent.rs", innocent),
@@ -1326,6 +1600,7 @@ fn no_production_source_can_signal_or_reconfigure_a_process() {
     );
     let mut found = Vec::new();
     let mut receivers = 0;
+    let mut attributes = BTreeSet::new();
     for path in &files {
         let text = std::fs::read_to_string(path).expect("a readable source file");
         let name = path
@@ -1335,6 +1610,7 @@ fn no_production_source_can_signal_or_reconfigure_a_process() {
             .to_string();
         found.extend(token_violations(&name, &text));
         receivers += signal_receivers(&text);
+        production_attributes(&text, &mut attributes);
     }
     assert!(
         found.is_empty(),
@@ -1346,7 +1622,8 @@ fn no_production_source_can_signal_or_reconfigure_a_process() {
     assert_eq!(receivers, RECEIVED_SIGNALS.len());
     println!(
         "PX-008 source audit: {} files read as tokens, 0 violations; signal receivers \
-         {RECEIVED_SIGNALS:?}; file access through {FILE_ALLOWED:?} and fs {FS_ALLOWED:?} only",
+         {RECEIVED_SIGNALS:?}; file access through {FILE_ALLOWED:?} and fs {FS_ALLOWED:?} only; \
+         attributes {attributes:?}",
         files.len()
     );
 }

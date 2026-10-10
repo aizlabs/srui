@@ -120,11 +120,14 @@ struct SSHTransportLiveIntegrationTests {
         // authentication, the bridge subsystem exec and the sessiond handshake. The 2s default is
         // a local-actor budget; on a 3-core runner sharing itself with the whole suite that round
         // trip is seconds, so the deadline has to cover the transport rather than a hop.
+        // Revision 1 can be applied before the controller enables event dispatch; activating in
+        // that window throws `resumeNotConfirmed`, so wait for both.
         try await AsyncTestSupport.eventually(
             timeout: .seconds(15),
-            description: "initial revision over SSH"
+            description: "initial revision and event dispatch over SSH"
         ) {
             applier.lastAppliedRevision == Revision(1)
+                && controller.isEventDispatchEnabled
         }
 
         let textID = NodeId(2)

@@ -34,18 +34,11 @@ struct SSHTransportPostureTests {
         #expect(args.contains("StrictHostKeyChecking=yes"), "Expected StrictHostKeyChecking=yes (§19.1)")
 
         // §19.1 Rule 6: Fixed subsystem request, not a shell command string
+        // `-s` is a flag; the subsystem name is the operand after the host, and `--` ends
+        // option parsing before the host.
         #expect(args.contains("-s"), "Expected -s flag for subsystem mode (§19.1)")
-        if let sIndex = args.firstIndex(of: "-s") {
-            #expect(sIndex + 1 < args.count)
-            #expect(args[sIndex + 1] == "srui", "Expected fixed subsystem 'srui' following -s (§19.1)")
-        }
-
-        // Host destination must be present (before -s on macOS OpenSSH)
-        #expect(args.contains("remote.example.com"))
-        if let sIndex = args.firstIndex(of: "-s") {
-            #expect(sIndex > 0)
-            #expect(args[sIndex - 1] == "remote.example.com")
-        }
+        #expect(Array(args.suffix(4)) == ["-s", "--", "remote.example.com", "srui"],
+                "Expected `-s -- <host> <subsystem>` at the end of the invocation (§19.1)")
 
         // Ensure no shell command injection wrappers are present
         #expect(!args.contains("/bin/sh"))
@@ -54,6 +47,19 @@ struct SSHTransportPostureTests {
         #expect(!args.contains("-L"))
         #expect(!args.contains("-R"))
         #expect(!args.contains("-D"))
+    }
+
+    @Test("A host that begins with a dash is a destination after --, never an ssh option")
+    func dashLeadingHostIsNotAnOption() {
+        let host = "-oProxyCommand=touch /tmp/srui-injected"
+        let args = SSHConfiguration(host: host).buildArguments()
+
+        guard let endOfOptions = args.firstIndex(of: "--") else {
+            Issue.record("Missing -- before the host")
+            return
+        }
+        #expect(Array(args[(endOfOptions + 1)...]) == [host, "srui"])
+        #expect(args.firstIndex(of: host) == endOfOptions + 1, "The host must appear only after --")
     }
 
     @Test("Custom configuration options are formatted correctly")

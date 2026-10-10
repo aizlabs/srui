@@ -143,9 +143,10 @@ public struct SSHConfiguration: Sendable, Equatable {
         }
 
         // §19.1: Fixed subsystem request rather than a shell-interpolated command string.
-        // Host precedes `-s` for compatibility with macOS OpenSSH (verified by live integration tests).
-        args.append(host)
-        args.append(contentsOf: ["-s", subsystem])
+        // `-s` takes no argument: it makes the remote command (the operand after the host) a
+        // subsystem name. `--` ends option parsing, so a host that begins with `-` (for example
+        // `-oProxyCommand=…`) is a destination, never an ssh option.
+        args.append(contentsOf: ["-s", "--", host, subsystem])
 
         return args
     }

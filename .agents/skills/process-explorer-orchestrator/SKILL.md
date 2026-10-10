@@ -43,12 +43,12 @@ Choose an agent context whose requirements fit the ticket. A specialized reviewe
 
 For each ticket:
 
-1. Confirm the candidate base commit, branch, and worktree. Never write in a checkout on `main`. Create a new `codex/<ticket-id>-<short-name>` worktree from the intended base.
+1. Run `git fetch origin` and resolve the intended base against the freshly fetched ref, not a remembered SHA. `origin/main` moves while a ticket is in flight, and a dependency PR may have merged since the last look. Confirm the candidate base commit, branch, and worktree. Never write in a checkout on `main`. Create a new `codex/<ticket-id>-<short-name>` worktree from the intended base.
 2. Mark the ticket `implementing` in external run state with the commit, branch, worktree, and timestamp.
 3. Start one implementer context with only the ticket, required design sections, baseline, dependency completion notes, scoped verification profile, and worktree path.
 4. Wait for its bounded result. It must report changed files, commands, evidence, and blockers and normally commit only its ticket. If the user requires the final task commit after verification, preserve an immutable candidate snapshot for the clean verifier, then confirm the final commit has the same tree. Do not pass unstaged implementation state to the verifier.
 5. Start a fresh verifier context from the candidate commit with the ticket and scoped verification profile. Do not pass the implementer's conclusions as trusted evidence.
-6. Accept the ticket only when the verifier returns `pass`; record the verifier commit, commands, evidence, and report path.
+6. Accept the ticket only when the verifier returns `pass`; record the verifier commit, commands, evidence, and report path. Accepting and delivering are one action, not two: unless delivery is suppressed, `git fetch origin` again, then push the task branch and open or update its pull request in the same step, so a passing ticket never waits on a later turn. Grant that authority to the verifier context itself when the orchestrator may not be live to act on the verdict.
 7. Honor an explicit stop-on-fail/blocked instruction when an agent returns that terminal result. Otherwise, on `fail`, preserve the candidate and send only the verifier findings back for a bounded correction; re-verify from a fresh context. On `blocked`, record the missing prerequisite and stop dependent scheduling. Ordinary implementation debugging and bounded setup recovery happen before a terminal verdict, unless the user explicitly requests stopping on the first unsuccessful command.
 8. Schedule the next ready ticket only after dependencies are verified. Do not implement follow-on tickets opportunistically.
 
@@ -85,7 +85,9 @@ Do not run a repository-wide hook merely because a ticket changes documentation.
 
 ## External actions
 
-Creating branches, commits, and worktrees is part of this workflow. For an ordinary implementation or supervision request, the delivery step after a passing verification is to push the task branch and open or update its pull request; the initiating implementation request authorizes that delivery. An explicit local-only or canary request suppresses push and pull-request creation. If the request does not establish either mode, mark delivery `pending_authorization` and ask before pushing. Merging to `main` is never performed by this skill. Do not send messages or deploy artifacts unless separately authorized.
+Creating branches, commits, and worktrees is part of this workflow. For an ordinary implementation or supervision request, the delivery step after a passing verification is to push the task branch and open or update its pull request; the initiating implementation request authorizes that delivery. Delivery belongs to whichever context observes the passing verdict — grant it to the verifier when the orchestrator may not be live — and it runs in the same step as acceptance rather than being deferred. An explicit local-only or canary request suppresses push and pull-request creation. If the request does not establish either mode, mark delivery `pending_authorization` and ask before pushing. Merging to `main` is never performed by this skill. Do not send messages or deploy artifacts unless separately authorized.
+
+After the pull request exists, confirm its review gate rather than assuming the push finished the job. `Codex Review Resolved` keys on the head SHA and fails closed after fifteen minutes; Codex reviews automatically only on PR open or ready-for-review, so any later push needs a `@codex review` comment and a re-run of the failed check. Review comments are closed with the `address-pr-review-comments` skill: fix, push, reply with evidence, resolve the thread. Never skip the gate.
 
 ## Stop conditions
 

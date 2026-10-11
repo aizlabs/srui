@@ -24,8 +24,11 @@
 //!   outstanding, in flight or given up, however often it is hidden and
 //!   shown again: a field shown again while its read is in flight adopts
 //!   that read, and a field whose read was given up is not read again until
-//!   that read returns. So one wedged field holds exactly one worker and
-//!   every other field keeps being read. Reads
+//!   that read returns. So one wedged field holds exactly one worker. While
+//!   fewer than [`Limits::max_in_flight`] fields are wedged, every other
+//!   field keeps being read; if that many or more wedge at once they fill
+//!   every in-flight slot until [`Limits::read_deadline`] gives them up, and
+//!   the reclaimed slots then serve the other fields again. Reads
 //!   still running — in flight or given up — never exceed
 //!   [`Limits::max_abandoned`], so a stuck source occupies a bounded number of
 //!   workers.

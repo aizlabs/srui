@@ -20,9 +20,26 @@
 //!   bounded). Every dispatched read answers exactly once: a job dropped unrun
 //!   or a read that panics answers as a failure through its reply guard, and a
 //!   read outstanding past [`Limits::read_deadline`] is given up — its field
-//!   fails and its slot is reclaimed — with at most [`Limits::max_abandoned`]
-//!   given-up reads still holding a worker, so a stuck source occupies a
-//!   bounded number of workers and never stops collection for good.
+//!   fails and its slot is reclaimed. A field is never read again while a
+//!   given-up read of its own is still outstanding, so one wedged field holds
+//!   at most one worker (two only if it was hidden and shown again while its
+//!   first read was in flight) and every other field keeps being read. Reads
+//!   still running — in flight or given up — never exceed
+//!   [`Limits::max_abandoned`], so a stuck source occupies a bounded number of
+//!   workers.
+//!
+//!   The residual: if that many distinct fields wedge at once, nothing can be
+//!   dispatched until one of their reads returns. Collection then stalls, but
+//!   honestly: a field with a value turns stale, a field without one reads
+//!   failed once it has waited past the read deadline, and collection resumes
+//!   by itself as soon as any wedged read returns. A wedged read that never
+//!   returns holds its worker for the life of the process; nothing here can
+//!   cancel blocking work.
+//!
+//!   The deadline is measured on [`SuspendAwareClock`], so a wall clock set
+//!   forward by at least [`Limits::read_deadline`] gives up every read in
+//!   flight at that moment: their fields read failed until their reads
+//!   return, and recover on the next read.
 //! * **Every demanded field is read.** Dispatch goes to never-read fields
 //!   first, then to the oldest reading, so no field starves behind the front
 //!   of the demanded list.
@@ -245,12 +262,14 @@ pub struct Limits {
     pub min_interval: Duration,
     /// A read outstanding this long is given up: its field becomes
     /// [`FieldState::Failed`], its in-flight slot is reclaimed, and whatever
-    /// it returns later is discarded.
+    /// it returns later is discarded. A demanded field still without a value
+    /// this long after it was first demanded also reads failed.
     pub read_deadline: Duration,
-    /// Most given-up reads that have not returned yet. Each may still hold a
-    /// worker, so while this many are outstanding nothing new is dispatched:
-    /// a source that hangs every read occupies at most
-    /// `max_in_flight + max_abandoned` workers.
+    /// Most reads still running at once, in flight and given up together: a
+    /// read is dispatched only while fewer than this many are outstanding, so
+    /// given-up reads never exceed it either, and a source that hangs every
+    /// read occupies at most this many workers. Keep it at least
+    /// `max_in_flight`, or it, not `max_in_flight`, limits concurrency.
     pub max_abandoned: usize,
 }
 
@@ -331,10 +350,22 @@ struct Reading {
     result: FieldResult,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct Slot {
     pending: Option<Pending>,
     reading: Option<Reading>,
+    /// When this field was first demanded, since it was last hidden.
+    demanded_since: SourceTime,
+}
+
+impl Slot {
+    fn new(now: SourceTime) -> Self {
+        Self {
+            pending: None,
+            reading: None,
+            demanded_since: now,
+        }
+    }
 }
 
 struct Completion {
@@ -406,10 +437,13 @@ pub struct OnDemandFields<D: Dispatch> {
     slots: HashMap<FieldId, Slot>,
     last_sequence: u64,
     /// Every read dispatched and not yet answered, by sequence number. Its
-    /// size is bounded by `max_in_flight + max_abandoned`.
+    /// size is bounded by `max_abandoned`.
     outstanding: HashMap<u64, Outstanding>,
     in_flight: usize,
     abandoned: usize,
+    /// Fields with a given-up read still outstanding, and how many: none of
+    /// them is dispatched again until all of its given-up reads return.
+    wedged: HashMap<FieldId, usize>,
     sender: Sender<Completion>,
     completions: Receiver<Completion>,
 }
@@ -434,6 +468,7 @@ impl<D: Dispatch> OnDemandFields<D> {
             outstanding: HashMap::new(),
             in_flight: 0,
             abandoned: 0,
+            wedged: HashMap::new(),
             sender,
             completions,
         }
@@ -485,13 +520,16 @@ impl<D: Dispatch> OnDemandFields<D> {
         type Due = (Option<(SourceTime, u64)>, usize, FieldId);
         let mut due: Vec<Due> = Vec::new();
         for (position, field) in order.into_iter().enumerate() {
-            let slot = self.slots.entry(field.clone()).or_default();
+            let slot = self
+                .slots
+                .entry(field.clone())
+                .or_insert_with(|| Slot::new(now));
             let last = slot
                 .reading
                 .as_ref()
                 .map(|reading| (reading.observed_at, reading.sequence));
             let fresh = last.is_some_and(|(at, _)| at.age_at(now) < self.limits.min_interval);
-            if slot.pending.is_none() && !fresh {
+            if slot.pending.is_none() && !fresh && !self.wedged.contains_key(&field) {
                 due.push((last, position, field));
             }
         }
@@ -501,7 +539,7 @@ impl<D: Dispatch> OnDemandFields<D> {
         due.sort_unstable_by_key(|due| (due.0, due.1));
         for (_, _, field) in due {
             if self.in_flight >= self.limits.max_in_flight
-                || self.abandoned >= self.limits.max_abandoned
+                || self.in_flight + self.abandoned >= self.limits.max_abandoned
             {
                 break;
             }
@@ -556,6 +594,7 @@ impl<D: Dispatch> OnDemandFields<D> {
             read.abandoned = true;
             self.in_flight -= 1;
             self.abandoned += 1;
+            *self.wedged.entry(read.field.clone()).or_insert(0) += 1;
             if let Some(slot) = self.slots.get_mut(&read.field) {
                 if slot
                     .pending
@@ -604,8 +643,15 @@ impl<D: Dispatch> OnDemandFields<D> {
             return false;
         };
         if read.abandoned {
-            // Given up at its deadline; its field already says so.
+            // Given up at its deadline; its field already says so. The field
+            // may be read again once none of its given-up reads is out.
             self.abandoned -= 1;
+            if let Some(count) = self.wedged.get_mut(&read.field) {
+                *count -= 1;
+                if *count == 0 {
+                    self.wedged.remove(&read.field);
+                }
+            }
             return false;
         }
         self.in_flight -= 1;
@@ -653,20 +699,28 @@ impl<D: Dispatch> OnDemandFields<D> {
     }
 
     /// The state of one field, or `None` when it is not demanded — a hidden
-    /// field has no state, because it is not collected.
+    /// field has no state, because it is not collected. A field without a
+    /// value is failed, not warming up, while a given-up read of its own is
+    /// outstanding or once it has waited [`Limits::read_deadline`] since it
+    /// was demanded.
     pub fn state(&self, target: &ProcessKey, key: MetricKey) -> Option<FieldState> {
-        let slot = self.slots.get(&(target.clone(), key))?;
+        let field = (target.clone(), key);
+        let slot = self.slots.get(&field)?;
+        let now = self.clock.now();
         let Some(reading) = &slot.reading else {
-            return Some(FieldState::WarmingUp);
+            let overdue = slot.demanded_since.age_at(now) >= self.limits.read_deadline;
+            return Some(if overdue || self.wedged.contains_key(&field) {
+                FieldState::Failed
+            } else {
+                FieldState::WarmingUp
+            });
         };
         let observed_at = reading.observed_at;
         Some(match &reading.result {
-            Ok(value) if observed_at.age_at(self.clock.now()) > self.limits.max_age => {
-                FieldState::Stale {
-                    value: value.clone(),
-                    observed_at,
-                }
-            }
+            Ok(value) if observed_at.age_at(now) > self.limits.max_age => FieldState::Stale {
+                value: value.clone(),
+                observed_at,
+            },
             Ok(value) => FieldState::Present {
                 value: value.clone(),
                 observed_at,
@@ -1347,11 +1401,219 @@ mod tests {
         late();
         assert_eq!(f.fields.collect_completed(), 0);
         assert_eq!(f.fields.demand(both).dispatched, 1);
+        // Dispatched now, but it waited a full deadline without a value while
+        // the bound held: failed, not warming up, until its read answers.
         assert_eq!(
             f.fields.state(&second, SMAPS_LIKE),
-            Some(FieldState::WarmingUp)
+            Some(FieldState::Failed)
         );
         assert_eq!(f.fields.state(&first, SMAPS_LIKE), Some(FieldState::Failed));
+        f.jobs.take(0)();
+        f.fields.collect_completed();
+        assert_eq!(
+            f.fields.state(&second, SMAPS_LIKE).unwrap().availability(),
+            Availability::Present
+        );
+    }
+
+    /// Runs every queued job in dispatch order except those whose target is
+    /// in `wedged`, which are kept unrun — reads that never return. Each
+    /// queued job is matched to its read through the dispatch sequence.
+    fn run_all_but(
+        f: &mut Fixture,
+        wedged: &[&ProcessKey],
+        seen: &mut u64,
+        kept: &mut Vec<(FieldId, Job)>,
+    ) {
+        let mut fresh: Vec<(u64, FieldId)> = f
+            .fields
+            .outstanding
+            .iter()
+            .filter(|(sequence, _)| **sequence > *seen)
+            .map(|(sequence, read)| (*sequence, read.field.clone()))
+            .collect();
+        fresh.sort_unstable_by_key(|read| read.0);
+        assert_eq!(fresh.len(), f.jobs.queued());
+        for (sequence, field) in fresh {
+            *seen = sequence;
+            let job = f.jobs.take(0);
+            if wedged.contains(&&field.0) {
+                kept.push((field, job));
+            } else {
+                job();
+            }
+        }
+    }
+
+    /// Review round 2, N1: reads in flight and given up together never
+    /// exceed `max_abandoned`, so the given-up count cannot overshoot it when
+    /// in-flight reads later expire.
+    #[test]
+    fn running_reads_never_exceed_the_bound() {
+        let mut f = fixture(Limits {
+            max_in_flight: 2,
+            max_abandoned: 2,
+            read_deadline: Duration::from_secs(5),
+            ..limits()
+        });
+        let [a, b, c] = <[ProcessKey; 3]>::try_from(targets()).unwrap();
+        let all = [a, b, c].map(|key| (key, SMAPS_LIKE));
+        let (mut seen, mut kept) = (0, Vec::new());
+        // One field wedges first, so one read is already given up when the
+        // others are demanded: only one more may be dispatched.
+        for tick in 0..20 {
+            let wanted = if tick < 3 { &all[..1] } else { &all[..] };
+            f.fields.demand(wanted.to_vec());
+            let wedged: Vec<&ProcessKey> = all.iter().map(|field| &field.0).collect();
+            run_all_but(&mut f, &wedged, &mut seen, &mut kept);
+            f.fields.collect_completed();
+            assert!(f.fields.in_flight() + f.fields.abandoned() <= 2);
+            assert!(f.fields.outstanding.len() <= 2);
+            f.clock.advance(Duration::from_secs(3));
+        }
+        assert_eq!(f.fields.abandoned(), 2);
+        assert_eq!(kept.len(), 2);
+    }
+
+    /// Review round 2, B1: one field whose read never returns. It is given up
+    /// once, stays failed, and is never dispatched again while that read is
+    /// out — not after a deadline, not after being hidden and shown again —
+    /// while every other field keeps being read and a newly shown field gets
+    /// a value. When the wedged read finally returns, the field is read again.
+    #[test]
+    fn one_wedged_field_never_stops_the_others() {
+        let mut f = fixture(Limits {
+            max_in_flight: 2,
+            max_abandoned: 3,
+            read_deadline: Duration::from_secs(5),
+            min_interval: Duration::from_secs(1),
+            max_age: Duration::from_secs(10),
+            ..limits()
+        });
+        let [hung, other, third] = <[ProcessKey; 3]>::try_from(targets()).unwrap();
+        let (mut seen, mut kept) = (0, Vec::new());
+        for tick in 0..1_000u64 {
+            let mut wanted = Vec::new();
+            // The wedged row is hidden for a while and shown again.
+            if !(300..400).contains(&tick) {
+                wanted.push((hung.clone(), SMAPS_LIKE));
+            }
+            wanted.push((other.clone(), SMAPS_LIKE));
+            if tick >= 500 {
+                wanted.push((third.clone(), SMAPS_LIKE));
+            }
+            f.fields.demand(wanted);
+            run_all_but(&mut f, &[&hung], &mut seen, &mut kept);
+            f.fields.collect_completed();
+            if tick >= 5 && !(300..400).contains(&tick) {
+                assert_eq!(
+                    f.fields.state(&hung, SMAPS_LIKE),
+                    Some(FieldState::Failed),
+                    "tick {tick}"
+                );
+            }
+            assert_eq!(
+                f.fields.state(&other, SMAPS_LIKE).unwrap().availability(),
+                Availability::Present,
+                "tick {tick}"
+            );
+            if tick >= 500 {
+                assert_eq!(
+                    f.fields.state(&third, SMAPS_LIKE).unwrap().availability(),
+                    Availability::Present,
+                    "tick {tick}"
+                );
+            }
+            assert!(f.fields.abandoned() <= 1, "tick {tick}");
+            f.clock.advance(Duration::from_secs(1));
+        }
+        assert_eq!(kept.len(), 1, "the wedged field was dispatched once");
+        assert_eq!(f.fields.abandoned(), 1);
+        assert!(f.source.reads().iter().all(|read| read.0 != hung));
+        // The wedged read returns at last: discarded, and the field is due.
+        let (field, late) = kept.pop().unwrap();
+        assert_eq!(field, (hung.clone(), SMAPS_LIKE));
+        late();
+        assert_eq!(f.fields.collect_completed(), 0);
+        assert_eq!(f.fields.abandoned(), 0);
+        f.fields.demand([(hung.clone(), SMAPS_LIKE)]);
+        f.jobs.take(0)();
+        f.fields.collect_completed();
+        assert_eq!(
+            f.fields.state(&hung, SMAPS_LIKE).unwrap().availability(),
+            Availability::Present
+        );
+    }
+
+    /// Review round 2, B1(b): as many distinct wedged fields as the bound
+    /// allows stop every dispatch. Nothing then sits warming up forever: a
+    /// field without a value reads failed once it has waited a deadline, one
+    /// with a value turns stale, and collection resumes by itself as soon as
+    /// any wedged read returns.
+    #[test]
+    fn saturation_by_wedged_fields_is_reported_and_recovers() {
+        let mut f = fixture(Limits {
+            max_in_flight: 2,
+            max_abandoned: 2,
+            read_deadline: Duration::from_secs(5),
+            min_interval: Duration::from_secs(1),
+            max_age: Duration::from_secs(10),
+            ..limits()
+        });
+        let [first, second, shown] = <[ProcessKey; 3]>::try_from(targets()).unwrap();
+        let (mut seen, mut kept) = (0, Vec::new());
+        let all = [
+            (first.clone(), SMAPS_LIKE),
+            (second.clone(), SMAPS_LIKE),
+            (first.clone(), TABLE_LIKE),
+        ];
+        // One field gets a value first; then two others wedge.
+        f.fields.demand([all[2].clone()]);
+        run_all_but(&mut f, &[], &mut seen, &mut kept);
+        f.fields.collect_completed();
+        f.clock.advance(Duration::from_secs(1));
+        f.fields.demand(all.clone());
+        run_all_but(&mut f, &[&first, &second], &mut seen, &mut kept);
+        // Both slots went to the never-read fields, which wedged.
+        assert_eq!(kept.len(), 2);
+        let mut with_shown = all.to_vec();
+        with_shown.push((shown.clone(), SMAPS_LIKE));
+        for tick in 0..30 {
+            f.clock.advance(Duration::from_secs(1));
+            let report = f.fields.demand(with_shown.clone());
+            run_all_but(&mut f, &[&first, &second], &mut seen, &mut kept);
+            f.fields.collect_completed();
+            if tick >= 4 {
+                assert_eq!(report.dispatched, 0, "tick {tick}: saturated");
+                assert_eq!(f.fields.abandoned(), 2);
+            }
+            if tick >= 5 {
+                assert_eq!(
+                    f.fields.state(&shown, SMAPS_LIKE),
+                    Some(FieldState::Failed),
+                    "tick {tick}: waited past the deadline"
+                );
+            }
+        }
+        assert_eq!(kept.len(), 2, "no field was dispatched twice");
+        assert_eq!(
+            f.fields.state(&first, TABLE_LIKE).unwrap().availability(),
+            Availability::Stale
+        );
+        // One wedged read returns: collection resumes on the next demand.
+        let (_, late) = kept.remove(0);
+        late();
+        f.fields.collect_completed();
+        assert_eq!(f.fields.abandoned(), 1);
+        f.clock.advance(Duration::from_secs(1));
+        assert_eq!(f.fields.demand(with_shown.clone()).dispatched, 1);
+        run_all_but(&mut f, &[&first, &second], &mut seen, &mut kept);
+        f.fields.collect_completed();
+        assert_eq!(
+            f.fields.state(&shown, SMAPS_LIKE).unwrap().availability(),
+            Availability::Present,
+            "the never-read field is served first"
+        );
     }
 
     /// Review C3: freshness time counts a suspend (the wall clock jumps while

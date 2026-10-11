@@ -1,7 +1,7 @@
 //! Server-side row projection and session-local item allocation
 //! (§§6.2, 8; PX-002 rows, PX-003 process-instance keys, PX-004 refresh,
-//! PX-005 and PX-006 metric cells).
-use crate::metric;
+//! PX-005 and PX-006 metric cells, PX-042 catalogued columns).
+use crate::catalogue::PROCESS_LIST;
 use crate::source::{BootId, HostId, Observed, PidNamespaceId, ProcessKey, ProcessSnapshot};
 use srui_sdk::{ItemId, Value};
 use srui_semantic_tree::ModelItem;
@@ -166,27 +166,16 @@ impl SessionItemIds {
                         id
                     }
                 };
-                let pid = match key.pid {
-                    Observed::Known(pid) => Value::UnsignedInt(u64::from(pid)),
-                    Observed::Missing(reason) => {
-                        Value::String(metric::missing_text(reason).to_string())
-                    }
-                };
+                // One cell per catalogued column, in the order the table's
+                // headings were built from (PX-042).
+                let cells = PROCESS_LIST
+                    .iter()
+                    .map(|field| field.cell(&key, record))
+                    .collect();
                 Ok(Row {
                     key,
                     item_id,
-                    value: Value::List(vec![
-                        pid,
-                        Value::String(record.display_name.as_str().to_string()),
-                        // The one place a byte count becomes text: the stored
-                        // value stays an exact integer, and the client renders
-                        // what this produced rather than scaling a unit itself.
-                        Value::String(metric::bytes_cell(&record.resident)),
-                        // Likewise for CPU: the stored interval stays exact, and
-                        // the warming-up and unread states are words, not zeros
-                        // (PX-006).
-                        Value::String(metric::cpu_cell(&record.cpu)),
-                    ]),
+                    value: Value::List(cells),
                 })
             })
             .collect()

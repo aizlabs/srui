@@ -22,9 +22,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// and how to read it. A definition is documentation that travels with the code
 /// that produces the number, so a row's meaning cannot drift from its source.
 ///
-/// This is deliberately not a registry: PX-042 owns registering metrics,
-/// scheduling them and describing their availability. This ticket adds one
-/// metric and states what it is.
+/// A definition is the prose half of a metric. Its typed half — unit, raw type,
+/// origin, aggregation, formatter, sort, capability, sensitivity, collection
+/// cost and refresh tier — is its [`crate::catalogue::MetricSpec`] (PX-042),
+/// which checks this `unit` text against the typed unit it declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetricDefinition {
     /// Stable identifier, never a display string.
@@ -38,6 +39,33 @@ pub struct MetricDefinition {
     /// What the number does and does not account for.
     pub interpretation: &'static str,
 }
+
+/// The process ID as the scanned root lists it (PX-002, catalogued by PX-042).
+/// A PID is never an identity on its own: rows are keyed by the full
+/// [`crate::source::ProcessKey`], and this is only what the row displays.
+pub const PROCESS_ID: MetricDefinition = MetricDefinition {
+    id: "process.pid",
+    label: "PID",
+    unit: "process ID",
+    source: "The numeric directory name of the process in the scanned root, confirmed by \
+             /proc/<pid>/stat field 1 (K1)",
+    interpretation: "The process (thread group) ID in the PID namespace the scanned procfs \
+                     was mounted for. Reused after a process ends, so it identifies nothing \
+                     on its own; a PID the scan could not read is published as a word, never \
+                     as 0.",
+};
+
+/// The process name (PX-002, catalogued by PX-042).
+pub const PROCESS_NAME: MetricDefinition = MetricDefinition {
+    id: "process.name",
+    label: "Name",
+    unit: "text",
+    source: "Linux /proc/<pid>/stat field 2 (comm), between the first '(' and the last ')' \
+             (K1)",
+    interpretation: "The kernel's command name, at most 15 bytes, set by the process itself \
+                     and therefore untrusted: sanitized to inert text, bounded, and never \
+                     interpreted.",
+};
 
 /// Resident set size: the pages a process has in real memory now.
 pub const RESIDENT_MEMORY: MetricDefinition = MetricDefinition {

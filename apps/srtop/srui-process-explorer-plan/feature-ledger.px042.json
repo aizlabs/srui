@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-042",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "A typed server-side metric catalogue for the fields srtop already publishes (process PID, name, resident memory and CPU; the seven PX-007 system-summary figures), one availability vocabulary, and an on-demand collection policy for expensive fields proven with scripted sources; no new metric family, no production expensive field, no change to any published cell, heading or summary line, no htop parity claim",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md",
+      "K1": "https://docs.kernel.org/filesystems/proc.html"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX042-001",
+      "feature": "Every published field is one typed catalogue entry: stable dotted key, unit, §6.5 raw type (unsigned integer, string or small typed record), origin, aggregation semantics (none, sum, non-additive), default formatter and typed sort, required capability, sensitivity, collection cost and supported refresh tiers; the four process columns and seven system-summary figures are catalogued and the table's headings and row cells are built from the same catalogued column list, with every heading, cell and summary line unchanged",
+      "scope": "PX-042/apps/srtop server-side catalogue; fake, scripted and live procfs sources unchanged in output",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-042",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-042.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX042-002",
+      "feature": "The catalogue refuses a malformed key, a duplicate key, more than its entry bound, and every incompatible unit: a definition whose unit text names another unit, a raw type, formatter, aggregation or sort that does not fit the unit; it refuses an expensive or process-content field that claims every-sample collection, a field with no or repeated tiers, and a host-wide field offered on demand",
+      "scope": "PX-042/catalogue validation, unit tests with deliberate one-change refusals",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-042",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-042.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX042-003",
+      "feature": "One availability vocabulary — present, warming up, permission denied, unsupported, stale and failed — distinct for every field, with only present carrying a quantity; the existing per-field states (Observed, CpuUsage, FigureGap, SystemCpu) map onto it and each non-present state's word is exactly the cell the field already publishes",
+      "scope": "PX-042/process and system fields; no published wording changed",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-042",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-042.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX042-004",
+      "feature": "Expensive fields are collected only on demand for the selected or visible rows that ask for them: hidden fields are forgotten and never read, sampled or uncatalogued fields are refused rather than polled, tracked fields and outstanding reads are bounded, reads run on the runtime's blocking pool so a blocked read leaves the sample loop publishing, an older completion never replaces a newer result, and each value carries the monotonic start time of its read, is failed if stamped outside its request-to-drain window, and is stale rather than present once older than its freshness bound",
+      "scope": "PX-042/on-demand policy proven with scripted expensive fields, a manual clock and a manual dispatcher; no production expensive field exists, and no selection or visible-range signal drives it yet",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-042",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-042.md"
+      ]
+    }
+  ]
+}

@@ -788,6 +788,18 @@ impl ProcessField {
         self.spec().definition.label
     }
 
+    /// The column's short name on its sort button: the heading without its
+    /// unit clause, so the button stays a control label rather than a
+    /// measurement explanation (PX-009).
+    pub fn button_name(self) -> &'static str {
+        match self {
+            Self::Pid => "PID",
+            Self::Name => "Name",
+            Self::Resident => "Resident",
+            Self::Cpu => "CPU",
+        }
+    }
+
     /// Whether this record's value of this field can be stated. `key` is the
     /// session-anchored key the row is published under.
     pub fn availability(self, key: &ProcessKey, record: &ProcessRecord) -> Availability {

@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-009",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Server-authoritative sorting of the published process list by PID, name, resident memory or CPU, ascending or descending, through a row of four standard Buttons; rows reordered by delete-and-reinsert under their own item IDs inside one transaction per move unit, a native single selection the generic client anchors to item IDs; no process action, no filtering, no new metric, no protocol or client change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX009-001",
+      "feature": "Sort by PID, name, resident memory or CPU, ascending or descending: a first click on a column applies its catalogued default direction (PID and name ascending, resident memory and CPU descending), a second click reverses it; values compare by their typed stored values (PID, bytes and tenths of a CPU numerically, the sanitized name by Unicode scalar value), never by cell text; a value that is not present (denied, unavailable, warming up, unmeasurable) sorts last in both directions and is never a zero; ties and the missing group are ordered by a total ProcessKey order that is the same in both directions; until the first click the rows keep their source's order",
+      "scope": "PX-009/apps/srtop server-side ordering (src/sort.rs); fixtures with ties, every missing state, numeric versus lexical values and a reused PID",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-009",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-009.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX009-002",
+      "feature": "A reorder keeps every row's item ID: only the rows off a longest increasing run move, each deleted and reinserted under its own item ID with its current value, and a move's deletion and reinsertion always commit in the same transaction, so no revision a client can hold lacks a row; a reorder larger than one transaction commits as several complete move units; a native single selection, anchored by the generic client to item IDs, stays on the same process through sort clicks and through refreshes that change CPU rankings",
+      "scope": "PX-009/refresh planner (plan_moves, commit) and the native table over real SSH; standard MODEL_DELETE and MODEL_INSERT only",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-009",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-009.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX009-003",
+      "feature": "Sort requests are standard ACTIVATE events on four standard Buttons, disabled (and refused by event validation) when nothing is collected; a click is applied and published before its acknowledgement, clicks apply one at a time against the order the previous one left, every later sample is published in the active order at publication time, so a scan running when a click lands cannot republish the older order, and a replayed older click is answered from the session's settled result without effect",
+      "scope": "PX-009/sort handlers, shared view and refresh loop; the PX-008 process-control audit admits exactly these four registrations",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-009",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-009.md"
+      ]
+    }
+  ]
+}

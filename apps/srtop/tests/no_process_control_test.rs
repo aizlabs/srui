@@ -27,8 +27,11 @@
 //!   dynamic loading (`unsafe`, `extern`, `asm!`, `libc`, `nix`, `syscall`,
 //!   `dlopen`, …); outbound sockets (`UnixStream`, `TcpStream`, `UdpSocket`,
 //!   `connect`); the runtime's PTY facility (`pty`, `TerminalSpec`, …); any
-//!   handler for client input (`Session::on` in method or path form,
-//!   `on_result`, `on_text_edit`, a model range provider); `include`, called or
+//!   handler for client input except the sort controls' — `on` in method or
+//!   path form is refused unless the call names exactly one of the four
+//!   sort-button node constants as its first argument and `ACTIVATE` as its
+//!   second (PX-009's standard semantic controls); `on_result`, `on_text_edit`
+//!   and a model range provider unconditionally; `include`, called or
 //!   renamed; or a macro definition (`macro_rules!`), whose expansion can
 //!   assemble tokens this audit never sees together. Attributes come from an
 //!   allowlist — `doc`, `derive` of the standard derives, `cfg`, `must_use`, the
@@ -626,12 +629,28 @@ fn scan(level: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
                     }
                 }
                 match name.as_str() {
-                    // `x.on(..)` and `Session::on(&session, ..)`: a client event handler
-                    "on" if is_punct(prev, '.') || is_path_sep(prev) => report(
-                        line,
-                        "handler",
-                        "`on`: installs a client event handler".into(),
-                    ),
+                    // `x.on(..)` and `Session::on(&session, ..)`: a client event
+                    // handler. The sort controls' four ACTIVATE registrations
+                    // are the one allowance (PX-009): the first argument must
+                    // be a sort-button node constant by name and the second
+                    // `ACTIVATE`, so a handler on any other node, under any
+                    // other event type, or through a computed argument stays
+                    // refused exactly as before.
+                    "on" if is_punct(prev, '.') || is_path_sep(prev) => {
+                        let allowed = match next {
+                            Some(Tok::Group(Delimiter::Parenthesis, tokens, _)) => {
+                                is_sort_button_activation(tokens)
+                            }
+                            _ => false,
+                        };
+                        if !allowed {
+                            report(
+                                line,
+                                "handler",
+                                "`on`: installs a client event handler".into(),
+                            );
+                        }
+                    }
                     "fs" => {
                         if is_path_sep(next) {
                             match after {
@@ -709,6 +728,42 @@ fn scan(level: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
             _ => {}
         }
     }
+}
+
+/// The four node constants whose `ACTIVATE` handlers are the audit's one
+/// client-input allowance: the sort buttons PX-009 installs.
+const SORT_BUTTON_CONSTANTS: &[&str] = &["SORT_PID", "SORT_NAME", "SORT_RESIDENT", "SORT_CPU"];
+
+/// Whether an `on(..)` argument list is one of the sort buttons' `ACTIVATE`
+/// registrations: the first argument exactly a sort-button node constant, the
+/// second exactly `ACTIVATE` (PX-009). A computed first argument, another node,
+/// another event type, or a handler taken as a value is not the allowance and
+/// stays refused.
+fn is_sort_button_activation(tokens: &[Tok]) -> bool {
+    let mut arguments: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    for token in tokens {
+        match token {
+            Tok::Punct(',', _) => arguments.push(std::mem::take(&mut current)),
+            Tok::Ident(name, _, _) => current.push(name.clone()),
+            // Anything else — an expression, a reference, a nested group —
+            // makes the argument one this rule cannot name.
+            _ => current.push('\u{0}'.to_string()),
+        }
+    }
+    arguments.push(current);
+    // Each argument must be exactly one plain identifier to be nameable here;
+    // anything composite — a reference, an expression, a nested group — fails.
+    let bare = |argument: Option<&Vec<String>>| -> Option<String> {
+        match argument?.as_slice() {
+            [only] if !only.is_empty() => Some(only.clone()),
+            _ => None,
+        }
+    };
+    let node = bare(arguments.first());
+    let event = bare(arguments.get(1));
+    matches!(node.as_deref(), Some(name) if SORT_BUTTON_CONSTANTS.contains(&name))
+        && event.as_deref() == Some("ACTIVATE")
 }
 
 /// Every violation in the production tokens of one source file.
@@ -1310,7 +1365,11 @@ fn the_source_audit_reports_every_known_bypass() {
             "ident",
         ),
         ("create_terminal_node", "session.create_terminal_node(id, spec)?;", "ident"),
-        // client input reaching application code (N8)
+        // client input reaching application code (N8). The sort buttons'
+        // ACTIVATE registrations are the one allowance, and only in the exact
+        // shape PX-009 installs them: a bare sort-button constant, then
+        // ACTIVATE. Everything else — another node, another event type, a
+        // computed argument — is still a handler this audit refuses.
         ("session.on", "session.on(TABLE, ACTIVATE, |_, _| {});", "handler"),
         (
             "Session::on as a plain call (N8)",
@@ -1318,6 +1377,26 @@ fn the_source_audit_reports_every_known_bypass() {
             "handler",
         ),
         ("on as a value", "let install = Session::on;", "handler"),
+        (
+            "a handler on another node",
+            "session.on(KILL_BUTTON, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a sort button under another event",
+            "session.on(SORT_PID, SELECTION_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a computed sort handler target",
+            "session.on(buttons[i], ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a sort button by path with a receiver",
+            "Session::on(&session, SORT_PID, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
         ("on_result", "session.on_result(TABLE, ACTIVATE, |_, _| Ok(()));", "ident"),
         ("model range provider", "impl ModelRangeProvider for Rows {}", "ident"),
         // outbound connections
@@ -1355,6 +1434,12 @@ fn the_source_audit_reports_every_known_bypass() {
         "connections.spawn(poll(view, source, session, interval, token));",
         "let sampled = tokio::task::spawn_blocking(move || source.snapshot()).await;",
         "let token = shutdown.child_token();",
+        // the sort controls' ACTIVATE registrations, exactly as PX-009 installs
+        // them: the audit's one client-input allowance
+        "session.on(SORT_PID, ACTIVATE, move |session, _| { sort_clicked(&pid, session, ProcessField::Pid); });",
+        "session.on(SORT_NAME, ACTIVATE, move |session, _| { sort_clicked(&name, session, ProcessField::Name); });",
+        "session.on(SORT_RESIDENT, ACTIVATE, move |session, _| { sort_clicked(&resident, session, ProcessField::Resident); });",
+        "session.on(SORT_CPU, ACTIVATE, move |session, _| { sort_clicked(&cpu, session, ProcessField::Cpu); });",
         "let kind = std::fs::symlink_metadata(&path)?;",
         "use std::fs::File;",
         "use std::os::unix::fs::MetadataExt;",

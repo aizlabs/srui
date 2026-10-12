@@ -1,7 +1,8 @@
 //! Read-only Process Explorer shell using existing SRUI widgets and transactions
 //! (design §§6–8, 12, 22, 29; PX-001/PX-002/PX-003/PX-004, PX-007 system
-//! summary). No action handlers are installed and no process is ever opened for
-//! control.
+//! summary, PX-009 server-authoritative sorting). No process is ever opened for
+//! control: the only client-input handlers are the four sort buttons', which
+//! reorder the published rows and touch no process.
 
 pub mod catalogue;
 pub mod metric;
@@ -9,6 +10,7 @@ pub mod on_demand;
 pub mod procfs;
 mod projection;
 pub mod refresh;
+pub mod sort;
 pub mod source;
 pub mod summary;
 
@@ -20,19 +22,88 @@ pub const COLUMN: NodeId = NodeId::new(2);
 pub const HEADING: NodeId = NodeId::new(3);
 pub const STATUS: NodeId = NodeId::new(4);
 pub const TABLE: NodeId = NodeId::new(5);
+/// The sort controls' row, between the system summary and the table (PX-009).
+pub const SORT_ROW: NodeId = NodeId::new(20);
+/// One sort button per catalogued column, in column order.
+pub const SORT_PID: NodeId = NodeId::new(21);
+pub const SORT_NAME: NodeId = NodeId::new(22);
+pub const SORT_RESIDENT: NodeId = NodeId::new(23);
+pub const SORT_CPU: NodeId = NodeId::new(24);
+/// Every sort button with the column it orders, in column order (PX-009).
+pub const SORT_BUTTONS: [(NodeId, catalogue::ProcessField); 4] = [
+    (SORT_PID, catalogue::ProcessField::Pid),
+    (SORT_NAME, catalogue::ProcessField::Name),
+    (SORT_RESIDENT, catalogue::ProcessField::Resident),
+    (SORT_CPU, catalogue::ProcessField::Cpu),
+];
 pub const MODEL: ModelId = ModelId::new(1);
 pub const TITLE: &str = "Process Explorer";
 pub const FIXTURE_TITLE: &str = "Process Explorer — title fixture";
 pub const STATUS_TEXT: &str = "Read-only · Process collection not started";
-/// Every node of the shell: the five above and the system summary between the
-/// status line and the table (PX-007). Rows are model items, never nodes.
-pub const SHELL_NODE_COUNT: usize = 5 + summary::NODE_COUNT;
+/// Every node of the shell: the five above, the fourteen of the system summary
+/// (PX-007), which sits between the status line and the sort controls, and the
+/// sort row with its four buttons (PX-009). Rows are model items, never nodes.
+pub const SHELL_NODE_COUNT: usize = 5 + summary::NODE_COUNT + 1 + SORT_BUTTONS.len();
+
+/// The sort button that orders `field`.
+pub fn sort_button_of(field: catalogue::ProcessField) -> NodeId {
+    match field {
+        catalogue::ProcessField::Pid => SORT_PID,
+        catalogue::ProcessField::Name => SORT_NAME,
+        catalogue::ProcessField::Resident => SORT_RESIDENT,
+        catalogue::ProcessField::Cpu => SORT_CPU,
+    }
+}
+
+/// Installs the four sort buttons' `ACTIVATE` handlers (§7.6, PX-009).
+///
+/// A click is applied before the event is acknowledged: the handler reorders
+/// `view` and publishes the result, so the acknowledgement's revision already
+/// holds the new order (§18.2). Clicks are applied one at a time, in the order
+/// the session dispatches them, each against the order the previous one left,
+/// and the refresh loop publishes every later sample in that order. Nothing
+/// here reads a PID, a row or any argument the client supplied: the column is
+/// the button's, fixed when the handler is installed. These are the only
+/// client-input handlers srtop installs.
+pub fn install_sort_handlers(session: &Session, view: &refresh::SharedView) {
+    let pid = std::sync::Arc::clone(view);
+    session.on(SORT_PID, ACTIVATE, move |session, _| {
+        sort_clicked(&pid, session, catalogue::ProcessField::Pid);
+    });
+    let name = std::sync::Arc::clone(view);
+    session.on(SORT_NAME, ACTIVATE, move |session, _| {
+        sort_clicked(&name, session, catalogue::ProcessField::Name);
+    });
+    let resident = std::sync::Arc::clone(view);
+    session.on(SORT_RESIDENT, ACTIVATE, move |session, _| {
+        sort_clicked(&resident, session, catalogue::ProcessField::Resident);
+    });
+    let cpu = std::sync::Arc::clone(view);
+    session.on(SORT_CPU, ACTIVATE, move |session, _| {
+        sort_clicked(&cpu, session, catalogue::ProcessField::Cpu);
+    });
+}
+
+/// One click on `field`'s sort button.
+fn sort_clicked(
+    view: &std::sync::Mutex<refresh::ProcessView>,
+    session: &Session,
+    field: catalogue::ProcessField,
+) {
+    if let Err(error) = refresh::lock_view(view).click_sort(session, field) {
+        // A failed transaction leaves the store unchanged and the view holding
+        // what the store holds; the click is acknowledged and the next one
+        // applies against the order that did commit.
+        eprintln!("srtop: sort not published: {error}");
+    }
+}
 
 /// Creates the complete empty shell in one authoritative commit. It has no
-/// source, so its summary says that nothing was sampled.
+/// source, so its summary says that nothing was sampled and its sort buttons
+/// are disabled: there is no collection for them to order.
 pub fn initialize(session: &Session) -> Result<(), SessionError> {
     let summary = summary::properties(&summary::summarize(&summary::State::NotStarted));
-    initialize_rows(session, vec![], STATUS_TEXT, &summary)
+    initialize_rows(session, vec![], STATUS_TEXT, &summary, false)
 }
 
 /// Samples the injected source once and publishes its model rows atomically with the shell,
@@ -200,7 +271,14 @@ fn plural(count: usize) -> &'static str {
     }
 }
 
-/// Publishes the shell, its system summary and `items` in one transaction.
+/// Publishes the shell, its system summary, its sort controls and `items` in
+/// one transaction.
+///
+/// `sort_enabled` enables the sort buttons, which a shell with a source does
+/// and an uncollected one does not: sorting a table that samples nothing has
+/// no meaning, and a disabled control is refused by event validation (§7.4)
+/// rather than merely discouraged. No button is marked active: until the first
+/// click the rows are in their source's order, as before sorting existed.
 ///
 /// `items` must already be bounded to what one catch-up snapshot of the
 /// resulting model can carry: this is the start path, and a client that
@@ -213,6 +291,7 @@ pub(crate) fn initialize_rows(
     items: Vec<srui_semantic_tree::ModelItem>,
     status: &str,
     summary: &summary::Properties,
+    sort_enabled: bool,
 ) -> Result<(), SessionError> {
     // §26 bounds the items in a single model mutation batch, and a live host can
     // hold more processes than that bound. The rows are therefore published as
@@ -255,10 +334,24 @@ pub(crate) fn initialize_rows(
             .role(TextRole::Status)
             .create(ui)?;
         ui.set(STATUS, READ_ONLY, true)?;
-        // The system summary, between the status line and the table: standard
-        // Text and Progress nodes only (PX-007).
+        // The system summary, between the status line and the sort controls:
+        // standard Text and Progress nodes only (PX-007).
         for operation in summary::create_operations(summary) {
             ui.apply_op(&operation)?;
+        }
+        // The sort controls: standard Buttons in a Row, one per catalogued
+        // column, whose labels state the active order and whose activation is
+        // the only client input this app handles (PX-009).
+        Row::builder(SORT_ROW)
+            .parent(COLUMN)
+            .spacing_role(SpacingRole::Normal)
+            .create(ui)?;
+        for (button, field) in SORT_BUTTONS {
+            Button::builder(button)
+                .parent(SORT_ROW)
+                .label(sort::sort_button_label(field, None))
+                .create(ui)?;
+            ui.set(button, ENABLED, sort_enabled)?;
         }
         Table::builder(TABLE)
             .parent(COLUMN)
@@ -267,6 +360,11 @@ pub(crate) fn initialize_rows(
             // are built from, so a column cannot be labeled as something other
             // than what the server published into it (PX-005, PX-042).
             .columns(catalogue::PROCESS_LIST.map(|field| Value::String(field.heading().into())))
+            // A native selection, local presentation state (§22.5) the client
+            // anchors to item IDs, so it follows its process when the rows are
+            // reordered (PX-009). No handler acts on it: the server attaches no
+            // meaning to a selection yet.
+            .selection_mode(SelectionMode::Single)
             .label("Processes")
             .grow(1.0)
             .create(ui)?;
@@ -411,15 +509,19 @@ mod tests {
         initialize(&session).unwrap();
         assert_eq!(session.current_revision(), 1);
         session.with_store(|store| {
-            // The five shell nodes and the fourteen of the system summary
-            // (PX-007), which sits between the status line and the table.
-            assert_eq!(store.node_count(), 19);
-            assert_eq!(SHELL_NODE_COUNT, 19);
+            // The five shell nodes, the fourteen of the system summary
+            // (PX-007) and the sort row with its four buttons (PX-009).
+            assert_eq!(store.node_count(), 24);
+            assert_eq!(SHELL_NODE_COUNT, 24);
             assert_eq!(store.root_ids(), &[SURFACE]);
             assert_eq!(store.children_of(SURFACE), Some([COLUMN].as_slice()));
             assert_eq!(
                 store.children_of(COLUMN),
-                Some([HEADING, STATUS, summary::SUMMARY, TABLE].as_slice())
+                Some([HEADING, STATUS, summary::SUMMARY, SORT_ROW, TABLE].as_slice())
+            );
+            assert_eq!(
+                store.children_of(SORT_ROW),
+                Some([SORT_PID, SORT_NAME, SORT_RESIDENT, SORT_CPU].as_slice())
             );
             assert_eq!(
                 store.children_of(summary::SUMMARY),
@@ -453,6 +555,11 @@ mod tests {
                 (COLUMN, TypeRef::COLUMN),
                 (HEADING, TypeRef::TEXT),
                 (STATUS, TypeRef::TEXT),
+                (SORT_ROW, TypeRef::ROW),
+                (SORT_PID, TypeRef::BUTTON),
+                (SORT_NAME, TypeRef::BUTTON),
+                (SORT_RESIDENT, TypeRef::BUTTON),
+                (SORT_CPU, TypeRef::BUTTON),
                 (TABLE, TypeRef::TABLE),
             ];
             let summary_nodes = summary::LAYOUT.map(|(id, node_type, _)| (id, node_type));
@@ -461,6 +568,20 @@ mod tests {
                 assert_eq!(node.node_type, expected_type);
                 assert!(!node.has_property(ACTIONS));
                 assert!(!node.has_property(ACTION_KEY));
+            }
+            // The sort buttons of a shell that samples nothing are disabled:
+            // there is no collection for them to order, and a disabled control
+            // is refused by event validation rather than merely discouraged.
+            // No button is marked active: nothing is sorted yet (PX-009).
+            for (button, label) in [
+                (SORT_PID, "Sort by PID"),
+                (SORT_NAME, "Sort by Name"),
+                (SORT_RESIDENT, "Sort by Resident"),
+                (SORT_CPU, "Sort by CPU"),
+            ] {
+                let node = store.get_node(button).unwrap();
+                assert_eq!(node.get_property(LABEL), Some(&Value::String(label.into())));
+                assert_eq!(node.get_property(ENABLED), Some(&Value::Bool(false)));
             }
             // An empty shell has sampled nothing and says so in every line.
             assert_eq!(
@@ -527,7 +648,7 @@ mod tests {
             );
             assert_eq!(
                 store.children_of(COLUMN),
-                Some([HEADING, STATUS, summary::SUMMARY, TABLE].as_slice())
+                Some([HEADING, STATUS, summary::SUMMARY, SORT_ROW, TABLE].as_slice())
             );
             assert_eq!(store.get_model(MODEL).unwrap().item_count, 0);
         });

@@ -6,7 +6,7 @@ use srui_process_explorer::refresh::{refresh_status, RefreshCounts};
 use srui_process_explorer::source::*;
 use srui_process_explorer::summary::{FRESHNESS_TEXT, LAYOUT, SUMMARY};
 use srui_process_explorer::{
-    start_from_source, COLUMN, HEADING, MODEL, SHELL_NODE_COUNT, STATUS, SURFACE, TABLE,
+    start_from_source, COLUMN, HEADING, MODEL, SHELL_NODE_COUNT, SORT_ROW, STATUS, SURFACE, TABLE,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
 use srui_sdk::{EnumToken, ItemId, NodeId, Operation, TextRole, Value, ROLE, TEXT};
@@ -108,7 +108,7 @@ fn assert_shell_intact(session: &Session) {
         assert_eq!(store.root_ids(), &[SURFACE]);
         assert_eq!(
             store.children_of(COLUMN),
-            Some([HEADING, STATUS, SUMMARY, TABLE].as_slice())
+            Some([HEADING, STATUS, SUMMARY, SORT_ROW, TABLE].as_slice())
         );
         assert_eq!(store.children_of(TABLE), Some([].as_slice()));
         assert_eq!(store.get_node(TABLE).unwrap().model_ref(), Some(MODEL));

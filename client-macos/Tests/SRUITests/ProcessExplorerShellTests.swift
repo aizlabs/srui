@@ -1,4 +1,4 @@
-// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008: real non-PTY SSH launch through the unchanged generic client (§§4, 8, 12, 19.2, 22, 29, 31).
+// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
 import Testing
 import Foundation
 import AppKit
@@ -411,6 +411,96 @@ struct ProcessExplorerShellTests {
         print("PX-008 same-client evidence: explorer window \(window.windowNumber) '\(window.title)' rows=\(Self.nativeRows(table))")
         await controller.stop()
     }
+
+    /// PX-009: the sort buttons are standard native buttons; a click is a standard `ACTIVATE`
+    /// (§7.6), the server reorders its own rows, and the generic client shows the new order in
+    /// the same native table with the selection still on the same process, because the rows keep
+    /// their item IDs (§6.2, §8) and the client anchors its selection to them.
+    @Test(.timeLimit(.minutes(1)))
+    @MainActor
+    func sortButtonsReorderTheNativeTableAndTheSelectionStaysOnItsProcess() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-source"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await controller.start()
+        // Clicks may be sent once the catch-up snapshot is applied and dispatch has reopened.
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer over SSH") {
+            applier.lastAppliedRevision == Revision(1)
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
+        let scroll = try #require(tableHandle.view as? NSScrollView)
+        let table = try #require(scroll.documentView as? NSTableView)
+        let buttonHandles = try Self.sortButtonIDs.map { id in
+            try #require(renderer.registry.handle(for: NodeId(id)), "sort button \(id)")
+        }
+        let buttons = try buttonHandles.map { handle in try #require(handle.view as? NSButton) }
+        // Nothing is sorted yet: the source's order, and no button claims an order.
+        #expect(buttons.map(\.title) == ["Sort by PID", "Sort by Name", "Sort by Resident", "Sort by CPU"])
+        #expect(buttons.allSatisfy { $0.isEnabled })
+        #expect(Self.nativeRows(table) == Self.fakeRows)
+        let identities = Self.modelItemIDs(applier)
+        #expect(identities.count == 3)
+
+        // Select the second worker natively, as a user would.
+        table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        let selected = identities[1]
+        let workerB = Self.fakeRows[1]
+
+        // Name ascending: `helper` first, the two `worker`s tied and kept in identity order.
+        NativeActivation.click(buttons[1])
+        let byName = [Self.fakeRows[2], Self.fakeRows[0], Self.fakeRows[1]]
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the order by name") {
+            Self.nativeRows(table) == byName && buttons[1].title == "Sort by Name \u{2191}"
+        }
+        #expect(Self.modelRows(applier) == byName)
+        #expect(Set(Self.modelItemIDs(applier)) == Set(identities), "sorting creates and destroys no row")
+        #expect(table.selectedRowIndexes == IndexSet(integer: 2), "the selection followed its process")
+        #expect(Self.modelItemIDs(applier)[2] == selected)
+        let selectedRow = table.selectedRow
+        try #require(selectedRow >= 0)
+        #expect(Self.nativeRows(table)[selectedRow] == workerB)
+
+        // A second click reverses it; the selection follows again.
+        NativeActivation.click(buttons[1])
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the order by name, descending") {
+            Self.nativeRows(table) == Self.fakeRows && buttons[1].title == "Sort by Name \u{2193}"
+        }
+        #expect(table.selectedRowIndexes == IndexSet(integer: 1))
+        #expect(Self.modelItemIDs(applier) == identities)
+
+        // CPU, descending by default: the rows are already in that order and stay put; only the
+        // two buttons whose meaning changed are relabelled, and the unavailable share is last.
+        let revision = applier.lastAppliedRevision
+        NativeActivation.click(buttons[3])
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the order by CPU") {
+            buttons[3].title == "Sort by CPU \u{2193}" && buttons[1].title == "Sort by Name"
+        }
+        #expect(applier.lastAppliedRevision.value == revision.value + 1)
+        #expect(Self.nativeRows(table) == Self.fakeRows)
+        #expect(table.selectedRowIndexes == IndexSet(integer: 1))
+
+        // Every reorder happened inside the native controls built once.
+        #expect(renderer.registry.handle(for: NodeId(5)) === tableHandle)
+        #expect(scroll.documentView as? NSTableView === table)
+        for (handle, id) in zip(buttonHandles, Self.sortButtonIDs) {
+            #expect(renderer.registry.handle(for: NodeId(id)) === handle, "sort button \(id) was rebuilt")
+        }
+        print("PX-009 native SSH evidence: window \(window.windowNumber); buttons=\(buttons.map(\.title)); rows=\(Self.nativeRows(table)); itemIDs=\(Self.modelItemIDs(applier)); selected item \(selected) at row \(table.selectedRow); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
+    // PX-009: the sort row's four buttons, in column order.
+    fileprivate static let sortButtonIDs: [UInt64] = [21, 22, 23, 24]
+    private static let fakeRows = [
+        ["4101", "worker", "1.1 MiB", "250.0%"],
+        ["4102", "worker", "0 B", "0.0%"],
+        ["Unavailable", "helper", "Denied", "Warming up"],
+    ]
 
     /// The client `RendererDemoApp --ssh/--socket` builds for every live session: nothing in it
     /// knows which application is on the other end.

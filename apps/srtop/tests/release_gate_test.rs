@@ -21,7 +21,9 @@
 //! would be application traffic too; none may appear either.
 use srui_process_explorer::refresh::{poll, MIN_REFRESH_INTERVAL};
 use srui_process_explorer::source::{FakeProcessSource, ProcessSnapshot, ProcessSource};
-use srui_process_explorer::{start_from_source, update_title, FIXTURE_TITLE, HEADING, SURFACE};
+use srui_process_explorer::{
+    install_sort_handlers, start_from_source, update_title, FIXTURE_TITLE, HEADING, SURFACE,
+};
 use srui_protocol::{
     decode_framed, encode_framed, operation, srui_message::Msg, ClientHello, SruiMessage,
 };
@@ -29,7 +31,7 @@ use srui_sessiond::{
     handle_connection, logical_class_for_server_envelope, LogicalChannelClass, Session,
     CORE_VERSION,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -159,8 +161,11 @@ async fn a_frozen_fake_source_sends_a_synchronized_client_no_app_ui_mutation_acr
         inner: FakeProcessSource,
         samples,
     };
-    // As `main` does: publish the first snapshot, then poll the same source.
+    // As `main` does: publish the first snapshot, install the sort buttons'
+    // handlers on the shared view, then poll the same source.
     let (view, _) = start_from_source(&session, &mut source).expect("the fake source publishes");
+    let view = Arc::new(Mutex::new(view));
+    install_sort_handlers(&session, &view);
     let shutdown = CancellationToken::new();
     let polling = tokio::spawn(poll(
         view,

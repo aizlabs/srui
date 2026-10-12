@@ -3,7 +3,11 @@
 //! (PX-007). The semantic node tree is built once, by
 //! [`crate::initialize_from_source`]; every later tick emits nothing but model
 //! mutations and — only when they actually changed — the status text and the
-//! summary's scalar properties ([`crate::summary`]).
+//! summary's scalar properties ([`crate::summary`]). Since PX-009 the
+//! collection can also be sorted ([`crate::sort`]): a sort request reorders the
+//! published rows, and every later refresh publishes in the active order. A row
+//! that changes place keeps its item identity: it is moved, never replaced —
+//! see [`plan_moves`].
 //!
 //! Four rules shape this module:
 //!
@@ -12,7 +16,8 @@
 //!   source's internal state — is ever serialized, so an unchanging source
 //!   produces an idle wire (§12.2). The sample time is the one exception, and
 //!   only because a client sees it: the data-freshness line publishes it, to
-//!   the second (PX-007).
+//!   the second (PX-007). A sort request for the order already published is the
+//!   same kind of non-change: it opens nothing (PX-009).
 //! * Rows are deleted only on the word of a scan that is entitled to say a
 //!   process is gone. A scan that could not list the process filesystem, or
 //!   whose records this app refuses to identify, is an error published over the
@@ -80,15 +85,17 @@
 //! [`srui_protocol::DEFAULT_MAX_FRAME_SIZE`] less a fixed allowance for the
 //! envelope the operations travel in, so payload is never mistaken for frame.
 
+use crate::catalogue::ProcessField;
 use crate::projection::{Row, SessionItemIds};
+use crate::sort::{self, SortOrder};
 use crate::source::{ProcessSnapshot, ProcessSource, Retention};
 use crate::summary::{self, CollectorError, Sample};
 use crate::{
-    bounded, initialize_rows, published_status_from, ScanReport, MAX_PUBLISHED_LABEL_BYTES, MODEL,
-    STATUS,
+    bounded, initialize_rows, published_status_from, sort_button_of, ScanReport,
+    MAX_PUBLISHED_LABEL_BYTES, MODEL, STATUS,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
-use srui_sdk::{ItemId, Operation, Value, TEXT};
+use srui_sdk::{ItemId, NodeId, Operation, Value, LABEL, TEXT};
 use srui_semantic_tree::{
     DEFAULT_MAX_CACHED_ITEMS_PER_MODEL, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
 };
@@ -96,6 +103,7 @@ use srui_sessiond::{Session, SessionError};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -162,9 +170,10 @@ const RECORD_PROPERTY_BYTES: usize = 24;
 /// `CREATE_MODEL` operation and one `CREATE_NODE` operation per shell node,
 /// each with its framing, header and properties (§13, §18).
 ///
-/// The shell is five nodes with fixed labels and a two-column header, so the
-/// real cost is a few hundred bytes; 4 KiB is far above every encoding of them
-/// and leaves the ceiling insensitive to a later label. The status text and the
+/// The shell is ten nodes — heading, status, table, the summary's column and
+/// the sort row with its four short-labelled buttons (PX-009) — so the real
+/// cost is a few hundred bytes; 4 KiB is far above every encoding of them and
+/// leaves the ceiling insensitive to a later label. The status text and the
 /// system summary are what a scan can lengthen, so each is charged separately,
 /// at its own fixed reserve ([`STATUS_RESERVE_BYTES`], [`SUMMARY_RESERVE_BYTES`];
 /// `the_shell_status_and_summary_fit_their_snapshot_allowances` measures all
@@ -265,6 +274,10 @@ pub struct Refreshed {
     pub inserted: usize,
     pub deleted: usize,
     pub updated: usize,
+    /// Rows that changed place and kept their item identity (PX-009): each is
+    /// deleted and reinserted under its own item ID in one transaction, and is
+    /// counted here rather than in `inserted` or `deleted`.
+    pub moved: usize,
     /// Rows the scan did not confirm and that were kept rather than deleted.
     pub retained: usize,
     /// Rows the scan did not confirm and that were dropped anyway, because
@@ -277,6 +290,8 @@ pub struct Refreshed {
     pub status_changed: bool,
     /// Summary properties this refresh set or cleared (PX-007).
     pub summary: usize,
+    /// Sort-button labels a sort request set (PX-009).
+    pub controls: usize,
     /// Transactions this refresh committed. Zero means the snapshot held no
     /// user-visible change and nothing was sent.
     pub transactions: usize,
@@ -303,6 +318,11 @@ pub struct ProcessView {
     /// The most rows this view publishes: [`MAX_PUBLISHED_ROWS`], further
     /// lowered to whatever this session's store will cache.
     published_limit: usize,
+    /// The order the collection is published in (PX-009), or `None` until the
+    /// first sort request: the source's own order, as before sorting existed.
+    /// Every refresh publishes its target in this order, so a snapshot sampled
+    /// before a newer request is still published in the newer order.
+    sort: Option<SortOrder>,
 }
 
 impl ProcessView {
@@ -352,6 +372,7 @@ impl ProcessView {
             rows.iter().map(Row::to_model_item).collect(),
             &status,
             &summary,
+            true,
         )?;
         ids.retain(&rows);
         Ok((
@@ -362,6 +383,7 @@ impl ProcessView {
                 summary,
                 sample,
                 published_limit,
+                sort: None,
             },
             snapshot,
         ))
@@ -434,6 +456,14 @@ impl ProcessView {
         }
         let confirmed_ids: HashSet<ItemId> = confirmed.iter().map(|row| row.item_id).collect();
         let mut target = retain_unconfirmed(&self.rows, confirmed, &retention);
+        // Once a sort is active the target is published in it, confirmed and
+        // retained rows alike: a retained row sorts under the values it was
+        // published with, not last as though its values were missing. The order
+        // is the view's at publication time, never the one in force when the
+        // snapshot was sampled (PX-009).
+        if let Some(order) = self.sort {
+            target.sort_by(|left, right| sort::compare(order, left, right));
+        }
         // Retention is bounded by construction, whatever a scan can and cannot
         // enumerate: the rows carried forward are evicted down to what the
         // published-row ceiling leaves once this scan's own rows are counted.
@@ -460,17 +490,7 @@ impl ProcessView {
         );
         debug_assert!(status.len() <= STATUS_RESERVE_BYTES);
 
-        let (batch, max_ops) = session.with_store(|store| {
-            let limits = store.limits();
-            (
-                // Both bounds apply: this store's own limit, and the wire
-                // default every conforming decoder enforces (§26).
-                limits
-                    .max_items_per_model_operation
-                    .clamp(1, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION),
-                limits.max_transaction_operations.max(1),
-            )
-        });
+        let (batch, max_ops) = mutation_limits(session);
 
         let mut plan = Vec::new();
         if status != self.status {
@@ -481,8 +501,18 @@ impl ProcessView {
         // Then the summary, whose lines are scalar properties: only the ones a
         // client would see change are planned (PX-007).
         plan.extend(summary_effects(&self.summary, &summary));
-        plan.extend(diff(
+        // Then the rows that changed place, each moved under its own item ID
+        // (PX-009), and only then what really appeared, ended or changed.
+        let moved = plan_moves(
             &self.rows,
+            &target,
+            batch,
+            max_ops,
+            MAX_TRANSACTION_PAYLOAD_BYTES,
+        );
+        plan.extend(moved.plan);
+        plan.extend(diff(
+            &moved.rows,
             &target,
             batch,
             MAX_TRANSACTION_PAYLOAD_BYTES,
@@ -494,15 +524,7 @@ impl ProcessView {
             truncated,
             ..Refreshed::default()
         };
-        for planned in &plan {
-            match &planned.effect {
-                Effect::Status(_) => result.status_changed = true,
-                Effect::Summary(_) => result.summary += 1,
-                Effect::Delete(ids) => result.deleted += ids.len(),
-                Effect::Insert(_, rows) => result.inserted += rows.len(),
-                Effect::Update(rows) => result.updated += rows.len(),
-            }
-        }
+        count(&plan, &mut result);
         if plan.is_empty() {
             // Nothing a client can see changed: no transaction is opened, so an
             // unchanging host produces no traffic at all. The rows stand, so the
@@ -520,11 +542,114 @@ impl ProcessView {
                 rows: &mut self.rows,
                 status: &mut self.status,
                 summary: &mut self.summary,
+                sort: &mut self.sort,
             },
         );
         result.transactions = transactions;
         self.ids.retain(&self.rows);
         outcome.map(|()| result)
+    }
+
+    /// The order this view publishes in (PX-009), or `None` while the
+    /// collection is still in its source's order.
+    pub fn sort(&self) -> Option<SortOrder> {
+        self.sort
+    }
+
+    /// Applies one click on `field`'s sort button (§7.6, PX-009): the column's
+    /// catalogued default direction when it is not the active column, the
+    /// reverse of the active direction when it is.
+    ///
+    /// A click is resolved against the order this view holds when the click is
+    /// applied, and clicks are applied one at a time in the order they arrive,
+    /// so the last click always decides the order the client ends up with.
+    pub fn click_sort(
+        &mut self,
+        session: &Session,
+        field: ProcessField,
+    ) -> Result<Refreshed, SessionError> {
+        self.set_sort(session, SortOrder::resolve(self.sort, field))
+    }
+
+    /// Makes `order` the collection's active sort and republishes the rows in
+    /// it (PX-009).
+    ///
+    /// Every row keeps its item identity: a row that changes place is moved —
+    /// deleted and reinserted under its own item ID inside one transaction
+    /// ([`plan_moves`]) — never replaced by a new row, so a client's native
+    /// selection, which is anchored to item IDs, stays on the same process
+    /// (§6.2, §8). The rows are the ones already published; nothing is sampled,
+    /// and the published set does not change, only its order. A request for the
+    /// order already published commits nothing at all.
+    ///
+    /// The buttons' labels are planned ahead of the rows, like the status on a
+    /// refresh, and the view's record of the active order advances when the
+    /// label naming it commits. Should a later transaction of the same request
+    /// fail, the view still holds what the store holds — the new order, with
+    /// the rows partly moved — and the next refresh completes the move, since it
+    /// publishes in that order.
+    pub fn set_sort(
+        &mut self,
+        session: &Session,
+        order: SortOrder,
+    ) -> Result<Refreshed, SessionError> {
+        if self.sort == Some(order) {
+            // A request for the order already published changes nothing a
+            // client can see, so it opens no transaction, exactly as an
+            // unchanged snapshot does.
+            self.ids.retain(&self.rows);
+            return Ok(Refreshed::default());
+        }
+        let mut target = self.rows.clone();
+        target.sort_by(|left, right| sort::compare(order, left, right));
+        let (batch, max_ops) = mutation_limits(session);
+        let mut plan = Vec::new();
+        if let Some(previous) = self.sort.filter(|previous| previous.field != order.field) {
+            plan.push(Planned::new(Effect::SortLabel {
+                node: sort_button_of(previous.field),
+                label: sort::sort_button_label(previous.field, None),
+                activates: None,
+            }));
+        }
+        plan.push(Planned::new(Effect::SortLabel {
+            node: sort_button_of(order.field),
+            label: sort::sort_button_label(order.field, Some(order.direction)),
+            activates: Some(order),
+        }));
+        let moved = plan_moves(
+            &self.rows,
+            &target,
+            batch,
+            max_ops,
+            MAX_TRANSACTION_PAYLOAD_BYTES,
+        );
+        debug_assert_eq!(
+            moved.rows.iter().map(|row| row.item_id).collect::<Vec<_>>(),
+            target.iter().map(|row| row.item_id).collect::<Vec<_>>()
+        );
+        plan.extend(moved.plan);
+        let mut result = Refreshed::default();
+        count(&plan, &mut result);
+        let (transactions, outcome) = commit(
+            session,
+            &plan,
+            max_ops,
+            MAX_TRANSACTION_PAYLOAD_BYTES,
+            &mut Published {
+                rows: &mut self.rows,
+                status: &mut self.status,
+                summary: &mut self.summary,
+                sort: &mut self.sort,
+            },
+        );
+        result.transactions = transactions;
+        self.ids.retain(&self.rows);
+        outcome.map(|()| result)
+    }
+
+    /// The item identities of the published rows, in published order.
+    pub fn item_ids(&self) -> Vec<ItemId> {
+        self.rows.iter().map(|row| row.item_id).collect()
     }
 
     /// The summary this refresh publishes (PX-007): this scan's sample if it is
@@ -603,6 +728,7 @@ impl ProcessView {
                 rows: &mut self.rows,
                 status: &mut self.status,
                 summary: &mut self.summary,
+                sort: &mut self.sort,
             },
         );
         result.transactions = transactions;
@@ -621,6 +747,40 @@ impl ProcessView {
     }
 }
 
+/// This store's bound on the items of one model operation, clamped to the wire
+/// default every conforming decoder enforces, and its bound on the operations of
+/// one transaction (§26).
+fn mutation_limits(session: &Session) -> (usize, usize) {
+    session.with_store(|store| {
+        let limits = store.limits();
+        (
+            // Both bounds apply: this store's own limit, and the wire default
+            // every conforming decoder enforces (§26).
+            limits
+                .max_items_per_model_operation
+                .clamp(1, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION),
+            limits.max_transaction_operations.max(1),
+        )
+    })
+}
+
+/// Adds what `plan` publishes to `result`'s counts. The operations of a move
+/// count once, as moved rows, never as a deletion and an insertion.
+fn count(plan: &[Planned], result: &mut Refreshed) {
+    for planned in plan {
+        match &planned.effect {
+            Effect::Status(_) => result.status_changed = true,
+            Effect::Summary(_) => result.summary += 1,
+            Effect::SortLabel { .. } => result.controls += 1,
+            Effect::Delete(_) if planned.moving => {}
+            Effect::Insert(_, rows) if planned.moving => result.moved += rows.len(),
+            Effect::Delete(ids) => result.deleted += ids.len(),
+            Effect::Insert(_, rows) => result.inserted += rows.len(),
+            Effect::Update(rows) => result.updated += rows.len(),
+        }
+    }
+}
+
 /// Commits a plan as consecutive transactions of at most `max_ops` operations
 /// and at most `max_bytes` of operation payload.
 ///
@@ -634,6 +794,12 @@ impl ProcessView {
 /// each is recorded into `published` as it commits, so a plan that stops
 /// partway leaves this app's idea of what the client holds equal to what the
 /// store holds. Returns how many transactions committed and the first failure.
+///
+/// A transaction never ends inside a unit of operations the planner joined
+/// ([`Planned::joins_next`]): a move's deletion and its reinsertion always
+/// travel together (PX-009), so no client ever holds a revision in which a
+/// moved row is missing. The planner sizes each unit to fit one transaction on
+/// its own.
 fn commit(
     session: &Session,
     plan: &[Planned],
@@ -655,6 +821,23 @@ fn commit(
             }
             bytes += cost;
             end += 1;
+        }
+        // Never end a transaction inside a joined unit: end before it instead,
+        // unless it is the first thing in this transaction — then it travels
+        // whole, which the planner's sizing makes a transaction it fits.
+        if end < plan.len() && plan[end - 1].joins_next {
+            let mut cut = end;
+            while cut > start && plan[cut - 1].joins_next {
+                cut -= 1;
+            }
+            debug_assert!(cut > start, "a joined unit larger than one transaction");
+            if cut > start {
+                end = cut;
+            } else {
+                while end < plan.len() && plan[end - 1].joins_next {
+                    end += 1;
+                }
+            }
         }
         let chunk = &plan[start..end];
         match session.transaction(|ui| {
@@ -792,11 +975,12 @@ fn rows_word(count: usize) -> &'static str {
 /// grew because a scan or a collector failed therefore cannot shrink the row
 /// budget and delete a row no scan said had ended.
 ///
-/// The rows kept are the *leading* ones, in the order the source already
-/// publishes — `ProcFsSource` sorts by ascending PID — so the published window
-/// is a deterministic function of the snapshot alone. An unchanged host keeps
-/// exactly the rows it kept last tick: no row churns in and out, and an
-/// identical tick still publishes nothing.
+/// The rows kept are the *leading* ones, in the order the collection is
+/// published in — initially ascending PID, then whatever the active sort says
+/// — so the published window is a deterministic function of the snapshot and
+/// the active order alone. An unchanged host keeps exactly the rows it kept
+/// last tick: no row churns in and out, and an identical tick still publishes
+/// nothing.
 fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
     let budget = MAX_TRANSACTION_PAYLOAD_BYTES
         .saturating_sub(SNAPSHOT_SHELL_BYTES + STATUS_RESERVE_BYTES + SUMMARY_RESERVE_BYTES);
@@ -923,12 +1107,28 @@ struct Planned {
     op: Operation,
     effect: Effect,
     bytes: usize,
+    /// The next operation belongs to the same unit, which [`commit`] never
+    /// splits across transactions: a move's deletion and reinsertion (PX-009).
+    joins_next: bool,
+    /// This operation is part of a move ([`plan_moves`]), counted as moved
+    /// rows rather than as a deletion or an insertion.
+    moving: bool,
 }
 
 enum Effect {
     Status(String),
     /// One summary property set, or cleared (PX-007).
     Summary(summary::Change),
+    /// One sort button's label set, and — when the label names the column that
+    /// just became the active order — the order it activates (PX-009). The
+    /// order is recorded as this effect's transaction commits, so a request
+    /// that stops partway leaves the view holding exactly the order its labels
+    /// announced.
+    SortLabel {
+        node: NodeId,
+        label: String,
+        activates: Option<SortOrder>,
+    },
     Delete(Vec<ItemId>),
     Insert(u64, Vec<Row>),
     Update(Vec<Row>),
@@ -939,6 +1139,8 @@ struct Published<'a> {
     rows: &'a mut Vec<Row>,
     status: &'a mut String,
     summary: &'a mut summary::Properties,
+    /// The order the labels have announced (PX-009).
+    sort: &'a mut Option<SortOrder>,
 }
 
 /// The planned operations that turn the `published` summary into `target`:
@@ -962,6 +1164,9 @@ impl Planned {
                 Some(value) => Operation::set_property(change.node, change.property, value.clone()),
                 None => Operation::clear_property(change.node, change.property),
             },
+            Effect::SortLabel { node, label, .. } => {
+                Operation::set_property(*node, LABEL, Value::String(label.clone()))
+            }
             Effect::Delete(ids) => Operation::model_delete_items(MODEL, ids.iter().copied()),
             Effect::Insert(index, rows) => {
                 Operation::model_insert(MODEL, *index, rows.iter().map(Row::to_model_item))
@@ -971,7 +1176,21 @@ impl Planned {
             }
         };
         let bytes = OPERATION_FRAMING_BYTES + OPERATION_HEADER_BYTES + effect.payload_bytes();
-        Self { op, effect, bytes }
+        Self {
+            op,
+            effect,
+            bytes,
+            joins_next: false,
+            moving: false,
+        }
+    }
+
+    /// The same operation as part of a move.
+    fn in_move(effect: Effect) -> Self {
+        Self {
+            moving: true,
+            ..Self::new(effect)
+        }
     }
 }
 
@@ -984,6 +1203,7 @@ impl Effect {
             // The node and property are in the fixed header; a clear carries no
             // value at all.
             Self::Summary(change) => change.value.as_ref().map_or(0, value_wire_bytes),
+            Self::SortLabel { label, .. } => VALUE_FRAMING_BYTES + label.len(),
             Self::Delete(ids) => ids.len() * ITEM_ID_BYTES,
             Self::Insert(_, rows) | Self::Update(rows) => rows.iter().map(row_wire_bytes).sum(),
         }
@@ -996,6 +1216,7 @@ impl Effect {
             rows,
             status,
             summary,
+            sort,
         } = published;
         match self {
             Self::Status(text) => status.clone_from(text),
@@ -1008,6 +1229,11 @@ impl Effect {
                     None => {
                         summary.remove(&key);
                     }
+                }
+            }
+            Self::SortLabel { activates, .. } => {
+                if let Some(order) = activates {
+                    **sort = Some(*order);
                 }
             }
             Self::Delete(ids) => {
@@ -1195,12 +1421,271 @@ fn flush_insert(plan: &mut Vec<Planned>, start: u64, rows: &mut Vec<Row>, bytes:
     plan.push(Planned::new(Effect::Insert(start, std::mem::take(rows))));
 }
 
+/// A move plan, and the rows a client holds once all of it committed.
+struct Moves {
+    plan: Vec<Planned>,
+    /// `published`, with every moved row in its new place and carrying the
+    /// value `target` gives it.
+    rows: Vec<Row>,
+}
+
+/// The moves that put the rows `published` and `target` share into `target`'s
+/// order, every row keeping its item ID (§6.2, §8; PX-009).
+///
+/// The standard model operations have no move (§13: insert, delete, update and
+/// reset a range), and §8 offers insert and delete *by item identity*. A row
+/// therefore changes place by being deleted and reinserted under its own item
+/// ID; no new row ever stands in for it. Three properties make that a move
+/// rather than a replacement:
+///
+/// * Only the rows that must move do. The rows left in place are a longest
+///   increasing subsequence of the published rows' ranks in `target`, so a
+///   process that climbed the CPU ranking moves alone, not with every row it
+///   passed.
+/// * No revision a client can hold is missing a moved row. A row's deletion and
+///   its reinsertion are one unit that [`commit`] never splits
+///   ([`Planned::joins_next`]), and each unit is sized to fit one transaction by
+///   itself, by operations (`max_ops`), items per operation (`batch`) and bytes
+///   (`max_bytes`). A client applies a transaction whole, so a selection it
+///   anchors to item IDs is restored onto the same item after each one.
+/// * Units are planned in `target` order, and each moved row is reinserted
+///   right after the row that precedes it in `target`, which is already in its
+///   final relative place. A reorder too large for one transaction therefore
+///   passes through revisions that hold every row, with the rows placed so far
+///   already in their final order.
+///
+/// A store whose transactions hold a single operation cannot carry a move at
+/// all; there each operation travels alone, as every other plan's does.
+///
+/// Rows only in `published` — about to be deleted — stay where they are, and rows
+/// only in `target` — about to be inserted — are not this function's. A moved row
+/// is reinserted with `target`'s value, so a row that moved and changed is sent
+/// once.
+fn plan_moves(
+    published: &[Row],
+    target: &[Row],
+    batch: usize,
+    max_ops: usize,
+    max_bytes: usize,
+) -> Moves {
+    let in_published: HashSet<ItemId> = published.iter().map(|row| row.item_id).collect();
+    // The shared rows, in their target order; a row's rank is its place there.
+    let order: Vec<&Row> = target
+        .iter()
+        .filter(|row| in_published.contains(&row.item_id))
+        .collect();
+    let rank: HashMap<ItemId, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(index, row)| (row.item_id, index))
+        .collect();
+    let ranks: Vec<usize> = published
+        .iter()
+        .filter_map(|row| rank.get(&row.item_id).copied())
+        .collect();
+    let kept = longest_increasing(&ranks, order.len());
+    let mut rows = published.to_vec();
+    let mut plan = Vec::new();
+    if kept.iter().all(|&kept| kept) {
+        return Moves { plan, rows };
+    }
+
+    let joined = max_ops >= 2;
+    let operation = OPERATION_FRAMING_BYTES + OPERATION_HEADER_BYTES;
+    // What one operation may spend on items once its framing and header are
+    // paid for, exactly as `diff` charges it.
+    let budget = max_bytes.saturating_sub(operation).max(1);
+    let deleted_batch = batch.min(budget / ITEM_ID_BYTES).max(1);
+    let mut unit = MoveUnit::default();
+    for (index, row) in order.iter().enumerate() {
+        if kept[index] {
+            continue;
+        }
+        let cost = row_wire_bytes(row);
+        // A row continues the last run when the row before it in `target` is
+        // that run's last row, and the run has room for it.
+        let mut extends = index > 0
+            && unit.runs.last().is_some_and(|run| {
+                run.last_rank == index - 1 && run.rows.len() < batch && run.bytes + cost <= budget
+            });
+        let runs = unit.runs.len() + usize::from(!extends);
+        let moved = unit.moved + 1;
+        let deletions = moved.div_ceil(deleted_batch);
+        let ops = deletions + runs;
+        let bytes = deletions * operation
+            + moved * ITEM_ID_BYTES
+            + runs * operation
+            + unit.row_bytes
+            + cost;
+        if unit.moved > 0 && joined && (ops > max_ops || bytes > max_bytes) {
+            // This row would not fit the unit's transaction: the unit is
+            // complete, and the row opens the next one.
+            flush_moves(
+                std::mem::take(&mut unit),
+                &mut rows,
+                &mut plan,
+                deleted_batch,
+                joined,
+            );
+            extends = false;
+        }
+        if extends {
+            let run = unit.runs.last_mut().expect("a run continues");
+            run.rows.push((*row).clone());
+            run.bytes += cost;
+            run.last_rank = index;
+        } else {
+            unit.runs.push(MoveRun {
+                anchor: index.checked_sub(1).map(|previous| order[previous].item_id),
+                rows: vec![(*row).clone()],
+                bytes: cost,
+                last_rank: index,
+            });
+        }
+        unit.moved += 1;
+        unit.row_bytes += cost;
+    }
+    if unit.moved > 0 {
+        flush_moves(unit, &mut rows, &mut plan, deleted_batch, joined);
+    }
+    Moves { plan, rows }
+}
+
+/// The rows of one transaction-sized group of moves.
+#[derive(Default)]
+struct MoveUnit {
+    runs: Vec<MoveRun>,
+    moved: usize,
+    row_bytes: usize,
+}
+
+/// Rows consecutive in the target order, reinserted by one `MODEL_INSERT`
+/// right after `anchor`: the row before the first of them in the target order,
+/// or the front of the collection when there is none.
+struct MoveRun {
+    anchor: Option<ItemId>,
+    rows: Vec<Row>,
+    bytes: usize,
+    last_rank: usize,
+}
+
+/// Plans one unit of moves — its deletions, then its reinsertions in ascending
+/// order, each at its final index — and applies it to `rows`.
+fn flush_moves(
+    unit: MoveUnit,
+    rows: &mut Vec<Row>,
+    plan: &mut Vec<Planned>,
+    deleted_batch: usize,
+    joined: bool,
+) {
+    let first = plan.len();
+    let ids: Vec<ItemId> = unit
+        .runs
+        .iter()
+        .flat_map(|run| run.rows.iter().map(|row| row.item_id))
+        .collect();
+    for chunk in ids.chunks(deleted_batch) {
+        plan.push(Planned::in_move(Effect::Delete(chunk.to_vec())));
+    }
+    let moving: HashSet<ItemId> = ids.into_iter().collect();
+    let mut runs: HashMap<Option<ItemId>, Vec<Row>> = unit
+        .runs
+        .into_iter()
+        .map(|run| (run.anchor, run.rows))
+        .collect();
+    let mut placed: Vec<Row> = Vec::with_capacity(rows.len());
+    let mut inserts: Vec<(u64, Vec<Row>)> = Vec::new();
+    place_runs(None, &mut runs, &mut placed, &mut inserts);
+    for row in std::mem::take(rows) {
+        if moving.contains(&row.item_id) {
+            continue;
+        }
+        let id = row.item_id;
+        placed.push(row);
+        place_runs(Some(id), &mut runs, &mut placed, &mut inserts);
+    }
+    debug_assert!(runs.is_empty(), "every run's anchor is placed");
+    *rows = placed;
+    for (index, inserted) in inserts {
+        plan.push(Planned::in_move(Effect::Insert(index, inserted)));
+    }
+    if joined {
+        let last = plan.len() - 1;
+        for planned in &mut plan[first..last] {
+            planned.joins_next = true;
+        }
+    }
+}
+
+/// Places the run anchored after `anchor`, then any run anchored after that
+/// run's last row, recording where each one starts.
+fn place_runs(
+    anchor: Option<ItemId>,
+    runs: &mut HashMap<Option<ItemId>, Vec<Row>>,
+    placed: &mut Vec<Row>,
+    inserts: &mut Vec<(u64, Vec<Row>)>,
+) {
+    let mut anchor = anchor;
+    while let Some(run) = runs.remove(&anchor) {
+        anchor = run.last().map(|row| row.item_id);
+        inserts.push((placed.len() as u64, run.clone()));
+        placed.extend(run);
+    }
+}
+
+/// Which of `0..len` lie on one longest strictly increasing subsequence of
+/// `sequence`, a permutation of them: patience sorting, O(n log n), and the
+/// same answer for the same input every time.
+fn longest_increasing(sequence: &[usize], len: usize) -> Vec<bool> {
+    // `tails[k]` is the position of the smallest last value of any increasing
+    // subsequence of length `k + 1` found so far.
+    let mut tails: Vec<usize> = Vec::new();
+    let mut previous: Vec<Option<usize>> = vec![None; sequence.len()];
+    for (position, &value) in sequence.iter().enumerate() {
+        let length = tails.partition_point(|&tail| sequence[tail] < value);
+        if length > 0 {
+            previous[position] = Some(tails[length - 1]);
+        }
+        if length == tails.len() {
+            tails.push(position);
+        } else {
+            tails[length] = position;
+        }
+    }
+    let mut kept = vec![false; len];
+    let mut cursor = tails.last().copied();
+    while let Some(position) = cursor {
+        kept[sequence[position]] = true;
+        cursor = previous[position];
+    }
+    kept
+}
+
+/// A view shared between the poll loop that refreshes it and the sort buttons'
+/// handlers that reorder it (PX-009). Each holds the lock only while it
+/// publishes, never while the source is sampled, so a click is applied while a
+/// slow scan is still running.
+pub type SharedView = Arc<Mutex<ProcessView>>;
+
+/// Locks a shared view. A panic while publishing leaves the view recording what
+/// committed, as every publish records each transaction as it commits, so a
+/// poisoned lock is taken over rather than ending the session.
+pub fn lock_view(view: &Mutex<ProcessView>) -> std::sync::MutexGuard<'_, ProcessView> {
+    view.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Polls `source` until `shutdown` is cancelled, publishing each difference.
 ///
 /// A failed sample never ends the loop and never empties the table: the error is
 /// published over the last-known rows and the next successful scan converges.
+///
+/// The view is locked only to publish, after the sample is taken, and is
+/// published in the order it holds at that moment (PX-009): a sort request
+/// applied while a scan was running is never overwritten by that scan's
+/// result, which is published in the newer order.
 pub async fn poll<S>(
-    mut view: ProcessView,
+    view: SharedView,
     mut source: S,
     session: Arc<Session>,
     interval: Duration,
@@ -1233,7 +1718,7 @@ pub async fn poll<S>(
         };
         source = returned;
         let status = source.status_text().to_string();
-        if let Err(error) = view.apply(&session, &status, &snapshot) {
+        if let Err(error) = lock_view(&view).apply(&session, &status, &snapshot) {
             // The store is unchanged by a failed transaction and the view still
             // holds what the client holds, so the next tick simply tries again.
             eprintln!("srtop: refresh not published: {error}");
@@ -1335,22 +1820,34 @@ mod tests {
             .key
             .clone();
         (0..rows)
-            .map(|index| Row {
-                key: ProcessKey {
+            .map(|index| {
+                let key = ProcessKey {
                     pid: Observed::Known(index as u32 + 1),
                     creation: crate::source::CreationToken::Opaque(format!("widest-{index}")),
                     ..template.clone()
-                },
-                item_id: ItemId::new(1_000 + index),
-                value: Value::List(vec![
-                    Value::UnsignedInt(index + 1),
-                    Value::String(name.as_str().to_string()),
-                    // The widest metric cell this app can publish, so the
-                    // ceiling this fixture proves covers every real row
-                    // (PX-005), in both metric columns (PX-006).
-                    Value::String(widest_metric_cell()),
-                    Value::String(widest_metric_cell()),
-                ]),
+                };
+                // The cells are the widest missing words, so the order values
+                // are missing in both metric columns (PX-009).
+                let record = ProcessRecord {
+                    key: key.clone(),
+                    display_name: name.clone(),
+                    resident: Observed::Missing(MissingReason::Unavailable),
+                    cpu: crate::source::CpuUsage::Missing(MissingReason::Unavailable),
+                };
+                Row {
+                    sort: crate::sort::SortValues::of_record(&key, &record),
+                    key,
+                    item_id: ItemId::new(1_000 + index),
+                    value: Value::List(vec![
+                        Value::UnsignedInt(index + 1),
+                        Value::String(name.as_str().to_string()),
+                        // The widest metric cell this app can publish, so the
+                        // ceiling this fixture proves covers every real row
+                        // (PX-005), in both metric columns (PX-006).
+                        Value::String(widest_metric_cell()),
+                        Value::String(widest_metric_cell()),
+                    ]),
+                }
             })
             .collect()
     }
@@ -1447,6 +1944,7 @@ mod tests {
                 rows: &mut view.rows,
                 status: &mut view.status,
                 summary: &mut view.summary,
+                sort: &mut view.sort,
             },
         );
         assert!(outcome.is_ok());
@@ -1994,7 +2492,7 @@ mod tests {
     fn the_shell_status_and_summary_fit_their_snapshot_allowances() {
         let session = srui_sessiond::Session::mint();
         let status = "\u{20000}".repeat(STATUS_RESERVE_BYTES / 4);
-        crate::initialize_rows(&session, Vec::new(), &status, &widest_summary()).unwrap();
+        crate::initialize_rows(&session, Vec::new(), &status, &widest_summary(), false).unwrap();
         let hello = srui_protocol::ClientHello {
             core_version: "0.5.0".to_string(),
             profiles: vec!["org.srui.standard-widgets/1".to_string()],
@@ -2123,6 +2621,7 @@ mod tests {
                         Value::String("appended".into()),
                         Value::String("0 B".into()),
                     ]),
+                    sort: template.sort.clone(),
                 }],
             ))
         };
@@ -2137,6 +2636,7 @@ mod tests {
                 rows: &mut view.rows,
                 status: &mut view.status,
                 summary: &mut view.summary,
+                sort: &mut view.sort,
             },
         );
         assert!(outcome.is_ok());
@@ -2164,6 +2664,7 @@ mod tests {
                 rows: &mut view.rows,
                 status: &mut view.status,
                 summary: &mut view.summary,
+                sort: &mut view.sort,
             },
         );
         assert!(outcome.is_err(), "a duplicate item ID must be refused");
@@ -2235,5 +2736,184 @@ mod tests {
             });
         }
         assert_ne!(rows_of(&view), published, "the script must move the rows");
+    }
+
+    #[test]
+    fn the_rows_kept_in_place_are_one_longest_increasing_run() {
+        let kept = |sequence: &[usize]| -> Vec<usize> {
+            longest_increasing(sequence, sequence.len())
+                .iter()
+                .enumerate()
+                .filter_map(|(rank, kept)| kept.then_some(rank))
+                .collect()
+        };
+        assert_eq!(kept(&[0, 1, 2, 3]), [0, 1, 2, 3]);
+        assert_eq!(kept(&[3, 2, 1, 0]).len(), 1);
+        // One row that sank to the end moves alone, not the rows it passed.
+        assert_eq!(kept(&[1, 2, 3, 0]), [1, 2, 3]);
+        assert_eq!(kept(&[3, 0, 1, 2]), [0, 1, 2]);
+        assert_eq!(kept(&[5, 0, 4, 1, 2, 3]), [0, 1, 2, 3]);
+        assert_eq!(kept(&[]), Vec::<usize>::new());
+    }
+
+    /// `count` consecutive processes, PIDs 1 to `count`, as one snapshot.
+    struct Numbered(u32);
+
+    impl ProcessSource for Numbered {
+        fn status_text(&self) -> &str {
+            FAKE_STATUS_TEXT
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            let mut snapshot = FakeProcessSource.snapshot();
+            let template = snapshot.records[0].clone();
+            snapshot.records = (1..=self.0)
+                .map(|pid| ProcessRecord {
+                    key: ProcessKey {
+                        pid: Observed::Known(pid),
+                        creation: CreationToken::Opaque(format!("numbered-{pid}")),
+                        ..template.key.clone()
+                    },
+                    ..template.clone()
+                })
+                .collect();
+            snapshot
+        }
+    }
+
+    /// The item IDs each committed transaction since `revision` deleted and
+    /// inserted, and its operation count.
+    fn committed_moves(
+        session: &srui_sessiond::Session,
+        revision: u64,
+    ) -> Vec<(Vec<u64>, Vec<u64>, usize)> {
+        use srui_protocol::operation::Op;
+        session
+            .collect_replayed_transactions(revision)
+            .expect("the journal holds this run")
+            .into_iter()
+            .map(|transaction| {
+                let mut deleted = Vec::new();
+                let mut inserted = Vec::new();
+                for operation in &transaction.operations {
+                    match &operation.op {
+                        Some(Op::ModelDelete(delete)) => deleted.extend(delete.item_ids.clone()),
+                        Some(Op::ModelInsert(insert)) => {
+                            inserted.extend(insert.items.iter().map(|item| item.item_id))
+                        }
+                        _ => {}
+                    }
+                }
+                deleted.sort_unstable();
+                inserted.sort_unstable();
+                (deleted, inserted, transaction.operations.len())
+            })
+            .collect()
+    }
+
+    /// PX-009: a reorder larger than one transaction commits as several, each a
+    /// complete set of moves — no revision a client can hold lacks a row — and
+    /// the rows placed so far are already in their final order.
+    #[test]
+    fn a_reorder_larger_than_one_transaction_never_drops_a_row() {
+        let session = srui_sessiond::Session::mint();
+        let (mut view, _) = ProcessView::start(&session, &mut Numbered(40)).unwrap();
+        let revision = session.current_revision();
+        let mut target = view.rows.clone();
+        target.reverse();
+        // At most three items an operation and four operations a transaction:
+        // a unit moves at most six rows (two deletions, two insertions).
+        let moves = plan_moves(&view.rows, &target, 3, 4, MAX_TRANSACTION_PAYLOAD_BYTES);
+        assert_eq!(
+            moves.rows.iter().map(|row| row.item_id).collect::<Vec<_>>(),
+            target.iter().map(|row| row.item_id).collect::<Vec<_>>()
+        );
+        // A reversal keeps exactly one row in place.
+        let moved: usize = moves
+            .plan
+            .iter()
+            .map(|planned| match &planned.effect {
+                Effect::Insert(_, rows) => rows.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(moved, 39);
+        assert!(moves.plan.iter().all(|planned| planned.moving));
+        // A status change ahead of the moves: it may not share a transaction
+        // with a unit it would split.
+        let mut plan = vec![Planned::new(Effect::Status("reordering".into()))];
+        plan.extend(moves.plan);
+        let (transactions, outcome) = commit(
+            &session,
+            &plan,
+            4,
+            MAX_TRANSACTION_PAYLOAD_BYTES,
+            &mut Published {
+                rows: &mut view.rows,
+                status: &mut view.status,
+                summary: &mut view.summary,
+                sort: &mut view.sort,
+            },
+        );
+        assert!(outcome.is_ok());
+        let committed = committed_moves(&session, revision);
+        assert_eq!(committed.len(), transactions);
+        assert_eq!(transactions, 1 + 39_usize.div_ceil(6));
+        assert_eq!(
+            committed[0],
+            (vec![], vec![], 1),
+            "the status travels alone"
+        );
+        for (deleted, inserted, operations) in &committed[1..] {
+            assert!(*operations <= 4);
+            assert!(!deleted.is_empty());
+            assert_eq!(
+                deleted, inserted,
+                "a transaction put back every row it removed"
+            );
+        }
+        assert_eq!(rows_of(&view), store_rows(&session));
+        assert_eq!(
+            view.item_ids(),
+            target.iter().map(|row| row.item_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// PX-009: one row that changes place moves alone, inside one transaction,
+    /// carrying its new value; the rows it passed are not touched.
+    #[test]
+    fn one_row_that_changes_place_moves_alone() {
+        let session = srui_sessiond::Session::mint();
+        let (view, _) = ProcessView::start(&session, &mut Numbered(6)).unwrap();
+        let mut target = view.rows.clone();
+        let mut last = target.remove(5);
+        last.value = Value::String("changed".into());
+        target.insert(1, last.clone());
+        let moves = plan_moves(
+            &view.rows,
+            &target,
+            1_000,
+            1_000,
+            MAX_TRANSACTION_PAYLOAD_BYTES,
+        );
+        assert_eq!(moves.plan.len(), 2);
+        assert!(moves.plan[0].joins_next && !moves.plan[1].joins_next);
+        assert!(matches!(&moves.plan[0].effect, Effect::Delete(ids) if ids == &[last.item_id]));
+        assert!(
+            matches!(&moves.plan[1].effect, Effect::Insert(1, rows) if rows == &[last.clone()])
+        );
+        assert_eq!(moves.rows, target);
+        // Nothing left for the refresh diff to send: the move carried the value.
+        assert!(diff(&moves.rows, &target, 1_000, MAX_TRANSACTION_PAYLOAD_BYTES).is_empty());
+        // And rows that need no move plan nothing at all.
+        assert!(plan_moves(
+            &view.rows,
+            &view.rows,
+            1_000,
+            1_000,
+            MAX_TRANSACTION_PAYLOAD_BYTES
+        )
+        .plan
+        .is_empty());
     }
 }

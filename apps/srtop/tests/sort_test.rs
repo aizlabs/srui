@@ -831,3 +831,250 @@ fn sort_controls_are_standard_buttons_enabled_only_with_a_collection() {
     assert_eq!(view.lock().unwrap().sort(), None, "no handler ran");
     assert_eq!(label(&empty, SORT_PID), "Sort by PID");
 }
+
+/// Correction round 1: an in-place update changes a row's order values, and so
+/// does a sample whose value moved without changing its cell; a later click
+/// sorts by those current values, never by the ones the row was inserted with.
+#[test]
+fn a_click_after_an_in_place_update_sorts_by_current_values() {
+    // CPU warms up on its first sample, as a live source's does.
+    let first = vec![
+        record(
+            Some(1),
+            "a",
+            "a",
+            Observed::Known(1024),
+            CpuUsage::WarmingUp,
+        ),
+        record(
+            Some(2),
+            "b",
+            "b",
+            Observed::Known(1024),
+            CpuUsage::WarmingUp,
+        ),
+    ];
+    // Then both are measured, and `b` grows by bytes its `1.0 KiB` cell hides.
+    let second = vec![
+        record(Some(1), "a", "a", Observed::Known(1024), cpu(10)),
+        record(Some(2), "b", "b", Observed::Known(1100), cpu(90)),
+    ];
+    let (session, mut view, mut source) = started(vec![first, second]);
+    let outcome = view.refresh(&session, &mut source).unwrap();
+    assert_eq!((outcome.updated, outcome.moved), (2, 0));
+    let cells: Vec<Vec<String>> = rows(&session).into_iter().map(|(_, cells)| cells).collect();
+    assert_eq!(cells[0][2..], ["1.0 KiB", "10.0%"]);
+    assert_eq!(cells[1][2..], ["1.0 KiB", "90.0%"]);
+    view.click_sort(&session, ProcessField::Cpu).unwrap();
+    assert_eq!(
+        pids(&session),
+        ["2", "1"],
+        "CPU descending by the published shares"
+    );
+    // Resident descending: `b`'s 1,100 bytes above `a`'s 1,024, although no
+    // cell ever said so.
+    view.click_sort(&session, ProcessField::Resident).unwrap();
+    assert_eq!(pids(&session), ["2", "1"]);
+    view.click_sort(&session, ProcessField::Resident).unwrap();
+    assert_eq!(pids(&session), ["1", "2"]);
+    assert_eq!(
+        view.item_ids(),
+        rows(&session).iter().map(|(id, _)| *id).collect::<Vec<_>>()
+    );
+}
+
+/// Correction round 1: one refresh that moves a row towards the end and inserts
+/// an arrival at a lower index keeps the view's record equal to the store.
+#[test]
+fn a_move_and_an_arrival_in_one_refresh_keep_the_view_equal_to_the_store() {
+    let first = vec![
+        record(Some(1), "p1", "a", Observed::Known(1), cpu(50)),
+        record(Some(2), "p2", "b", Observed::Known(1), cpu(40)),
+        record(Some(3), "p3", "c", Observed::Known(1), cpu(30)),
+    ];
+    // `p1` sinks to the bottom, `p4` arrives near the top, nothing ends.
+    let mut second = first.clone();
+    second[0].cpu = cpu(10);
+    second.push(record(Some(4), "p4", "d", Observed::Known(1), cpu(45)));
+    let (session, mut view, mut source) = started(vec![first, second]);
+    view.click_sort(&session, ProcessField::Cpu).unwrap();
+    let outcome = view.refresh(&session, &mut source).unwrap();
+    assert_eq!(
+        (outcome.moved, outcome.inserted, outcome.deleted),
+        (1, 1, 0)
+    );
+    assert_eq!(pids(&session), ["4", "2", "3", "1"]);
+    assert_eq!(
+        view.item_ids(),
+        rows(&session).iter().map(|(id, _)| *id).collect::<Vec<_>>()
+    );
+    // The next refresh plans from that record: nothing to do.
+    let outcome = view.refresh(&session, &mut source).unwrap();
+    assert_eq!(
+        (
+            outcome.moved,
+            outcome.inserted,
+            outcome.deleted,
+            outcome.updated
+        ),
+        (0, 0, 0, 0)
+    );
+}
+
+/// A deterministic generator: a fixed seed, no clock.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self, bound: u64) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (self.0 >> 33) % bound
+    }
+}
+
+/// The typed value of one column of a fixture record, `None` when missing: a
+/// test-local statement of the ordering rules, independent of `src/sort.rs`.
+fn expected_value(record: &ProcessRecord, field: ProcessField) -> Option<Result<u64, String>> {
+    match field {
+        ProcessField::Pid => match record.key.pid {
+            Observed::Known(pid) => Some(Ok(u64::from(pid))),
+            Observed::Missing(_) => None,
+        },
+        ProcessField::Name => Some(Err(record.display_name.as_str().to_string())),
+        ProcessField::Resident => match record.resident {
+            Observed::Known(bytes) => Some(Ok(bytes)),
+            Observed::Missing(_) => None,
+        },
+        ProcessField::Cpu => match &record.cpu {
+            // One-second intervals at 100 ticks a second: tenths of a percent.
+            CpuUsage::Measured(interval) => Some(Ok(interval.ticks * 10)),
+            CpuUsage::WarmingUp | CpuUsage::Missing(_) => None,
+        },
+    }
+}
+
+/// The PID cells `records` must be published in under `order`: typed values in
+/// the requested direction, missing last both ways, then ascending PID (every
+/// fixture key differs only in PID and token, and PIDs are unique here).
+fn expected_order(records: &[ProcessRecord], order: SortOrder) -> Vec<String> {
+    let mut sorted: Vec<&ProcessRecord> = records.iter().collect();
+    let pid = |record: &ProcessRecord| match record.key.pid {
+        Observed::Known(pid) => pid,
+        Observed::Missing(_) => u32::MAX,
+    };
+    sorted.sort_by(|left, right| {
+        let compared = match (
+            expected_value(left, order.field),
+            expected_value(right, order.field),
+        ) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Greater,
+            (Some(_), None) => return std::cmp::Ordering::Less,
+            (Some(left), Some(right)) => match order.direction {
+                SortDirection::Ascending => left.cmp(&right),
+                SortDirection::Descending => right.cmp(&left),
+            },
+        };
+        compared.then_with(|| pid(left).cmp(&pid(right)))
+    });
+    sorted
+        .iter()
+        .map(|record| pid(record).to_string())
+        .collect()
+}
+
+/// Correction round 1: a seeded random walk of samples and clicks. After every
+/// step the view's record is the store's, the published rows are exactly the
+/// sample's, and once a sort is active they are in its order.
+#[test]
+fn a_random_walk_of_samples_and_clicks_keeps_the_view_equal_to_the_store_and_sorted() {
+    const NAMES: [&str; 8] = ["a", "b", "a", "Z", "b10", "b9", "a", "c"];
+    const FIELDS: [ProcessField; 4] = [
+        ProcessField::Pid,
+        ProcessField::Name,
+        ProcessField::Resident,
+        ProcessField::Cpu,
+    ];
+    let mut random = Lcg(0x5EED_0009);
+    let sample = |random: &mut Lcg| -> Vec<ProcessRecord> {
+        let mut records = Vec::new();
+        for pid in 1..=8u32 {
+            if random.next(4) == 0 {
+                continue;
+            }
+            records.push({
+                let resident = match random.next(5) {
+                    0 => Observed::Missing(MissingReason::Denied),
+                    1 => Observed::Known(0),
+                    2 => Observed::Known(1024),
+                    3 => Observed::Known(1030),
+                    _ => Observed::Known(2048),
+                };
+                let usage = match random.next(7) {
+                    0 => CpuUsage::WarmingUp,
+                    1 => CpuUsage::Missing(MissingReason::Unavailable),
+                    2 => cpu(0),
+                    3 => cpu(5),
+                    4 => cpu(10),
+                    5 => cpu(50),
+                    _ => cpu(90),
+                };
+                let token = format!("walk-{pid}");
+                record(Some(pid), &token, NAMES[pid as usize - 1], resident, usage)
+            });
+        }
+        records
+    };
+    let session = Session::mint();
+    let mut current = sample(&mut random);
+    let mut source = Steps::new(vec![current.clone()]);
+    let (mut view, _) = start_from_source(&session, &mut source).unwrap();
+    let mut clicks = 0;
+    let mut refreshes = 0;
+    for step in 0..400u64 {
+        if random.next(4) == 0 {
+            let field = FIELDS[random.next(4) as usize];
+            view.click_sort(&session, field).unwrap();
+            clicks += 1;
+        } else {
+            current = sample(&mut random);
+            view.apply(
+                &session,
+                FAKE_STATUS_TEXT,
+                &snapshot(current.clone(), step + 10),
+            )
+            .unwrap();
+            refreshes += 1;
+        }
+        let published = rows(&session);
+        assert_eq!(
+            view.item_ids(),
+            published.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            "step {step}: the view's record is the store's"
+        );
+        let mut held = pids(&session);
+        if let Some(order) = view.sort() {
+            assert_eq!(
+                held,
+                expected_order(&current, order),
+                "step {step}: {order:?}"
+            );
+        }
+        held.sort();
+        let mut sampled: Vec<String> = current
+            .iter()
+            .map(|record| match record.key.pid {
+                Observed::Known(pid) => pid.to_string(),
+                Observed::Missing(_) => unreachable!("every walk PID is observed"),
+            })
+            .collect();
+        sampled.sort();
+        assert_eq!(held, sampled, "step {step}: exactly the sample's rows");
+    }
+    assert!(
+        clicks > 50 && refreshes > 200,
+        "{clicks} clicks, {refreshes} samples"
+    );
+}

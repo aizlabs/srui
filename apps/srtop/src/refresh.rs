@@ -528,7 +528,10 @@ impl ProcessView {
         if plan.is_empty() {
             // Nothing a client can see changed: no transaction is opened, so an
             // unchanging host produces no traffic at all. The rows stand, so the
-            // identities worth keeping are still exactly theirs.
+            // identities worth keeping are still exactly theirs. Their order
+            // values may still have moved without a cell changing — bytes
+            // inside one displayed unit — and are brought up to this sample.
+            refresh_sort_values(&mut self.rows, &target);
             self.ids.retain(&self.rows);
             return Ok(result);
         }
@@ -546,6 +549,10 @@ impl ProcessView {
             },
         );
         result.transactions = transactions;
+        // Order values never reach the wire, so every published row takes this
+        // sample's whatever committed: a later click sorts by current values,
+        // never by the ones a row was first published with.
+        refresh_sort_values(&mut self.rows, &target);
         self.ids.retain(&self.rows);
         outcome.map(|()| result)
     }
@@ -1245,13 +1252,12 @@ impl Effect {
                 rows.splice(at..at, inserted.iter().cloned());
             }
             Self::Update(updated) => {
-                let values: HashMap<ItemId, &Value> = updated
-                    .iter()
-                    .map(|row| (row.item_id, &row.value))
-                    .collect();
+                let values: HashMap<ItemId, &Row> =
+                    updated.iter().map(|row| (row.item_id, row)).collect();
                 for row in rows.iter_mut() {
-                    if let Some(value) = values.get(&row.item_id) {
-                        row.value = (*value).clone();
+                    if let Some(update) = values.get(&row.item_id) {
+                        row.value = update.value.clone();
+                        row.sort = update.sort.clone();
                     }
                 }
             }
@@ -1268,11 +1274,20 @@ fn record_committed(chunk: &[Planned], published: &mut Published<'_>) {
     let mut index = 0;
     while index < chunk.len() {
         if matches!(chunk[index].effect, Effect::Insert(..)) {
+            // Merge only a run whose indices ascend past the rows inserted
+            // before them, which is what `insert_run` assumes. A move's
+            // reinsertion can be followed by an arrival at a lower index
+            // (PX-009); that one opens a new run, applied after the first,
+            // exactly as the store applied it.
             let start = index;
-            while matches!(
-                chunk.get(index).map(|planned| &planned.effect),
-                Some(Effect::Insert(..))
-            ) {
+            let mut floor = 0u64;
+            while let Some(Effect::Insert(at, rows)) =
+                chunk.get(index).map(|planned| &planned.effect)
+            {
+                if index > start && *at < floor {
+                    break;
+                }
+                floor = *at + rows.len() as u64;
                 index += 1;
             }
             insert_run(published.rows, &chunk[start..index]);
@@ -1419,6 +1434,25 @@ fn flush_insert(plan: &mut Vec<Planned>, start: u64, rows: &mut Vec<Row>, bytes:
         return;
     }
     plan.push(Planned::new(Effect::Insert(start, std::mem::take(rows))));
+}
+
+/// Gives every published row the order values `target` holds for it: those of
+/// the latest sample, or the ones a retained row was last published with.
+///
+/// Order values are server-side only and are not compared when a refresh
+/// decides what to send, so a value that changed without changing its cell —
+/// bytes inside one displayed unit — would otherwise never reach the view, and
+/// a later click would sort by it (PX-009).
+fn refresh_sort_values(rows: &mut [Row], target: &[Row]) {
+    let current: HashMap<ItemId, &crate::sort::SortValues> =
+        target.iter().map(|row| (row.item_id, &row.sort)).collect();
+    for row in rows.iter_mut() {
+        if let Some(values) = current.get(&row.item_id) {
+            if row.sort != **values {
+                row.sort = (*values).clone();
+            }
+        }
+    }
 }
 
 /// A move plan, and the rows a client holds once all of it committed.

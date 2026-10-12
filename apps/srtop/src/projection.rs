@@ -2,6 +2,7 @@
 //! (§§6.2, 8; PX-002 rows, PX-003 process-instance keys, PX-004 refresh,
 //! PX-005 and PX-006 metric cells, PX-042 catalogued columns).
 use crate::catalogue::PROCESS_LIST;
+use crate::sort::SortValues;
 use crate::source::{BootId, HostId, Observed, PidNamespaceId, ProcessKey, ProcessSnapshot};
 use srui_sdk::{ItemId, Value};
 use srui_semantic_tree::ModelItem;
@@ -9,16 +10,21 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 
 /// One projected row: the process instance it was projected from, the opaque
-/// item ID that instance owns, and the exact value published to the model.
+/// item ID that instance owns, the exact value published to the model, and the
+/// typed order values the published collection sorts by (PX-009).
 ///
 /// The key travels with the row because a refresh publishes rows the current
 /// scan did not confirm (PX-004): the allocator must be able to tell an identity
-/// that is still on screen from one that is not.
+/// that is still on screen from one that is not. The order values travel with it
+/// for the same reason: a retained row takes part in every sort under the values
+/// it was published with, rather than sinking to the end as though its values
+/// were missing.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Row {
     pub(crate) key: ProcessKey,
     pub(crate) item_id: ItemId,
     pub(crate) value: Value,
+    pub(crate) sort: SortValues,
 }
 
 impl Row {
@@ -167,15 +173,19 @@ impl SessionItemIds {
                     }
                 };
                 // One cell per catalogued column, in the order the table's
-                // headings were built from (PX-042).
+                // headings were built from (PX-042), and the same record's
+                // typed order values, so sorting never has to parse a
+                // formatted cell back into the number it came from (PX-009).
                 let cells = PROCESS_LIST
                     .iter()
                     .map(|field| field.cell(&key, record))
                     .collect();
+                let sort = SortValues::of_record(&key, record);
                 Ok(Row {
                     key,
                     item_id,
                     value: Value::List(cells),
+                    sort,
                 })
             })
             .collect()

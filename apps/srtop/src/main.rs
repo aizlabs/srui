@@ -1,6 +1,6 @@
 //! Existing sessiond runtime/SSH bridge host for the PX-001 shell (§§12, 20, 27, 29).
 use srui_process_explorer::{
-    initialize,
+    initialize, install_sort_handlers,
     procfs::ProcFsSource,
     refresh::{poll, DEFAULT_REFRESH_INTERVAL, MAX_REFRESH_INTERVAL, MIN_REFRESH_INTERVAL},
     source::{FakeProcessSource, ProcessSource, ScriptedFakeSource},
@@ -10,7 +10,11 @@ use srui_sessiond::{handle_connection, Session};
 use srui_unix_security::{
     effective_uid, prepare_private_socket_parent, require_unprivileged_uid, validate_peer,
 };
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{net::UnixListener, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -36,6 +40,11 @@ where
     S: ProcessSource + Send + 'static,
 {
     let (view, _) = start_from_source(session, &mut source)?;
+    // The refresh loop and the sort buttons' handlers share the published view
+    // (PX-009). The handlers are installed here, before the socket is served,
+    // so a ready instance always answers a click.
+    let view = Arc::new(Mutex::new(view));
+    install_sort_handlers(session, &view);
     let session = Arc::clone(session);
     let shutdown = shutdown.child_token();
     connections.spawn(poll(view, source, session, interval, shutdown));

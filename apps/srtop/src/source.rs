@@ -1139,9 +1139,530 @@ impl ProcessSource for ScriptedFakeSource {
     }
 }
 
+/// Status label of the synthetic scale source.
+pub const SCALE_STATUS_TEXT: &str = "Read-only · Synthetic scale source";
+pub const SCALE_SOURCE: &str = "synthetic-scale-v1";
+
+/// Deterministic 64-bit XorShift* pseudo-random number generator.
+/// No external crates or OS entropy sources.
+#[derive(Debug, Clone)]
+pub struct DeterministicPrng {
+    state: u64,
+}
+
+impl DeterministicPrng {
+    pub const DEFAULT_SEED: u64 = 0x5CA1_AB1E_DEAD_BEEF;
+
+    pub fn new(seed: u64) -> Self {
+        let state = if seed == 0 { Self::DEFAULT_SEED } else { seed };
+        Self { state }
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        self.state ^= self.state >> 12;
+        self.state ^= self.state << 25;
+        self.state ^= self.state >> 27;
+        self.state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    pub fn next_u32(&mut self) -> u32 {
+        (self.next_u64() >> 32) as u32
+    }
+
+    pub fn gen_range(&mut self, min: u64, max: u64) -> u64 {
+        if min >= max {
+            return min;
+        }
+        min + (self.next_u64() % (max - min))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpuTier {
+    Idle,   // 88%
+    Light,  // 9%
+    Active, // 2.8%
+    Heavy,  // 0.2%
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AvailabilityTier {
+    Normal,
+    Denied,
+    Unavailable,
+    WarmingUp,
+}
+
+#[derive(Debug, Clone)]
+struct SyntheticProcessInstance {
+    pid: u32,
+    start_tick: u64,
+    name: String,
+    cmdline: String,
+    is_kernel_thread: bool,
+    cpu_tier: CpuTier,
+    resident_bytes: u64,
+    availability: AvailabilityTier,
+    ticks: u64,
+    first_sample: bool,
+}
+
+impl SyntheticProcessInstance {
+    fn to_record(&self) -> ProcessRecord {
+        let key = ProcessKey {
+            source: SourceId(SCALE_SOURCE.into()),
+            host: Observed::Known(HostId("scale-host".into())),
+            boot: Observed::Known(BootId("scale-boot-0001".into())),
+            pid_namespace: Observed::Known(PidNamespaceId(4_026_531_836)),
+            pid: Observed::Known(self.pid),
+            creation: CreationToken::Opaque(format!("scale-{}-{}", self.pid, self.start_tick)),
+        };
+        let display_name =
+            DisplayName::from(self.name.as_str()).with_command(self.cmdline.as_bytes());
+        let resident = match self.availability {
+            AvailabilityTier::Denied => Observed::Missing(MissingReason::Denied),
+            AvailabilityTier::Unavailable => Observed::Missing(MissingReason::Unavailable),
+            _ => {
+                if self.is_kernel_thread {
+                    Observed::Known(0)
+                } else {
+                    Observed::Known(self.resident_bytes)
+                }
+            }
+        };
+        let cpu = match self.availability {
+            AvailabilityTier::WarmingUp => CpuUsage::WarmingUp,
+            AvailabilityTier::Unavailable => CpuUsage::Missing(MissingReason::Unavailable),
+            _ => {
+                if self.first_sample {
+                    CpuUsage::WarmingUp
+                } else {
+                    CpuUsage::Measured(CpuInterval {
+                        ticks: self.ticks,
+                        ticks_per_second: 100,
+                        elapsed: Duration::from_secs(1),
+                    })
+                }
+            }
+        };
+        ProcessRecord {
+            key,
+            display_name,
+            resident,
+            cpu,
+        }
+    }
+}
+
+const DAEMON_TEMPLATES: &[(&str, &str, bool)] = &[
+    ("systemd", "/sbin/init splash", false),
+    ("kthreadd", "[kthreadd]", true),
+    ("kworker/0:0-events", "[kworker/0:0-events]", true),
+    ("sshd", "/usr/sbin/sshd -D", false),
+    ("systemd-journald", "/lib/systemd/systemd-journald", false),
+    ("systemd-udevd", "/lib/systemd/systemd-udevd", false),
+    ("cron", "/usr/sbin/cron -f", false),
+    (
+        "dbus-daemon",
+        "/usr/bin/dbus-daemon --system --address=systemd: --nofork",
+        false,
+    ),
+    ("rsyslogd", "/usr/sbin/rsyslogd -n -iNONE", false),
+    ("launchd", "/sbin/launchd", false),
+];
+
+const SERVICE_TEMPLATES: &[(&str, &str)] = &[
+    (
+        "postgres",
+        "/usr/lib/postgresql/16/bin/postgres -D /var/lib/postgresql/16/main -c config_file=/etc/postgresql/16/main/postgresql.conf",
+    ),
+    ("postgres: worker", "postgres: 16/main: background writer"),
+    ("postgres: worker", "postgres: 16/main: autovacuum worker"),
+    ("postgres: worker", "postgres: 16/main: walwriter"),
+    (
+        "nginx",
+        "nginx: master process /usr/sbin/nginx -g daemon on; master_process on;",
+    ),
+    ("nginx: worker", "nginx: worker process"),
+    ("redis-server", "/usr/bin/redis-server 127.0.0.1:6379"),
+    (
+        "dockerd",
+        "/usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock",
+    ),
+    ("containerd", "/usr/bin/containerd"),
+    (
+        "mysqld",
+        "/usr/sbin/mysqld --daemon --pid-file=/var/run/mysqld/mysqld.pid",
+    ),
+];
+
+const USER_APP_TEMPLATES: &[(&str, &str)] = &[
+    (
+        "cargo",
+        "cargo test --locked --manifest-path apps/srtop/Cargo.toml",
+    ),
+    (
+        "rustc",
+        "rustc --crate-name srui_process_explorer --edition=2021 src/lib.rs",
+    ),
+    (
+        "node",
+        "node /app/server.js --cluster --port 8080 --workers 4",
+    ),
+    (
+        "python3",
+        "python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000",
+    ),
+    ("bash", "/bin/bash --login"),
+    ("zsh", "-zsh"),
+    ("git", "git status --short --branch"),
+    ("vim", "vim apps/srtop/src/source.rs"),
+    ("htop", "htop --delay 10"),
+    ("tmux", "tmux new-session -s main"),
+];
+
+const EPHEMERAL_TEMPLATES: &[(&str, &str)] = &[
+    (
+        "worker",
+        "/usr/local/bin/worker --queue=tasks --concurrency=8 --role=worker",
+    ),
+    (
+        "worker",
+        "/usr/bin/worker --job=etl --batch-size=1000 --role=worker",
+    ),
+    ("sh", "/bin/sh -c worker.sh"),
+    ("grep", "grep -r PATTERN /var/log"),
+    ("sed", "sed -i -e s/foo/bar/g /tmp/scratch"),
+    ("curl", "curl -sSL https://api.internal/health"),
+    ("sleep", "sleep 60"),
+    (
+        "builder",
+        "/usr/bin/builder --step=compile --target=release",
+    ),
+    ("cat", "cat /proc/cpuinfo"),
+    ("tar", "tar -czf /tmp/backup.tar.gz /var/data"),
+];
+
+/// Deterministic, reproducible synthetic process source for scale testing (PX-010-G01).
+///
+/// Simulates realistic Linux host workloads across 1,000, 10,000, and 100,000 rows
+/// using a fixed-seed PRNG (0x5CA1_AB1E_DEAD_BEEF), Pareto/power-law CPU% distribution,
+/// log-normal RSS memory, realistic command lines, controllable churn, and distinct
+/// creation tokens for recycled PIDs.
+#[derive(Debug, Clone)]
+pub struct SyntheticProcessSource {
+    target_count: usize,
+    churn_fraction: f64,
+    step: usize,
+    rng: DeterministicPrng,
+    processes: Vec<SyntheticProcessInstance>,
+    recycled_pids: Vec<u32>,
+    next_pid: u32,
+    vanished: usize,
+}
+
+impl SyntheticProcessSource {
+    pub const DEFAULT_SEED: u64 = DeterministicPrng::DEFAULT_SEED;
+    pub const DEFAULT_CHURN_FRACTION: f64 = 0.02; // 2% churn per sample
+    pub const EPOCH_SECONDS: u64 = 1_800_000_000;
+
+    pub fn new(count: usize) -> Self {
+        Self::with_options(count, Self::DEFAULT_SEED, Self::DEFAULT_CHURN_FRACTION)
+    }
+
+    pub fn with_seed(count: usize, seed: u64) -> Self {
+        Self::with_options(count, seed, Self::DEFAULT_CHURN_FRACTION)
+    }
+
+    pub fn with_churn(count: usize, churn_fraction: f64) -> Self {
+        Self::with_options(count, Self::DEFAULT_SEED, churn_fraction)
+    }
+
+    pub fn with_options(count: usize, seed: u64, churn_fraction: f64) -> Self {
+        let mut rng = DeterministicPrng::new(seed);
+        let mut processes = Vec::with_capacity(count);
+
+        let (daemon_count, service_count, user_count, ephemeral_count) = if count <= 10 {
+            let d = count.min(2);
+            let s = (count - d).min(3);
+            let u = (count - d - s).min(3);
+            let e = count - d - s - u;
+            (d, s, u, e)
+        } else {
+            let d = (count * 5 / 100).clamp(1, 300);
+            let s = (count * 25 / 100).max(1);
+            let u = (count * 40 / 100).max(1);
+            let e = count.saturating_sub(d + s + u);
+            (d, s, u, e)
+        };
+
+        let mut current_pid: u32 = 1;
+
+        // 1. Daemons
+        for i in 0..daemon_count {
+            let pid = current_pid;
+            current_pid += 1;
+            let tmpl = DAEMON_TEMPLATES[i % DAEMON_TEMPLATES.len()];
+            processes.push(Self::create_instance(
+                &mut rng,
+                pid,
+                0,
+                tmpl.0,
+                tmpl.1,
+                tmpl.2,
+                (256 * 1024, 4 * 1024 * 1024),
+            ));
+        }
+
+        // 2. Persistent services
+        for i in 0..service_count {
+            let pid = current_pid;
+            current_pid += 1;
+            let tmpl = SERVICE_TEMPLATES[i % SERVICE_TEMPLATES.len()];
+            processes.push(Self::create_instance(
+                &mut rng,
+                pid,
+                0,
+                tmpl.0,
+                tmpl.1,
+                false,
+                (512 * 1024 * 1024, 4 * 1024 * 1024 * 1024),
+            ));
+        }
+
+        // 3. User apps
+        for i in 0..user_count {
+            let pid = current_pid;
+            current_pid += 1;
+            let tmpl = USER_APP_TEMPLATES[i % USER_APP_TEMPLATES.len()];
+            processes.push(Self::create_instance(
+                &mut rng,
+                pid,
+                0,
+                tmpl.0,
+                tmpl.1,
+                false,
+                (16 * 1024 * 1024, 256 * 1024 * 1024),
+            ));
+        }
+
+        // 4. Ephemeral workers
+        for i in 0..ephemeral_count {
+            let pid = current_pid;
+            current_pid += 1;
+            let tmpl = EPHEMERAL_TEMPLATES[i % EPHEMERAL_TEMPLATES.len()];
+            processes.push(Self::create_instance(
+                &mut rng,
+                pid,
+                0,
+                tmpl.0,
+                tmpl.1,
+                false,
+                (256 * 1024, 64 * 1024 * 1024),
+            ));
+        }
+
+        let next_pid = current_pid;
+
+        Self {
+            target_count: count,
+            churn_fraction,
+            step: 0,
+            rng,
+            processes,
+            recycled_pids: Vec::new(),
+            next_pid,
+            vanished: 0,
+        }
+    }
+
+    fn create_instance(
+        rng: &mut DeterministicPrng,
+        pid: u32,
+        start_tick: u64,
+        name: &str,
+        cmdline: &str,
+        is_kernel_thread: bool,
+        resident_range: (u64, u64),
+    ) -> SyntheticProcessInstance {
+        let resident_bytes = if is_kernel_thread {
+            0
+        } else {
+            rng.gen_range(resident_range.0, resident_range.1)
+        };
+
+        // Pareto / power-law CPU distribution:
+        // 88% idle: 0 ticks
+        // 9% light: 1..=5 ticks
+        // 2.8% active: 5..=50 ticks
+        // 0.2% heavy: 100..=400 ticks
+        let cpu_roll = rng.gen_range(0, 1000);
+        let (cpu_tier, ticks) = if cpu_roll < 880 {
+            (CpuTier::Idle, 0)
+        } else if cpu_roll < 970 {
+            (CpuTier::Light, rng.gen_range(1, 6))
+        } else if cpu_roll < 998 {
+            (CpuTier::Active, rng.gen_range(5, 51))
+        } else {
+            (CpuTier::Heavy, rng.gen_range(100, 401))
+        };
+
+        // Availability state:
+        // 1.0% Denied
+        // 0.5% Unavailable
+        // 2.0% WarmingUp
+        // rest: Normal
+        let avail_roll = rng.gen_range(0, 1000);
+        let availability = if avail_roll < 10 {
+            AvailabilityTier::Denied
+        } else if avail_roll < 15 {
+            AvailabilityTier::Unavailable
+        } else if avail_roll < 35 {
+            AvailabilityTier::WarmingUp
+        } else {
+            AvailabilityTier::Normal
+        };
+
+        SyntheticProcessInstance {
+            pid,
+            start_tick,
+            name: name.to_string(),
+            cmdline: cmdline.to_string(),
+            is_kernel_thread,
+            cpu_tier,
+            resident_bytes,
+            availability,
+            ticks,
+            first_sample: false,
+        }
+    }
+
+    pub fn step(&self) -> usize {
+        self.step
+    }
+
+    pub fn target_count(&self) -> usize {
+        self.target_count
+    }
+
+    pub fn system() -> SystemSample {
+        SystemSample {
+            cpu: SystemCpu::Measured(SystemCpuInterval {
+                busy: 320,
+                total: 1000,
+                cpus: Some(16),
+            }),
+            memory: Ok(MemoryFigures {
+                total: 64 << 30,
+                available: 48 << 30,
+            }),
+            swap: Ok(SwapFigures {
+                total: 16 << 30,
+                free: 14 << 30,
+            }),
+            uptime: Ok(86_400 * 5 + 3_600 * 2),
+            load: Ok(LoadAverages {
+                one: 120,
+                five: 110,
+                fifteen: 95,
+            }),
+        }
+    }
+}
+
+impl ProcessSource for SyntheticProcessSource {
+    fn status_text(&self) -> &str {
+        SCALE_STATUS_TEXT
+    }
+
+    fn snapshot(&mut self) -> ProcessSnapshot {
+        if self.step > 0 {
+            // Apply churn
+            let churn_count = if self.churn_fraction > 0.0 && !self.processes.is_empty() {
+                let count = (self.target_count as f64 * self.churn_fraction).round() as usize;
+                count.max(1).min(self.processes.len())
+            } else {
+                0
+            };
+
+            if churn_count > 0 {
+                // Remove churn_count ephemeral instances from the tail
+                let start_idx = self.processes.len() - churn_count;
+                for instance in self.processes.drain(start_idx..) {
+                    self.recycled_pids.push(instance.pid);
+                }
+                self.vanished = churn_count;
+
+                // Spawn churn_count new instances
+                for i in 0..churn_count {
+                    let pid = if let Some(recycled) = self.recycled_pids.pop() {
+                        recycled
+                    } else {
+                        let p = self.next_pid;
+                        self.next_pid += 1;
+                        p
+                    };
+                    let start_tick = (self.step as u64) * 100 + i as u64;
+                    let tmpl = EPHEMERAL_TEMPLATES[(self.step + i) % EPHEMERAL_TEMPLATES.len()];
+                    let mut inst = Self::create_instance(
+                        &mut self.rng,
+                        pid,
+                        start_tick,
+                        tmpl.0,
+                        tmpl.1,
+                        false,
+                        (256 * 1024, 64 * 1024 * 1024),
+                    );
+                    inst.first_sample = true;
+                    self.processes.push(inst);
+                }
+            } else {
+                self.vanished = 0;
+            }
+
+            // Advance dynamic CPU ticks for all surviving processes
+            for inst in &mut self.processes {
+                if inst.first_sample {
+                    continue;
+                }
+                match inst.cpu_tier {
+                    CpuTier::Idle => inst.ticks = 0,
+                    CpuTier::Light => inst.ticks = self.rng.gen_range(1, 6),
+                    CpuTier::Active => inst.ticks = self.rng.gen_range(5, 51),
+                    CpuTier::Heavy => inst.ticks = self.rng.gen_range(100, 401),
+                }
+            }
+        } else {
+            self.vanished = 0;
+        }
+
+        let records: Vec<ProcessRecord> = self.processes.iter().map(|p| p.to_record()).collect();
+        let sampled_at = SnapshotTime(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(Self::EPOCH_SECONDS + self.step as u64),
+        );
+        self.step += 1;
+
+        // Clear first_sample flags for the next step
+        for inst in &mut self.processes {
+            inst.first_sample = false;
+        }
+
+        ProcessSnapshot {
+            source: SourceId(SCALE_SOURCE.into()),
+            sampled_at,
+            records,
+            vanished: self.vanished,
+            capped: CappedRecords::none(),
+            completeness: Completeness::Complete,
+            system: Self::system(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn the_scripted_sequence_is_cyclic_and_only_its_sample_time_always_moves() {
@@ -1575,6 +2096,126 @@ mod tests {
         assert!(
             !uncertain.contains(&8999),
             "and no PID the listing did not name"
+        );
+    }
+
+    #[test]
+    fn synthetic_source_is_deterministic_and_reproducible() {
+        let mut source_a = SyntheticProcessSource::new(1000);
+        let mut source_b = SyntheticProcessSource::new(1000);
+
+        for step in 0..5 {
+            let snap_a = source_a.snapshot();
+            let snap_b = source_b.snapshot();
+            assert_eq!(snap_a.sampled_at, snap_b.sampled_at, "step {step}");
+            assert_eq!(snap_a.records.len(), snap_b.records.len(), "step {step}");
+            assert_eq!(snap_a.vanished, snap_b.vanished, "step {step}");
+            assert_eq!(snap_a.records, snap_b.records, "step {step}");
+            assert_eq!(snap_a.system, snap_b.system, "step {step}");
+        }
+    }
+
+    #[test]
+    fn synthetic_source_different_seeds_produce_different_snapshots() {
+        let mut source_a = SyntheticProcessSource::with_seed(100, 0x1111);
+        let mut source_b = SyntheticProcessSource::with_seed(100, 0x2222);
+        let snap_a = source_a.snapshot();
+        let snap_b = source_b.snapshot();
+        assert_ne!(snap_a.records, snap_b.records);
+    }
+
+    #[test]
+    fn synthetic_source_cpu_and_availability_distribution() {
+        let mut source = SyntheticProcessSource::new(10000);
+        let snap = source.snapshot();
+        assert_eq!(snap.records.len(), 10000);
+
+        let mut idle = 0;
+        let mut light = 0;
+        let mut active = 0;
+        let mut heavy = 0;
+        let mut denied = 0;
+        let mut unavailable = 0;
+        let mut warming_up = 0;
+
+        for r in &snap.records {
+            match r.resident {
+                Observed::Missing(MissingReason::Denied) => denied += 1,
+                Observed::Missing(MissingReason::Unavailable) => unavailable += 1,
+                _ => {}
+            }
+            match r.cpu {
+                CpuUsage::WarmingUp => warming_up += 1,
+                CpuUsage::Missing(MissingReason::Unavailable) => unavailable += 1,
+                CpuUsage::Measured(interval) => {
+                    if interval.ticks == 0 {
+                        idle += 1;
+                    } else if interval.ticks <= 5 {
+                        light += 1;
+                    } else if interval.ticks <= 50 {
+                        active += 1;
+                    } else {
+                        heavy += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Pareto distribution: 88% idle, 9% light, 2.8% active, 0.2% heavy
+        // With N=10000, idle is expected ~8600-9000, light ~800-1000, active ~200-350, heavy ~10-40.
+        assert!((8500..=9000).contains(&idle), "idle count: {idle}");
+        assert!((750..=1050).contains(&light), "light count: {light}");
+        assert!((200..=380).contains(&active), "active count: {active}");
+        assert!((5..=50).contains(&heavy), "heavy count: {heavy}");
+
+        // Availability: ~1% denied, ~0.5% unavailable, ~2% warming up
+        assert!((60..=140).contains(&denied), "denied count: {denied}");
+        assert!(
+            (30..=120).contains(&unavailable),
+            "unavailable count: {unavailable}"
+        );
+        assert!(
+            (150..=250).contains(&warming_up),
+            "warming_up count: {warming_up}"
+        );
+    }
+
+    #[test]
+    fn synthetic_source_recycled_pids_mint_distinct_process_keys() {
+        let mut source = SyntheticProcessSource::with_churn(100, 0.10); // 10% churn = 10 exits/entries
+        let snap0 = source.snapshot();
+        let initial_keys: HashMap<u32, ProcessKey> = snap0
+            .records
+            .iter()
+            .filter_map(|r| match r.key.pid {
+                Observed::Known(pid) => Some((pid, r.key.clone())),
+                Observed::Missing(_) => None,
+            })
+            .collect();
+
+        // Run several churn steps to stimulate recycled PIDs
+        let mut observed_recycled = false;
+        for _ in 0..10 {
+            let snap = source.snapshot();
+            assert_eq!(snap.records.len(), 100);
+            assert_eq!(snap.vanished, 10);
+            for r in &snap.records {
+                if let Observed::Known(pid) = r.key.pid {
+                    if let Some(old_key) = initial_keys.get(&pid) {
+                        if old_key.creation != r.key.creation {
+                            // Same PID, but different creation token!
+                            assert_ne!(&old_key.creation, &r.key.creation);
+                            assert_ne!(old_key, &r.key);
+                            observed_recycled = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            observed_recycled,
+            "recycled PIDs must appear and mint distinct ProcessKeys"
         );
     }
 }

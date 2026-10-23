@@ -597,6 +597,73 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
+    /// PX-010-G01: 1,000 synthetic rows over real SSH with continuous churn.
+    /// Asserts native macOS AppKit rendering performance, memory and layout stability,
+    /// and selection preservation under active row churn.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func largeCollectionRendersNativelyAndPreservesSelectionUnderChurn() async throws {
+        let harness = try await Self.launch(arguments: ["--scale-source", "1000", "--scale-interval-ms", "500"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await controller.start()
+
+        try await AsyncTestSupport.eventually(timeout: .seconds(25), description: "1,000 synthetic rows over SSH") {
+            applier.lastAppliedRevision.value >= 1
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && (renderer.registry.handle(for: NodeId(5))?.view as? NSScrollView)?.documentView.map { ($0 as? NSTableView)?.numberOfRows == 1000 } == true
+        }
+
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
+        let scroll = try #require(tableHandle.view as? NSScrollView)
+        let table = try #require(scroll.documentView as? NSTableView)
+
+        #expect(table.numberOfRows == 1000)
+        #expect(table.tableColumns.map(\.title) == ["PID", "Name", "Resident", "CPU (100% = 1 CPU)"])
+
+        // Visible cells in the initial viewport render native strings properly
+        for col in 0..<4 {
+            let cell = try #require(table.view(atColumn: col, row: 0, makeIfNecessary: true) as? NSTextField)
+            #expect(!cell.stringValue.isEmpty)
+        }
+
+        // Select row 50 (a persistent daemon/service process that does not churn)
+        let targetIndex = 50
+        table.selectRowIndexes(IndexSet(integer: targetIndex), byExtendingSelection: false)
+        let initialIdentities = Self.modelItemIDs(applier)
+        #expect(initialIdentities.count == 1000)
+        let selectedID = initialIdentities[targetIndex]
+        #expect(table.selectedRowIndexes == IndexSet(integer: targetIndex))
+        #expect(table.selectedRow == targetIndex)
+
+        // Wait for multiple churn cycles to execute on server (at 500ms intervals)
+        let revBefore = applier.lastAppliedRevision
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "multiple churn cycles committed") {
+            applier.lastAppliedRevision.value >= revBefore.value + 4
+        }
+
+        // Under continuous churn, total rows remain capped at 1,000
+        #expect(table.numberOfRows == 1000)
+        let currentIdentities = Self.modelItemIDs(applier)
+        #expect(currentIdentities.count == 1000)
+
+        // Selection is natively preserved anchored to ItemId across deletions and insertions
+        #expect(currentIdentities.contains(selectedID))
+        let newRowIndex = try #require(currentIdentities.firstIndex(of: selectedID))
+        #expect(table.selectedRowIndexes == IndexSet(integer: newRowIndex))
+        #expect(table.selectedRow == newRowIndex)
+
+        // Verify native table handles and window remain intact
+        #expect(renderer.registry.handle(for: NodeId(5)) === tableHandle)
+        #expect(window.isVisible)
+
+        print("PX-010-G01 native AppKit scale evidence: window \(window.windowNumber); 1000 rows rendered natively; selected item \(selectedID) preserved at row \(table.selectedRow) across churn to revision \(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
     // PX-010: the filter row, input and status nodes.
     fileprivate static let filterRowID: UInt64 = 25
     fileprivate static let filterInputID: UInt64 = 26

@@ -1,6 +1,6 @@
 //! Existing sessiond runtime/SSH bridge host for the PX-001 shell (§§12, 20, 27, 29).
 use srui_process_explorer::{
-    initialize, install_sort_handlers,
+    initialize, install_filter_handlers, install_sort_handlers,
     procfs::ProcFsSource,
     refresh::{poll, DEFAULT_REFRESH_INTERVAL, MAX_REFRESH_INTERVAL, MIN_REFRESH_INTERVAL},
     source::{FakeProcessSource, ProcessSource, ScriptedFakeSource},
@@ -45,6 +45,7 @@ where
     // so a ready instance always answers a click.
     let view = Arc::new(Mutex::new(view));
     install_sort_handlers(session, &view);
+    install_filter_handlers(session, &view);
     let session = Arc::clone(session);
     let shutdown = shutdown.child_token();
     connections.spawn(poll(view, source, session, interval, shutdown));

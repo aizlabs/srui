@@ -5,6 +5,7 @@
 //! reorder the published rows and touch no process.
 
 pub mod catalogue;
+pub mod filter;
 pub mod metric;
 pub mod on_demand;
 pub mod procfs;
@@ -22,6 +23,18 @@ pub const COLUMN: NodeId = NodeId::new(2);
 pub const HEADING: NodeId = NodeId::new(3);
 pub const STATUS: NodeId = NodeId::new(4);
 pub const TABLE: NodeId = NodeId::new(5);
+/// The filter controls' row, between the system summary and the sort controls (PX-010).
+pub const FILTER_ROW: NodeId = NodeId::new(25);
+/// The native filter text field (PX-010).
+pub const FILTER_INPUT: NodeId = NodeId::new(26);
+/// The filter pending/committed status caption (PX-010).
+pub const FILTER_STATUS: NodeId = NodeId::new(27);
+pub const FILTER_LABEL: &str = "Filter processes";
+pub const FILTER_PLACEHOLDER: &str = "Filter by name or command (| for OR)";
+pub const FILTER_DESCRIPTION: &str =
+    "Filters visible table rows on the server by process name or available command text. Separate OR terms with |.";
+pub const UNCOLLECTED_FILTER_STATUS: &str = "Filter disabled: process collection not started";
+pub const FILTER_NODE_COUNT: usize = 3;
 /// The sort controls' row, between the system summary and the table (PX-009).
 pub const SORT_ROW: NodeId = NodeId::new(20);
 /// One sort button per catalogued column, in column order.
@@ -41,9 +54,11 @@ pub const TITLE: &str = "Process Explorer";
 pub const FIXTURE_TITLE: &str = "Process Explorer — title fixture";
 pub const STATUS_TEXT: &str = "Read-only · Process collection not started";
 /// Every node of the shell: the five above, the fourteen of the system summary
-/// (PX-007), which sits between the status line and the sort controls, and the
-/// sort row with its four buttons (PX-009). Rows are model items, never nodes.
-pub const SHELL_NODE_COUNT: usize = 5 + summary::NODE_COUNT + 1 + SORT_BUTTONS.len();
+/// (PX-007), which sits between the status line and the filter controls, the three
+/// of the filter bar (PX-010), and the sort row with its four buttons (PX-009).
+/// Rows are model items, never nodes.
+pub const SHELL_NODE_COUNT: usize =
+    5 + summary::NODE_COUNT + FILTER_NODE_COUNT + 1 + SORT_BUTTONS.len();
 
 /// The sort button that orders `field`.
 pub fn sort_button_of(field: catalogue::ProcessField) -> NodeId {
@@ -82,6 +97,19 @@ pub fn install_sort_handlers(session: &Session, view: &refresh::SharedView) {
     session.on(SORT_CPU, ACTIVATE, move |session, _| {
         sort_clicked(&cpu, session, catalogue::ProcessField::Cpu);
     });
+}
+
+/// Installs the filter input's `TEXT_EDIT` handler (§7.6, §22.6, PX-010).
+pub fn install_filter_handlers(session: &Session, view: &refresh::SharedView) {
+    let view = std::sync::Arc::clone(view);
+    session.on(FILTER_INPUT, TEXT_EDIT, move |session, event| {
+        refresh::filter_edited(&view, session, event);
+    });
+}
+
+/// Alias for [`install_filter_handlers`].
+pub fn register_filter_handlers(session: &Session, view: &refresh::SharedView) {
+    install_filter_handlers(session, view);
 }
 
 /// One click on `field`'s sort button.
@@ -334,11 +362,45 @@ pub(crate) fn initialize_rows(
             .role(TextRole::Status)
             .create(ui)?;
         ui.set(STATUS, READ_ONLY, true)?;
-        // The system summary, between the status line and the sort controls:
+        // The system summary, between the status line and the filter controls:
         // standard Text and Progress nodes only (PX-007).
         for operation in summary::create_operations(summary) {
             ui.apply_op(&operation)?;
         }
+        // The filter controls: standard TextInput and Text caption in a Row,
+        // between the system summary and the sort controls (PX-010).
+        Row::builder(FILTER_ROW)
+            .parent(COLUMN)
+            .spacing_role(SpacingRole::Normal)
+            .create(ui)?;
+        TextInput::builder(FILTER_INPUT)
+            .parent(FILTER_ROW)
+            .label(FILTER_LABEL)
+            .placeholder(FILTER_PLACEHOLDER)
+            .value("")
+            .role(InputRole::Search)
+            .accessible_description(FILTER_DESCRIPTION)
+            .create(ui)?;
+        ui.set(FILTER_INPUT, ENABLED, sort_enabled)?;
+        let initial_filter_status = if sort_enabled {
+            let shown = items.len();
+            if shown == 0 {
+                "Filter: none · 0 rows".to_string()
+            } else {
+                format!("Filter: none · showing all {shown} rows")
+            }
+        } else {
+            UNCOLLECTED_FILTER_STATUS.to_string()
+        };
+        Text::builder(FILTER_STATUS)
+            .parent(FILTER_ROW)
+            .text(initial_filter_status)
+            .role(if sort_enabled {
+                TextRole::Status
+            } else {
+                TextRole::Caption
+            })
+            .create(ui)?;
         // The sort controls: standard Buttons in a Row, one per catalogued
         // column, whose labels state the active order and whose activation is
         // the only client input this app handles (PX-009).
@@ -510,14 +572,29 @@ mod tests {
         assert_eq!(session.current_revision(), 1);
         session.with_store(|store| {
             // The five shell nodes, the fourteen of the system summary
-            // (PX-007) and the sort row with its four buttons (PX-009).
-            assert_eq!(store.node_count(), 24);
-            assert_eq!(SHELL_NODE_COUNT, 24);
+            // (PX-007), the three of the filter bar (PX-010) and the sort row
+            // with its four buttons (PX-009).
+            assert_eq!(store.node_count(), 27);
+            assert_eq!(SHELL_NODE_COUNT, 27);
             assert_eq!(store.root_ids(), &[SURFACE]);
             assert_eq!(store.children_of(SURFACE), Some([COLUMN].as_slice()));
             assert_eq!(
                 store.children_of(COLUMN),
-                Some([HEADING, STATUS, summary::SUMMARY, SORT_ROW, TABLE].as_slice())
+                Some(
+                    [
+                        HEADING,
+                        STATUS,
+                        summary::SUMMARY,
+                        FILTER_ROW,
+                        SORT_ROW,
+                        TABLE
+                    ]
+                    .as_slice()
+                )
+            );
+            assert_eq!(
+                store.children_of(FILTER_ROW),
+                Some([FILTER_INPUT, FILTER_STATUS].as_slice())
             );
             assert_eq!(
                 store.children_of(SORT_ROW),
@@ -555,6 +632,9 @@ mod tests {
                 (COLUMN, TypeRef::COLUMN),
                 (HEADING, TypeRef::TEXT),
                 (STATUS, TypeRef::TEXT),
+                (FILTER_ROW, TypeRef::ROW),
+                (FILTER_INPUT, TypeRef::TEXT_INPUT),
+                (FILTER_STATUS, TypeRef::TEXT),
                 (SORT_ROW, TypeRef::ROW),
                 (SORT_PID, TypeRef::BUTTON),
                 (SORT_NAME, TypeRef::BUTTON),
@@ -569,6 +649,25 @@ mod tests {
                 assert!(!node.has_property(ACTIONS));
                 assert!(!node.has_property(ACTION_KEY));
             }
+            // The filter controls of a shell that samples nothing are disabled:
+            let filter_input = store.get_node(FILTER_INPUT).unwrap();
+            assert_eq!(
+                filter_input.get_property(LABEL),
+                Some(&Value::String(FILTER_LABEL.into()))
+            );
+            assert_eq!(
+                filter_input.get_property(PLACEHOLDER),
+                Some(&Value::String(FILTER_PLACEHOLDER.into()))
+            );
+            assert_eq!(
+                filter_input.get_property(ENABLED),
+                Some(&Value::Bool(false))
+            );
+            let filter_status = store.get_node(FILTER_STATUS).unwrap();
+            assert_eq!(
+                filter_status.get_property(TEXT),
+                Some(&Value::String(UNCOLLECTED_FILTER_STATUS.into()))
+            );
             // The sort buttons of a shell that samples nothing are disabled:
             // there is no collection for them to order, and a disabled control
             // is refused by event validation rather than merely discouraged.
@@ -648,7 +747,17 @@ mod tests {
             );
             assert_eq!(
                 store.children_of(COLUMN),
-                Some([HEADING, STATUS, summary::SUMMARY, SORT_ROW, TABLE].as_slice())
+                Some(
+                    [
+                        HEADING,
+                        STATUS,
+                        summary::SUMMARY,
+                        FILTER_ROW,
+                        SORT_ROW,
+                        TABLE
+                    ]
+                    .as_slice()
+                )
             );
             assert_eq!(store.get_model(MODEL).unwrap().item_count, 0);
         });

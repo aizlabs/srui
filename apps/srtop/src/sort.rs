@@ -299,6 +299,7 @@ mod tests {
             key,
             item_id: srui_sdk::ItemId::new(id),
             value: srui_sdk::Value::UnsignedInt(id),
+            display_name: record.display_name,
         }
     }
 

@@ -494,6 +494,114 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
+    /// PX-010: the filter input is a standard native NSTextField; editing it sends `TEXT_EDIT`,
+    /// the server filters its own rows and updates the filter status line, and the generic client
+    /// shows the filtered rows in the same native table with the selection still on the same process,
+    /// because the rows keep their item IDs server-side and the client anchors its selection to them.
+    @Test(.timeLimit(.minutes(1)))
+    @MainActor
+    func filterInputFiltersTheNativeTableAndPreservesSelection() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-source"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        renderer.textEditingSession.debounceNanoseconds = 0
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer over SSH with filter controls") {
+            applier.lastAppliedRevision == Revision(1)
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(Self.filterInputID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
+        let scroll = try #require(tableHandle.view as? NSScrollView)
+        let table = try #require(scroll.documentView as? NSTableView)
+        let filterHandle = try #require(renderer.registry.handle(for: NodeId(Self.filterInputID)))
+        let filterField = try #require(filterHandle.view as? NSTextField)
+        let filterAdapter = try #require(filterHandle.textAdapter)
+        let statusHandle = try #require(renderer.registry.handle(for: NodeId(Self.filterStatusID)))
+        let statusField = try #require(statusHandle.view as? NSTextField)
+
+        #expect(filterField.isEditable)
+        #expect(filterField.placeholderString == "Filter by name or command (| for OR)")
+        #expect(filterField.stringValue == "")
+        #expect(statusField.stringValue == "Filter: none · showing all 3 rows")
+        #expect(Self.nativeRows(table) == Self.fakeRows)
+        let identities = Self.modelItemIDs(applier)
+        #expect(identities.count == 3)
+
+        // Select helper natively (row 2).
+        table.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
+        let selected = identities[2]
+        let helperRow = Self.fakeRows[2]
+
+        // Filter for "helper": matches only helper, moving it from index 2 to index 0.
+        filterField.stringValue = "helper"
+        filterAdapter.notifyTextDidChangeForTests()
+        filterAdapter.notifyEndEditingForTests()
+
+        let byHelper = [helperRow]
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "filter by helper") {
+            Self.nativeRows(table) == byHelper && statusField.stringValue.contains("\"helper\" · 1 of 3 rows matched")
+        }
+        #expect(Self.modelRows(applier) == byHelper)
+        #expect(Self.modelItemIDs(applier) == [selected])
+        // The selection followed helper from row 2 to row 0!
+        #expect(table.selectedRowIndexes == IndexSet(integer: 0))
+        #expect(table.selectedRow == 0)
+        #expect(Self.nativeRows(table)[0] == helperRow)
+
+        // Clear filter: all rows return and helper is back at row 2 with selection intact.
+        filterField.stringValue = ""
+        filterAdapter.notifyTextDidChangeForTests()
+        filterAdapter.notifyEndEditingForTests()
+
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "cleared filter") {
+            Self.nativeRows(table) == Self.fakeRows && statusField.stringValue.contains("showing all 3 rows")
+        }
+        #expect(Self.modelItemIDs(applier) == identities)
+        #expect(table.selectedRowIndexes == IndexSet(integer: 2))
+        #expect(table.selectedRow == 2)
+        #expect(Self.nativeRows(table)[2] == helperRow)
+
+        // Filter for "worker": matches both worker processes (rows 0 and 1). Helper is filtered out.
+        filterField.stringValue = "worker"
+        filterAdapter.notifyTextDidChangeForTests()
+        filterAdapter.notifyEndEditingForTests()
+
+        let byWorker = [Self.fakeRows[0], Self.fakeRows[1]]
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "filter by worker") {
+            Self.nativeRows(table) == byWorker && statusField.stringValue.contains("\"worker\" · 2 of 3 rows matched")
+        }
+        #expect(Self.modelRows(applier) == byWorker)
+        #expect(Self.modelItemIDs(applier) == [identities[0], identities[1]])
+
+        // Clear filter again: ItemIds remain completely stable.
+        filterField.stringValue = ""
+        filterAdapter.notifyTextDidChangeForTests()
+        filterAdapter.notifyEndEditingForTests()
+
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "cleared filter again") {
+            Self.nativeRows(table) == Self.fakeRows && statusField.stringValue.contains("showing all 3 rows")
+        }
+        #expect(Self.modelItemIDs(applier) == identities)
+
+        // Native handles were built once and kept throughout filtering.
+        #expect(renderer.registry.handle(for: NodeId(5)) === tableHandle)
+        #expect(renderer.registry.handle(for: NodeId(Self.filterInputID)) === filterHandle)
+        #expect(renderer.registry.handle(for: NodeId(Self.filterStatusID)) === statusHandle)
+
+        print("PX-010 native SSH evidence: window \(window.windowNumber); filterField=\(filterField.stringValue); status=\(statusField.stringValue); rows=\(Self.nativeRows(table)); itemIDs=\(Self.modelItemIDs(applier)); selected item \(selected) at row \(table.selectedRow); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
+    // PX-010: the filter row, input and status nodes.
+    fileprivate static let filterRowID: UInt64 = 25
+    fileprivate static let filterInputID: UInt64 = 26
+    fileprivate static let filterStatusID: UInt64 = 27
+
     // PX-009: the sort row's four buttons, in column order.
     fileprivate static let sortButtonIDs: [UInt64] = [21, 22, 23, 24]
     private static let fakeRows = [

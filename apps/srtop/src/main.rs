@@ -3,7 +3,7 @@ use srui_process_explorer::{
     initialize, install_filter_handlers, install_sort_handlers,
     procfs::ProcFsSource,
     refresh::{poll, DEFAULT_REFRESH_INTERVAL, MAX_REFRESH_INTERVAL, MIN_REFRESH_INTERVAL},
-    source::{FakeProcessSource, ProcessSource, ScriptedFakeSource},
+    source::{FakeProcessSource, ProcessSource, ScriptedFakeSource, SyntheticProcessSource},
     start_from_source, update_title, FIXTURE_TITLE,
 };
 use srui_sessiond::{handle_connection, Session};
@@ -26,6 +26,7 @@ enum Collection {
     Fake,
     Sequence,
     Live,
+    Scale(usize),
 }
 
 /// Publishes the first snapshot and starts the refresh loop for one source.
@@ -57,7 +58,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--socket")) {
         return Err("usage: srtop --socket PATH [--smoke-fixture] \
-             [--fake-source | --fake-sequence | --live-source] [--refresh-interval-ms MS]"
+             [--fake-source | --fake-sequence | --live-source | --procfs | --scale-source COUNT] \
+             [--refresh-interval-ms MS | --scale-interval-ms MS]"
             .into());
     }
     let socket_path = PathBuf::from(args.next().ok_or("missing --socket PATH")?);
@@ -68,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(value) = args.next() {
         let select = |current: &mut Collection, chosen| {
             if *current != Collection::None {
-                return Err("choose one of --fake-source, --fake-sequence or --live-source");
+                return Err("choose one of --fake-source, --fake-sequence, --live-source (or --procfs) or --scale-source");
             }
             *current = chosen;
             Ok(())
@@ -77,8 +79,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some("--smoke-fixture") if !fixture => fixture = true,
             Some("--fake-source") => select(&mut collection, Collection::Fake)?,
             Some("--fake-sequence") => select(&mut collection, Collection::Sequence)?,
-            Some("--live-source") => select(&mut collection, Collection::Live)?,
-            Some("--refresh-interval-ms") if interval.is_none() => {
+            Some("--live-source") | Some("--procfs") => select(&mut collection, Collection::Live)?,
+            Some("--scale-source") => {
+                let count: usize = args
+                    .next()
+                    .ok_or("missing --scale-source COUNT")?
+                    .to_str()
+                    .ok_or("--scale-source COUNT must be a number")?
+                    .parse()
+                    .map_err(|_| "--scale-source COUNT must be a number")?;
+                select(&mut collection, Collection::Scale(count))?;
+            }
+            Some("--refresh-interval-ms") | Some("--scale-interval-ms") if interval.is_none() => {
                 let milliseconds: u64 = args
                     .next()
                     .ok_or("missing --refresh-interval-ms MS")?
@@ -138,6 +150,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Collection::Live => collect(
             &session,
             ProcFsSource::live(),
+            interval,
+            &shutdown,
+            &mut connections,
+        ),
+        Collection::Scale(count) => collect(
+            &session,
+            SyntheticProcessSource::new(count),
             interval,
             &shutdown,
             &mut connections,

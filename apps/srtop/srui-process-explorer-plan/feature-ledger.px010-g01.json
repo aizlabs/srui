@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-010-G01",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Gate early live collection scale, progress, and resource budgets in SRUI Process Explorer; deterministic synthetic workload source, scale CLI options, throughput and transaction frame bounds, selection stability under churn, and architectural limit probing up to 100,000 rows without process control bypass",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX010G01-001",
+      "feature": "SyntheticProcessSource provides a deterministic, reproducible process collection seeded with 0x5CA1_AB1E_DEAD_BEEF, featuring Pareto power-law CPU% distribution, log-normal resident memory, realistic command lines across daemon, service, user, and ephemeral tiers, and distinct CreationToken::Opaque on every churn replacement so recycled PIDs never reuse cached client identities",
+      "scope": "PX-010-G01/SyntheticProcessSource in src/source.rs; PRNG, templates, distributions, and churn replacement",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-010-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-010-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX010G01-002",
+      "feature": "Command-line options --scale-source <COUNT> and --scale-interval-ms <MS> allow configurable scale testing in srtop; options are mutually exclusive with --fake-source and --procfs / --live-source, with bounds checking ensuring positive counts and intervals between 50 ms and 60,000 ms",
+      "scope": "PX-010-G01/CLI parsing and execution in src/main.rs",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-010-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-010-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX010G01-003",
+      "feature": "Scale qualification at 1,000 and 10,000 rows under continuous churn, sorting, and filtering: verifies throughput within a 3-second refresh budget, wire frames bounded by DEFAULT_MAX_FRAME_SIZE (16 MiB), no frame or operation coalescing of structural tree mutations, and constant UI node count plateau (27 nodes)",
+      "scope": "PX-010-G01/Integration test suite in tests/scale_test.rs (1k, 10k benchmarks, wire frame size, node plateau)",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-010-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-010-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX010G01-004",
+      "feature": "Architectural limit probing at 100,000 rows and stress testing of finite resource caps: verifies enforcement of MAX_PUBLISHED_ROWS ceiling (100,000), frame truncation, excess row eviction, concurrent telemetry model range progress, deterministic RTT envelope bounds [0, 100, 300, 600 ms], and stale filter generation rejection",
+      "scope": "PX-010-G01/tests/scale_test.rs probe 100k, finite caps, concurrent model_range telemetry, RTT envelopes, and stale filter rejection",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-010-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-010-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX010G01-005",
+      "feature": "Native macOS AppKit verification over real SSH: largeCollectionRendersNativelyAndPreservesSelectionUnderChurn confirms generic client NSTableView renders 1,000 rows natively over SSH with smooth layout, correct cell strings, and selection anchored to ItemId preserved across multi-cycle server churn",
+      "scope": "PX-010-G01/client-macos/Tests/SRUITests/ProcessExplorerShellTests.swift",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-010-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-010-G01.md"
+      ]
+    }
+  ]
+}

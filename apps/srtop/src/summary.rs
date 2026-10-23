@@ -175,6 +175,8 @@ pub enum State<'a> {
         error: Option<CollectorError>,
         /// The source the latest attempt read.
         source: &'a SourceId,
+        /// How many rows matched the active filter, or `None` when no filter is active.
+        filter_matches: Option<usize>,
     },
 }
 
@@ -254,10 +256,11 @@ pub fn summarize(state: &State<'_>) -> Summary {
             last,
             error,
             source,
+            filter_matches,
         } => {
             let freshness = freshness(last, error, source);
             match last {
-                Some(sample) => sampled(sample, freshness),
+                Some(sample) => sampled(sample, freshness, filter_matches),
                 None => unsampled(freshness),
             }
         }
@@ -282,7 +285,7 @@ fn unsampled(freshness: Line) -> Summary {
 }
 
 /// The summary of one successful sample.
-fn sampled(sample: &Sample, freshness: Line) -> Summary {
+fn sampled(sample: &Sample, freshness: Line, filter_matches: Option<usize>) -> Summary {
     let (cpu, cpu_bar) = cpu(&sample.system.cpu);
     let (memory, memory_bar) = memory(&sample.system.memory);
     let (swap, swap_bar) = swap(&sample.system.swap);
@@ -295,7 +298,7 @@ fn sampled(sample: &Sample, freshness: Line) -> Summary {
         swap_bar,
         load: load(&sample.system.load),
         uptime: uptime(&sample.system.uptime),
-        processes: processes(&sample.processes),
+        processes: processes(&sample.processes, filter_matches),
         freshness,
     }
 }
@@ -479,10 +482,14 @@ fn uptime(uptime: &Result<u64, FigureGap>) -> Line {
 /// The process count, in the status line's own counts and words, and scoped to
 /// what srtop can state: the processes this reader can see in the scanned root,
 /// which the PID namespace the mount was made for and the mount's visibility
-/// options (`hidepid`) bound without telling it, and no filter of srtop's own. A complete scan is
-/// complete over that view, never a claim about the whole host.
-fn processes(count: &ProcessCount) -> Line {
+/// options (`hidepid`) bound without telling it, and the active filter if one
+/// is set. A complete scan is complete over that view, never a claim about the
+/// whole host.
+fn processes(count: &ProcessCount, filter_matches: Option<usize>) -> Line {
     let mut text = format!("{}: {} listed", metric::PROCESS_COUNT.label, count.listed);
+    if let Some(matched) = filter_matches {
+        text.push_str(&format!(" · {matched} matching srtop filter"));
+    }
     if count.unreadable > 0 {
         text.push_str(&format!(" · {} unreadable", count.unreadable));
     }
@@ -494,8 +501,15 @@ fn processes(count: &ProcessCount) -> Line {
     } else {
         " · incomplete scan"
     });
-    text.push_str(" · no srtop filter");
+    if filter_matches.is_none() {
+        text.push_str(" · no srtop filter");
+    }
     Line::new(text, TextRole::Body)
+}
+
+/// Publishes the process visibility line for a given process count and filter matches.
+pub fn process_visibility_line(count: &ProcessCount, filter_matches: Option<usize>) -> Line {
+    processes(count, filter_matches)
 }
 
 /// The data-freshness line: when the figures on screen were sampled and from
@@ -684,7 +698,7 @@ pub fn changes(published: &Properties, target: &Properties) -> Vec<Change> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{FakeProcessSource, ScriptedFakeSource, SystemCpuInterval};
+    use crate::source::{FakeProcessSource, ProcessSource, ScriptedFakeSource, SystemCpuInterval};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     /// 2027-01-15 08:00:00 UTC, the fake sources' own sample time.
@@ -711,6 +725,7 @@ mod tests {
             last: Some(sample),
             error: None,
             source: &sample.source,
+            filter_matches: None,
         })
     }
 
@@ -1046,6 +1061,7 @@ mod tests {
                 last: Some(&last),
                 error: Some(error),
                 source: &last.source,
+                filter_matches: None,
             });
             assert_eq!(
                 failed.freshness.text,
@@ -1070,6 +1086,7 @@ mod tests {
             last: None,
             error: Some(CollectorError::ProcessList(MissingReason::Unavailable)),
             source: &source,
+            filter_matches: None,
         });
         assert_eq!(
             failed.freshness.text,
@@ -1122,12 +1139,15 @@ mod tests {
     #[test]
     fn the_process_count_names_its_scope_in_the_status_lines_words() {
         let count = |listed, unreadable, capped, complete| {
-            processes(&ProcessCount {
-                listed,
-                unreadable,
-                capped,
-                complete,
-            })
+            processes(
+                &ProcessCount {
+                    listed,
+                    unreadable,
+                    capped,
+                    complete,
+                },
+                None,
+            )
             .text
         };
         assert_eq!(
@@ -1163,6 +1183,32 @@ mod tests {
             assert!(line.ends_with(" · no srtop filter"), "{line}");
             assert!(!line.contains("unfiltered"), "{line}");
         }
+    }
+
+    #[test]
+    fn the_process_count_names_filter_match_count_when_a_filter_is_active() {
+        let snapshot = crate::source::FakeProcessSource.snapshot();
+        let sample = Sample::of(&snapshot).unwrap();
+        let active = summarize(&State::Collecting {
+            last: Some(&sample),
+            error: None,
+            source: &sample.source,
+            filter_matches: Some(1),
+        });
+        assert_eq!(
+            active.processes.text,
+            "Processes visible to this reader: 3 listed · 1 matching srtop filter · complete scan"
+        );
+        let none_matched = summarize(&State::Collecting {
+            last: Some(&sample),
+            error: None,
+            source: &sample.source,
+            filter_matches: Some(0),
+        });
+        assert_eq!(
+            none_matched.processes.text,
+            "Processes visible to this reader: 3 listed · 0 matching srtop filter · complete scan"
+        );
     }
 
     /// Every line and bar description fits its bound uncut, at its widest, so
@@ -1223,12 +1269,14 @@ mod tests {
                 last: None,
                 error,
                 source: &source,
+                filter_matches: None,
             }));
             for last in &samples {
                 summaries.push(summarize(&State::Collecting {
                     last: Some(last),
                     error,
                     source: &source,
+                    filter_matches: None,
                 }));
             }
         }

@@ -110,6 +110,8 @@ fn the_summary_is_published_as_text_and_progress_and_nothing_else() {
                     TypeRef::TABLE,
                     // The sort buttons beside the summary (PX-009).
                     TypeRef::BUTTON,
+                    // The command filter input (PX-010).
+                    TypeRef::TEXT_INPUT,
                 ]
                 .contains(&node.node_type),
                 "node {id} is a {:?}",

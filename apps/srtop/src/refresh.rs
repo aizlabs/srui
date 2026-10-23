@@ -86,16 +86,17 @@
 //! envelope the operations travel in, so payload is never mistaken for frame.
 
 use crate::catalogue::ProcessField;
+use crate::filter::{FilterGeneration, FilterQuery, PendingFilter};
 use crate::projection::{Row, SessionItemIds};
 use crate::sort::{self, SortOrder};
 use crate::source::{ProcessSnapshot, ProcessSource, Retention};
 use crate::summary::{self, CollectorError, Sample};
 use crate::{
-    bounded, initialize_rows, published_status_from, sort_button_of, ScanReport,
-    MAX_PUBLISHED_LABEL_BYTES, MODEL, STATUS,
+    bounded, initialize_rows, published_status_from, sort_button_of, ScanReport, FILTER_INPUT,
+    FILTER_STATUS, MAX_PUBLISHED_LABEL_BYTES, MODEL, STATUS,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
-use srui_sdk::{ItemId, NodeId, Operation, Value, LABEL, TEXT};
+use srui_sdk::{ItemId, NodeId, Operation, Value, LABEL, TEXT, VALUE};
 use srui_semantic_tree::{
     DEFAULT_MAX_CACHED_ITEMS_PER_MODEL, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
 };
@@ -217,6 +218,10 @@ const STATUS_RESERVE_BYTES: usize = MAX_PUBLISHED_LABEL_BYTES + MAX_STATUS_CLAUS
 /// the protocol's encoder.
 const SUMMARY_RESERVE_BYTES: usize = 8 * 1024;
 
+/// Bytes reserved for the command filter input and status in a catch-up snapshot (PX-010):
+/// one `TextInput` and one status `Text` with their properties and max query/status lengths.
+pub const FILTER_RESERVE_BYTES: usize = 2048;
+
 /// The most of a rejection reason the status quotes. The reason is this app's
 /// own error text, not a record's, and it is bounded all the same so that the
 /// status stays inside [`MAX_STATUS_CLAUSE_BYTES`] whatever a later error says.
@@ -307,8 +312,10 @@ impl Refreshed {
 /// allocator that owns the rows' item IDs.
 pub struct ProcessView {
     ids: SessionItemIds,
+    unfiltered_rows: Vec<Row>,
     rows: Vec<Row>,
     status: String,
+    filter_status: String,
     /// The summary's properties as the client holds them (PX-007).
     summary: summary::Properties,
     /// The last successful sample, which the summary shows until another
@@ -323,9 +330,27 @@ pub struct ProcessView {
     /// Every refresh publishes its target in this order, so a snapshot sampled
     /// before a newer request is still published in the newer order.
     sort: Option<SortOrder>,
+    /// The active committed filter query (PX-010).
+    committed_filter: FilterQuery,
+    /// Generation of the active committed filter query (PX-010).
+    committed_generation: FilterGeneration,
+    /// Counter allocating monotonic generations for staged queries (PX-010).
+    filter_generation: FilterGeneration,
+    /// Currently staged pending filter awaiting commit (PX-010).
+    pending_filter: Option<PendingFilter>,
 }
 
 impl ProcessView {
+    fn published(&mut self) -> Published<'_> {
+        Published {
+            rows: &mut self.rows,
+            status: &mut self.status,
+            summary: &mut self.summary,
+            sort: &mut self.sort,
+            filter_status: &mut self.filter_status,
+        }
+    }
+
     /// Publishes the shell and the first snapshot in one transaction, and keeps
     /// the state a later [`Self::refresh`] diffs against.
     pub fn start(
@@ -335,7 +360,7 @@ impl ProcessView {
         let source_status = source.status_text().to_string();
         let snapshot = source.snapshot();
         let mut ids = SessionItemIds::default();
-        let mut rows = ids.project(&snapshot)?;
+        let unfiltered_rows = ids.project(&snapshot)?;
         // Both bounds are this store's as well as the protocol's: a session
         // minted with a lower cached-item limit publishes fewer rows, never rows
         // its own store would refuse.
@@ -346,6 +371,7 @@ impl ProcessView {
         // later is brought up by one snapshot of this same model. The status is
         // charged its fixed reserve, never its current length, so the rows that
         // fit do not depend on what this tick's status happens to say.
+        let mut rows = unfiltered_rows.clone();
         let truncated = bound_to_publishable_collection(&mut rows, published_limit);
         let status = refresh_status(
             &source_status,
@@ -366,6 +392,7 @@ impl ProcessView {
             last: sample.as_ref(),
             error,
             source: &snapshot.source,
+            filter_matches: None,
         }));
         initialize_rows(
             session,
@@ -374,16 +401,30 @@ impl ProcessView {
             &summary,
             true,
         )?;
-        ids.retain(&rows);
+        ids.retain(&unfiltered_rows);
+        let committed_filter = FilterQuery::default();
+        let committed_generation = FilterGeneration::INITIAL;
+        let filter_status = committed_filter.format_committed_status(
+            committed_generation,
+            rows.len(),
+            unfiltered_rows.len(),
+            unfiltered_rows.len(),
+        );
         Ok((
             Self {
                 ids,
+                unfiltered_rows,
                 rows,
                 status,
+                filter_status,
                 summary,
                 sample,
                 published_limit,
                 sort: None,
+                committed_filter,
+                committed_generation,
+                filter_generation: FilterGeneration::INITIAL,
+                pending_filter: None,
             },
             snapshot,
         ))
@@ -442,38 +483,51 @@ impl ProcessView {
         } else {
             snapshot.retention()
         };
-        // The summary shows the last successful sample (PX-007): this scan, if
-        // its process list was read and accepted, and otherwise the one before
-        // it, marked with this scan's collector error.
-        let summary = self.summarize(snapshot, rejected.is_some());
-        // A scan that confirmed nothing and is entitled to delete nothing has no
-        // row work to do at all: the target *is* the published rows. It plans
-        // only its status and summary, so a failure whose text is the longest
-        // this app emits cannot cost a row — there is no row budget, no diff and
-        // no eviction on this path to cost one.
-        if confirmed.is_empty() && retention.is_global() {
-            return self.publish_status_only(session, source_status, snapshot, rejected, summary);
-        }
         let confirmed_ids: HashSet<ItemId> = confirmed.iter().map(|row| row.item_id).collect();
-        let mut target = retain_unconfirmed(&self.rows, confirmed, &retention);
+        let confirmed_empty = confirmed.is_empty();
+        let mut unfiltered_target =
+            retain_unconfirmed(&self.unfiltered_rows, confirmed, &retention);
         // Once a sort is active the target is published in it, confirmed and
         // retained rows alike: a retained row sorts under the values it was
         // published with, not last as though its values were missing. The order
         // is the view's at publication time, never the one in force when the
         // snapshot was sampled (PX-009).
         if let Some(order) = self.sort {
-            target.sort_by(|left, right| sort::compare(order, left, right));
+            unfiltered_target.sort_by(|left, right| sort::compare(order, left, right));
         }
         // Retention is bounded by construction, whatever a scan can and cannot
         // enumerate: the rows carried forward are evicted down to what the
         // published-row ceiling leaves once this scan's own rows are counted.
-        let evicted = evict_unconfirmed_beyond(&mut target, &confirmed_ids, self.published_limit);
+        let evicted =
+            evict_unconfirmed_beyond(&mut unfiltered_target, &confirmed_ids, self.published_limit);
+        let (target, matched, filter_truncated) = project_visible_rows(
+            &unfiltered_target,
+            &self.committed_filter,
+            self.published_limit,
+        );
+        let filter_matches = if self.committed_filter.is_empty() {
+            None
+        } else {
+            Some(matched)
+        };
+        // The summary shows the last successful sample (PX-007): this scan, if
+        // its process list was read and accepted, and otherwise the one before
+        // it, marked with this scan's collector error.
+        let summary = self.summarize(snapshot, rejected.is_some(), filter_matches);
+        // A scan that confirmed nothing and is entitled to delete nothing has no
+        // row work to do at all: the target *is* the published rows. It plans
+        // only its status and summary, so a failure whose text is the longest
+        // this app emits cannot cost a row — there is no row budget, no diff and
+        // no eviction on this path to cost one.
+        if confirmed_empty && retention.is_global() {
+            return self.publish_status_only(session, source_status, snapshot, rejected, summary);
+        }
         // A client receives the status and the rows in the same catch-up
         // snapshot, so the status is charged against the frame before the rows
         // are — at its fixed reserve, never at this tick's length, so no clause a
         // degraded scan adds can shrink the row budget and delete a row the scan
         // never said had ended.
-        let truncated = bound_to_publishable_collection(&mut target, self.published_limit);
+        let truncated = filter_truncated;
         let retained = target
             .iter()
             .filter(|row| !confirmed_ids.contains(&row.item_id))
@@ -489,6 +543,12 @@ impl ProcessView {
             },
         );
         debug_assert!(status.len() <= STATUS_RESERVE_BYTES);
+        let filter_status = self.committed_filter.format_committed_status(
+            self.committed_generation,
+            target.len(),
+            matched,
+            unfiltered_target.len(),
+        );
 
         let (batch, max_ops) = mutation_limits(session);
 
@@ -497,6 +557,9 @@ impl ProcessView {
             // First, so a scan that failed explains itself even if a later batch
             // of the same refresh does not commit.
             plan.push(Planned::new(Effect::Status(status)));
+        }
+        if filter_status != self.filter_status {
+            plan.push(Planned::new(Effect::FilterStatus(filter_status)));
         }
         // Then the summary, whose lines are scalar properties: only the ones a
         // client would see change are planned (PX-007).
@@ -532,7 +595,9 @@ impl ProcessView {
             // values may still have moved without a cell changing — bytes
             // inside one displayed unit — and are brought up to this sample.
             refresh_sort_values(&mut self.rows, &target);
-            self.ids.retain(&self.rows);
+            refresh_sort_values(&mut self.unfiltered_rows, &unfiltered_target);
+            self.unfiltered_rows = unfiltered_target;
+            self.ids.retain(&self.unfiltered_rows);
             return Ok(result);
         }
 
@@ -541,19 +606,16 @@ impl ProcessView {
             &plan,
             max_ops,
             MAX_TRANSACTION_PAYLOAD_BYTES,
-            &mut Published {
-                rows: &mut self.rows,
-                status: &mut self.status,
-                summary: &mut self.summary,
-                sort: &mut self.sort,
-            },
+            &mut self.published(),
         );
         result.transactions = transactions;
         // Order values never reach the wire, so every published row takes this
         // sample's whatever committed: a later click sorts by current values,
         // never by the ones a row was first published with.
         refresh_sort_values(&mut self.rows, &target);
-        self.ids.retain(&self.rows);
+        refresh_sort_values(&mut self.unfiltered_rows, &unfiltered_target);
+        self.unfiltered_rows = unfiltered_target;
+        self.ids.retain(&self.unfiltered_rows);
         outcome.map(|()| result)
     }
 
@@ -604,11 +666,16 @@ impl ProcessView {
             // A request for the order already published changes nothing a
             // client can see, so it opens no transaction, exactly as an
             // unchanged snapshot does.
-            self.ids.retain(&self.rows);
+            self.ids.retain(&self.unfiltered_rows);
             return Ok(Refreshed::default());
         }
-        let mut target = self.rows.clone();
-        target.sort_by(|left, right| sort::compare(order, left, right));
+        self.unfiltered_rows
+            .sort_by(|left, right| sort::compare(order, left, right));
+        let (target, _, _) = project_visible_rows(
+            &self.unfiltered_rows,
+            &self.committed_filter,
+            self.published_limit,
+        );
         let (batch, max_ops) = mutation_limits(session);
         let mut plan = Vec::new();
         if let Some(previous) = self.sort.filter(|previous| previous.field != order.field) {
@@ -642,15 +709,11 @@ impl ProcessView {
             &plan,
             max_ops,
             MAX_TRANSACTION_PAYLOAD_BYTES,
-            &mut Published {
-                rows: &mut self.rows,
-                status: &mut self.status,
-                summary: &mut self.summary,
-                sort: &mut self.sort,
-            },
+            &mut self.published(),
         );
         result.transactions = transactions;
-        self.ids.retain(&self.rows);
+        refresh_sort_values(&mut self.rows, &target);
+        self.ids.retain(&self.unfiltered_rows);
         outcome.map(|()| result)
     }
 
@@ -659,11 +722,29 @@ impl ProcessView {
         self.rows.iter().map(|row| row.item_id).collect()
     }
 
+    /// Re-evaluates the summary using the last sample and updated filter match count.
+    fn summarize_with_matches(&self, filter_matches: Option<usize>) -> summary::Properties {
+        match &self.sample {
+            Some(sample) => summary::properties(&summary::summarize(&summary::State::Collecting {
+                last: Some(sample),
+                error: None,
+                source: &sample.source,
+                filter_matches,
+            })),
+            None => summary::properties(&summary::summarize(&summary::State::NotStarted)),
+        }
+    }
+
     /// The summary this refresh publishes (PX-007): this scan's sample if it is
     /// one, and otherwise the last successful sample marked with this scan's
     /// collector error. A scan this app rejected is not a sample, whatever it
     /// read.
-    fn summarize(&mut self, snapshot: &ProcessSnapshot, rejected: bool) -> summary::Properties {
+    fn summarize(
+        &mut self,
+        snapshot: &ProcessSnapshot,
+        rejected: bool,
+        filter_matches: Option<usize>,
+    ) -> summary::Properties {
         let error = if rejected {
             Some(CollectorError::Rejected)
         } else {
@@ -679,6 +760,7 @@ impl ProcessView {
             last: self.sample.as_ref(),
             error,
             source: &snapshot.source,
+            filter_matches,
         }))
     }
 
@@ -722,7 +804,7 @@ impl ProcessView {
         result.summary = plan.len() - usize::from(result.status_changed);
         if plan.is_empty() {
             // An identical failure republishes nothing at all.
-            self.ids.retain(&self.rows);
+            self.ids.retain(&self.unfiltered_rows);
             return Ok(result);
         }
         let max_ops = session.with_store(|store| store.limits().max_transaction_operations.max(1));
@@ -731,15 +813,10 @@ impl ProcessView {
             &plan,
             max_ops,
             MAX_TRANSACTION_PAYLOAD_BYTES,
-            &mut Published {
-                rows: &mut self.rows,
-                status: &mut self.status,
-                summary: &mut self.summary,
-                sort: &mut self.sort,
-            },
+            &mut self.published(),
         );
         result.transactions = transactions;
-        self.ids.retain(&self.rows);
+        self.ids.retain(&self.unfiltered_rows);
         outcome.map(|()| result)
     }
 
@@ -751,6 +828,258 @@ impl ProcessView {
     /// Number of published rows.
     pub fn row_count(&self) -> usize {
         self.rows.len()
+    }
+
+    /// Stages a filter query change with a new monotonic generation (PX-010).
+    ///
+    /// Updates the filter status line to show that the new generation is pending,
+    /// while the table continues to show the currently committed results.
+    pub fn stage_filter(
+        &mut self,
+        session: &Session,
+        query: &str,
+    ) -> Result<FilterGeneration, SessionError> {
+        let next_gen = self.filter_generation.next();
+        self.filter_generation = next_gen;
+        let filter_query = FilterQuery::parse(query);
+        let pending = PendingFilter {
+            generation: next_gen,
+            query: filter_query,
+        };
+        let pending_status = pending.query.format_pending_status(
+            next_gen,
+            self.committed_generation,
+            self.rows.len(),
+            self.unfiltered_rows.len(),
+        );
+        self.pending_filter = Some(pending);
+
+        if pending_status != self.filter_status {
+            let plan = vec![Planned::new(Effect::FilterStatus(pending_status))];
+            let max_ops =
+                session.with_store(|store| store.limits().max_transaction_operations.max(1));
+            let (_, outcome) = commit(
+                session,
+                &plan,
+                max_ops,
+                MAX_TRANSACTION_PAYLOAD_BYTES,
+                &mut self.published(),
+            );
+            outcome?;
+        }
+        Ok(next_gen)
+    }
+
+    /// Commits a staged query generation (PX-010).
+    ///
+    /// Rejects stale or out-of-order generations so older query results cannot
+    /// replace the newest result set. When applied, filters visible rows from
+    /// `unfiltered_rows` preserving item identity and selection, updates the
+    /// system summary with matching counts, and publishes the committed filter status.
+    pub fn commit_filter(
+        &mut self,
+        session: &Session,
+        generation: FilterGeneration,
+    ) -> Result<Refreshed, SessionError> {
+        if generation < self.committed_generation {
+            return Ok(Refreshed::default());
+        }
+
+        let query = match &self.pending_filter {
+            Some(pending) if pending.generation == generation => {
+                let q = pending.query.clone();
+                self.pending_filter = None;
+                q
+            }
+            _ => {
+                if generation == self.committed_generation {
+                    return Ok(Refreshed::default());
+                }
+                return Ok(Refreshed::default());
+            }
+        };
+
+        self.committed_generation = generation;
+        self.committed_filter = query;
+
+        let (target, matched, _) = project_visible_rows(
+            &self.unfiltered_rows,
+            &self.committed_filter,
+            self.published_limit,
+        );
+
+        let filter_matches = if self.committed_filter.is_empty() {
+            None
+        } else {
+            Some(matched)
+        };
+        let summary = self.summarize_with_matches(filter_matches);
+
+        let new_filter_status = self.committed_filter.format_committed_status(
+            self.committed_generation,
+            target.len(),
+            matched,
+            self.unfiltered_rows.len(),
+        );
+
+        let (batch, max_ops) = mutation_limits(session);
+        let mut plan = Vec::new();
+
+        let current_input_val = session.with_store(|store| {
+            store
+                .get_node(FILTER_INPUT)
+                .and_then(|n| n.get_property(VALUE))
+                .and_then(Value::as_string)
+                .unwrap_or("")
+                .to_string()
+        });
+        if current_input_val != self.committed_filter.raw() {
+            plan.push(Planned::new(Effect::FilterValue(
+                self.committed_filter.raw().to_string(),
+            )));
+        }
+
+        if new_filter_status != self.filter_status {
+            plan.push(Planned::new(Effect::FilterStatus(new_filter_status)));
+        }
+        plan.extend(summary_effects(&self.summary, &summary));
+
+        let moved = plan_moves(
+            &self.rows,
+            &target,
+            batch,
+            max_ops,
+            MAX_TRANSACTION_PAYLOAD_BYTES,
+        );
+        plan.extend(moved.plan);
+        plan.extend(diff(
+            &moved.rows,
+            &target,
+            batch,
+            MAX_TRANSACTION_PAYLOAD_BYTES,
+        ));
+
+        let mut result = Refreshed::default();
+        count(&plan, &mut result);
+
+        if plan.is_empty() {
+            refresh_sort_values(&mut self.rows, &target);
+            self.ids.retain(&self.unfiltered_rows);
+            return Ok(result);
+        }
+
+        let (transactions, outcome) = commit(
+            session,
+            &plan,
+            max_ops,
+            MAX_TRANSACTION_PAYLOAD_BYTES,
+            &mut self.published(),
+        );
+        result.transactions = transactions;
+        refresh_sort_values(&mut self.rows, &target);
+        self.ids.retain(&self.unfiltered_rows);
+        outcome.map(|()| result)
+    }
+
+    /// Stages and commits a filter query (PX-010).
+    pub fn set_filter(
+        &mut self,
+        session: &Session,
+        query: &str,
+    ) -> Result<Refreshed, SessionError> {
+        let generation = self.stage_filter(session, query)?;
+        self.commit_filter(session, generation)
+    }
+
+    /// Handles a client `TEXT_EDIT` event on the filter input (PX-010).
+    pub fn handle_client_text_edit(
+        &mut self,
+        session: &Session,
+        text: &str,
+    ) -> Result<Refreshed, SessionError> {
+        self.set_filter(session, text)
+    }
+
+    /// The active committed filter query.
+    pub fn committed_filter(&self) -> &FilterQuery {
+        &self.committed_filter
+    }
+
+    /// Monotonic generation of the active committed filter query.
+    pub fn committed_generation(&self) -> FilterGeneration {
+        self.committed_generation
+    }
+
+    /// Currently allocated filter generation.
+    pub fn filter_generation(&self) -> FilterGeneration {
+        self.filter_generation
+    }
+
+    /// Pending staged filter, if any.
+    pub fn pending_filter(&self) -> Option<&PendingFilter> {
+        self.pending_filter.as_ref()
+    }
+
+    /// Current filter status text.
+    pub fn filter_status(&self) -> &str {
+        &self.filter_status
+    }
+
+    /// Count of unfiltered rows retained server-side.
+    pub fn unfiltered_row_count(&self) -> usize {
+        self.unfiltered_rows.len()
+    }
+
+    /// Unfiltered rows retained server-side.
+    #[allow(dead_code)]
+    pub(crate) fn unfiltered_rows(&self) -> &[Row] {
+        &self.unfiltered_rows
+    }
+}
+
+/// Filters `unfiltered` rows according to `filter`, preserving their active order,
+/// and bounds them to `limit`. Returns the matching visible rows, the total match count,
+/// and the count of truncated matching rows beyond `limit`.
+fn project_visible_rows(
+    unfiltered: &[Row],
+    filter: &FilterQuery,
+    limit: usize,
+) -> (Vec<Row>, usize, usize) {
+    let mut matching = Vec::new();
+    let mut total_matches = 0;
+    for row in unfiltered {
+        if filter.matches_row(row) {
+            total_matches += 1;
+            matching.push(row.clone());
+        }
+    }
+    let truncated = bound_to_publishable_collection(&mut matching, limit);
+    (matching, total_matches, truncated)
+}
+
+/// Dispatches a `TEXT_EDIT` event on the filter input to the shared view (PX-010).
+pub fn filter_edited(
+    view: &std::sync::Mutex<ProcessView>,
+    session: &Session,
+    event: &srui_protocol::Event,
+) {
+    let text = srui_semantic_tree::Event::try_from(event.clone())
+        .ok()
+        .and_then(|e| e.text_arg().map(|s| s.to_string()))
+        .unwrap_or_else(|| {
+            session
+                .with_store(|store| {
+                    store.get_node(crate::FILTER_INPUT).and_then(|node| {
+                        match node.properties.get(&srui_sdk::VALUE) {
+                            Some(srui_sdk::Value::String(s)) => Some(s.clone()),
+                            _ => None,
+                        }
+                    })
+                })
+                .unwrap_or_default()
+        });
+    if let Err(error) = lock_view(view).handle_client_text_edit(session, &text) {
+        eprintln!("srtop: filter not published: {error}");
     }
 }
 
@@ -779,6 +1108,7 @@ fn count(plan: &[Planned], result: &mut Refreshed) {
             Effect::Status(_) => result.status_changed = true,
             Effect::Summary(_) => result.summary += 1,
             Effect::SortLabel { .. } => result.controls += 1,
+            Effect::FilterStatus(_) | Effect::FilterValue(_) => result.controls += 1,
             Effect::Delete(_) if planned.moving => {}
             Effect::Insert(_, rows) if planned.moving => result.moved += rows.len(),
             Effect::Delete(ids) => result.deleted += ids.len(),
@@ -976,8 +1306,9 @@ fn rows_word(count: usize) -> &'static str {
 /// one frame in numbers a model may not cache. Both are applied here, where the
 /// rows are chosen.
 ///
-/// The status is charged [`STATUS_RESERVE_BYTES`] rather than its own length, and
-/// the system summary [`SUMMARY_RESERVE_BYTES`] rather than its own (PX-007), so
+/// The status is charged [`STATUS_RESERVE_BYTES`] rather than its own length,
+/// the system summary [`SUMMARY_RESERVE_BYTES`] rather than its own (PX-007), and
+/// the command filter controls [`FILTER_RESERVE_BYTES`] rather than their own (PX-010), so
 /// the rows that fit are a function of the rows alone. A status or summary that
 /// grew because a scan or a collector failed therefore cannot shrink the row
 /// budget and delete a row no scan said had ended.
@@ -989,8 +1320,9 @@ fn rows_word(count: usize) -> &'static str {
 /// last tick: no row churns in and out, and an identical tick still publishes
 /// nothing.
 fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
-    let budget = MAX_TRANSACTION_PAYLOAD_BYTES
-        .saturating_sub(SNAPSHOT_SHELL_BYTES + STATUS_RESERVE_BYTES + SUMMARY_RESERVE_BYTES);
+    let budget = MAX_TRANSACTION_PAYLOAD_BYTES.saturating_sub(
+        SNAPSHOT_SHELL_BYTES + STATUS_RESERVE_BYTES + SUMMARY_RESERVE_BYTES + FILTER_RESERVE_BYTES,
+    );
     let mut spent = 0usize;
     let mut kept = 0usize;
     for row in rows.iter() {
@@ -1136,6 +1468,10 @@ enum Effect {
         label: String,
         activates: Option<SortOrder>,
     },
+    /// The command filter status text set (PX-010).
+    FilterStatus(String),
+    /// The command filter text input value set (PX-010).
+    FilterValue(String),
     Delete(Vec<ItemId>),
     Insert(u64, Vec<Row>),
     Update(Vec<Row>),
@@ -1148,6 +1484,8 @@ struct Published<'a> {
     summary: &'a mut summary::Properties,
     /// The order the labels have announced (PX-009).
     sort: &'a mut Option<SortOrder>,
+    /// The filter status text announced (PX-010).
+    filter_status: &'a mut String,
 }
 
 /// The planned operations that turn the `published` summary into `target`:
@@ -1173,6 +1511,12 @@ impl Planned {
             },
             Effect::SortLabel { node, label, .. } => {
                 Operation::set_property(*node, LABEL, Value::String(label.clone()))
+            }
+            Effect::FilterStatus(text) => {
+                Operation::set_property(FILTER_STATUS, TEXT, Value::String(text.clone()))
+            }
+            Effect::FilterValue(val) => {
+                Operation::set_property(FILTER_INPUT, VALUE, Value::String(val.clone()))
             }
             Effect::Delete(ids) => Operation::model_delete_items(MODEL, ids.iter().copied()),
             Effect::Insert(index, rows) => {
@@ -1211,6 +1555,8 @@ impl Effect {
             // value at all.
             Self::Summary(change) => change.value.as_ref().map_or(0, value_wire_bytes),
             Self::SortLabel { label, .. } => VALUE_FRAMING_BYTES + label.len(),
+            Self::FilterStatus(text) => VALUE_FRAMING_BYTES + text.len(),
+            Self::FilterValue(val) => VALUE_FRAMING_BYTES + val.len(),
             Self::Delete(ids) => ids.len() * ITEM_ID_BYTES,
             Self::Insert(_, rows) | Self::Update(rows) => rows.iter().map(row_wire_bytes).sum(),
         }
@@ -1224,9 +1570,12 @@ impl Effect {
             status,
             summary,
             sort,
+            filter_status,
         } = published;
         match self {
             Self::Status(text) => status.clone_from(text),
+            Self::FilterStatus(text) => filter_status.clone_from(text),
+            Self::FilterValue(_) => {}
             Self::Summary(change) => {
                 let key = (change.node, change.property);
                 match &change.value {
@@ -1870,6 +2219,7 @@ mod tests {
                 };
                 Row {
                     sort: crate::sort::SortValues::of_record(&key, &record),
+                    display_name: name.clone(),
                     key,
                     item_id: ItemId::new(1_000 + index),
                     value: Value::List(vec![
@@ -1969,18 +2319,8 @@ mod tests {
         // byte bound can split this plan: three operations are far inside the
         // operation bound it is also given.
         let ceiling = plan[0].bytes + plan[1].bytes;
-        let (transactions, outcome) = commit(
-            &session,
-            &plan,
-            1_000,
-            ceiling,
-            &mut Published {
-                rows: &mut view.rows,
-                status: &mut view.status,
-                summary: &mut view.summary,
-                sort: &mut view.sort,
-            },
-        );
+        let (transactions, outcome) =
+            commit(&session, &plan, 1_000, ceiling, &mut view.published());
         assert!(outcome.is_ok());
         assert_eq!(transactions, 2, "three operations, two frames");
         assert_eq!(session.current_revision(), 3);
@@ -2314,7 +2654,10 @@ mod tests {
             }),
         };
         let budget = MAX_TRANSACTION_PAYLOAD_BYTES
-            - (SNAPSHOT_SHELL_BYTES + STATUS_RESERVE_BYTES + SUMMARY_RESERVE_BYTES);
+            - (SNAPSHOT_SHELL_BYTES
+                + STATUS_RESERVE_BYTES
+                + SUMMARY_RESERVE_BYTES
+                + FILTER_RESERVE_BYTES);
         let mut published = Vec::new();
         for system in [
             SystemSample::not_provided(),
@@ -2548,13 +2891,17 @@ mod tests {
                 <= SNAPSHOT_SHELL_BYTES
                     + STATUS_RESERVE_BYTES
                     + SUMMARY_RESERVE_BYTES
+                    + FILTER_RESERVE_BYTES
                     + TRANSACTION_ENVELOPE_BYTES,
             "a snapshot with no row is {frame} bytes, above the allowances the row budget \
              leaves for it"
         );
         println!(
             "PX-007 snapshot without rows: frame={frame} allowances={}",
-            SNAPSHOT_SHELL_BYTES + STATUS_RESERVE_BYTES + SUMMARY_RESERVE_BYTES
+            SNAPSHOT_SHELL_BYTES
+                + STATUS_RESERVE_BYTES
+                + SUMMARY_RESERVE_BYTES
+                + FILTER_RESERVE_BYTES
         );
     }
 
@@ -2649,6 +2996,7 @@ mod tests {
                 3 + offset,
                 vec![Row {
                     key: template.key.clone(),
+                    display_name: template.display_name.clone(),
                     item_id: ItemId::new(100 + offset),
                     value: Value::List(vec![
                         Value::UnsignedInt(9000 + offset),
@@ -2666,12 +3014,7 @@ mod tests {
             &plan,
             2,
             MAX_TRANSACTION_PAYLOAD_BYTES,
-            &mut Published {
-                rows: &mut view.rows,
-                status: &mut view.status,
-                summary: &mut view.summary,
-                sort: &mut view.sort,
-            },
+            &mut view.published(),
         );
         assert!(outcome.is_ok());
         assert_eq!(transactions, 2, "four operations, two per transaction");
@@ -2694,12 +3037,7 @@ mod tests {
             &plan,
             2,
             MAX_TRANSACTION_PAYLOAD_BYTES,
-            &mut Published {
-                rows: &mut view.rows,
-                status: &mut view.status,
-                summary: &mut view.summary,
-                sort: &mut view.sort,
-            },
+            &mut view.published(),
         );
         assert!(outcome.is_err(), "a duplicate item ID must be refused");
         assert_eq!(transactions, 1);
@@ -2882,12 +3220,7 @@ mod tests {
             &plan,
             4,
             MAX_TRANSACTION_PAYLOAD_BYTES,
-            &mut Published {
-                rows: &mut view.rows,
-                status: &mut view.status,
-                summary: &mut view.summary,
-                sort: &mut view.sort,
-            },
+            &mut view.published(),
         );
         assert!(outcome.is_ok());
         let committed = committed_moves(&session, revision);

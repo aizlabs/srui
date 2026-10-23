@@ -239,9 +239,62 @@ pub const REPLACEMENT: char = '\u{fffd}';
 /// Names are data: they are sanitized once here and never interpolated into a
 /// shell command, a format string or any evaluated content.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DisplayName(String);
+pub struct DisplayName {
+    name: String,
+    command: Option<String>,
+}
 
 impl DisplayName {
+    /// Creates a display name with no command text.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            command: None,
+        }
+    }
+
+    /// Attaches sanitized command text to this display name.
+    pub fn with_command(mut self, command: impl AsRef<[u8]>) -> Self {
+        self.command = Self::sanitize_command(command.as_ref());
+        self
+    }
+
+    /// Returns the attached sanitized command text, if any.
+    pub fn command_text(&self) -> Option<&str> {
+        self.command.as_deref()
+    }
+
+    /// Sanitizes command text bytes into an inert string, bounded to
+    /// [`crate::filter::MAX_COMMAND_TEXT_BYTES`].
+    pub fn sanitize_command(raw: &[u8]) -> Option<String> {
+        let decoded = String::from_utf8_lossy(raw);
+        let mut cmd = String::with_capacity(decoded.len());
+        let mut truncated = false;
+        let mut bytes_spent = 0;
+        for character in decoded.chars() {
+            let ch_len = character.len_utf8();
+            if bytes_spent + ch_len > crate::filter::MAX_COMMAND_TEXT_BYTES {
+                truncated = true;
+                break;
+            }
+            bytes_spent += ch_len;
+            cmd.push(match character {
+                _ if Self::is_space_separator(character) => ' ',
+                _ if Self::is_unsafe(character) => REPLACEMENT,
+                _ => character,
+            });
+        }
+        if truncated {
+            cmd.push('…');
+        }
+        let trimmed = cmd.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
     /// Accepts arbitrary OS bytes: invalid UTF-8 becomes U+FFFD, control, bidi
     /// and zero-width characters are replaced, surrounding whitespace is trimmed
     /// and the result is bounded. Interior spaces and parentheses are preserved
@@ -268,13 +321,16 @@ impl DisplayName {
             name.push('…');
         }
         let trimmed = name.trim();
-        if trimmed.is_empty() {
-            return Self(UNNAMED_PROCESS.to_string());
-        }
-        if trimmed.len() == name.len() {
-            Self(name)
+        let name_str = if trimmed.is_empty() {
+            UNNAMED_PROCESS.to_string()
+        } else if trimmed.len() == name.len() {
+            name
         } else {
-            Self(trimmed.to_string())
+            trimmed.to_string()
+        };
+        Self {
+            name: name_str,
+            command: None,
         }
     }
 
@@ -365,7 +421,7 @@ impl DisplayName {
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.name
     }
 }
 
@@ -397,6 +453,19 @@ pub struct ProcessRecord {
     /// instance ([`crate::metric::CPU_USAGE`]); per field like `resident`, and
     /// never a [`Completeness`] degradation.
     pub cpu: CpuUsage,
+}
+
+impl ProcessRecord {
+    /// Attaches sanitized command text to this record's display name.
+    pub fn with_command(mut self, command: impl AsRef<[u8]>) -> Self {
+        self.display_name = self.display_name.with_command(command);
+        self
+    }
+
+    /// Returns the attached sanitized command text, if any.
+    pub fn command_text(&self) -> Option<&str> {
+        self.display_name.command_text()
+    }
 }
 
 /// What part of the scan could not be observed.
@@ -824,7 +893,7 @@ impl ProcessSource for FakeProcessSource {
                 // multithreaded process using two and a half logical CPUs.
                 ProcessRecord {
                     key: Self::key("worker-a", Observed::Known(4101)),
-                    display_name: "worker".into(),
+                    display_name: DisplayName::from("worker").with_command(b"worker --role=worker"),
                     resident: Observed::Known(1_234_567),
                     cpu: CpuUsage::Measured(CpuInterval {
                         ticks: 250,
@@ -835,7 +904,7 @@ impl ProcessSource for FakeProcessSource {
                 // Known zeros, which must survive as zeros.
                 ProcessRecord {
                     key: Self::key("worker-b", Observed::Known(4102)),
-                    display_name: "worker".into(),
+                    display_name: DisplayName::from("worker").with_command(b"worker --role=worker"),
                     resident: Observed::Known(0),
                     cpu: CpuUsage::Measured(CpuInterval {
                         ticks: 0,
@@ -847,7 +916,7 @@ impl ProcessSource for FakeProcessSource {
                 // reasons: the states are per field, not per record.
                 ProcessRecord {
                     key: Self::key("helper", Observed::Missing(MissingReason::Unavailable)),
-                    display_name: "helper".into(),
+                    display_name: DisplayName::from("helper").with_command(b"helper --daemon"),
                     resident: Observed::Missing(MissingReason::Denied),
                     cpu: CpuUsage::WarmingUp,
                 },
@@ -1163,6 +1232,25 @@ mod tests {
         let long = DisplayName::sanitize(&b"n".repeat(MAX_DISPLAY_NAME_CHARS + 50));
         assert_eq!(long.as_str().chars().count(), MAX_DISPLAY_NAME_CHARS + 1);
         assert!(long.as_str().ends_with('…'));
+    }
+
+    #[test]
+    fn command_text_is_sanitized_and_bounded() {
+        let name = DisplayName::from("worker").with_command(b"/usr/bin/worker --arg=val\x1b[31m");
+        assert_eq!(name.as_str(), "worker");
+        assert_eq!(
+            name.command_text(),
+            Some("/usr/bin/worker --arg=val\u{fffd}[31m")
+        );
+
+        let empty = DisplayName::from("worker").with_command(b"    ");
+        assert_eq!(empty.command_text(), None);
+
+        let long_raw = "a".repeat(crate::filter::MAX_COMMAND_TEXT_BYTES + 50);
+        let bounded = DisplayName::from("worker").with_command(long_raw.as_bytes());
+        let cmd = bounded.command_text().unwrap();
+        assert!(cmd.ends_with('…'));
+        assert!(cmd.len() <= crate::filter::MAX_COMMAND_TEXT_BYTES + '…'.len_utf8());
     }
 
     #[test]

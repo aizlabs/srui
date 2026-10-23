@@ -3,7 +3,9 @@
 //! PX-005 and PX-006 metric cells, PX-042 catalogued columns).
 use crate::catalogue::PROCESS_LIST;
 use crate::sort::SortValues;
-use crate::source::{BootId, HostId, Observed, PidNamespaceId, ProcessKey, ProcessSnapshot};
+use crate::source::{
+    BootId, DisplayName, HostId, Observed, PidNamespaceId, ProcessKey, ProcessSnapshot,
+};
 use srui_sdk::{ItemId, Value};
 use srui_semantic_tree::ModelItem;
 use std::collections::{HashMap, HashSet};
@@ -25,6 +27,7 @@ pub(crate) struct Row {
     pub(crate) item_id: ItemId,
     pub(crate) value: Value,
     pub(crate) sort: SortValues,
+    pub(crate) display_name: DisplayName,
 }
 
 impl Row {
@@ -186,6 +189,7 @@ impl SessionItemIds {
                     item_id,
                     value: Value::List(cells),
                     sort,
+                    display_name: record.display_name.clone(),
                 })
             })
             .collect()

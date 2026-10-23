@@ -6,7 +6,8 @@ use srui_process_explorer::refresh::{refresh_status, RefreshCounts};
 use srui_process_explorer::source::*;
 use srui_process_explorer::summary::{FRESHNESS_TEXT, LAYOUT, SUMMARY};
 use srui_process_explorer::{
-    start_from_source, COLUMN, HEADING, MODEL, SHELL_NODE_COUNT, SORT_ROW, STATUS, SURFACE, TABLE,
+    start_from_source, COLUMN, FILTER_ROW, FILTER_STATUS, HEADING, MODEL, SHELL_NODE_COUNT,
+    SORT_ROW, STATUS, SURFACE, TABLE,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
 use srui_sdk::{EnumToken, ItemId, NodeId, Operation, TextRole, Value, ROLE, TEXT};
@@ -92,7 +93,9 @@ fn is_scalar_shell_property(op: &Operation) -> bool {
     let summary = |id: &NodeId| LAYOUT.iter().any(|(node, _, _)| node == id);
     match op {
         Operation::SetProperty { id, property, .. } => {
-            (*id == STATUS && *property == TEXT) || summary(id)
+            (*id == STATUS && *property == TEXT)
+                || (*id == FILTER_STATUS && *property == TEXT)
+                || summary(id)
         }
         Operation::ClearProperty { id, .. } => summary(id),
         _ => false,
@@ -108,7 +111,7 @@ fn assert_shell_intact(session: &Session) {
         assert_eq!(store.root_ids(), &[SURFACE]);
         assert_eq!(
             store.children_of(COLUMN),
-            Some([HEADING, STATUS, SUMMARY, SORT_ROW, TABLE].as_slice())
+            Some([HEADING, STATUS, SUMMARY, FILTER_ROW, SORT_ROW, TABLE].as_slice())
         );
         assert_eq!(store.children_of(TABLE), Some([].as_slice()));
         assert_eq!(store.get_node(TABLE).unwrap().model_ref(), Some(MODEL));

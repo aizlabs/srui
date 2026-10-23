@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-010",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Server-authoritative command and process-name filtering with a responsive native TextInput, two-phase staging and committing with monotonic generations, pending and committed status indications, and item-identity preservation across filtering cycles; no process action, no regex/shell execution, no protocol or client change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX010-001",
+      "feature": "A native TextInput filters the process list by process name and available command text on the server; queries match case-insensitively using Unicode case folding; multiple search terms are separated by `|` (OR logic); non-ASCII whitespace and control characters are sanitized to inert spaces; the query is capped at 512 bytes and at most 16 non-empty OR terms are evaluated; no regex backtracking or shell execution is possible",
+      "scope": "PX-010/filter grammar and evaluator (src/filter.rs); query sanitization, 512-byte cap, 16-term cap, Unicode folding, OR terms, and command line arg matching",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-010",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-010.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX010-002",
+      "feature": "Two-phase filter staging and committing with monotonic generations (FilterGeneration): local typing remains immediate; editing stages the query and updates the filter status to show the pending query; when committed, the filter status displays committed counts; out-of-order generations from stale asynchronous processing or delayed events are rejected, so older query results never replace newer ones",
+      "scope": "PX-010/refresh loop (src/refresh.rs) filter staging, committing, generation check, and status formatting",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-010",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-010.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX010-003",
+      "feature": "Filtering preserves process identity (ItemId): unfiltered rows are retained server-side in ProcessView; rows filtered out and restored when clearing or broadening the query keep their exact ItemIds, and the generic client's native table selection anchors to ItemId and follows matching processes as they move",
+      "scope": "PX-010/ProcessView.unfiltered_rows and native table selection over real SSH in ProcessExplorerShellTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-010",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-010.md"
+      ]
+    }
+  ]
+}

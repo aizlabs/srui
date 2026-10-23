@@ -631,15 +631,17 @@ fn scan(level: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
                 match name.as_str() {
                     // `x.on(..)` and `Session::on(&session, ..)`: a client event
                     // handler. The sort controls' four ACTIVATE registrations
-                    // are the one allowance (PX-009): the first argument must
-                    // be a sort-button node constant by name and the second
-                    // `ACTIVATE`, so a handler on any other node, under any
-                    // other event type, or through a computed argument stays
-                    // refused exactly as before.
+                    // (PX-009) and the filter input's TEXT_EDIT registration
+                    // (PX-010) are the allowances: the first argument must
+                    // be a sort-button node constant with `ACTIVATE`, or
+                    // `FILTER_INPUT` with `TEXT_EDIT`, so a handler on any
+                    // other node, under any other event type, or through a
+                    // computed argument stays refused exactly as before.
                     "on" if is_punct(prev, '.') || is_path_sep(prev) => {
                         let allowed = match next {
                             Some(Tok::Group(Delimiter::Parenthesis, tokens, _)) => {
                                 is_sort_button_activation(tokens)
+                                    || is_filter_input_text_edit(tokens)
                             }
                             _ => false,
                         };
@@ -764,6 +766,31 @@ fn is_sort_button_activation(tokens: &[Tok]) -> bool {
     let event = bare(arguments.get(1));
     matches!(node.as_deref(), Some(name) if SORT_BUTTON_CONSTANTS.contains(&name))
         && event.as_deref() == Some("ACTIVATE")
+}
+
+/// Whether an `on(..)` argument list is the filter input's `TEXT_EDIT`
+/// registration: the first argument exactly `FILTER_INPUT`, the second
+/// exactly `TEXT_EDIT` (PX-010).
+fn is_filter_input_text_edit(tokens: &[Tok]) -> bool {
+    let mut arguments: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    for token in tokens {
+        match token {
+            Tok::Punct(',', _) => arguments.push(std::mem::take(&mut current)),
+            Tok::Ident(name, _, _) => current.push(name.clone()),
+            _ => current.push('\u{0}'.to_string()),
+        }
+    }
+    arguments.push(current);
+    let bare = |argument: Option<&Vec<String>>| -> Option<String> {
+        match argument?.as_slice() {
+            [only] if !only.is_empty() => Some(only.clone()),
+            _ => None,
+        }
+    };
+    let node = bare(arguments.first());
+    let event = bare(arguments.get(1));
+    node.as_deref() == Some("FILTER_INPUT") && event.as_deref() == Some("TEXT_EDIT")
 }
 
 /// Every violation in the production tokens of one source file.
@@ -1388,6 +1415,16 @@ fn the_source_audit_reports_every_known_bypass() {
             "handler",
         ),
         (
+            "a filter input under another event",
+            "session.on(FILTER_INPUT, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a computed filter handler target",
+            "session.on(inputs[i], TEXT_EDIT, |_, _| {});",
+            "handler",
+        ),
+        (
             "a computed sort handler target",
             "session.on(buttons[i], ACTIVATE, |_, _| {});",
             "handler",
@@ -1440,6 +1477,8 @@ fn the_source_audit_reports_every_known_bypass() {
         "session.on(SORT_NAME, ACTIVATE, move |session, _| { sort_clicked(&name, session, ProcessField::Name); });",
         "session.on(SORT_RESIDENT, ACTIVATE, move |session, _| { sort_clicked(&resident, session, ProcessField::Resident); });",
         "session.on(SORT_CPU, ACTIVATE, move |session, _| { sort_clicked(&cpu, session, ProcessField::Cpu); });",
+        // the filter input's TEXT_EDIT registration (PX-010)
+        "session.on(FILTER_INPUT, TEXT_EDIT, move |session, event| { refresh::filter_edited(&view, session, event); });",
         "let kind = std::fs::symlink_metadata(&path)?;",
         "use std::fs::File;",
         "use std::os::unix::fs::MetadataExt;",

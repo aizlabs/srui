@@ -1,8 +1,10 @@
 //! Read-only Process Explorer shell using existing SRUI widgets and transactions
 //! (design §§6–8, 12, 22, 29; PX-001/PX-002/PX-003/PX-004, PX-007 system
-//! summary, PX-009 server-authoritative sorting). No process is ever opened for
-//! control: the only client-input handlers are the four sort buttons', which
-//! reorder the published rows and touch no process.
+//! summary, PX-009 server-authoritative sorting, PX-010 filtering, PX-068
+//! column chooser). No process is ever opened for control: the only
+//! client-input handlers are the sort buttons', the filter input's and the
+//! column chooser buttons', which reorder, filter or re-lay out the published
+//! rows and touch no process.
 
 pub mod catalogue;
 pub mod filter;
@@ -49,16 +51,115 @@ pub const SORT_BUTTONS: [(NodeId, catalogue::ProcessField); 4] = [
     (SORT_RESIDENT, catalogue::ProcessField::Resident),
     (SORT_CPU, catalogue::ProcessField::Cpu),
 ];
+/// The column chooser's row, between the sort controls and the table (PX-068).
+pub const COLUMN_CHOOSER_ROW: NodeId = NodeId::new(28);
+/// Per catalogued column, in column order: one button that hides or shows it,
+/// and two that move it one place earlier or later among the visible columns.
+pub const COLUMN_TOGGLE_PID: NodeId = NodeId::new(29);
+pub const COLUMN_EARLIER_PID: NodeId = NodeId::new(30);
+pub const COLUMN_LATER_PID: NodeId = NodeId::new(31);
+pub const COLUMN_TOGGLE_NAME: NodeId = NodeId::new(32);
+pub const COLUMN_EARLIER_NAME: NodeId = NodeId::new(33);
+pub const COLUMN_LATER_NAME: NodeId = NodeId::new(34);
+pub const COLUMN_TOGGLE_RESIDENT: NodeId = NodeId::new(35);
+pub const COLUMN_EARLIER_RESIDENT: NodeId = NodeId::new(36);
+pub const COLUMN_LATER_RESIDENT: NodeId = NodeId::new(37);
+pub const COLUMN_TOGGLE_CPU: NodeId = NodeId::new(38);
+pub const COLUMN_EARLIER_CPU: NodeId = NodeId::new(39);
+pub const COLUMN_LATER_CPU: NodeId = NodeId::new(40);
+/// The button that restores the default columns (PX-068).
+pub const COLUMNS_RESTORE: NodeId = NodeId::new(41);
+
+/// What one column chooser button does (PX-068). Each is resolved against the
+/// layout the server holds when the click is applied, never against anything
+/// the client supplied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnAction {
+    /// Hide the column when it is shown, show it when it is hidden.
+    Toggle(catalogue::ProcessField),
+    /// Swap the column with the visible column before it.
+    Earlier(catalogue::ProcessField),
+    /// Swap the column with the visible column after it.
+    Later(catalogue::ProcessField),
+    /// Bring back the catalogued default layout.
+    RestoreDefaults,
+}
+
+impl ColumnAction {
+    /// The layout this action turns `layout` into.
+    pub fn apply(self, layout: &catalogue::ColumnLayout) -> catalogue::ColumnLayout {
+        match self {
+            Self::Toggle(field) if layout.shows(field) => layout.hiding(field),
+            Self::Toggle(field) => layout.showing(field),
+            Self::Earlier(field) => layout.moving_earlier(field),
+            Self::Later(field) => layout.moving_later(field),
+            Self::RestoreDefaults => catalogue::ColumnLayout::default(),
+        }
+    }
+
+    /// The button's label under `layout`: what a click would do, naming the
+    /// column by its short name.
+    pub fn label(self, layout: &catalogue::ColumnLayout) -> String {
+        match self {
+            Self::Toggle(field) if layout.shows(field) => {
+                format!("Hide {} column", field.button_name())
+            }
+            Self::Toggle(field) => format!("Show {} column", field.button_name()),
+            Self::Earlier(field) => format!("Move {} column left", field.button_name()),
+            Self::Later(field) => format!("Move {} column right", field.button_name()),
+            Self::RestoreDefaults => "Restore default columns".to_string(),
+        }
+    }
+
+    /// Whether a click would change `layout`: a control that cannot is
+    /// disabled, so event validation refuses it (§7.4).
+    pub fn enabled(self, layout: &catalogue::ColumnLayout) -> bool {
+        match self {
+            Self::Toggle(field) => !layout.shows(field) || layout.can_hide(field),
+            Self::Earlier(field) => layout.can_move_earlier(field),
+            Self::Later(field) => layout.can_move_later(field),
+            Self::RestoreDefaults => !layout.is_default(),
+        }
+    }
+}
+
+/// Every column chooser button with what it does, in published order (PX-068).
+pub const COLUMN_CHOOSER_BUTTONS: [(NodeId, ColumnAction); 13] = {
+    use catalogue::ProcessField::*;
+    use ColumnAction::*;
+    [
+        (COLUMN_TOGGLE_PID, Toggle(Pid)),
+        (COLUMN_EARLIER_PID, Earlier(Pid)),
+        (COLUMN_LATER_PID, Later(Pid)),
+        (COLUMN_TOGGLE_NAME, Toggle(Name)),
+        (COLUMN_EARLIER_NAME, Earlier(Name)),
+        (COLUMN_LATER_NAME, Later(Name)),
+        (COLUMN_TOGGLE_RESIDENT, Toggle(Resident)),
+        (COLUMN_EARLIER_RESIDENT, Earlier(Resident)),
+        (COLUMN_LATER_RESIDENT, Later(Resident)),
+        (COLUMN_TOGGLE_CPU, Toggle(Cpu)),
+        (COLUMN_EARLIER_CPU, Earlier(Cpu)),
+        (COLUMN_LATER_CPU, Later(Cpu)),
+        (COLUMNS_RESTORE, RestoreDefaults),
+    ]
+};
+pub const COLUMN_CHOOSER_NODE_COUNT: usize = 1 + COLUMN_CHOOSER_BUTTONS.len();
+
 pub const MODEL: ModelId = ModelId::new(1);
 pub const TITLE: &str = "Process Explorer";
 pub const FIXTURE_TITLE: &str = "Process Explorer — title fixture";
 pub const STATUS_TEXT: &str = "Read-only · Process collection not started";
 /// Every node of the shell: the five above, the fourteen of the system summary
 /// (PX-007), which sits between the status line and the filter controls, the three
-/// of the filter bar (PX-010), and the sort row with its four buttons (PX-009).
-/// Rows are model items, never nodes.
-pub const SHELL_NODE_COUNT: usize =
-    5 + summary::NODE_COUNT + FILTER_NODE_COUNT + 1 + SORT_BUTTONS.len();
+/// of the filter bar (PX-010), the sort row with its four buttons (PX-009),
+/// and the column chooser's row with its buttons (PX-068). Rows are model
+/// items, never nodes.
+pub const SHELL_NODE_COUNT: usize = 5
+    + summary::NODE_COUNT
+    + FILTER_NODE_COUNT
+    + 1
+    + SORT_BUTTONS.len()
+    + COLUMN_CHOOSER_NODE_COUNT;
 
 /// The sort button that orders `field`.
 pub fn sort_button_of(field: catalogue::ProcessField) -> NodeId {
@@ -97,6 +198,52 @@ pub fn install_sort_handlers(session: &Session, view: &refresh::SharedView) {
     session.on(SORT_CPU, ACTIVATE, move |session, _| {
         sort_clicked(&cpu, session, catalogue::ProcessField::Cpu);
     });
+}
+
+/// Installs the column chooser buttons' `ACTIVATE` handlers (§7.6, PX-068).
+///
+/// Like a sort click, a chooser click is applied before the event is
+/// acknowledged, so the acknowledgement's revision already holds the new
+/// headings and cells. The action is the button's, fixed here; nothing the
+/// client sent is read, no process is touched, and the rows keep their item
+/// IDs, order and active sort.
+pub fn install_column_handlers(session: &Session, view: &refresh::SharedView) {
+    use catalogue::ProcessField::*;
+    use ColumnAction::*;
+    let handler = |action: ColumnAction| {
+        let view = std::sync::Arc::clone(view);
+        move |session: &Session, _: &srui_protocol::Event| column_clicked(&view, session, action)
+    };
+    session.on(COLUMN_TOGGLE_PID, ACTIVATE, handler(Toggle(Pid)));
+    session.on(COLUMN_EARLIER_PID, ACTIVATE, handler(Earlier(Pid)));
+    session.on(COLUMN_LATER_PID, ACTIVATE, handler(Later(Pid)));
+    session.on(COLUMN_TOGGLE_NAME, ACTIVATE, handler(Toggle(Name)));
+    session.on(COLUMN_EARLIER_NAME, ACTIVATE, handler(Earlier(Name)));
+    session.on(COLUMN_LATER_NAME, ACTIVATE, handler(Later(Name)));
+    session.on(COLUMN_TOGGLE_RESIDENT, ACTIVATE, handler(Toggle(Resident)));
+    session.on(
+        COLUMN_EARLIER_RESIDENT,
+        ACTIVATE,
+        handler(Earlier(Resident)),
+    );
+    session.on(COLUMN_LATER_RESIDENT, ACTIVATE, handler(Later(Resident)));
+    session.on(COLUMN_TOGGLE_CPU, ACTIVATE, handler(Toggle(Cpu)));
+    session.on(COLUMN_EARLIER_CPU, ACTIVATE, handler(Earlier(Cpu)));
+    session.on(COLUMN_LATER_CPU, ACTIVATE, handler(Later(Cpu)));
+    session.on(COLUMNS_RESTORE, ACTIVATE, handler(RestoreDefaults));
+}
+
+/// One click on a column chooser button.
+fn column_clicked(
+    view: &std::sync::Mutex<refresh::ProcessView>,
+    session: &Session,
+    action: ColumnAction,
+) {
+    if let Err(error) = refresh::lock_view(view).click_column(session, action) {
+        // As for a sort click: the view still holds what committed, and the
+        // next click applies against that.
+        eprintln!("srtop: column layout not published: {error}");
+    }
 }
 
 /// Installs the filter input's `TEXT_EDIT` handler (§7.6, §22.6, PX-010).
@@ -415,13 +562,29 @@ pub(crate) fn initialize_rows(
                 .create(ui)?;
             ui.set(button, ENABLED, sort_enabled)?;
         }
+        // The column chooser: standard Buttons in a Row, whose labels state
+        // what a click does to the default layout the table starts with
+        // (PX-068). Like the sort buttons, they are disabled while nothing is
+        // collected.
+        let layout = catalogue::ColumnLayout::default();
+        Row::builder(COLUMN_CHOOSER_ROW)
+            .parent(COLUMN)
+            .spacing_role(SpacingRole::Normal)
+            .create(ui)?;
+        for (button, action) in COLUMN_CHOOSER_BUTTONS {
+            Button::builder(button)
+                .parent(COLUMN_CHOOSER_ROW)
+                .label(action.label(&layout))
+                .create(ui)?;
+            ui.set(button, ENABLED, sort_enabled && action.enabled(&layout))?;
+        }
         Table::builder(TABLE)
             .parent(COLUMN)
             .model_ref(MODEL)
             // Headings come from the same catalogued column list the cells
             // are built from, so a column cannot be labeled as something other
             // than what the server published into it (PX-005, PX-042).
-            .columns(catalogue::PROCESS_LIST.map(|field| Value::String(field.heading().into())))
+            .columns(refresh::column_headings(&layout))
             // A native selection, local presentation state (§22.5) the client
             // anchors to item IDs, so it follows its process when the rows are
             // reordered (PX-009). No handler acts on it: the server attaches no
@@ -572,10 +735,11 @@ mod tests {
         assert_eq!(session.current_revision(), 1);
         session.with_store(|store| {
             // The five shell nodes, the fourteen of the system summary
-            // (PX-007), the three of the filter bar (PX-010) and the sort row
-            // with its four buttons (PX-009).
-            assert_eq!(store.node_count(), 27);
-            assert_eq!(SHELL_NODE_COUNT, 27);
+            // (PX-007), the three of the filter bar (PX-010), the sort row
+            // with its four buttons (PX-009) and the column chooser's row with
+            // its thirteen buttons (PX-068).
+            assert_eq!(store.node_count(), 41);
+            assert_eq!(SHELL_NODE_COUNT, 41);
             assert_eq!(store.root_ids(), &[SURFACE]);
             assert_eq!(store.children_of(SURFACE), Some([COLUMN].as_slice()));
             assert_eq!(
@@ -587,6 +751,7 @@ mod tests {
                         summary::SUMMARY,
                         FILTER_ROW,
                         SORT_ROW,
+                        COLUMN_CHOOSER_ROW,
                         TABLE
                     ]
                     .as_slice()
@@ -599,6 +764,10 @@ mod tests {
             assert_eq!(
                 store.children_of(SORT_ROW),
                 Some([SORT_PID, SORT_NAME, SORT_RESIDENT, SORT_CPU].as_slice())
+            );
+            assert_eq!(
+                store.children_of(COLUMN_CHOOSER_ROW),
+                Some(COLUMN_CHOOSER_BUTTONS.map(|(button, _)| button).as_slice())
             );
             assert_eq!(
                 store.children_of(summary::SUMMARY),
@@ -640,10 +809,12 @@ mod tests {
                 (SORT_NAME, TypeRef::BUTTON),
                 (SORT_RESIDENT, TypeRef::BUTTON),
                 (SORT_CPU, TypeRef::BUTTON),
+                (COLUMN_CHOOSER_ROW, TypeRef::ROW),
                 (TABLE, TypeRef::TABLE),
             ];
             let summary_nodes = summary::LAYOUT.map(|(id, node_type, _)| (id, node_type));
-            for (id, expected_type) in shell.into_iter().chain(summary_nodes) {
+            let chooser = COLUMN_CHOOSER_BUTTONS.map(|(id, _)| (id, TypeRef::BUTTON));
+            for (id, expected_type) in shell.into_iter().chain(summary_nodes).chain(chooser) {
                 let node = store.get_node(id).unwrap();
                 assert_eq!(node.node_type, expected_type);
                 assert!(!node.has_property(ACTIONS));
@@ -677,6 +848,27 @@ mod tests {
                 (SORT_NAME, "Sort by Name"),
                 (SORT_RESIDENT, "Sort by Resident"),
                 (SORT_CPU, "Sort by CPU"),
+            ] {
+                let node = store.get_node(button).unwrap();
+                assert_eq!(node.get_property(LABEL), Some(&Value::String(label.into())));
+                assert_eq!(node.get_property(ENABLED), Some(&Value::Bool(false)));
+            }
+            // So are the column chooser's, labelled for the default layout
+            // (PX-068).
+            for (button, label) in [
+                (COLUMN_TOGGLE_PID, "Hide PID column"),
+                (COLUMN_EARLIER_PID, "Move PID column left"),
+                (COLUMN_LATER_PID, "Move PID column right"),
+                (COLUMN_TOGGLE_NAME, "Hide Name column"),
+                (COLUMN_EARLIER_NAME, "Move Name column left"),
+                (COLUMN_LATER_NAME, "Move Name column right"),
+                (COLUMN_TOGGLE_RESIDENT, "Hide Resident column"),
+                (COLUMN_EARLIER_RESIDENT, "Move Resident column left"),
+                (COLUMN_LATER_RESIDENT, "Move Resident column right"),
+                (COLUMN_TOGGLE_CPU, "Hide CPU column"),
+                (COLUMN_EARLIER_CPU, "Move CPU column left"),
+                (COLUMN_LATER_CPU, "Move CPU column right"),
+                (COLUMNS_RESTORE, "Restore default columns"),
             ] {
                 let node = store.get_node(button).unwrap();
                 assert_eq!(node.get_property(LABEL), Some(&Value::String(label.into())));
@@ -730,6 +922,45 @@ mod tests {
     }
 
     #[test]
+    fn chooser_controls_state_what_a_click_does_and_disable_what_it_cannot() {
+        use crate::catalogue::{ColumnLayout, ProcessField::*};
+        let default = ColumnLayout::default();
+        let enabled: Vec<bool> = COLUMN_CHOOSER_BUTTONS
+            .iter()
+            .map(|(_, action)| action.enabled(&default))
+            .collect();
+        // Every column can be hidden; the first cannot move left, the last
+        // cannot move right, and the defaults are already shown.
+        assert_eq!(
+            enabled,
+            [true, false, true, true, true, true, true, true, true, true, true, false, false]
+        );
+        let hidden = ColumnAction::Toggle(Resident).apply(&default);
+        assert_eq!(hidden.fields(), [Pid, Name, Cpu]);
+        assert_eq!(
+            ColumnAction::Toggle(Resident).label(&hidden),
+            "Show Resident column"
+        );
+        assert!(ColumnAction::Toggle(Resident).enabled(&hidden));
+        assert!(!ColumnAction::Earlier(Resident).enabled(&hidden));
+        assert!(!ColumnAction::Later(Resident).enabled(&hidden));
+        assert!(ColumnAction::RestoreDefaults.enabled(&hidden));
+        assert_eq!(ColumnAction::RestoreDefaults.apply(&hidden), default);
+        assert_eq!(
+            ColumnAction::Toggle(Resident).apply(&hidden).fields(),
+            [Pid, Name, Cpu, Resident]
+        );
+        // The last visible column cannot be hidden.
+        let single = ColumnLayout::new(&[Cpu]).unwrap();
+        assert!(!ColumnAction::Toggle(Cpu).enabled(&single));
+        assert_eq!(ColumnAction::Toggle(Cpu).apply(&single), single);
+        // No chooser label reads as a sort control.
+        for (_, action) in COLUMN_CHOOSER_BUTTONS {
+            assert!(!action.label(&default).to_lowercase().contains("sort"));
+        }
+    }
+
+    #[test]
     fn title_fixture_preserves_nodes_and_empty_model() {
         let session = Session::mint();
         initialize(&session).unwrap();
@@ -754,6 +985,7 @@ mod tests {
                         summary::SUMMARY,
                         FILTER_ROW,
                         SORT_ROW,
+                        COLUMN_CHOOSER_ROW,
                         TABLE
                     ]
                     .as_slice()

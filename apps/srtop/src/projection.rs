@@ -1,7 +1,8 @@
 //! Server-side row projection and session-local item allocation
 //! (§§6.2, 8; PX-002 rows, PX-003 process-instance keys, PX-004 refresh,
-//! PX-005 and PX-006 metric cells, PX-042 catalogued columns).
-use crate::catalogue::PROCESS_LIST;
+//! PX-005 and PX-006 metric cells, PX-042 catalogued columns, PX-068 chosen
+//! columns).
+use crate::catalogue::{ColumnLayout, PROCESS_LIST};
 use crate::sort::SortValues;
 use crate::source::{
     BootId, DisplayName, HostId, Observed, PidNamespaceId, ProcessKey, ProcessSnapshot,
@@ -21,10 +22,18 @@ use std::io;
 /// for the same reason: a retained row takes part in every sort under the values
 /// it was published with, rather than sinking to the end as though its values
 /// were missing.
+///
+/// `cells` holds every catalogued column's cell, in [`PROCESS_LIST`] order,
+/// whichever columns are shown; `value` is those cells projected onto the
+/// published [`ColumnLayout`] (PX-068). A layout change re-projects `value`
+/// from `cells` without resampling, so a retained row is re-laid out under the
+/// cells it was published with, and identity and order values never depend on
+/// which columns are visible.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Row {
     pub(crate) key: ProcessKey,
     pub(crate) item_id: ItemId,
+    pub(crate) cells: Vec<Value>,
     pub(crate) value: Value,
     pub(crate) sort: SortValues,
     pub(crate) display_name: DisplayName,
@@ -34,6 +43,26 @@ impl Row {
     pub(crate) fn to_model_item(&self) -> ModelItem {
         ModelItem::with_value(self.item_id, self.value.clone())
     }
+
+    /// This row with its published value projected onto `layout`.
+    pub(crate) fn laid_out(&self, layout: &ColumnLayout) -> Self {
+        Self {
+            value: lay_out(&self.cells, layout),
+            ..self.clone()
+        }
+    }
+}
+
+/// The published value of a row whose catalogued cells are `cells`: one cell
+/// per visible column, in the layout's order (PX-068).
+pub(crate) fn lay_out(cells: &[Value], layout: &ColumnLayout) -> Value {
+    Value::List(
+        layout
+            .fields()
+            .iter()
+            .map(|field| cells[field.index()].clone())
+            .collect(),
+    )
 }
 
 /// The global identity of the scanned source — host, boot and PID namespace —
@@ -138,7 +167,11 @@ impl SessionItemIds {
         self.assigned.len()
     }
 
-    pub(crate) fn project(&mut self, snapshot: &ProcessSnapshot) -> io::Result<Vec<Row>> {
+    pub(crate) fn project(
+        &mut self,
+        snapshot: &ProcessSnapshot,
+        layout: &ColumnLayout,
+    ) -> io::Result<Vec<Row>> {
         // The keys are anchored before anything is looked up, on a copy of the
         // session identity, so a snapshot this projection rejects leaves the
         // remembered identity exactly as it was.
@@ -175,11 +208,12 @@ impl SessionItemIds {
                         id
                     }
                 };
-                // One cell per catalogued column, in the order the table's
-                // headings were built from (PX-042), and the same record's
-                // typed order values, so sorting never has to parse a
-                // formatted cell back into the number it came from (PX-009).
-                let cells = PROCESS_LIST
+                // One cell per catalogued column (PX-042), published in the
+                // order of the visible columns the table's headings were built
+                // from (PX-068), and the same record's typed order values, so
+                // sorting never has to parse a formatted cell back into the
+                // number it came from (PX-009), visible or not.
+                let cells: Vec<Value> = PROCESS_LIST
                     .iter()
                     .map(|field| field.cell(&key, record))
                     .collect();
@@ -187,7 +221,8 @@ impl SessionItemIds {
                 Ok(Row {
                     key,
                     item_id,
-                    value: Value::List(cells),
+                    value: lay_out(&cells, layout),
+                    cells,
                     sort,
                     display_name: record.display_name.clone(),
                 })
@@ -226,10 +261,10 @@ mod tests {
         ];
         for lost in lose {
             let mut ids = SessionItemIds::default();
-            let original = ids.project(&base).unwrap();
+            let original = ids.project(&base, &ColumnLayout::default()).unwrap();
             let mut degraded = base.clone();
             globally(&mut degraded, lost);
-            let rows = ids.project(&degraded).unwrap();
+            let rows = ids.project(&degraded, &ColumnLayout::default()).unwrap();
             assert_eq!(
                 rows.iter().map(|row| row.item_id).collect::<Vec<_>>(),
                 original.iter().map(|row| row.item_id).collect::<Vec<_>>(),
@@ -237,7 +272,7 @@ mod tests {
             );
             assert_eq!(ids.tracked(), original.len(), "and allocates nothing");
             // Recovery is not a change either.
-            let recovered = ids.project(&base).unwrap();
+            let recovered = ids.project(&base, &ColumnLayout::default()).unwrap();
             assert_eq!(recovered, original);
         }
     }
@@ -262,15 +297,15 @@ mod tests {
         ];
         for (lost, changed) in changes {
             let mut ids = SessionItemIds::default();
-            let original = ids.project(&base).unwrap();
+            let original = ids.project(&base, &ColumnLayout::default()).unwrap();
             let mut degraded = base.clone();
             globally(&mut degraded, lost);
-            ids.project(&degraded).unwrap();
+            ids.project(&degraded, &ColumnLayout::default()).unwrap();
             // The remembered value exists and is not reused: a value that was
             // read, and disagrees, is another source's.
             let mut moved = base.clone();
             globally(&mut moved, changed);
-            let rows = ids.project(&moved).unwrap();
+            let rows = ids.project(&moved, &ColumnLayout::default()).unwrap();
             assert!(
                 rows.iter()
                     .all(|row| original.iter().all(|old| old.item_id != row.item_id)),
@@ -279,7 +314,7 @@ mod tests {
             // What was observed last is what a later degraded scan anchors to.
             let mut lost_again = moved.clone();
             globally(&mut lost_again, lost);
-            let again = ids.project(&lost_again).unwrap();
+            let again = ids.project(&lost_again, &ColumnLayout::default()).unwrap();
             assert_eq!(
                 again.iter().map(|row| row.item_id).collect::<Vec<_>>(),
                 rows.iter().map(|row| row.item_id).collect::<Vec<_>>()
@@ -294,7 +329,7 @@ mod tests {
             key.host = Observed::Missing(MissingReason::Denied)
         });
         let mut ids = SessionItemIds::default();
-        let rows = ids.project(&first).unwrap();
+        let rows = ids.project(&first, &ColumnLayout::default()).unwrap();
         assert!(
             rows.iter()
                 .all(|row| row.key.host == Observed::Missing(MissingReason::Denied)),
@@ -306,17 +341,17 @@ mod tests {
     fn identity_survives_reorder_and_rename_and_never_aliases_across_sources() {
         let mut snapshot = FakeProcessSource.snapshot();
         let mut ids = SessionItemIds::default();
-        let original = ids.project(&snapshot).unwrap();
+        let original = ids.project(&snapshot, &ColumnLayout::default()).unwrap();
         snapshot.records.reverse();
         snapshot.records[2].display_name = "renamed".into();
-        let reordered = ids.project(&snapshot).unwrap();
+        let reordered = ids.project(&snapshot, &ColumnLayout::default()).unwrap();
         assert_eq!(reordered[2].item_id, original[0].item_id);
         assert_eq!(reordered[0].item_id, original[2].item_id);
         snapshot.source = SourceId("another-source".into());
         for record in &mut snapshot.records {
             record.key.source = SourceId("another-source".into());
         }
-        let other_source = ids.project(&snapshot).unwrap();
+        let other_source = ids.project(&snapshot, &ColumnLayout::default()).unwrap();
         assert!(other_source
             .iter()
             .all(|row| original.iter().all(|old| old.item_id != row.item_id)));
@@ -326,11 +361,11 @@ mod tests {
     fn same_pid_with_a_different_creation_token_gets_a_new_item_id() {
         let mut snapshot = FakeProcessSource.snapshot();
         let mut ids = SessionItemIds::default();
-        let original = ids.project(&snapshot).unwrap();
+        let original = ids.project(&snapshot, &ColumnLayout::default()).unwrap();
         // Same PID, same name, same host/boot/namespace: only the creation token
         // differs, which is exactly a reused PID after the first instance exited.
         snapshot.records[0].key.creation = CreationToken::Opaque("worker-a-restarted".into());
-        let reused = ids.project(&snapshot).unwrap();
+        let reused = ids.project(&snapshot, &ColumnLayout::default()).unwrap();
         assert_ne!(reused[0].item_id, original[0].item_id);
         assert_eq!(reused[0].value, original[0].value);
         assert_eq!(reused[1].item_id, original[1].item_id);
@@ -343,7 +378,7 @@ mod tests {
         use crate::source::{BootId, HostId, PidNamespaceId};
         let base = FakeProcessSource.snapshot();
         let mut ids = SessionItemIds::default();
-        let original = ids.project(&base).unwrap();
+        let original = ids.project(&base, &ColumnLayout::default()).unwrap();
         let mut previous = original[0].item_id;
         let mutate: [fn(&mut ProcessKey); 4] = [
             |key| key.boot = Observed::Known(BootId("fake-boot-0002".into())),
@@ -354,7 +389,7 @@ mod tests {
         for change in mutate {
             let mut snapshot = base.clone();
             change(&mut snapshot.records[0].key);
-            let rows = ids.project(&snapshot).unwrap();
+            let rows = ids.project(&snapshot, &ColumnLayout::default()).unwrap();
             assert_ne!(rows[0].item_id, original[0].item_id);
             assert_ne!(rows[0].item_id, previous);
             previous = rows[0].item_id;
@@ -367,7 +402,9 @@ mod tests {
         snapshot.records[1].key = snapshot.records[0].key.clone();
         let mut ids = SessionItemIds::default();
         assert_eq!(
-            ids.project(&snapshot).unwrap_err().kind(),
+            ids.project(&snapshot, &ColumnLayout::default())
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidData
         );
         assert!(ids.assigned.is_empty());
@@ -379,7 +416,9 @@ mod tests {
         let mut snapshot = FakeProcessSource.snapshot();
         snapshot.records[0].key.pid = Observed::Known(0);
         snapshot.records[1].key.pid = Observed::Missing(MissingReason::Denied);
-        let rows = SessionItemIds::default().project(&snapshot).unwrap();
+        let rows = SessionItemIds::default()
+            .project(&snapshot, &ColumnLayout::default())
+            .unwrap();
         // Every cell of a row states its own availability: this fixture's first
         // record carries a known zero PID beside a readable metric, its second a
         // denied PID beside a known-zero metric, and its third an unavailable PID
@@ -403,13 +442,13 @@ mod tests {
     fn forgetting_an_unpublished_identity_never_hands_its_id_back_out() {
         let snapshot = FakeProcessSource.snapshot();
         let mut ids = SessionItemIds::default();
-        let original = ids.project(&snapshot).unwrap();
+        let original = ids.project(&snapshot, &ColumnLayout::default()).unwrap();
         assert_eq!(ids.tracked(), 3);
         // Only the first row is still on screen: the other two identities are
         // gone from the collection and must not be remembered forever.
         ids.retain(&original[..1]);
         assert_eq!(ids.tracked(), 1);
-        let again = ids.project(&snapshot).unwrap();
+        let again = ids.project(&snapshot, &ColumnLayout::default()).unwrap();
         assert_eq!(
             again[0].item_id, original[0].item_id,
             "a published identity keeps its row"
@@ -432,7 +471,7 @@ mod tests {
             for (index, record) in snapshot.records.iter_mut().enumerate() {
                 record.key.creation = CreationToken::Opaque(format!("churn-{tick}-{index}"));
             }
-            let rows = ids.project(&snapshot).unwrap();
+            let rows = ids.project(&snapshot, &ColumnLayout::default()).unwrap();
             ids.retain(&rows);
             assert_eq!(ids.tracked(), rows.len());
             let lowest = rows.iter().map(|row| row.item_id.get()).min().unwrap();
@@ -450,7 +489,9 @@ mod tests {
         let mut snapshot = FakeProcessSource.snapshot();
         snapshot.records[0].display_name =
             crate::source::DisplayName::sanitize(b"ev\x07il ) $(reboot) (\xff");
-        let rows = SessionItemIds::default().project(&snapshot).unwrap();
+        let rows = SessionItemIds::default()
+            .project(&snapshot, &ColumnLayout::default())
+            .unwrap();
         let Value::List(cells) = &rows[0].value else {
             panic!("expected table cells")
         };

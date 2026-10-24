@@ -85,18 +85,19 @@
 //! [`srui_protocol::DEFAULT_MAX_FRAME_SIZE`] less a fixed allowance for the
 //! envelope the operations travel in, so payload is never mistaken for frame.
 
-use crate::catalogue::ProcessField;
+use crate::catalogue::{ColumnLayout, LayoutError, ProcessField};
 use crate::filter::{FilterGeneration, FilterQuery, PendingFilter};
 use crate::projection::{Row, SessionItemIds};
 use crate::sort::{self, SortOrder};
 use crate::source::{ProcessSnapshot, ProcessSource, Retention};
 use crate::summary::{self, CollectorError, Sample};
 use crate::{
-    bounded, initialize_rows, published_status_from, sort_button_of, ScanReport, FILTER_INPUT,
-    FILTER_STATUS, MAX_PUBLISHED_LABEL_BYTES, MODEL, STATUS,
+    bounded, initialize_rows, published_status_from, sort_button_of, ColumnAction, ScanReport,
+    COLUMN_CHOOSER_BUTTONS, FILTER_INPUT, FILTER_STATUS, MAX_PUBLISHED_LABEL_BYTES, MODEL, STATUS,
+    TABLE,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
-use srui_sdk::{ItemId, NodeId, Operation, Value, LABEL, TEXT, VALUE};
+use srui_sdk::{ItemId, NodeId, Operation, Value, COLUMNS, ENABLED, LABEL, TEXT, VALUE};
 use srui_semantic_tree::{
     DEFAULT_MAX_CACHED_ITEMS_PER_MODEL, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
 };
@@ -171,15 +172,16 @@ const RECORD_PROPERTY_BYTES: usize = 24;
 /// `CREATE_MODEL` operation and one `CREATE_NODE` operation per shell node,
 /// each with its framing, header and properties (§13, §18).
 ///
-/// The shell is ten nodes — heading, status, table, the summary's column and
-/// the sort row with its four short-labelled buttons (PX-009) — so the real
-/// cost is a few hundred bytes; 4 KiB is far above every encoding of them and
-/// leaves the ceiling insensitive to a later label. The status text and the
+/// The shell's structure — heading, status, table, the summary's nodes, the
+/// sort row with its four short-labelled buttons (PX-009), the filter row
+/// (PX-010) and the column chooser's row with its thirteen short-labelled
+/// buttons (PX-068) — costs a few kilobytes at most; 8 KiB is above every
+/// encoding of them and leaves the ceiling insensitive to a later label. The status text and the
 /// system summary are what a scan can lengthen, so each is charged separately,
 /// at its own fixed reserve ([`STATUS_RESERVE_BYTES`], [`SUMMARY_RESERVE_BYTES`];
 /// `the_shell_status_and_summary_fit_their_snapshot_allowances` measures all
 /// three on the snapshot a client is sent).
-const SNAPSHOT_SHELL_BYTES: usize = 4096;
+const SNAPSHOT_SHELL_BYTES: usize = 8192;
 
 /// Bytes one `MODEL_RESET_RANGE` operation of a snapshot costs beyond its items.
 /// A snapshot emits one per [`DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION`] rows.
@@ -295,7 +297,9 @@ pub struct Refreshed {
     pub status_changed: bool,
     /// Summary properties this refresh set or cleared (PX-007).
     pub summary: usize,
-    /// Sort-button labels a sort request set (PX-009).
+    /// Sort-button labels a sort request set (PX-009), filter controls
+    /// (PX-010), and the table headings and chooser buttons a column layout
+    /// change set (PX-068).
     pub controls: usize,
     /// Transactions this refresh committed. Zero means the snapshot held no
     /// user-visible change and nothing was sent.
@@ -338,6 +342,46 @@ pub struct ProcessView {
     filter_generation: FilterGeneration,
     /// Currently staged pending filter awaiting commit (PX-010).
     pending_filter: Option<PendingFilter>,
+    /// The visible columns the table's headings and every row's cells are
+    /// published in (PX-068). Every refresh projects its rows in it.
+    columns: ColumnLayout,
+}
+
+/// Why a column layout request was not published (PX-068).
+#[derive(Debug)]
+pub enum ColumnsError {
+    /// The request is not a layout; nothing was committed.
+    Layout(LayoutError),
+    /// A transaction failed; the view holds what did commit.
+    Session(SessionError),
+}
+
+impl std::fmt::Display for ColumnsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Layout(error) => write!(formatter, "not a column layout: {error}"),
+            Self::Session(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ColumnsError {}
+
+impl From<SessionError> for ColumnsError {
+    fn from(error: SessionError) -> Self {
+        Self::Session(error)
+    }
+}
+
+/// The table's headings for `layout`: each visible column's catalogued
+/// heading, in the layout's order, so a heading always names the cell beneath
+/// it (PX-042, PX-068).
+pub fn column_headings(layout: &ColumnLayout) -> Vec<Value> {
+    layout
+        .fields()
+        .iter()
+        .map(|field| Value::String(field.heading().into()))
+        .collect()
 }
 
 impl ProcessView {
@@ -348,6 +392,7 @@ impl ProcessView {
             summary: &mut self.summary,
             sort: &mut self.sort,
             filter_status: &mut self.filter_status,
+            columns: &mut self.columns,
         }
     }
 
@@ -360,7 +405,9 @@ impl ProcessView {
         let source_status = source.status_text().to_string();
         let snapshot = source.snapshot();
         let mut ids = SessionItemIds::default();
-        let unfiltered_rows = ids.project(&snapshot)?;
+        // The shell starts in the default layout (PX-068).
+        let columns = ColumnLayout::default();
+        let unfiltered_rows = ids.project(&snapshot, &columns)?;
         // Both bounds are this store's as well as the protocol's: a session
         // minted with a lower cached-item limit publishes fewer rows, never rows
         // its own store would refuse.
@@ -425,6 +472,7 @@ impl ProcessView {
                 committed_generation,
                 filter_generation: FilterGeneration::INITIAL,
                 pending_filter: None,
+                columns,
             },
             snapshot,
         ))
@@ -471,7 +519,7 @@ impl ProcessView {
         // A snapshot this app cannot identify is not evidence that any process
         // ended. It is published as an error over the last-known rows, exactly
         // like a scan that could not list the process filesystem at all.
-        let (confirmed, rejected) = match self.ids.project(snapshot) {
+        let (confirmed, rejected) = match self.ids.project(snapshot, &self.columns) {
             Ok(rows) => (rows, None),
             Err(error) => (Vec::new(), Some(error.to_string())),
         };
@@ -713,6 +761,120 @@ impl ProcessView {
         );
         result.transactions = transactions;
         refresh_sort_values(&mut self.rows, &target);
+        self.ids.retain(&self.unfiltered_rows);
+        outcome.map(|()| result)
+    }
+
+    /// The visible columns, in published order (PX-068).
+    pub fn columns(&self) -> Vec<ProcessField> {
+        self.columns.fields().to_vec()
+    }
+
+    /// The published column layout (PX-068).
+    pub fn column_layout(&self) -> &ColumnLayout {
+        &self.columns
+    }
+
+    /// Applies one click on a column chooser button (§7.6, PX-068), resolved
+    /// against the layout this view holds when the click is applied.
+    pub fn click_column(
+        &mut self,
+        session: &Session,
+        action: ColumnAction,
+    ) -> Result<Refreshed, SessionError> {
+        let layout = action.apply(&self.columns);
+        self.publish_layout(session, layout)
+    }
+
+    /// Shows exactly `fields`, in that order (PX-068). A request that is not a
+    /// layout — no column, or one column twice — is refused and commits
+    /// nothing.
+    pub fn set_columns(
+        &mut self,
+        session: &Session,
+        fields: &[ProcessField],
+    ) -> Result<Refreshed, ColumnsError> {
+        let layout = ColumnLayout::new(fields).map_err(ColumnsError::Layout)?;
+        self.publish_layout(session, layout)
+            .map_err(ColumnsError::Session)
+    }
+
+    /// Shows the catalogued default columns again (PX-068).
+    pub fn restore_default_columns(
+        &mut self,
+        session: &Session,
+    ) -> Result<Refreshed, SessionError> {
+        self.publish_layout(session, ColumnLayout::default())
+    }
+
+    /// Makes `layout` the published column layout (PX-068).
+    ///
+    /// A layout is presentation, not identity: the published rows, their item
+    /// IDs, their order and the active sort are all kept. The table's headings
+    /// are set, the chooser buttons whose label or enablement changes are
+    /// updated, and every published row whose cells change is updated in place
+    /// — `MODEL_UPDATE`s only, never a deletion, so no client revision lacks a
+    /// row it had selected, and the table and its model are never recreated.
+    /// Rows keep every catalogued cell and typed order value, so a hidden
+    /// sorted column still orders the rows exactly, and showing it again needs
+    /// no new sample. When the whole change fits one transaction it is
+    /// committed as one, so headings and cells never disagree on the wire.
+    fn publish_layout(
+        &mut self,
+        session: &Session,
+        layout: ColumnLayout,
+    ) -> Result<Refreshed, SessionError> {
+        if layout == self.columns {
+            self.ids.retain(&self.unfiltered_rows);
+            return Ok(Refreshed::default());
+        }
+        let target: Vec<Row> = self.rows.iter().map(|row| row.laid_out(&layout)).collect();
+        let (batch, max_ops) = mutation_limits(session);
+        let mut plan = vec![Planned::new(Effect::Columns(layout.clone()))];
+        for (node, action) in COLUMN_CHOOSER_BUTTONS {
+            let label = action.label(&layout);
+            if label != action.label(&self.columns) {
+                plan.push(Planned::new(Effect::ChooserLabel { node, label }));
+            }
+            let enabled = action.enabled(&layout);
+            if enabled != action.enabled(&self.columns) {
+                plan.push(Planned::new(Effect::ChooserEnabled { node, enabled }));
+            }
+        }
+        plan.extend(diff(
+            &self.rows,
+            &target,
+            batch,
+            MAX_TRANSACTION_PAYLOAD_BYTES,
+        ));
+        let bytes: usize = plan.iter().map(|planned| planned.bytes).sum();
+        if plan.len() <= max_ops && bytes <= MAX_TRANSACTION_PAYLOAD_BYTES {
+            let last = plan.len() - 1;
+            for planned in &mut plan[..last] {
+                planned.joins_next = true;
+            }
+        }
+        let mut result = Refreshed::default();
+        count(&plan, &mut result);
+        debug_assert_eq!(
+            (result.inserted, result.deleted, result.moved),
+            (0, 0, 0),
+            "a layout change only updates rows in place"
+        );
+        let (transactions, outcome) = commit(
+            session,
+            &plan,
+            max_ops,
+            MAX_TRANSACTION_PAYLOAD_BYTES,
+            &mut self.published(),
+        );
+        result.transactions = transactions;
+        // The server-side rows follow whatever layout committed, so a later
+        // sort, filter or refresh publishes from cells in that layout.
+        let committed = self.columns.clone();
+        for row in &mut self.unfiltered_rows {
+            *row = row.laid_out(&committed);
+        }
         self.ids.retain(&self.unfiltered_rows);
         outcome.map(|()| result)
     }
@@ -1109,6 +1271,9 @@ fn count(plan: &[Planned], result: &mut Refreshed) {
             Effect::Summary(_) => result.summary += 1,
             Effect::SortLabel { .. } => result.controls += 1,
             Effect::FilterStatus(_) | Effect::FilterValue(_) => result.controls += 1,
+            Effect::Columns(_) | Effect::ChooserLabel { .. } | Effect::ChooserEnabled { .. } => {
+                result.controls += 1
+            }
             Effect::Delete(_) if planned.moving => {}
             Effect::Insert(_, rows) if planned.moving => result.moved += rows.len(),
             Effect::Delete(ids) => result.deleted += ids.len(),
@@ -1329,7 +1494,12 @@ fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
         if kept == limit {
             break;
         }
-        let mut cost = row_wire_bytes(row);
+        // Reserve every catalogued cell, including hidden columns. Otherwise
+        // hiding a wide field admits extra rows that cannot fit when restored,
+        // and the following refresh evicts them despite an unchanged source.
+        let mut cost = MODEL_ITEM_FRAMING_BYTES
+            + VALUE_FRAMING_BYTES
+            + row.cells.iter().map(value_wire_bytes).sum::<usize>();
         if kept.is_multiple_of(DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION) {
             // This row opens another operation of the exported snapshot.
             cost += SNAPSHOT_RANGE_BYTES;
@@ -1472,6 +1642,19 @@ enum Effect {
     FilterStatus(String),
     /// The command filter text input value set (PX-010).
     FilterValue(String),
+    /// The table's headings set to a layout's, which becomes the published
+    /// layout as this effect commits (PX-068).
+    Columns(ColumnLayout),
+    /// One column chooser button's label set (PX-068).
+    ChooserLabel {
+        node: NodeId,
+        label: String,
+    },
+    /// One column chooser button enabled or disabled (PX-068).
+    ChooserEnabled {
+        node: NodeId,
+        enabled: bool,
+    },
     Delete(Vec<ItemId>),
     Insert(u64, Vec<Row>),
     Update(Vec<Row>),
@@ -1486,6 +1669,8 @@ struct Published<'a> {
     sort: &'a mut Option<SortOrder>,
     /// The filter status text announced (PX-010).
     filter_status: &'a mut String,
+    /// The column layout the headings announce (PX-068).
+    columns: &'a mut ColumnLayout,
 }
 
 /// The planned operations that turn the `published` summary into `target`:
@@ -1517,6 +1702,15 @@ impl Planned {
             }
             Effect::FilterValue(val) => {
                 Operation::set_property(FILTER_INPUT, VALUE, Value::String(val.clone()))
+            }
+            Effect::Columns(layout) => {
+                Operation::set_property(TABLE, COLUMNS, Value::List(column_headings(layout)))
+            }
+            Effect::ChooserLabel { node, label } => {
+                Operation::set_property(*node, LABEL, Value::String(label.clone()))
+            }
+            Effect::ChooserEnabled { node, enabled } => {
+                Operation::set_property(*node, ENABLED, Value::Bool(*enabled))
             }
             Effect::Delete(ids) => Operation::model_delete_items(MODEL, ids.iter().copied()),
             Effect::Insert(index, rows) => {
@@ -1557,6 +1751,15 @@ impl Effect {
             Self::SortLabel { label, .. } => VALUE_FRAMING_BYTES + label.len(),
             Self::FilterStatus(text) => VALUE_FRAMING_BYTES + text.len(),
             Self::FilterValue(val) => VALUE_FRAMING_BYTES + val.len(),
+            Self::Columns(layout) => {
+                VALUE_FRAMING_BYTES
+                    + column_headings(layout)
+                        .iter()
+                        .map(value_wire_bytes)
+                        .sum::<usize>()
+            }
+            Self::ChooserLabel { label, .. } => VALUE_FRAMING_BYTES + label.len(),
+            Self::ChooserEnabled { .. } => VALUE_FRAMING_BYTES + SCALAR_VALUE_BYTES,
             Self::Delete(ids) => ids.len() * ITEM_ID_BYTES,
             Self::Insert(_, rows) | Self::Update(rows) => rows.iter().map(row_wire_bytes).sum(),
         }
@@ -1571,11 +1774,13 @@ impl Effect {
             summary,
             sort,
             filter_status,
+            columns,
         } = published;
         match self {
             Self::Status(text) => status.clone_from(text),
             Self::FilterStatus(text) => filter_status.clone_from(text),
-            Self::FilterValue(_) => {}
+            Self::FilterValue(_) | Self::ChooserLabel { .. } | Self::ChooserEnabled { .. } => {}
+            Self::Columns(layout) => columns.clone_from(layout),
             Self::Summary(change) => {
                 let key = (change.node, change.property);
                 match &change.value {
@@ -1606,6 +1811,7 @@ impl Effect {
                 for row in rows.iter_mut() {
                     if let Some(update) = values.get(&row.item_id) {
                         row.value = update.value.clone();
+                        row.cells = update.cells.clone();
                         row.sort = update.sort.clone();
                     }
                 }
@@ -1792,13 +1998,20 @@ fn flush_insert(plan: &mut Vec<Planned>, start: u64, rows: &mut Vec<Row>, bytes:
 /// decides what to send, so a value that changed without changing its cell —
 /// bytes inside one displayed unit — would otherwise never reach the view, and
 /// a later click would sort by it (PX-009).
+///
+/// The catalogued cells of hidden columns are server-side in the same way: a
+/// hidden cell that changed leaves the published value as it was, so it is
+/// brought up to `target` here too, and showing the column again publishes the
+/// latest sample rather than the one the column was hidden under (PX-068).
 fn refresh_sort_values(rows: &mut [Row], target: &[Row]) {
-    let current: HashMap<ItemId, &crate::sort::SortValues> =
-        target.iter().map(|row| (row.item_id, &row.sort)).collect();
+    let current: HashMap<ItemId, &Row> = target.iter().map(|row| (row.item_id, row)).collect();
     for row in rows.iter_mut() {
-        if let Some(values) = current.get(&row.item_id) {
-            if row.sort != **values {
-                row.sort = (*values).clone();
+        if let Some(latest) = current.get(&row.item_id) {
+            if row.sort != latest.sort {
+                row.sort = latest.sort.clone();
+            }
+            if row.cells != latest.cells {
+                row.cells = latest.cells.clone();
             }
         }
     }
@@ -2153,7 +2366,9 @@ mod tests {
     fn an_unconfirmed_row_keeps_the_place_it_already_holds() {
         let mut ids = SessionItemIds::default();
         let mut source = ScriptedFakeSource::default();
-        let first = ids.project(&source.snapshot()).unwrap();
+        let first = ids
+            .project(&source.snapshot(), &ColumnLayout::default())
+            .unwrap();
         assert_eq!(first.len(), 3);
         // The middle row is not confirmed by this scan.
         let confirmed = vec![first[0].clone(), first[2].clone()];
@@ -2220,8 +2435,12 @@ mod tests {
                 Row {
                     sort: crate::sort::SortValues::of_record(&key, &record),
                     display_name: name.clone(),
-                    key,
                     item_id: ItemId::new(1_000 + index),
+                    cells: crate::catalogue::PROCESS_LIST
+                        .iter()
+                        .map(|field| field.cell(&key, &record))
+                        .collect(),
+                    key,
                     value: Value::List(vec![
                         Value::UnsignedInt(index + 1),
                         Value::String(name.as_str().to_string()),
@@ -2363,7 +2582,9 @@ mod tests {
     fn an_unconfirmed_leading_row_stays_ahead_of_the_rows_that_followed_it() {
         let mut ids = SessionItemIds::default();
         let mut source = ScriptedFakeSource::default();
-        let first = ids.project(&source.snapshot()).unwrap();
+        let first = ids
+            .project(&source.snapshot(), &ColumnLayout::default())
+            .unwrap();
         let merged = retain_unconfirmed(&first, vec![first[1].clone()], &everything());
         assert_eq!(keyed(&merged), keyed(&first));
         let merged = retain_unconfirmed(&first, Vec::new(), &everything());
@@ -2998,6 +3219,7 @@ mod tests {
                     key: template.key.clone(),
                     display_name: template.display_name.clone(),
                     item_id: ItemId::new(100 + offset),
+                    cells: Vec::new(),
                     value: Value::List(vec![
                         Value::UnsignedInt(9000 + offset),
                         Value::String("appended".into()),

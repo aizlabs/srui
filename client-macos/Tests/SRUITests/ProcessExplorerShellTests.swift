@@ -653,6 +653,25 @@ struct ProcessExplorerShellTests {
             #expect(table.selectedRow >= 0 && Self.modelItemIDs(applier)[table.selectedRow] == selected, "\(step)")
         }
 
+        // Verify the chooser row has a horizontal scrolling container so all buttons
+        // remain accessible at ordinary window widths (PX-068):
+        let chooserRowHandle = try #require(renderer.registry.handle(for: NodeId(28)))
+        let chooserScroll = try #require(chooserRowHandle.view.enclosingScrollView, "chooser row is inside a scrolling container")
+        #expect(chooserScroll.hasHorizontalScroller)
+
+        // Trailing buttons like CPU and Restore defaults are inside the scrolling container
+        // and can be scrolled into view:
+        let initialHideCPU = try Self.chooserButton(renderer, column: 3, verbs: ["hide"])
+        #expect(initialHideCPU.enclosingScrollView === chooserScroll)
+        #expect(initialHideCPU.window === window)
+        initialHideCPU.scrollToVisible(initialHideCPU.bounds)
+
+        let restoreHandle = try #require(renderer.registry.handle(for: NodeId(41)))
+        let restoreButton = try #require(restoreHandle.view as? NSButton)
+        #expect(restoreButton.enclosingScrollView === chooserScroll)
+        #expect(restoreButton.window === window)
+        restoreButton.scrollToVisible(restoreButton.bounds)
+
         // Hide the sorted column, Name: its heading and its cells go; the rows keep the name order.
         let hideName = try Self.chooserButton(renderer, column: 1, verbs: ["hide"])
         NativeActivation.click(hideName)

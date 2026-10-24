@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-068",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Server-authoritative column chooser for the process table over the existing cheap catalogued columns (PID, Name, Resident, CPU): show, hide, reorder and restore defaults through standard native Buttons and standard ACTIVATE events; the table's columns property and every row's cells are republished in the chosen sequence by SET_PROPERTY and MODEL_UPDATE, never by recreating the table, its model or any row; no process action, no expensive collector, no protocol or client change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX068-001",
+      "feature": "A column layout is a non-empty sequence of distinct catalogued process columns owned by the server (ColumnLayout); the default preset is the catalogued PROCESS_LIST; a layout naming no column or one column twice is refused and commits nothing; the last visible column cannot be hidden",
+      "scope": "PX-068/catalogue (src/catalogue.rs) ColumnLayout, LayoutError, hide/show/move/restore",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-068",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-068.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX068-002",
+      "feature": "Rows keep every catalogued cell and typed sort value server-side and publish only the visible columns in layout order; a layout change sets the table's columns and updates each changed row in place under its own ItemId, so no committed revision lacks a row a client had selected, the active sort is kept even when its column is hidden, and later refreshes publish in the chosen layout",
+      "scope": "PX-068/projection (src/projection.rs) and refresh (src/refresh.rs) ProcessView::set_columns, restore_default_columns, click_column",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-068",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-068.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX068-003",
+      "feature": "The chooser is a row of standard Buttons — hide/show, move left and move right per column, and restore default columns — whose labels state what a click does and which are disabled when a click could change nothing; each ACTIVATE is applied before it is acknowledged, a replayed click is answered from its settled result, and the PX-008 audit admits exactly these node constants with ACTIVATE",
+      "scope": "PX-068/shell and handlers (src/lib.rs, src/main.rs), tests/columns_test.rs, tests/no_process_control_test.rs, client-macos ProcessExplorerShellTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-068",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-068.md"
+      ]
+    }
+  ]
+}

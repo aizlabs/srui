@@ -736,11 +736,30 @@ fn scan(level: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
 /// client-input allowance: the sort buttons PX-009 installs.
 const SORT_BUTTON_CONSTANTS: &[&str] = &["SORT_PID", "SORT_NAME", "SORT_RESIDENT", "SORT_CPU"];
 
+/// The column chooser's buttons (PX-068), whose `ACTIVATE` handlers re-lay out
+/// the published table and, like the sort buttons', touch no process.
+const COLUMN_CHOOSER_CONSTANTS: &[&str] = &[
+    "COLUMN_TOGGLE_PID",
+    "COLUMN_EARLIER_PID",
+    "COLUMN_LATER_PID",
+    "COLUMN_TOGGLE_NAME",
+    "COLUMN_EARLIER_NAME",
+    "COLUMN_LATER_NAME",
+    "COLUMN_TOGGLE_RESIDENT",
+    "COLUMN_EARLIER_RESIDENT",
+    "COLUMN_LATER_RESIDENT",
+    "COLUMN_TOGGLE_CPU",
+    "COLUMN_EARLIER_CPU",
+    "COLUMN_LATER_CPU",
+    "COLUMNS_RESTORE",
+];
+
 /// Whether an `on(..)` argument list is one of the sort buttons' `ACTIVATE`
 /// registrations: the first argument exactly a sort-button node constant, the
-/// second exactly `ACTIVATE` (PX-009). A computed first argument, another node,
-/// another event type, or a handler taken as a value is not the allowance and
-/// stays refused.
+/// second exactly `ACTIVATE` (PX-009). A column chooser button constant is
+/// accepted in the same exact shape (PX-068). A computed first argument,
+/// another node, another event type, or a handler taken as a value is not the
+/// allowance and stays refused.
 fn is_sort_button_activation(tokens: &[Tok]) -> bool {
     let mut arguments: Vec<Vec<String>> = Vec::new();
     let mut current: Vec<String> = Vec::new();
@@ -764,8 +783,11 @@ fn is_sort_button_activation(tokens: &[Tok]) -> bool {
     };
     let node = bare(arguments.first());
     let event = bare(arguments.get(1));
-    matches!(node.as_deref(), Some(name) if SORT_BUTTON_CONSTANTS.contains(&name))
-        && event.as_deref() == Some("ACTIVATE")
+    matches!(
+        node.as_deref(),
+        Some(name) if SORT_BUTTON_CONSTANTS.contains(&name)
+            || COLUMN_CHOOSER_CONSTANTS.contains(&name)
+    ) && event.as_deref() == Some("ACTIVATE")
 }
 
 /// Whether an `on(..)` argument list is the filter input's `TEXT_EDIT`
@@ -1430,6 +1452,16 @@ fn the_source_audit_reports_every_known_bypass() {
             "handler",
         ),
         (
+            "a column chooser button under another event",
+            "session.on(COLUMN_TOGGLE_CPU, TEXT_EDIT, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a computed column chooser target",
+            "session.on(COLUMN_CHOOSER_BUTTONS[i].0, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
             "a sort button by path with a receiver",
             "Session::on(&session, SORT_PID, ACTIVATE, |_, _| {});",
             "handler",
@@ -1477,6 +1509,9 @@ fn the_source_audit_reports_every_known_bypass() {
         "session.on(SORT_NAME, ACTIVATE, move |session, _| { sort_clicked(&name, session, ProcessField::Name); });",
         "session.on(SORT_RESIDENT, ACTIVATE, move |session, _| { sort_clicked(&resident, session, ProcessField::Resident); });",
         "session.on(SORT_CPU, ACTIVATE, move |session, _| { sort_clicked(&cpu, session, ProcessField::Cpu); });",
+        // the column chooser's ACTIVATE registrations, as PX-068 installs them
+        "session.on(COLUMN_TOGGLE_PID, ACTIVATE, handler(Toggle(Pid)));",
+        "session.on(COLUMNS_RESTORE, ACTIVATE, handler(RestoreDefaults));",
         // the filter input's TEXT_EDIT registration (PX-010)
         "session.on(FILTER_INPUT, TEXT_EDIT, move |session, event| { refresh::filter_edited(&view, session, event); });",
         "let kind = std::fs::symlink_metadata(&path)?;",

@@ -189,6 +189,27 @@ public final class LayoutRenderer {
 
     private func attach(_ child: NSView, to parent: RenderHandle) {
         if let stack = parent.view as? NSStackView {
+            if stack.orientation == .vertical,
+               let rowStack = child as? NSStackView,
+               rowStack.orientation == .horizontal {
+                let scrollView = NSScrollView(frame: .zero)
+                scrollView.hasHorizontalScroller = true
+                scrollView.hasVerticalScroller = false
+                scrollView.drawsBackground = false
+                scrollView.autohidesScrollers = true
+                rowStack.translatesAutoresizingMaskIntoConstraints = false
+                scrollView.documentView = rowStack
+                NSLayoutConstraint.activate([
+                    rowStack.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
+                    rowStack.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+                    rowStack.bottomAnchor.constraint(equalTo: scrollView.contentView.bottomAnchor),
+                    rowStack.widthAnchor.constraint(greaterThanOrEqualTo: scrollView.contentView.widthAnchor),
+                    scrollView.heightAnchor.constraint(equalTo: rowStack.heightAnchor),
+                ])
+                stack.addArrangedSubview(scrollView)
+                reconcileFillConstraints(for: parent)
+                return
+            }
             stack.addArrangedSubview(child)
             reconcileFillConstraints(for: parent)
             return
@@ -329,6 +350,9 @@ public final class LayoutRenderer {
     private func tearDown() {
         let handles = registry.removeAll()
         for handle in handles {
+            if let scroll = handle.view.enclosingScrollView, scroll.documentView === handle.view {
+                scroll.removeFromSuperview()
+            }
             handle.view.removeFromSuperview()
             handle.window?.close()
         }

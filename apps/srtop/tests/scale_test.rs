@@ -27,6 +27,7 @@ use srui_process_explorer::source::{
 };
 use srui_process_explorer::{
     install_filter_handlers, install_sort_handlers, start_from_source, FILTER_STATUS, MODEL,
+    SHELL_NODE_COUNT,
 };
 use srui_protocol::{
     decode_framed, encode_framed, operation::Op, srui_message, ClientHello,
@@ -417,8 +418,8 @@ fn test_scale_10000_rows_throughput_and_memory_caps() {
         );
     }
 
-    // Memory plateau: node count remains exactly SHELL_NODE_COUNT (27 nodes)
-    assert_eq!(session.with_store(|s| s.node_count()), 27);
+    // Memory plateau: node count remains exactly SHELL_NODE_COUNT
+    assert_eq!(session.with_store(|s| s.node_count()), SHELL_NODE_COUNT);
 }
 
 // ---------------------------------------------------------------------------

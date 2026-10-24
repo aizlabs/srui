@@ -772,7 +772,149 @@ pub const PROCESS_LIST: [ProcessField; 4] = [
     ProcessField::Cpu,
 ];
 
+/// Why a requested column layout is not one the table can publish (PX-068).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutError {
+    /// No column at all: a table with nothing to show is not a layout.
+    Empty,
+    /// The same column twice: one field would be published under two headings.
+    Duplicate(ProcessField),
+}
+
+impl fmt::Display for LayoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(formatter, "a column layout shows at least one column"),
+            Self::Duplicate(field) => {
+                write!(formatter, "column {:?} is named twice", field.button_name())
+            }
+        }
+    }
+}
+
+impl std::error::Error for LayoutError {}
+
+/// The visible columns of the process list, in the order they are published
+/// (PX-068): a non-empty sequence of distinct catalogued [`ProcessField`]s.
+/// The server owns it; the table's headings and every row's cells are both
+/// projected from it, and a hidden column is simply absent. Hiding a column
+/// never drops its typed values: rows keep every field, so the sort a hidden
+/// column orders stays exact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnLayout(Vec<ProcessField>);
+
+impl Default for ColumnLayout {
+    /// The default preset: every catalogued column, in [`PROCESS_LIST`] order.
+    fn default() -> Self {
+        Self(PROCESS_LIST.to_vec())
+    }
+}
+
+impl ColumnLayout {
+    /// `fields` as a layout, refused when it is empty or names a column twice.
+    pub fn new(fields: &[ProcessField]) -> Result<Self, LayoutError> {
+        if fields.is_empty() {
+            return Err(LayoutError::Empty);
+        }
+        for (index, field) in fields.iter().enumerate() {
+            if fields[..index].contains(field) {
+                return Err(LayoutError::Duplicate(*field));
+            }
+        }
+        Ok(Self(fields.to_vec()))
+    }
+
+    pub fn fields(&self) -> &[ProcessField] {
+        &self.0
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.0 == PROCESS_LIST
+    }
+
+    pub fn shows(&self, field: ProcessField) -> bool {
+        self.0.contains(&field)
+    }
+
+    pub fn position(&self, field: ProcessField) -> Option<usize> {
+        self.0.iter().position(|shown| *shown == field)
+    }
+
+    /// Whether `field` can be hidden: it is shown, and not the last column.
+    pub fn can_hide(&self, field: ProcessField) -> bool {
+        self.shows(field) && self.0.len() > 1
+    }
+
+    /// Whether `field` is shown and has a column before it.
+    pub fn can_move_earlier(&self, field: ProcessField) -> bool {
+        self.position(field).is_some_and(|position| position > 0)
+    }
+
+    /// Whether `field` is shown and has a column after it.
+    pub fn can_move_later(&self, field: ProcessField) -> bool {
+        self.position(field)
+            .is_some_and(|position| position + 1 < self.0.len())
+    }
+
+    /// This layout with `field` hidden; unchanged when it cannot be.
+    pub fn hiding(&self, field: ProcessField) -> Self {
+        if !self.can_hide(field) {
+            return self.clone();
+        }
+        Self(
+            self.0
+                .iter()
+                .copied()
+                .filter(|shown| *shown != field)
+                .collect(),
+        )
+    }
+
+    /// This layout with `field` shown, after every column already shown, so
+    /// the order the user chose for the others is kept; unchanged when it is
+    /// already shown.
+    pub fn showing(&self, field: ProcessField) -> Self {
+        let mut fields = self.0.clone();
+        if !fields.contains(&field) {
+            fields.push(field);
+        }
+        Self(fields)
+    }
+
+    /// `field` swapped with the column before it; unchanged when it has none.
+    pub fn moving_earlier(&self, field: ProcessField) -> Self {
+        let mut fields = self.0.clone();
+        if let Some(position) = self.position(field).filter(|position| *position > 0) {
+            fields.swap(position - 1, position);
+        }
+        Self(fields)
+    }
+
+    /// `field` swapped with the column after it; unchanged when it has none.
+    pub fn moving_later(&self, field: ProcessField) -> Self {
+        let mut fields = self.0.clone();
+        if let Some(position) = self
+            .position(field)
+            .filter(|position| position + 1 < fields.len())
+        {
+            fields.swap(position, position + 1);
+        }
+        Self(fields)
+    }
+}
+
 impl ProcessField {
+    /// This column's position in [`PROCESS_LIST`]: where its cell sits among a
+    /// row's catalogued cells, whatever layout is published.
+    pub fn index(self) -> usize {
+        match self {
+            Self::Pid => 0,
+            Self::Name => 1,
+            Self::Resident => 2,
+            Self::Cpu => 3,
+        }
+    }
+
     /// The catalogue entry this column publishes.
     pub fn spec(self) -> &'static MetricSpec {
         match self {
@@ -910,6 +1052,39 @@ mod tests {
         assert_eq!(process, columns, "every cheap process field is a column");
         assert_eq!(catalogue.every_sample(Scope::System).count(), 7);
         assert_eq!(catalogue.get(MetricKey::new("process.unknown")), None);
+    }
+
+    #[test]
+    fn column_layouts_hide_show_move_and_refuse_what_is_not_a_layout() {
+        use ProcessField::*;
+        let default = ColumnLayout::default();
+        assert!(default.is_default());
+        assert_eq!(default.fields(), PROCESS_LIST);
+        for field in PROCESS_LIST {
+            assert_eq!(PROCESS_LIST[field.index()], field);
+        }
+        assert_eq!(ColumnLayout::new(&[]), Err(LayoutError::Empty));
+        assert_eq!(
+            ColumnLayout::new(&[Pid, Name, Pid]),
+            Err(LayoutError::Duplicate(Pid))
+        );
+        let hidden = default.hiding(Resident);
+        assert_eq!(hidden.fields(), [Pid, Name, Cpu]);
+        assert!(!hidden.can_move_earlier(Resident));
+        assert!(!hidden.can_move_later(Resident));
+        assert_eq!(hidden.moving_earlier(Cpu).fields(), [Pid, Cpu, Name]);
+        assert_eq!(hidden.moving_later(Pid).fields(), [Name, Pid, Cpu]);
+        // The ends do not move past themselves.
+        assert_eq!(hidden.moving_earlier(Pid), hidden);
+        assert_eq!(hidden.moving_later(Cpu), hidden);
+        // A shown column returns after the others, which keep their order.
+        let moved = hidden.moving_earlier(Cpu);
+        assert_eq!(moved.showing(Resident).fields(), [Pid, Cpu, Name, Resident]);
+        assert_eq!(moved.showing(Pid), moved);
+        // The last column cannot be hidden.
+        let single = ColumnLayout::new(&[Name]).unwrap();
+        assert!(!single.can_hide(Name));
+        assert_eq!(single.hiding(Name), single);
     }
 
     #[test]

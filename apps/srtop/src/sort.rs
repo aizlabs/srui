@@ -298,6 +298,7 @@ mod tests {
             sort: SortValues::of_record(&key, &record),
             key,
             item_id: srui_sdk::ItemId::new(id),
+            cells: Vec::new(),
             value: srui_sdk::Value::UnsignedInt(id),
             display_name: record.display_name,
         }

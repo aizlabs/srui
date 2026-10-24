@@ -597,6 +597,161 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
+    /// PX-068: the column chooser is a set of standard native buttons; a click is a standard
+    /// `ACTIVATE`, the server republishes the table's `columns` and every row's cells in the
+    /// chosen sequence, and the generic client shows them in the same native table with the
+    /// rows still in their sorted order and the native selection still on the same process,
+    /// even while the sorted column is hidden.
+    @Test(.timeLimit(.minutes(1)))
+    @MainActor
+    func columnChooserHidesReordersAndRestoresColumnsAndTheSelectionStaysOnItsProcess() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-source"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer over SSH") {
+            applier.lastAppliedRevision == Revision(1)
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
+        let scroll = try #require(tableHandle.view as? NSScrollView)
+        let table = try #require(scroll.documentView as? NSTableView)
+        #expect(table.tableColumns.map(\.title) == Self.defaultHeadings)
+        #expect(Self.nativeRows(table) == Self.fakeRows)
+        let identities = Self.modelItemIDs(applier)
+        #expect(identities.count == 3)
+
+        // Sort by name (ascending): helper, then the two workers in identity order.
+        let sortByName = try #require(renderer.registry.handle(for: NodeId(Self.sortButtonIDs[1]))?.view as? NSButton)
+        NativeActivation.click(sortByName)
+        let byName = [Self.fakeRows[2], Self.fakeRows[0], Self.fakeRows[1]]
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the order by name") {
+            Self.nativeRows(table) == byName
+        }
+        let sortedIDs = [identities[2], identities[0], identities[1]]
+        #expect(Self.modelItemIDs(applier) == sortedIDs)
+
+        // Select the second worker natively, as a user would (row 2 of the sorted table).
+        table.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
+        let selected = identities[1]
+        #expect(table.selectedRowIndexes == IndexSet(integer: 2))
+
+        /// The sorted rows projected onto `columns`, indices into the default layout.
+        func projected(_ columns: [Int]) -> [[String]] {
+            byName.map { row in columns.map { row[$0] } }
+        }
+        func headings(_ columns: [Int]) -> [String] {
+            columns.map { Self.defaultHeadings[$0] }
+        }
+        func expectSelectionKept(_ step: String) {
+            #expect(Self.modelItemIDs(applier) == sortedIDs, "\(step): every process kept its item ID and its sorted place")
+            #expect(table.selectedRowIndexes == IndexSet(integer: 2), "\(step): the native selection stayed on its process")
+            #expect(table.selectedRow >= 0 && Self.modelItemIDs(applier)[table.selectedRow] == selected, "\(step)")
+        }
+
+        // Verify the chooser row has a horizontal scrolling container so all buttons
+        // remain accessible at ordinary window widths (PX-068):
+        let chooserRowHandle = try #require(renderer.registry.handle(for: NodeId(28)))
+        let chooserScroll = try #require(chooserRowHandle.view.enclosingScrollView, "chooser row is inside a scrolling container")
+        #expect(chooserScroll.hasHorizontalScroller)
+
+        // Trailing buttons like CPU and Restore defaults are inside the scrolling container
+        // and can be scrolled into view:
+        let initialHideCPU = try Self.chooserButton(renderer, column: 3, verbs: ["hide"])
+        #expect(initialHideCPU.enclosingScrollView === chooserScroll)
+        #expect(initialHideCPU.window === window)
+        initialHideCPU.scrollToVisible(initialHideCPU.bounds)
+
+        let restoreHandle = try #require(renderer.registry.handle(for: NodeId(41)))
+        let restoreButton = try #require(restoreHandle.view as? NSButton)
+        #expect(restoreButton.enclosingScrollView === chooserScroll)
+        #expect(restoreButton.window === window)
+        restoreButton.scrollToVisible(restoreButton.bounds)
+
+        // Hide the sorted column, Name: its heading and its cells go; the rows keep the name order.
+        let hideName = try Self.chooserButton(renderer, column: 1, verbs: ["hide"])
+        NativeActivation.click(hideName)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "Name hidden") {
+            table.tableColumns.map(\.title) == headings([0, 2, 3]) && Self.nativeRows(table) == projected([0, 2, 3])
+        }
+        #expect(Self.modelRows(applier) == projected([0, 2, 3]))
+        expectSelectionKept("hiding the sorted column")
+
+        // Move Resident earlier: it goes ahead of PID, and the cells follow their headings.
+        let moveResident = try Self.chooserButton(renderer, column: 2, verbs: ["left", "earlier"])
+        NativeActivation.click(moveResident)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "Resident moved earlier") {
+            table.tableColumns.map(\.title) == headings([2, 0, 3]) && Self.nativeRows(table) == projected([2, 0, 3])
+        }
+        #expect(Self.modelRows(applier) == projected([2, 0, 3]))
+        expectSelectionKept("reordering the columns")
+
+        // Hide CPU too.
+        let hideCPU = try Self.chooserButton(renderer, column: 3, verbs: ["hide"])
+        NativeActivation.click(hideCPU)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "CPU hidden") {
+            table.tableColumns.map(\.title) == headings([2, 0]) && Self.nativeRows(table) == projected([2, 0])
+        }
+        expectSelectionKept("hiding a second column")
+
+        // Restore the defaults: every column returns in catalogue order, the rows still by name.
+        let restore = try Self.restoreDefaultsButton(renderer)
+        NativeActivation.click(restore)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "default columns restored") {
+            table.tableColumns.map(\.title) == Self.defaultHeadings && Self.nativeRows(table) == byName
+        }
+        #expect(Self.modelRows(applier) == byName)
+        expectSelectionKept("restoring the defaults")
+
+        // Every change happened inside the native table built once.
+        #expect(renderer.registry.handle(for: NodeId(5)) === tableHandle)
+        #expect(scroll.documentView as? NSTableView === table)
+        print("PX-068 native SSH evidence: window \(window.windowNumber); columns=\(table.tableColumns.map(\.title)); rows=\(Self.nativeRows(table)); itemIDs=\(Self.modelItemIDs(applier)); selected item \(selected) at row \(table.selectedRow); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
+    // PX-068: the catalogued headings, and the short names the chooser's labels may use instead.
+    private static let defaultHeadings = ["PID", "Name", "Resident", "CPU (100% = 1 CPU)"]
+    private static let columnButtonNames = ["PID", "Name", "Resident", "CPU"]
+
+    /// Every enabled native button outside the sort row, with its title.
+    @MainActor
+    private static func enabledNonSortButtons(_ renderer: AppKitRenderer) -> [NSButton] {
+        renderer.registry.allHandles.compactMap { $0.view as? NSButton }.filter { button in
+            button.isEnabled && !button.title.lowercased().contains("sort")
+        }
+    }
+
+    /// The one enabled chooser button for the default layout's `column` whose title states one
+    /// of `verbs`, found by what a user reads on it, as the Rust suite does.
+    @MainActor
+    private static func chooserButton(_ renderer: AppKitRenderer, column: Int, verbs: [String]) throws -> NSButton {
+        let all = enabledNonSortButtons(renderer)
+        let matching = all.filter { button in
+            let title = button.title.lowercased()
+            return (title.contains(columnButtonNames[column].lowercased()) || title.contains(defaultHeadings[column].lowercased()))
+                && verbs.contains { title.contains($0) }
+        }
+        try #require(matching.count == 1, "expected one column chooser button for \(defaultHeadings[column]) labelled \(verbs); buttons: \(all.map(\.title))")
+        return matching[0]
+    }
+
+    /// The one enabled chooser button that restores the default columns.
+    @MainActor
+    private static func restoreDefaultsButton(_ renderer: AppKitRenderer) throws -> NSButton {
+        let all = enabledNonSortButtons(renderer)
+        let matching = all.filter { button in
+            let title = button.title.lowercased()
+            return title.contains("default") && (title.contains("restore") || title.contains("reset"))
+        }
+        try #require(matching.count == 1, "expected one button restoring the default columns; buttons: \(all.map(\.title))")
+        return matching[0]
+    }
+
     /// PX-010-G01: 1,000 synthetic rows over real SSH with continuous churn.
     /// Asserts native macOS AppKit rendering performance, memory and layout stability,
     /// and selection preservation under active row churn.

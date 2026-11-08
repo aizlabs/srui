@@ -63,7 +63,7 @@ final class ModelTreeStoreTests: XCTestCase {
         }
         let url = dir.appendingPathComponent("protocol/conformance-vectors/model_tree_shape_cases.json")
         let cases = try loadCases(url)
-        XCTAssertEqual(cases.count, 315, "pinned with the Rust and Python loaders")
+        XCTAssertEqual(cases.count, 323, "pinned with the Rust and Python loaders")
         try assertCases(cases)
     }
 
@@ -75,6 +75,93 @@ final class ModelTreeStoreTests: XCTestCase {
         let cases = try loadCases(URL(fileURLWithPath: path))
         try assertCases(cases)
         print("fuzz table: \(cases.count) cases agreed")
+    }
+
+    /// Exhaustive small-forest sweep hook: `SRUI_MODEL_TREE_SWEEP_OUT=<file>` writes one verdict
+    /// letter per cache (`.` accepted, `L`, `C`, `J`, `S`) for every cache of at most five items,
+    /// depths 0...3 and every descendant count, full and sparse, under limits 3 and 4 — the same
+    /// enumeration and format as `model_tree_test.rs` and
+    /// `protocol/tests/test_model_tree_shape_cases.py::enumerate_sweep`. Unset, it does nothing.
+    func testOptionalExhaustiveSweepWritesVerdicts() throws {
+        guard let path = ProcessInfo.processInfo.environment["SRUI_MODEL_TREE_SWEEP_OUT"] else { return }
+        let depths: [UInt64] = [0, 1, 2, 3]
+        var out = [UInt8]()
+        for maxDepth in [3, 4] {
+            for n in UInt64(1)...5 {
+                let base = UInt64(depths.count) * n
+                for mask in 1..<(1 << n) {
+                    let cached = (0..<n).filter { mask >> $0 & 1 == 1 }
+                    var total: UInt64 = 1
+                    for _ in cached { total *= base }
+                    for t in 0..<total {
+                        var built = Model(id: model, modelType: .tree, itemCount: n)
+                        var x = t
+                        for index in cached {
+                            let digit = x % base
+                            x /= base
+                            let item = treeItem(1000 + index, depths[Int(digit / n)], digit % n)
+                            built.items[index] = item
+                            built.idToIndex[item.itemID] = index
+                        }
+                        built.treeShaped = true
+                        do {
+                            try built.validateTreeShape(maxModelTreeDepth: maxDepth)
+                            out.append(UInt8(ascii: "."))
+                        } catch StoreError.maxModelTreeDepthExceeded {
+                            out.append(UInt8(ascii: "L"))
+                        } catch StoreError.invalidModelTree(_, _, let violation) {
+                            switch violation {
+                            case .descendantCountOutOfRange: out.append(UInt8(ascii: "C"))
+                            case .depthJump: out.append(UInt8(ascii: "J"))
+                            case .outsideParentSpan: out.append(UInt8(ascii: "S"))
+                            case .invalidProperty: out.append(UInt8(ascii: "P"))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        try Data(out).write(to: URL(fileURLWithPath: path))
+        print("sweep: \(out.count) caches written")
+    }
+
+    /// A deeper item directly after a cached leaf would be that leaf's child outside its empty
+    /// span: refused (PX-018-G01 round 1, F1), as are the sparse forms no forest can produce.
+    func testADeeperItemAfterACachedLeafIsRefused() {
+        let apply = { (items: [ModelItem], count: UInt64) -> (String, Int?)? in
+            self.codeAndIndex(TransactionApplier().apply(baseRevision: .initial, operations: [
+                .createModel(id: self.model, modelType: .tree, itemCount: count),
+                .modelResetRange(id: self.model, startIndex: 0, items: items, totalCount: nil),
+            ]))
+        }
+        XCTAssertEqual(apply([treeItem(1, 0, 0), treeItem(2, 1, 0)], 2)?.0, "model_tree_outside_parent_span")
+        XCTAssertEqual(apply([treeItem(1, 0, 1), treeItem(2, 1, 0), treeItem(3, 2, 0)], 3)?.0, "model_tree_outside_parent_span")
+        XCTAssertNil(apply([treeItem(1, 0, 1), treeItem(2, 1, 0), treeItem(3, 0, 0)], 3))
+    }
+
+    /// A flat model that gains the shape properties only through MODEL_UPDATE is checked from
+    /// that transaction on (round 1, F3): `updateItems` marks the model shaped.
+    func testAFlatModelGainingShapeThroughModelUpdateIsChecked() throws {
+        let applier = TransactionApplier()
+        let flat = (0..<3).map { ModelItem(itemID: ItemId(UInt64($0)), value: .null) }
+        XCTAssertNil(codeAndIndex(applier.apply(baseRevision: .initial, operations: [
+            .createModel(id: model, modelType: .tree, itemCount: 0),
+            .modelInsert(id: model, index: 0, items: flat),
+        ])))
+        XCTAssertEqual(applier.store.getModel(model)?.treeShaped, false)
+        let bad = ModelItem(itemID: ItemId(1), value: .null, properties: [.treeDepth: .unsignedInt(2)])
+        let result = applier.apply(baseRevision: applier.lastAppliedRevision, operations: [
+            .modelUpdate(id: model, index: nil, items: [bad]),
+        ])
+        XCTAssertEqual(codeAndIndex(result)?.0, "model_tree_depth_jump")
+        XCTAssertEqual(applier.store.getModel(model)?.treeShaped, false, "rolled back")
+        let good = ModelItem(itemID: ItemId(0), value: .null, properties: [.descendantCount: .unsignedInt(2)])
+        let child = ModelItem(itemID: ItemId(1), value: .null, properties: [.treeDepth: .unsignedInt(1)])
+        let child2 = ModelItem(itemID: ItemId(2), value: .null, properties: [.treeDepth: .unsignedInt(1)])
+        XCTAssertNil(codeAndIndex(applier.apply(baseRevision: applier.lastAppliedRevision, operations: [
+            .modelUpdate(id: model, index: nil, items: [good, child, child2]),
+        ])))
+        XCTAssertEqual(applier.store.getModel(model)?.treeShaped, true)
     }
 
     private func loadCases(_ url: URL) throws -> [[String: Any]] {
@@ -225,8 +312,9 @@ final class ModelTreeStoreTests: XCTestCase {
         XCTAssertEqual(defaultMaxModelTreeDepth, 256)
         XCTAssertEqual(StoreLimits().maxModelTreeDepth, 256)
         XCTAssertNil(codeAndIndex(applyChain(StoreLimits(), 256)))
-        guard case .failure(.opFailed(1, .maxModelTreeDepthExceeded(_, 256, 256, 256))) = applyChain(StoreLimits(), 257) else {
-            return XCTFail("expected the depth limit at index 256")
+        // Depth 255 is the deepest level, so the item there cannot hold the 257th level.
+        guard case .failure(.opFailed(1, .maxModelTreeDepthExceeded(_, 255, 256, 255))) = applyChain(StoreLimits(), 257) else {
+            return XCTFail("expected the depth limit at index 255")
         }
     }
 

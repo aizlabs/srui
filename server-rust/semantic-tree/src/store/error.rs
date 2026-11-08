@@ -18,16 +18,17 @@ pub enum ModelTreeViolation {
         descendant_count: u64,
         item_count: u64,
     },
-    /// Index 0 is not a root, or the item is more than one level deeper than the cached item
-    /// immediately before it.
+    /// No valid preorder reaches the item's depth through the preceding indices: depth grows by
+    /// at most one level per index, index 0 is a root, and the position right after a cached
+    /// item's span is no deeper than that item.
     DepthJump {
         tree_depth: u64,
-        /// Depth of the cached item at `index - 1`; `None` at index 0.
-        previous_depth: Option<u64>,
+        /// The deepest depth any forest consistent with the preceding cached items allows here.
+        deepest_reachable: u64,
     },
     /// The item lies inside a cached item's span without being deeper than it, its own span
-    /// runs past that item's span, or it directly follows a span while being deeper than the
-    /// span's owner.
+    /// runs past that item's span, or it directly follows a span — including a leaf's empty
+    /// span — while being deeper than the span's owner.
     OutsideParentSpan {
         /// Index of the cached item whose span the item violates.
         parent_index: u64,
@@ -62,19 +63,11 @@ impl fmt::Display for ModelTreeViolation {
             ),
             Self::DepthJump {
                 tree_depth,
-                previous_depth: Some(previous),
+                deepest_reachable,
             } => write!(
                 f,
-                "tree_depth {} jumps more than one level below the previous item's {}",
-                tree_depth, previous
-            ),
-            Self::DepthJump {
-                tree_depth,
-                previous_depth: None,
-            } => write!(
-                f,
-                "index 0 must be a root, but its tree_depth is {}",
-                tree_depth
+                "tree_depth {} is deeper than the preceding items allow (at most {})",
+                tree_depth, deepest_reachable
             ),
             Self::OutsideParentSpan { parent_index } => write!(
                 f,

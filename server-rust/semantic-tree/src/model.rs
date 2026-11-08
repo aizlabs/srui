@@ -191,18 +191,26 @@ impl Model {
     /// Checks the cached items against the preorder shape their `tree_depth` and
     /// `descendant_count` declare, and against `max_model_tree_depth` (§8, §26).
     ///
+    /// Exact for sparse caches: it accepts precisely the caches that some valid forest of
+    /// `item_count` items (roots at depth 0, every child one level below its parent, every depth
+    /// below the limit) agrees with on every cached item. A forest is a depth sequence with
+    /// `d[0] = 0` and `d[j+1] <= d[j] + 1`; a cached item at `i` fixes `d[i]`, requires every index
+    /// of its span `(i, i + descendant_count]` to be deeper, and the index right after the span (if
+    /// any) to be no deeper. Only cached items and the positions right after their spans carry
+    /// constraints, so the sweep visits those alone, tracking the deepest depth reachable so far.
+    ///
     /// Items are visited in index order and the first violation is reported, so the Swift replica
     /// and this store reject the same cache identically. Per item, in order:
     ///
-    /// 1. both properties are non-negative integers (absent is 0);
-    /// 2. `tree_depth < max_model_tree_depth`;
-    /// 3. `index + descendant_count < item_count`;
-    /// 4. index 0 has depth 0, and a cached item at `index - 1` is at most one level shallower;
-    /// 5. an item directly after a cached item's span is no deeper than that item, and an item
-    ///    inside the nearest enclosing cached span is deeper than its owner and ends inside it.
-    ///
-    /// Only cached items are compared: an uncached neighbour is never guessed at, so a sparse
-    /// replica accepts what the authoritative store accepts for the same cache (§6.3).
+    /// 1. both properties are non-negative integers (absent is 0) — `invalid_model_tree_property`;
+    /// 2. `tree_depth < max_model_tree_depth`, and an item with descendants leaves room for them
+    ///    (`tree_depth + 1 < max_model_tree_depth`) — `max_model_tree_depth_exceeded`;
+    /// 3. `index + descendant_count < item_count` — `model_tree_descendant_count_out_of_range`;
+    /// 4. the depth is reachable through the preceding indices, one level per index at most
+    ///    (index 0 is a root) — `model_tree_depth_jump`;
+    /// 5. directly after a cached item's span (a leaf's span is empty) the item is no deeper than
+    ///    that item; inside the nearest enclosing cached span it is deeper than its owner and its
+    ///    own span ends inside — `model_tree_outside_parent_span`.
     ///
     /// lc-debt: O(cached items) per touched hierarchical model per transaction; upgrade path is
     /// a check windowed around the touched index ranges plus a max-span index for rule 3.
@@ -215,16 +223,19 @@ impl Model {
             index,
             violation,
         };
-        // Open spans of cached items as (index, depth, last index of the span). Each entry is
-        // strictly deeper than the one below it, so the stack never exceeds the depth limit.
+        let limit = max_model_tree_depth as i128;
+        // Spans of cached items as (index, depth, last index of the span); a leaf's span ends at
+        // itself. Ends are non-increasing towards the top and depths strictly increasing, so the
+        // stack never holds more than `max_model_tree_depth + 1` entries.
         let mut open: Vec<(u64, u64, u64)> = Vec::new();
-        let mut previous: Option<(u64, u64)> = None;
+        // The deepest depth reachable at position `pos` (-1 before index 0).
+        let (mut pos, mut reach_at_pos): (i128, i128) = (-1, -1);
         for (&index, item) in &self.items {
             let depth =
                 tree_shape_value(item, PropertyRef::TREE_DEPTH).map_err(|v| fail(index, v))?;
             let descendants = tree_shape_value(item, PropertyRef::DESCENDANT_COUNT)
                 .map_err(|v| fail(index, v))?;
-            if depth >= max_model_tree_depth as u64 {
+            if (depth as i128) >= limit || (descendants > 0 && depth as i128 + 1 >= limit) {
                 return Err(StoreError::MaxModelTreeDepthExceeded {
                     model_id: self.id,
                     index,
@@ -241,26 +252,45 @@ impl Model {
                     },
                 ));
             }
-            let previous_depth = match previous {
-                Some((prev_index, prev_depth)) if prev_index + 1 == index => Some(prev_depth),
-                _ => None,
-            };
-            if (index == 0 && depth != 0)
-                || previous_depth.is_some_and(|prev| depth > prev.saturating_add(1))
-            {
+            // Close every span that ends before `index`; the position right after each is no
+            // deeper than its owner. At `index` itself that bound applies to this item.
+            let mut bound_here: Option<(u64, u64)> = None;
+            while let Some(&(_, _, end)) = open.last() {
+                if end >= index {
+                    break;
+                }
+                let after = end + 1;
+                let mut bound: Option<(u64, u64)> = None;
+                while let Some(&(owner, owner_depth, owner_end)) = open.last() {
+                    if owner_end != end {
+                        break;
+                    }
+                    if bound.is_none_or(|(_, d)| owner_depth < d) {
+                        bound = Some((owner, owner_depth));
+                    }
+                    open.pop();
+                }
+                let (_, bound_depth) = bound.expect("at least one span ends here");
+                if after == index {
+                    bound_here = bound;
+                } else {
+                    let walked = reach_at_pos + (after as i128 - pos);
+                    reach_at_pos = walked.min(limit - 1).min(bound_depth as i128);
+                    pos = after as i128;
+                }
+            }
+            let reachable = (reach_at_pos + (index as i128 - pos)).min(limit - 1);
+            if depth as i128 > reachable {
                 return Err(fail(
                     index,
                     ModelTreeViolation::DepthJump {
                         tree_depth: depth,
-                        previous_depth,
+                        deepest_reachable: reachable.max(0) as u64,
                     },
                 ));
             }
-            while let Some(&(owner, owner_depth, end)) = open.last() {
-                if end >= index {
-                    break;
-                }
-                if end + 1 == index && depth > owner_depth {
+            if let Some((owner, owner_depth)) = bound_here {
+                if depth > owner_depth {
                     return Err(fail(
                         index,
                         ModelTreeViolation::OutsideParentSpan {
@@ -268,7 +298,6 @@ impl Model {
                         },
                     ));
                 }
-                open.pop();
             }
             // `descendants < item_count - index`, so the span end cannot overflow.
             let end = index + descendants;
@@ -282,10 +311,9 @@ impl Model {
                     ));
                 }
             }
-            if descendants > 0 {
-                open.push((index, depth, end));
-            }
-            previous = Some((index, depth));
+            open.push((index, depth, end));
+            pos = index as i128;
+            reach_at_pos = depth as i128;
         }
         Ok(())
     }

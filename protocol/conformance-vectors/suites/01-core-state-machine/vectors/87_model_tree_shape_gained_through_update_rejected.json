@@ -1,0 +1,95 @@
+{
+  "name": "model_tree_shape_gained_through_update_rejected",
+  "description": "A flat model whose items gain tree_depth only through MODEL_UPDATE is shape-checked from that transaction on; depth 2 at index 1 is a jump (§8, §12.1).",
+  "spec_sections": [
+    "§4",
+    "§8",
+    "§12.1",
+    "§22.5",
+    "§26"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Files"
+          }
+        },
+        {
+          "type": "CREATE_MODEL",
+          "model_id": 10,
+          "model_type": "Tree",
+          "item_count": 0
+        },
+        {
+          "type": "MODEL_INSERT",
+          "model_id": 10,
+          "index": 0,
+          "items": [
+            {
+              "item_id": 1200,
+              "value": "row 0",
+              "properties": {}
+            },
+            {
+              "item_id": 1201,
+              "value": "row 1",
+              "properties": {}
+            },
+            {
+              "item_id": 1202,
+              "value": "row 2",
+              "properties": {}
+            }
+          ]
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Tree",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "model_ref": 10
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "MODEL_UPDATE",
+        "model_id": 10,
+        "index": null,
+        "items": [
+          {
+            "item_id": 1201,
+            "value": "row 1",
+            "properties": {
+              "tree_depth": 2
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "model_tree_depth_jump",
+    "failed_op_index": 0,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

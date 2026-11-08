@@ -187,10 +187,15 @@ struct HierarchicalTreeTests {
         )
         #expect(leafCell.disclosureButton.isHidden, "a leaf has no disclosure")
 
-        // A click flips an on/off button's state before it sends the action.
+        // A click flips an on/off button's state before it sends the action. `sendAction` routes
+        // through NSApp, which is nil until something creates the shared application; create it
+        // here so the test does not depend on which test ran first (no run loop is serviced).
+        _ = NSApplication.shared
         let button = cell.disclosureButton
         button.state = .off
         let action = try #require(button.action)
+        #expect(action == #selector(OutlineCollectionAdapter.disclosureButtonClicked(_:)))
+        #expect(button.target === adapter)
         #expect(button.sendAction(action, to: button.target))
         #expect(adapter.collapsedItemIDs == [Self.a])
         #expect(recorder.expansions == [Expansion(itemID: Self.a, expanded: false)])

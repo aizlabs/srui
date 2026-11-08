@@ -1,6 +1,6 @@
 {
   "name": "model_tree_depth_at_default_limit_success",
-  "description": "max_model_tree_depth counts levels (default 256), so tree_depth 255 is the deepest accepted level (§26).",
+  "description": "max_model_tree_depth counts levels (default 256), so tree_depth 255 is the deepest accepted level; at index 260 of a sparse cache some forest reaches it, one level per index (§8, §26).",
   "spec_sections": [
     "§4",
     "§8",
@@ -28,7 +28,7 @@
           "type": "CREATE_MODEL",
           "model_id": 10,
           "model_type": "Tree",
-          "item_count": 10
+          "item_count": 300
         },
         {
           "type": "CREATE_NODE",
@@ -50,7 +50,7 @@
       {
         "type": "MODEL_RESET_RANGE",
         "model_id": 10,
-        "start_index": 5,
+        "start_index": 260,
         "items": [
           {
             "item_id": 301,
@@ -79,16 +79,16 @@
         "10": {
           "model_id": 10,
           "model_type": "Tree",
-          "item_count": 10,
+          "item_count": 300,
           "cached_item_count": 1,
           "cached_ranges": [
             {
-              "start": 5,
+              "start": 260,
               "length": 1
             }
           ],
           "items": {
-            "5": {
+            "260": {
               "item_id": 301,
               "value": "deep",
               "properties": {

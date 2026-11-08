@@ -148,7 +148,7 @@ fn shared_case_table_matches_row_for_row() {
     let table = load_cases(&common::vectors_root().join("model_tree_shape_cases.json"));
     assert_eq!(
         table.cases.len(),
-        315,
+        323,
         "pinned with protocol/tests and the Swift loader"
     );
     assert_cases(&table);
@@ -164,6 +164,194 @@ fn optional_fuzz_table_matches_row_for_row() {
         assert_cases(&table);
         println!("fuzz table: {} cases agreed", table.cases.len());
     }
+}
+
+/// Exhaustive small-forest sweep hook: `SRUI_MODEL_TREE_SWEEP_OUT=<file>` enumerates every cache
+/// of at most five items with depths 0..=3 and every descendant count, full and sparse, under
+/// limits 3 and 4, and writes one verdict letter per cache (`.` accepted, `L`, `C`, `J`, `S`) in
+/// the order `protocol/tests/test_model_tree_shape_cases.py::enumerate_sweep` defines. The
+/// Swift `ModelTreeStoreTests` writes the same file format; the Python true-forest oracle
+/// classifies every verdict. Unset, it does nothing.
+#[test]
+fn optional_exhaustive_sweep_writes_verdicts() {
+    let Some(path) = std::env::var_os("SRUI_MODEL_TREE_SWEEP_OUT") else {
+        return;
+    };
+    const DEPTHS: [u64; 4] = [0, 1, 2, 3];
+    let mut out = Vec::new();
+    for max_depth in [3usize, 4] {
+        for n in 1u64..=5 {
+            let base = DEPTHS.len() as u64 * n;
+            for mask in 1u32..(1 << n) {
+                let cached: Vec<u64> = (0..n).filter(|i| mask >> i & 1 == 1).collect();
+                for t in 0..base.pow(cached.len() as u32) {
+                    let mut model = Model::new(MODEL, TypeRef::TREE, n);
+                    let mut x = t;
+                    for &index in &cached {
+                        let digit = x % base;
+                        x /= base;
+                        let item = tree_item(1000 + index, DEPTHS[(digit / n) as usize], digit % n);
+                        model.id_to_index.insert(item.item_id, index);
+                        model.items.insert(index, item);
+                    }
+                    model.tree_shaped = true;
+                    out.push(match model.validate_tree_shape(max_depth) {
+                        Ok(()) => b'.',
+                        Err(StoreError::MaxModelTreeDepthExceeded { .. }) => b'L',
+                        Err(StoreError::InvalidModelTree { violation, .. }) => match violation {
+                            ModelTreeViolation::DescendantCountOutOfRange { .. } => b'C',
+                            ModelTreeViolation::DepthJump { .. } => b'J',
+                            ModelTreeViolation::OutsideParentSpan { .. } => b'S',
+                            ModelTreeViolation::InvalidProperty { .. } => b'P',
+                        },
+                        Err(other) => panic!("unexpected {other}"),
+                    });
+                }
+            }
+        }
+    }
+    std::fs::write(&path, &out).expect("write sweep verdicts");
+    println!("sweep: {} caches written", out.len());
+}
+
+fn reset_code(items: Vec<ModelItem>, count: u64) -> Option<(&'static str, Option<usize>)> {
+    let mut store = SemanticStore::new();
+    store
+        .apply_transaction(
+            Revision::INITIAL,
+            vec![
+                Operation::create_model(MODEL, TypeRef::TREE, count),
+                Operation::model_reset_range(MODEL, 0, items, None),
+            ],
+        )
+        .err()
+        .map(|e| code(&e))
+}
+
+/// A deeper item directly after a cached leaf would be that leaf's child outside its empty span:
+/// refused on the SDK and store paths (round 1, F1).
+#[test]
+fn a_deeper_item_after_a_cached_leaf_is_refused() {
+    assert_eq!(
+        reset_code(vec![tree_item(1, 0, 0), tree_item(2, 1, 0)], 2),
+        Some(("model_tree_outside_parent_span", Some(1)))
+    );
+    assert_eq!(
+        reset_code(
+            vec![tree_item(1, 0, 1), tree_item(2, 1, 0), tree_item(3, 2, 0)],
+            3
+        ),
+        Some(("model_tree_outside_parent_span", Some(1)))
+    );
+    assert_eq!(
+        reset_code(
+            vec![tree_item(1, 0, 1), tree_item(2, 1, 0), tree_item(3, 0, 0)],
+            3
+        ),
+        None
+    );
+    // `validate_model_tree`, which the SDK settles every commit through, refuses it too.
+    let mut store = SemanticStore::new();
+    store.create_model(MODEL, TypeRef::TREE, 2).unwrap();
+    store
+        .model_reset_range(MODEL, 0, vec![tree_item(1, 0, 0), tree_item(2, 1, 0)], None)
+        .unwrap();
+    assert_eq!(
+        store
+            .validate_model_tree(MODEL)
+            .unwrap_err()
+            .conformance_code(),
+        "model_tree_outside_parent_span"
+    );
+}
+
+/// Sparse caches no forest can produce are refused even across uncached gaps (round 1, F1).
+#[test]
+fn sparse_caches_are_judged_against_every_possible_forest() {
+    // Depth 3 two indices after a root: the uncached index between can be at most depth 1.
+    let mut model = Model::new(MODEL, TypeRef::TREE, 4);
+    model
+        .reset_range(0, vec![tree_item(1, 0, 3)], None)
+        .unwrap();
+    model
+        .reset_range(2, vec![tree_item(3, 3, 0)], None)
+        .unwrap();
+    assert_eq!(
+        model
+            .validate_tree_shape(256)
+            .unwrap_err()
+            .conformance_code(),
+        "model_tree_depth_jump"
+    );
+    // An item at the deepest level cannot have descendants.
+    let mut model = Model::new(MODEL, TypeRef::TREE, 4);
+    model
+        .reset_range(0, vec![tree_item(1, 0, 3)], None)
+        .unwrap();
+    model
+        .reset_range(2, vec![tree_item(3, 2, 1)], None)
+        .unwrap();
+    assert_eq!(
+        model.validate_tree_shape(3).unwrap_err().conformance_code(),
+        "max_model_tree_depth_exceeded"
+    );
+}
+
+/// A flat model that gains the shape properties only through MODEL_UPDATE is checked from that
+/// transaction on (round 1, F3): `update_items` marks the model shaped.
+#[test]
+fn a_flat_model_gaining_shape_through_model_update_is_checked() {
+    let mut store = SemanticStore::new();
+    let flat: Vec<ModelItem> = (0..3)
+        .map(|i| ModelItem::with_value(ItemId::new(i), Value::Null))
+        .collect();
+    store
+        .apply_transaction(
+            Revision::INITIAL,
+            vec![
+                Operation::create_model(MODEL, TypeRef::TREE, 0),
+                Operation::model_insert(MODEL, 0, flat),
+            ],
+        )
+        .unwrap();
+    assert!(!store.get_model(MODEL).unwrap().tree_shaped);
+    let bad = ModelItem::new(
+        ItemId::new(1),
+        Value::Null,
+        [(PropertyRef::TREE_DEPTH, Value::UnsignedInt(2))],
+    );
+    let err = store
+        .apply_transaction(
+            store.revision(),
+            vec![Operation::model_update(MODEL, None, [bad])],
+        )
+        .unwrap_err();
+    assert_eq!(code(&err), ("model_tree_depth_jump", Some(0)));
+    assert!(!store.get_model(MODEL).unwrap().tree_shaped, "rolled back");
+    let shaped = [
+        ModelItem::new(
+            ItemId::new(0),
+            Value::Null,
+            [(PropertyRef::DESCENDANT_COUNT, Value::UnsignedInt(2))],
+        ),
+        ModelItem::new(
+            ItemId::new(1),
+            Value::Null,
+            [(PropertyRef::TREE_DEPTH, Value::UnsignedInt(1))],
+        ),
+        ModelItem::new(
+            ItemId::new(2),
+            Value::Null,
+            [(PropertyRef::TREE_DEPTH, Value::UnsignedInt(1))],
+        ),
+    ];
+    store
+        .apply_transaction(
+            store.revision(),
+            vec![Operation::model_update(MODEL, None, shaped)],
+        )
+        .expect("a valid forest through MODEL_UPDATE");
+    assert!(store.get_model(MODEL).unwrap().tree_shaped);
 }
 
 fn assert_cases(table: &CaseTable) {
@@ -350,17 +538,18 @@ fn default_limit_admits_256_levels_and_refuses_257() {
     apply_chain(StoreLimits::default(), 256).expect("tree_depth 255 is the deepest level");
     let err = apply_chain(StoreLimits::default(), 257).unwrap_err();
     match err {
+        // Depth 255 is the deepest level, so the item there cannot hold the 257th level.
         TxnError::OpFailed {
             op_index: 1,
             source:
                 StoreError::MaxModelTreeDepthExceeded {
-                    index: 256,
+                    index: 255,
                     limit: 256,
-                    tree_depth: 256,
+                    tree_depth: 255,
                     ..
                 },
         } => {}
-        other => panic!("expected the depth limit at index 256, got {other:?}"),
+        other => panic!("expected the depth limit at index 255, got {other:?}"),
     }
 }
 

@@ -201,6 +201,48 @@ fn a_transaction_leaving_a_touched_model_malformed_is_refused_at_commit() {
 }
 
 #[test]
+fn the_sdk_commit_refuses_a_deeper_item_after_a_cached_leaf() {
+    let leaf_then_deeper = [
+        ModelItem::new(
+            ItemId::new(1),
+            Value::Null,
+            [
+                (TREE_DEPTH, Value::UnsignedInt(0)),
+                (DESCENDANT_COUNT, Value::UnsignedInt(0)),
+            ],
+        ),
+        ModelItem::new(
+            ItemId::new(2),
+            Value::Null,
+            [
+                (TREE_DEPTH, Value::UnsignedInt(1)),
+                (DESCENDANT_COUNT, Value::UnsignedInt(0)),
+            ],
+        ),
+    ];
+    let session = Session::new("leaf-then-deeper");
+    let err = session
+        .transaction(|ui| {
+            ui.apply_op(&Operation::create_model(MODEL, TypeRef::TREE, 0))?;
+            ui.apply_op(&Operation::model_insert(MODEL, 0, leaf_then_deeper))?;
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SdkError::Store(StoreError::InvalidModelTree {
+                index: 1,
+                violation: ModelTreeViolation::OutsideParentSpan { parent_index: 0 },
+                ..
+            })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(session.current_revision().get(), 0);
+}
+
+#[test]
 fn on_expansion_changed_reports_item_and_state_and_ignores_malformed_reports() {
     let session = Session::new("tree-expansion");
     let tree = session

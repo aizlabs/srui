@@ -297,6 +297,27 @@
       ]
     },
     {
+      "id": "PX-011-G01",
+      "key": "collection-selection",
+      "phase": "B",
+      "title": "Server-promoted collection selection and reveal",
+      "depends_on": [
+        "PX-010-G01"
+      ],
+      "file": "tickets/PX-011-G01-collection-selection.md",
+      "refs": "D1 §§6.3, 7.4, 7.6, 8, 22.5, 22.7, 22.8, 26, 32; D2 T9, T21",
+      "sources": "",
+      "gate": "R1-prerequisite",
+      "build": "Let a server explicitly promote the selected item of a List, Table or Tree to semantic state and have the generic renderer reveal it, as §6.3 permits. Prefer existing standard semantics (property 10 `selected`, defined for a node or item) over new ones; if a new property, operation or enum value is unavoidable, add it through protocol/registry.yaml and srui.proto with codegen, registry-count asserts, Rust and Swift wire support, and conformance vectors in the same change, never ad hoc. The promoted selection names an ItemId only, never a row index. Specify and implement: promotion of an ItemId absent from the collection; selection_mode none; a user's local selection after a promotion (stays local, still emits SELECTION_CHANGED); a later promotion replacing local selection; reveal only when the promotion changes, never on unrelated commits; a target outside the cached range requested through the existing range machinery and then revealed; the accessibility selection notification. No application-specific client path.",
+      "verify": "Rust and Swift tests plus conformance vectors. A server promotes an ItemId in a 10,000-row table beyond the viewport: the native NSTableView selects that row and scrolls it into view. Promoting an unknown ItemId fails explicitly without a row-index fallback. Moving the item under sorting keeps the selection on its ItemId; deleting it clears the selection. A local click after a promotion emits SELECTION_CHANGED and is not overwritten by an unrelated commit. selection_mode none refuses promotion. Resync/reconnect restores the promoted selection from semantic state. Any new decode path enforces §26 limits with a negative vector.",
+      "out": "No Process Explorer feature work (PX-011 is reworked separately), no general scroll-position synchronization (scrolling stays local apart from the one reveal), no design-document edits.",
+      "status": "planned",
+      "size": "M",
+      "deps": [
+        "early-scale"
+      ]
+    },
+    {
       "key": "search",
       "phase": "B",
       "title": "Add find-next/find-previous and jump to PID",
@@ -304,7 +325,8 @@
       "verify": "Three identical names cycle predictably forward/backward without changing row count. No match has a visible explanation. A PID that was reused selects the new live record only as an explicit new search, never retargets an old selection automatically.",
       "out": "No process-changing actions, local application-policy engine, external automation IPC, or unrequested advanced metrics.",
       "deps": [
-        "early-scale"
+        "early-scale",
+        "collection-selection"
       ],
       "refs": "D1 §§6–8, 12, 22, 29; D2 T9–T11, T16, T21",
       "sources": "",
@@ -312,7 +334,8 @@
       "size": "S",
       "id": "PX-011",
       "depends_on": [
-        "PX-010-G01"
+        "PX-010-G01",
+        "PX-011-G01"
       ],
       "file": "tickets/PX-011-search.md",
       "status": "planned"
@@ -3323,6 +3346,7 @@
     "PX-010",
     "PX-010-G01",
     "PX-068",
+    "PX-011-G01",
     "PX-011",
     "PX-012",
     "PX-013",

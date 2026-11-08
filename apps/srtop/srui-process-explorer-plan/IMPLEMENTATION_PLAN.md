@@ -615,10 +615,34 @@ Apply the standing completion contract. Record evidence in `docs/process-explore
 
 ---
 
+#### PX-011-G01 — Server-promoted collection selection and reveal
+
+**Phase:** B · **Scope size:** M · **Status:** planned · **Gate:** R1-prerequisite
+**Dependencies:** PX-010-G01
+**Read:** D1 §§6.3, 7.4, 7.6, 8, 22.5, 22.7, 22.8, 26, 32; D2 T9, T21
+
+##### Build
+
+Let a server explicitly promote the selected item of a List, Table or Tree to semantic state and have the generic renderer reveal it, as §6.3 permits. Prefer existing standard semantics (property 10 `selected`, defined for a node or item) over new ones; if a new property, operation or enum value is unavoidable, add it through protocol/registry.yaml and srui.proto with codegen, registry-count asserts, Rust and Swift wire support, and conformance vectors in the same change, never ad hoc. The promoted selection names an ItemId only, never a row index. Specify and implement: promotion of an ItemId absent from the collection; selection_mode none; a user's local selection after a promotion (stays local, still emits SELECTION_CHANGED); a later promotion replacing local selection; reveal only when the promotion changes, never on unrelated commits; a target outside the cached range requested through the existing range machinery and then revealed; the accessibility selection notification. No application-specific client path.
+
+##### Out of scope
+
+No Process Explorer feature work (PX-011 is reworked separately), no general scroll-position synchronization (scrolling stays local apart from the one reveal), no design-document edits.
+
+##### Verification / acceptance criteria
+
+Rust and Swift tests plus conformance vectors. A server promotes an ItemId in a 10,000-row table beyond the viewport: the native NSTableView selects that row and scrolls it into view. Promoting an unknown ItemId fails explicitly without a row-index fallback. Moving the item under sorting keeps the selection on its ItemId; deleting it clears the selection. A local click after a promotion emits SELECTION_CHANGED and is not overwritten by an unrelated commit. selection_mode none refuses promotion. Resync/reconnect restores the promoted selection from semantic state. Any new decode path enforces §26 limits with a negative vector.
+
+##### Handoff and completion
+
+Apply the standing completion contract. Record evidence in `docs/process-explorer/completions/PX-011-G01.md`, update the individual feature ledger, and commit only this bounded change after required checks pass. A gate remains open if a required behavior or native test is missing.
+
+---
+
 #### PX-011 — Add find-next/find-previous and jump to PID
 
 **Phase:** B · **Scope size:** S · **Status:** planned · **Gate:** none
-**Dependencies:** PX-010-G01
+**Dependencies:** PX-010-G01, PX-011-G01
 **Read:** D1 §§6–8, 12, 22, 29; D2 T9–T11, T16, T21
 
 ##### Build

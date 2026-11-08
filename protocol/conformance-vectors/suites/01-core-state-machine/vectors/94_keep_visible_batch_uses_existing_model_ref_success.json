@@ -1,6 +1,6 @@
 {
   "name": "keep_visible_batch_uses_existing_model_ref_success",
-  "description": "A BATCH_PROPERTY_SET of keep_visible alone is admitted on a Table whose model_ref was set earlier: the rule is evaluated on the node's resulting property set, existing properties included (§8, §12.1).",
+  "description": "A BATCH_PROPERTY_SET that sets label and keep_visible but not model_ref is admitted on a Table whose model_ref was set earlier: the rule is evaluated on the node's resulting property set, existing properties included (§8, §12.1).",
   "spec_sections": [
     "§4 inv. 13",
     "§6.3",

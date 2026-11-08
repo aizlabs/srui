@@ -154,7 +154,8 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
     public private(set) var pendingPromotion: CollectionPromotion?
     /// The user changed the selection after the last promotion (§22.5).
     public private(set) var localSelectionSincePromotion = false
-    /// Server-hinted keep-in-view item and the row it was last revealed at (§6.3, §22.7).
+    /// Server-hinted keep-in-view item and its displayed row as of the last reveal or
+    /// re-baseline, `nil` while hidden or not yet revealed (§6.3, §22.7).
     public private(set) var keepVisible = CollectionKeepVisible()
 
     /// Collapsed items of a hierarchical model, by identity (§22.5). Only cached items.

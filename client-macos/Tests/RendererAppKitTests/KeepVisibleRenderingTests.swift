@@ -434,7 +434,7 @@ struct KeepVisibleRenderingTests {
     }
 
     @Test
-    func aHintUnderACollapsedParentNeverExpandsOrScrollsAndIsRevealedOnLocalExpand() throws {
+    func aHintUnderACollapsedParentNeverExpandsOrScrollsAndIsRevealedOnTheNextMovingCommit() throws {
         let harness = try Harness(store: Self.hierarchicalStore())
         defer { harness.tearDown() }
         let outline = try #require(harness.tableView as? NSOutlineView)

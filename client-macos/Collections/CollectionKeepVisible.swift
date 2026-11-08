@@ -31,7 +31,8 @@ import SemanticModel
 public struct CollectionKeepVisible: Equatable, Sendable {
     /// Hinted item identity; never a row index (§8).
     public private(set) var itemID: ItemId?
-    /// Row index at which the hinted item was last revealed, or `nil` before its first reveal.
+    /// The hinted item's displayed row as of the last reveal or re-baseline (a local disclosure
+    /// change), or `nil` while the item is hidden or not yet revealed.
     public private(set) var shownRow: Int?
 
     public init() {}

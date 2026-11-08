@@ -1,4 +1,4 @@
-// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012/PX-013/PX-014/PX-015/PX-016: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
+// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012/PX-013/PX-014/PX-015/PX-016/PX-017: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
 import Testing
 import Foundation
 import AppKit
@@ -964,6 +964,187 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
+    /// PX-017: "Follow selected process" is a standard native checkbox whose state the server
+    /// owns, beside a status line. The fixture lists 60 processes; under the CPU sort only
+    /// `tracked` (PID 6010) moves, to the scripted rank of each sample, and at the sixth sample it
+    /// has ended and a new process reuses its PID. Samples are taken only by Refresh now (the
+    /// interval is 300 s), so each step is deterministic. With follow on, a resort that moves the
+    /// process off-screen selects and reveals it through the generic promoted selection
+    /// (PX-011-G01); a sample that does not move it keeps the user's pan; with follow off, a resort
+    /// moves neither the viewport nor the selection off its process; and when the process ends,
+    /// follow stops and says so, and the new process with its PID is neither selected nor revealed.
+    @Test(.timeLimit(.minutes(1)))
+    @MainActor
+    func followKeepsTheFollowedProcessVisibleAndNeverJumpsOtherwise() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-follow", "--refresh-interval-ms", "300000"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer over SSH with its follow controls") {
+            applier.lastAppliedRevision.value >= 1
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(Self.followStatusID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        SurfacePresentation.forHostApplication().present(window)
+        window.contentView?.layoutSubtreeIfNeeded()
+        // The test host never activates; as in PX-016, this window is the key window.
+        let router = renderer.layoutRenderer.shortcutRouter
+        router.isWindowKey = { $0 === window }
+        func view<T>(_ id: UInt64, as _: T.Type = T.self) throws -> T {
+            try #require(renderer.registry.handle(for: NodeId(id))?.view as? T, "node \(id)")
+        }
+        let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
+        let table = try #require((tableHandle.view as? NSScrollView)?.documentView as? NSTableView)
+        let toggleHandle = try #require(renderer.registry.handle(for: NodeId(Self.followToggleID)))
+        let toggle: NSButton = try view(Self.followToggleID)
+        let status: NSTextField = try view(Self.followStatusID)
+        let refresh: NSButton = try view(Self.samplingRefreshID)
+        let sortByCPU: NSButton = try view(Self.sortButtonIDs[3])
+        let inspectorStatus: NSTextField = try view(Self.inspectorLineIDs[0])
+        let freshness = try #require(try Self.summaryLines(renderer).last)
+        let followKey = try Self.keyEvent("f", [.command, .shift], keyCode: 3, in: window)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "all 60 rows") {
+            table.numberOfRows == 60 && refresh.isEnabled
+        }
+        func isVisible(_ row: Int) -> Bool {
+            NSLocationInRange(row, table.rows(in: table.visibleRect))
+        }
+        func trackedRow() -> Int? {
+            Self.nativeRows(table).firstIndex { $0.first == "6010" }
+        }
+        /// Where the table is scrolled to: the vertical offset and the rows it shows. Column
+        /// widths may settle as cells change, so the width is not part of it.
+        func viewport() -> (offset: CGFloat, rows: NSRange) {
+            (table.visibleRect.origin.y, table.rows(in: table.visibleRect))
+        }
+        var trace: [String] = []
+        /// Takes one sample with Refresh now and waits for it to be drawn and for `done`.
+        func sample(_ step: String, until done: @escaping @MainActor () -> Bool) async throws {
+            let before = freshness.stringValue
+            NativeActivation.click(refresh)
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: step) {
+                freshness.stringValue != before
+                    && Self.nativeRows(table) == Self.modelRows(applier)
+                    && done()
+            }
+            trace.append("\(step): rows \(table.rows(in: table.visibleRect)), selected \(Array(table.selectedRowIndexes)) · \(status.stringValue)")
+        }
+
+        // A standard checkbox with its label, its shortcut and its status; follow starts off.
+        #expect(toggle.title == "Follow selected process" && toggle.state == .off && toggle.isEnabled)
+        #expect(toggleHandle.shortcutBinding?.shortcut.canonical == "primary+shift+f")
+        #expect(toggle.toolTip == "Follow selected process (⇧⌘F)")
+        #expect(status.stringValue == Self.followOffStatus)
+
+        // Nothing is selected: ⇧⌘F flips the checkbox locally, the server refuses with its
+        // reason and puts the checkbox back.
+        #expect(window.performKeyEquivalent(with: followKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the refusal") {
+            status.stringValue == "Follow: off · nothing is selected; select a row, then turn follow on"
+                && toggle.state == .off
+        }
+
+        // Sort by CPU: `tracked` is the busiest. Select it locally, then follow it.
+        NativeActivation.click(sortByCPU)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the order by CPU") {
+            sortByCPU.title == "Sort by CPU \u{2193}" && trackedRow() == 0
+                && Self.nativeRows(table) == Self.modelRows(applier)
+        }
+        table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on tracked") {
+            inspectorStatus.stringValue.hasPrefix("Selected process: PID 6010 · tracked")
+        }
+        let identities = Set(Self.modelItemIDs(applier))
+        let trackedID = Self.modelItemIDs(applier)[0]
+        #expect(window.performKeyEquivalent(with: followKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "following tracked") {
+            toggle.state == .on && status.stringValue.hasPrefix("Following PID 6010 · tracked · row 1 of 60 · ")
+        }
+        table.scrollRowToVisible(0)
+        #expect(!isVisible(40), "the viewport is shorter than the moves it must follow: \(table.rows(in: table.visibleRect))")
+
+        // A CPU resort moves it to row 56, off-screen: it stays selected and is revealed, and no
+        // row is created.
+        try await sample("resorted to row 56") {
+            trackedRow() == 55 && table.selectedRowIndexes == IndexSet(integer: 55) && isVisible(55)
+                && status.stringValue.contains("row 56 of 60")
+        }
+        #expect(table.numberOfRows == 60)
+        #expect(Set(Self.modelItemIDs(applier)) == identities && Self.modelItemIDs(applier)[55] == trackedID,
+                "the followed row is the same item, and no row was created")
+        #expect(applier.store.getNode(NodeId(5))?.promotedSelection == ItemId(trackedID))
+
+        // Pan away: the selection is unchanged, and a sample that does not move the process keeps
+        // the viewport where the user put it, with follow still on.
+        table.scrollRowToVisible(0)
+        let panned = viewport()
+        #expect(!isVisible(55) && table.selectedRowIndexes == IndexSet(integer: 55), "panning selects nothing")
+        try await sample("the same ranks") { true }
+        #expect(viewport() == panned, "a pan is kept while the followed process stays put")
+        #expect(table.selectedRowIndexes == IndexSet(integer: 55))
+        #expect(toggle.state == .on && status.stringValue.contains("row 56 of 60"))
+
+        // It moves again, to row 41: follow brings it back into view.
+        try await sample("resorted to row 41") {
+            trackedRow() == 40 && table.selectedRowIndexes == IndexSet(integer: 40) && isVisible(40)
+        }
+        #expect(viewport() != panned)
+
+        // Follow off, then pan to the top: a resort to row 51 moves neither the viewport nor the
+        // selection off its process.
+        #expect(window.performKeyEquivalent(with: followKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "follow off") {
+            toggle.state == .off && status.stringValue == Self.followOffStatus
+        }
+        table.scrollRowToVisible(0)
+        let top = viewport()
+        try await sample("resorted to row 51 with follow off") { trackedRow() == 50 }
+        #expect(viewport() == top, "non-follow mode does not jump the viewport")
+        #expect(table.selectedRowIndexes == IndexSet(integer: 50), "the selection stays on its process")
+        #expect(!isVisible(50))
+
+        // Follow on again: the process is revealed at once.
+        #expect(window.performKeyEquivalent(with: followKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "following again") {
+            toggle.state == .on && isVisible(50) && table.selectedRowIndexes == IndexSet(integer: 50)
+                && status.stringValue.contains("row 51 of 60")
+        }
+
+        // The process ends and a new one reuses PID 6010 in the same sample: follow stops and
+        // says why, and the new process is neither selected nor revealed.
+        table.scrollRowToVisible(59)
+        let bottom = viewport()
+        try await sample("the followed process ended") {
+            status.stringValue.hasPrefix("Follow stopped: PID 6010 · tracked has ended · a new process that reuses its PID is not followed")
+                && toggle.state == .off
+        }
+        let reusedRow = try #require(trackedRow())
+        #expect(reusedRow == 2)
+        #expect(Self.modelItemIDs(applier)[reusedRow] != trackedID, "the reused PID is another item")
+        #expect(!Self.modelItemIDs(applier).contains(trackedID))
+        #expect(table.selectedRowIndexes.isEmpty, "nothing is selected for the new process")
+        #expect(viewport() == bottom, "nothing scrolled to it")
+        #expect(applier.store.getNode(NodeId(5))?.promotedSelection == nil)
+        #expect(inspectorStatus.stringValue.contains("this process has ended"))
+        try await sample("after the end") { true }
+        #expect(table.selectedRowIndexes.isEmpty && viewport() == bottom && toggle.state == .off)
+
+        #expect(renderer.registry.handle(for: NodeId(5)) === tableHandle)
+        #expect(renderer.registry.handle(for: NodeId(Self.followToggleID)) === toggleHandle)
+        print("PX-017 native SSH evidence: window \(window.windowNumber); trackedID=\(trackedID); trace=\(trace); status=\(status.stringValue); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
+    // PX-017: the follow controls.
+    fileprivate static let followToggleID: UInt64 = 68
+    fileprivate static let followStatusID: UInt64 = 69
+    fileprivate static let followOffStatus =
+        "Follow: off · the selection stays on its process and the table stays where you scroll it"
+
     /// PX-016's bindings in the published reading order, with the label, the macOS rendering
     /// and the enabled state of a live, unsearched view at default columns.
     fileprivate struct KeyboardBinding {
@@ -987,6 +1168,8 @@ struct ProcessExplorerShellTests {
         KeyboardBinding(id: 23, label: "Sort by Resident", shortcut: "primary+3", display: "⌘3", initiallyEnabled: true),
         KeyboardBinding(id: 24, label: "Sort by CPU", shortcut: "primary+4", display: "⌘4", initiallyEnabled: true),
         KeyboardBinding(id: 41, label: "Restore default columns", shortcut: "primary+alt+r", display: "⌥⌘R", initiallyEnabled: false),
+        // PX-017: the follow checkbox, between the column chooser and the table.
+        KeyboardBinding(id: 68, label: "Follow selected process", shortcut: "primary+shift+f", display: "⇧⌘F", initiallyEnabled: true),
         KeyboardBinding(id: 5, label: "Processes", shortcut: "primary+l", display: "⌘L", initiallyEnabled: true),
         KeyboardBinding(id: 60, label: "Command line and executable", shortcut: "primary+i", display: "⌘I", initiallyEnabled: true),
     ]

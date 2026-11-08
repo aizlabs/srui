@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-017",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Follow selected process as an explicit server-side setting (a standard checkbox Toggle and a status Text) over the existing generic promoted collection selection (PX-011-G01) and shortcut property (PX-016-G01); ordinary selection preservation stays the client's and never scrolls; no protocol, registry, SDK, renderer or client source change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX017-001",
+      "feature": "Follow selected process is an explicit semantic setting: a standard checkbox Toggle (node 68, label Follow selected process, shortcut Shift-Command-F) and a status Text (node 69) in a Row (node 67) between the column chooser and the table, off in the creating commit, disabled with an explanation in the uncollected shell; its one handler is the toggle's VALUE_CHANGED, whose boolean turns follow on for the inspector's resolved process or off, and which always publishes the value the server holds so a refused request unchecks the client's box",
+      "scope": "PX-017/follow (src/follow.rs) Follow, FollowView; lib (src/lib.rs) FOLLOW_ROW, FOLLOW_TOGGLE, FOLLOW_STATUS, initialize_rows, install_follow_handlers, KEYBOARD_SHORTCUTS; refresh (src/refresh.rs) set_follow, follow_toggled; tests/follow_test.rs follow_is_an_explicit_off_by_default_setting, turning_follow_on_without_a_shown_selection_is_refused_and_unchecks_the_box; tests/no_process_control_test.rs is_follow_toggle",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX017-002",
+      "feature": "Sticky follow over CPU resorting: while on, every sample, sort or filter that moves the followed item ID to another row ends its plan, after every row operation, with that item's promotion (PX-011-G01), so the client selects and reveals it at its final place; a plan that does not move it promotes nothing; the followed row keeps its item ID and no row is created; the status names the PID, name and row",
+      "scope": "PX-017/refresh (src/refresh.rs) follow_effects in apply and republish; follow (src/follow.rs) Follow::track; tests/follow_test.rs cpu_resorting_keeps_the_followed_identity_revealed_without_creating_rows; client-macos/Tests/SRUITests/ProcessExplorerShellTests.swift followKeepsTheFollowedProcessVisibleAndNeverJumpsOtherwise",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX017-003",
+      "feature": "Manual pan: scrolling is local and never changes the selection or stops follow; the viewport stays where the user put it until the followed process changes row, and then the client scrolls the least distance that shows it",
+      "scope": "PX-017/follow (src/follow.rs) Follow::track shown_at; client-macos/Tests/SRUITests/ProcessExplorerShellTests.swift followKeepsTheFollowedProcessVisibleAndNeverJumpsOtherwise",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX017-004",
+      "feature": "Non-follow mode never promotes on a sample or a selection: ordinary selection preservation is the client's, anchored to item IDs, and a resort moves neither the viewport nor the selection off its process",
+      "scope": "PX-017/tests/follow_test.rs non_follow_mode_never_promotes_on_a_sample, non_follow_mode_never_promotes_on_a_selection; client-macos/Tests/SRUITests/ProcessExplorerShellTests.swift followKeepsTheFollowedProcessVisibleAndNeverJumpsOtherwise",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX017-005",
+      "feature": "Stops honestly: when the followed process ends follow turns itself off and says so, and a new process that reuses its PID (a new item ID) is never followed, selected or revealed, in the same sample or later; a filter or the row limit that hides it stops follow with that reason; a selection that names no shown row stops it too; follow never moves to another row by itself",
+      "scope": "PX-017/follow (src/follow.rs) Follow::track, Follow::selected; tests/follow_test.rs a_disappeared_process_never_transfers_follow_to_its_reused_pid, a_filter_that_hides_the_followed_process_stops_follow; source (src/source.rs) FollowSource; client-macos/Tests/SRUITests/ProcessExplorerShellTests.swift followKeepsTheFollowedProcessVisibleAndNeverJumpsOtherwise",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX017-006",
+      "feature": "Retargeting and selection ownership: while on, selecting another shown row (a click, the arrow keys or a search match) follows it without a promotion; a SELECTION_CHANGED whose observed_revision predates the latest promotion was replaced by it on the client, so that row is promoted back and the user's later choice wins",
+      "scope": "PX-017/refresh (src/refresh.rs) select_item_at, selection_changed, commit last_promotion, publish_search; tests/follow_test.rs selecting_another_row_follows_it_and_a_replaced_selection_is_restored",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX017-007",
+      "feature": "Budgets: the three follow nodes are charged a fixed FOLLOW_RESERVE_BYTES (2048) against the catch-up snapshot and measured on the encoder at 1172 bytes with the status at its widest; the follow status is at most 512 bytes plus the cut mark; the fifteen shortcuts cost 313 bytes",
+      "scope": "PX-017/refresh (src/refresh.rs) FOLLOW_RESERVE_BYTES, bound_to_publishable_collection, the_shell_status_and_summary_fit_their_snapshot_allowances",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017.md"
+      ]
+    }
+  ]
+}

@@ -3,11 +3,12 @@
 //! summary, PX-009 server-authoritative sorting, PX-010 filtering, PX-068
 //! column chooser, PX-011 find-next/find-previous and jump to PID, PX-015
 //! sampling interval, Pause view/Resume view and manual refresh, PX-016
-//! keyboard shortcuts). No process
+//! keyboard shortcuts, PX-017 follow selected process). No process
 //! is ever opened for control: the only client-input handlers are the sort
 //! buttons', the filter input's, the column chooser buttons', the search
-//! controls' and the sampling controls', which reorder, filter, re-lay out,
-//! locate, freeze or re-sample the published rows and touch no process. A
+//! controls', the sampling controls' and the follow toggle's, which reorder,
+//! filter, re-lay out, locate, freeze, re-sample or follow the published rows
+//! and touch no process. A
 //! keyboard shortcut (design §§7.4, 7.6, 22.5; PX-016-G01's standard
 //! `shortcut` property) sends the same event its control's click sends, or
 //! only moves local focus; it adds no handler.
@@ -15,6 +16,7 @@
 pub mod catalogue;
 pub mod command;
 pub mod filter;
+pub mod follow;
 pub mod inspector;
 pub mod metric;
 pub mod on_demand;
@@ -156,6 +158,13 @@ pub const INTERVAL_INPUT: NodeId = NodeId::new(64);
 pub const INTERVAL_APPLY: NodeId = NodeId::new(65);
 pub const SAMPLING_STATUS: NodeId = NodeId::new(66);
 pub const SAMPLING_NODE_COUNT: usize = 6;
+/// The follow controls (PX-017): a Row between the column chooser and the
+/// table holding the "Follow selected process" checkbox `Toggle` and its
+/// status line, which says whom follow is on, or why it is off.
+pub const FOLLOW_ROW: NodeId = NodeId::new(67);
+pub const FOLLOW_TOGGLE: NodeId = NodeId::new(68);
+pub const FOLLOW_STATUS: NodeId = NodeId::new(69);
+pub const FOLLOW_NODE_COUNT: usize = 3;
 
 /// The keyboard shortcuts (PX-016), in the shell's reading order: the
 /// standard `shortcut` property (31, PX-016-G01) on existing controls, in its
@@ -163,7 +172,9 @@ pub const SAMPLING_NODE_COUNT: usize = 6;
 ///
 /// - A button's shortcut is the click: the client sends the same `ACTIVATE`
 ///   through the same target and action, so a disabled button's shortcut does
-///   nothing and event validation refuses a forged one (§7.4).
+///   nothing and event validation refuses a forged one (§7.4). The follow
+///   toggle's (PX-017) is its click too: the client flips it and sends the
+///   same `VALUE_CHANGED`.
 /// - A text field's, the table's and the command line's shortcut only moves
 ///   local focus and sends nothing (§22.5). Native table movement, paging,
 ///   scrolling and text selection stay the client's own.
@@ -176,7 +187,7 @@ pub const SAMPLING_NODE_COUNT: usize = 6;
 /// resets are the existing "All visible users" and "Restore default columns"
 /// buttons; a text filter resets by deleting its text, which its focus
 /// shortcut selects whole. No node, handler or event is added.
-pub const KEYBOARD_SHORTCUTS: [(NodeId, &str); 14] = [
+pub const KEYBOARD_SHORTCUTS: [(NodeId, &str); 15] = [
     (SAMPLING_PAUSE, "primary+alt+p"),
     (SAMPLING_REFRESH, "primary+r"),
     (FILTER_INPUT, "primary+alt+f"),
@@ -189,6 +200,7 @@ pub const KEYBOARD_SHORTCUTS: [(NodeId, &str); 14] = [
     (SORT_RESIDENT, "primary+3"),
     (SORT_CPU, "primary+4"),
     (COLUMNS_RESTORE, "primary+alt+r"),
+    (FOLLOW_TOGGLE, "primary+shift+f"),
     (TABLE, "primary+l"),
     (INSPECTOR_COMMAND, "primary+i"),
 ];
@@ -277,8 +289,8 @@ pub const STATUS_TEXT: &str = "Read-only · Process collection not started";
 /// of the filter bar (PX-010), the sort row with its four buttons (PX-009),
 /// the column chooser's row with its buttons (PX-068), the seven search
 /// controls (PX-011), the six user-filter controls (PX-012), the six of
-/// the inspector (PX-013, PX-014) and the six sampling controls (PX-015).
-/// Rows are model items, never nodes.
+/// the inspector (PX-013, PX-014), the six sampling controls (PX-015) and the
+/// three follow controls (PX-017). Rows are model items, never nodes.
 pub const SHELL_NODE_COUNT: usize = 5
     + summary::NODE_COUNT
     + SAMPLING_NODE_COUNT
@@ -288,7 +300,8 @@ pub const SHELL_NODE_COUNT: usize = 5
     + COLUMN_CHOOSER_NODE_COUNT
     + SEARCH_NODE_COUNT
     + OWNER_NODE_COUNT
-    + INSPECTOR_NODE_COUNT;
+    + INSPECTOR_NODE_COUNT
+    + FOLLOW_NODE_COUNT;
 
 /// The sort button that orders `field`.
 pub fn sort_button_of(field: catalogue::ProcessField) -> NodeId {
@@ -486,6 +499,20 @@ pub fn install_sampling_handlers(session: &Session, view: &refresh::SharedView) 
     let apply = std::sync::Arc::clone(view);
     session.on(INTERVAL_APPLY, ACTIVATE, move |session, _| {
         refresh::interval_requested(&apply, session);
+    });
+}
+
+/// Installs the follow toggle's handler (§7.6, PX-017): its `VALUE_CHANGED`,
+/// whose boolean argument turns follow on for the process the inspector
+/// describes, or off. Only that boolean is read; the target is the server's
+/// own resolved selection, never anything the event names. The handler always
+/// publishes the value the server holds, so a refused request puts the
+/// client's checkbox back (§6.3). Follow re-promotes the followed row's item
+/// ID (PX-011-G01) and touches no process.
+pub fn install_follow_handlers(session: &Session, view: &refresh::SharedView) {
+    let follow = std::sync::Arc::clone(view);
+    session.on(FOLLOW_TOGGLE, VALUE_CHANGED, move |session, event| {
+        refresh::follow_toggled(&follow, session, event);
     });
 }
 
@@ -972,6 +999,29 @@ pub(crate) fn initialize_rows(
                 .create(ui)?;
             ui.set(button, ENABLED, sort_enabled && action.enabled(&layout))?;
         }
+        // The follow controls (PX-017): a standard checkbox Toggle and a
+        // status Text in a Row above the table they act on. Follow starts off.
+        let follow = follow::FollowView::initial(sort_enabled);
+        Row::builder(FOLLOW_ROW)
+            .parent(COLUMN)
+            .spacing_role(SpacingRole::Normal)
+            .create(ui)?;
+        Toggle::checkbox(FOLLOW_TOGGLE)
+            .parent(FOLLOW_ROW)
+            .label(follow::FOLLOW_LABEL)
+            .value(follow.checked)
+            .accessible_description(follow::FOLLOW_DESCRIPTION)
+            .create(ui)?;
+        ui.set(FOLLOW_TOGGLE, ENABLED, sort_enabled)?;
+        Text::builder(FOLLOW_STATUS)
+            .parent(FOLLOW_ROW)
+            .text(follow.status.as_str())
+            .role(if sort_enabled {
+                TextRole::Status
+            } else {
+                TextRole::Caption
+            })
+            .create(ui)?;
         Table::builder(TABLE)
             .parent(COLUMN)
             .model_ref(MODEL)
@@ -985,7 +1035,9 @@ pub(crate) fn initialize_rows(
             // inspector (PX-013), which describes the row and never selects
             // one. An explicit search promotes its match to the table's
             // semantic selection (PX-011, PX-011-G01), which the client
-            // selects and reveals; a later user click stays local.
+            // selects and reveals; a later user click stays local. While
+            // follow is on (PX-017), the followed row is promoted again each
+            // time it changes row, and only then.
             .selection_mode(SelectionMode::Single)
             .label("Processes")
             .grow(1.0)
@@ -1177,9 +1229,27 @@ mod tests {
             // its thirteen buttons (PX-068), the seven search controls
             // (PX-011), the six user-filter controls (PX-012) and the six of
             // the inspector (PX-013, and its command line since PX-014) and
-            // the six sampling controls (PX-015).
-            assert_eq!(store.node_count(), 66);
-            assert_eq!(SHELL_NODE_COUNT, 66);
+            // the six sampling controls (PX-015) and the three follow
+            // controls (PX-017).
+            assert_eq!(store.node_count(), 69);
+            assert_eq!(SHELL_NODE_COUNT, 69);
+            // A shell that samples nothing has nothing to follow, and says so
+            // (PX-017).
+            assert_eq!(
+                store.children_of(FOLLOW_ROW),
+                Some([FOLLOW_TOGGLE, FOLLOW_STATUS].as_slice())
+            );
+            let toggle = store.get_node(FOLLOW_TOGGLE).unwrap();
+            assert_eq!(
+                toggle.get_property(LABEL),
+                Some(&Value::String(follow::FOLLOW_LABEL.into()))
+            );
+            assert_eq!(toggle.get_property(VALUE), Some(&Value::Bool(false)));
+            assert_eq!(toggle.get_property(ENABLED), Some(&Value::Bool(false)));
+            assert_eq!(
+                store.get_node(FOLLOW_STATUS).unwrap().get_property(TEXT),
+                Some(&Value::String(follow::UNCOLLECTED_FOLLOW_STATUS.into()))
+            );
             assert_eq!(
                 store.children_of(SAMPLING_ROW),
                 Some(
@@ -1241,6 +1311,7 @@ mod tests {
                         SEARCH_ROW,
                         SORT_ROW,
                         COLUMN_CHOOSER_ROW,
+                        FOLLOW_ROW,
                         TABLE,
                         INSPECTOR
                     ]
@@ -1347,6 +1418,9 @@ mod tests {
                 (INTERVAL_INPUT, TypeRef::TEXT_INPUT),
                 (INTERVAL_APPLY, TypeRef::BUTTON),
                 (SAMPLING_STATUS, TypeRef::TEXT),
+                (FOLLOW_ROW, TypeRef::ROW),
+                (FOLLOW_TOGGLE, TypeRef::TOGGLE),
+                (FOLLOW_STATUS, TypeRef::TEXT),
             ];
             let summary_nodes = summary::LAYOUT.map(|(id, node_type, _)| (id, node_type));
             let chooser = COLUMN_CHOOSER_BUTTONS.map(|(id, _)| (id, TypeRef::BUTTON));
@@ -1553,6 +1627,7 @@ mod tests {
                         SEARCH_ROW,
                         SORT_ROW,
                         COLUMN_CHOOSER_ROW,
+                        FOLLOW_ROW,
                         TABLE,
                         INSPECTOR
                     ]
@@ -1605,11 +1680,17 @@ mod tests {
                     if expected.is_some() {
                         let behavior = shortcut_behavior(node.node_type);
                         assert!(behavior.is_some(), "node {id} does not admit a shortcut");
-                        // Buttons send their click's ACTIVATE; everything else
-                        // only takes focus. No Toggle is bound.
+                        // Buttons send their click's ACTIVATE, the one Toggle
+                        // (follow, PX-017) its click's VALUE_CHANGED;
+                        // everything else only takes focus.
                         assert_eq!(
                             behavior == Some(ShortcutBehavior::Activate),
                             node.node_type == TypeRef::BUTTON,
+                            "node {id}"
+                        );
+                        assert_eq!(
+                            behavior == Some(ShortcutBehavior::Toggle),
+                            node.id == FOLLOW_TOGGLE,
                             "node {id}"
                         );
                     }

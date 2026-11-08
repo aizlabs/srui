@@ -20,7 +20,10 @@
 //! PX-015 the view can be paused ([`crate::sampling`]): a paused view
 //! publishes no sample at all, every control keeps re-projecting the frozen
 //! rows, and the refresh loop's one ticker follows the interval the sampling
-//! controls set.
+//! controls set. Since PX-017 every publication that changes the rows also
+//! re-plans follow ([`crate::follow`]) last, after every row operation: while
+//! follow is on and the followed process changed row, the plan ends with its
+//! promotion, so the client reveals it at its final place.
 //!
 //! Four rules shape this module:
 //!
@@ -100,6 +103,7 @@
 
 use crate::catalogue::{ColumnLayout, LayoutError, ProcessField};
 use crate::filter::{FilterGeneration, FilterQuery, PendingFilter};
+use crate::follow::{Follow, FollowView};
 use crate::inspector::{
     DetailRead, DetailReads, DetailReadsIdle, DetailRequest, DetailSource, Inspector, InspectorView,
 };
@@ -112,11 +116,11 @@ use crate::source::{ProcessSnapshot, ProcessSource, Retention};
 use crate::summary::{self, CollectorError, Sample};
 use crate::{
     bounded, initialize_rows, published_status_from, sort_button_of, ColumnAction, ScanReport,
-    COLUMN_CHOOSER_BUTTONS, FILTER_INPUT, FILTER_STATUS, INSPECTOR_COMMAND, INSPECTOR_DETAILS,
-    INSPECTOR_METRICS, INSPECTOR_PROCESS, INSPECTOR_STATUS, INTERVAL_INPUT,
-    MAX_PUBLISHED_LABEL_BYTES, MODEL, OWNER_ALL, OWNER_INPUT, OWNER_MINE, OWNER_STATUS, PID_GO,
-    PID_INPUT, PID_SET_INPUT, SAMPLING_PAUSE, SAMPLING_REFRESH, SAMPLING_STATUS, SEARCH_INPUT,
-    SEARCH_NEXT, SEARCH_PREVIOUS, SEARCH_STATUS, STATUS, TABLE,
+    COLUMN_CHOOSER_BUTTONS, FILTER_INPUT, FILTER_STATUS, FOLLOW_STATUS, FOLLOW_TOGGLE,
+    INSPECTOR_COMMAND, INSPECTOR_DETAILS, INSPECTOR_METRICS, INSPECTOR_PROCESS, INSPECTOR_STATUS,
+    INTERVAL_INPUT, MAX_PUBLISHED_LABEL_BYTES, MODEL, OWNER_ALL, OWNER_INPUT, OWNER_MINE,
+    OWNER_STATUS, PID_GO, PID_INPUT, PID_SET_INPUT, SAMPLING_PAUSE, SAMPLING_REFRESH,
+    SAMPLING_STATUS, SEARCH_INPUT, SEARCH_NEXT, SEARCH_PREVIOUS, SEARCH_STATUS, STATUS, TABLE,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
 use srui_sdk::{ItemId, NodeId, Operation, Value, COLUMNS, ENABLED, LABEL, TEXT, VALUE};
@@ -293,6 +297,15 @@ pub const COMMAND_RESERVE_BYTES: usize = 10_240;
 /// measures it with every value at its widest.
 pub const SAMPLING_RESERVE_BYTES: usize = 2048;
 
+/// Bytes reserved for the follow controls in a catch-up snapshot (PX-017):
+/// the row, the "Follow selected process" `Toggle` with its label,
+/// description, shortcut and value, and the status line at
+/// [`crate::follow::MAX_FOLLOW_STATUS_BYTES`]. Charged at this fixed reserve,
+/// so a long follow status can never shrink the row budget;
+/// `the_shell_status_and_summary_fit_their_snapshot_allowances` measures it
+/// with the status at its widest.
+pub const FOLLOW_RESERVE_BYTES: usize = 2048;
+
 /// Bytes the `CLEAR_PROPERTY` settlement adds when a commit removes the
 /// promoted row (PX-011-G01): a clear carries no value.
 const PROMOTION_CLEAR_BYTES: usize = OPERATION_FRAMING_BYTES + OPERATION_HEADER_BYTES;
@@ -429,9 +442,17 @@ pub struct ProcessView {
     /// refresh. A PID jump never selects one of these (PX-011).
     unconfirmed: HashSet<ItemId>,
     /// The table's promoted selection (PX-011-G01) as the store holds it after
-    /// the last commit: set by an explicit search, cleared by settlement when
-    /// its row leaves the model.
+    /// the last commit: set by an explicit search or by follow (PX-017),
+    /// cleared by settlement when its row leaves the model.
     promoted: Option<ItemId>,
+    /// The revision of the latest commit that promoted the table's selection
+    /// (PX-017). A client's `SELECTION_CHANGED` observed before it was made
+    /// before that promotion replaced it on the client.
+    last_promotion: u64,
+    /// Follow selected process (PX-017).
+    follow: Follow,
+    /// The follow controls as the client holds them (PX-017).
+    follow_published: FollowView,
     /// The user filter, the PID set and the account-name cache (PX-012).
     owner: OwnerFilter,
     /// The user-filter controls as the client holds them (PX-012).
@@ -511,9 +532,11 @@ impl ProcessView {
             columns: &mut self.columns,
             search: &mut self.search_published,
             promoted: &mut self.promoted,
+            last_promotion: &mut self.last_promotion,
             owner: &mut self.owner_published,
             inspector: &mut self.inspector_published,
             sampling: &mut self.sampling_published,
+            follow: &mut self.follow_published,
         }
     }
 
@@ -639,6 +662,9 @@ impl ProcessView {
                 search_published: SearchView::initial(true),
                 unconfirmed: HashSet::new(),
                 promoted: None,
+                last_promotion: 0,
+                follow: Follow::default(),
+                follow_published: FollowView::initial(true),
                 owner,
                 owner_published,
                 inspector: Inspector::default(),
@@ -806,6 +832,14 @@ impl ProcessView {
         // and the inspector, whose metrics and state follow them (PX-013).
         plan.extend(self.search_effects(&target, &unfiltered_target, &unconfirmed));
         plan.extend(self.inspector_effects(&target, &unfiltered_target, &unconfirmed));
+        // Follow last of all (PX-017): its promotion names the followed row's
+        // final place, after every row operation of this plan.
+        plan.extend(follow_effects(
+            &mut self.follow,
+            &self.follow_published,
+            &target,
+            &unfiltered_target,
+        ));
 
         let mut result = Refreshed {
             retained,
@@ -833,6 +867,10 @@ impl ProcessView {
         let (transactions, outcome) =
             commit(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
+        if outcome.is_err() {
+            // The follow promotion may not have committed: reveal again next.
+            self.follow.forget_shown();
+        }
         // Order values never reach the wire, so every published row takes this
         // sample's whatever committed: a later click sorts by current values,
         // never by the ones a row was first published with.
@@ -1354,6 +1392,14 @@ impl ProcessView {
         // inspector's (PX-013).
         plan.extend(self.search_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
         plan.extend(self.inspector_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
+        // Follow last (PX-017): a filter that hides the followed process
+        // stops follow; a sort or a filter that moves it reveals it.
+        plan.extend(follow_effects(
+            &mut self.follow,
+            &self.follow_published,
+            &target,
+            &self.unfiltered_rows,
+        ));
 
         let mut result = Refreshed::default();
         count(&plan, &mut result);
@@ -1368,6 +1414,9 @@ impl ProcessView {
         let (transactions, outcome) =
             commit(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
+        if outcome.is_err() {
+            self.follow.forget_shown();
+        }
         refresh_sort_values(&mut self.rows, &target);
         self.ids.retain(&self.unfiltered_rows);
         self.search.observe(&self.rows);
@@ -1629,9 +1678,13 @@ impl ProcessView {
         });
         if let Some(row) = promoted {
             self.inspector.select(&row);
+            // While follow is on, the match is the process followed next
+            // (PX-017); the search's own promotion reveals it.
+            self.follow.selected(Some(&row), &self.rows, false);
         }
         plan.extend(self.search_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed));
         plan.extend(self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed));
+        plan.extend(self.follow_view_effects());
         self.publish_controls(session, plan)
     }
 
@@ -1697,13 +1750,88 @@ impl ProcessView {
         session: &Session,
         item: Option<ItemId>,
     ) -> Result<Refreshed, SessionError> {
+        self.select_item_at(session, item, session.current_revision())
+    }
+
+    /// [`Self::select_item`] for a selection the client made while it held
+    /// `observed_revision` (the event's `observed_revision`, §7.7, §18.2).
+    ///
+    /// While follow is on (PX-017), a selection of another shown row makes
+    /// that row the followed process, and one that names no shown row stops
+    /// follow. A selection observed before this view's latest promotion was
+    /// replaced on the client by that promotion (PX-011-G01), so the row is
+    /// promoted now and the user's later choice wins. With follow off nothing
+    /// is promoted, as before.
+    pub fn select_item_at(
+        &mut self,
+        session: &Session,
+        item: Option<ItemId>,
+        observed_revision: u64,
+    ) -> Result<Refreshed, SessionError> {
         let row = item.and_then(|item| self.rows.iter().find(|row| row.item_id == item).cloned());
-        match row {
-            Some(row) => self.inspector.select(&row),
+        match &row {
+            Some(row) => self.inspector.select(row),
             None => self.inspector.refuse(item),
         }
-        let plan = self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
+        let overridden = observed_revision < self.last_promotion;
+        let restore = self.follow.selected(row.as_ref(), &self.rows, overridden);
+        let mut plan = self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
+        plan.extend(restore.map(|row| Planned::new(Effect::Promote(Box::new(row)))));
+        plan.extend(self.follow_view_effects());
         self.publish_controls(session, plan)
+    }
+
+    /// Follow selected process (PX-017).
+    pub fn follow(&self) -> &Follow {
+        &self.follow
+    }
+
+    /// The follow controls as this view last published them (PX-017).
+    pub fn follow_view(&self) -> &FollowView {
+        &self.follow_published
+    }
+
+    /// The revision of the latest commit that promoted the table's selection
+    /// (PX-017).
+    pub fn last_promotion(&self) -> u64 {
+        self.last_promotion
+    }
+
+    /// Applies one follow toggle request (PX-017): `Some(true)` turns follow
+    /// on for the process the inspector describes and reveals it at once,
+    /// `Some(false)` turns it off, and `None` (a request without a boolean)
+    /// changes nothing. A selection that is not a shown row is refused with
+    /// its reason. The toggle's value is always published: the client's
+    /// checkbox already shows what was asked, so a refusal puts it back
+    /// (§6.3).
+    pub fn set_follow(
+        &mut self,
+        session: &Session,
+        on: Option<bool>,
+    ) -> Result<Refreshed, SessionError> {
+        let mut plan = Vec::new();
+        match on {
+            Some(true) => {
+                let selected = self.inspector.selected_row().cloned();
+                let reveal =
+                    self.follow
+                        .turn_on(selected.as_ref(), &self.rows, &self.unfiltered_rows);
+                plan.extend(reveal.map(|row| Planned::new(Effect::Promote(Box::new(row)))));
+            }
+            Some(false) => self.follow.turn_off(),
+            None => {}
+        }
+        let target = self.follow.view(&self.rows);
+        plan.push(Planned::new(Effect::FollowValue(target.checked)));
+        if target.status != self.follow_published.status {
+            plan.push(Planned::new(Effect::FollowStatus(target.status)));
+        }
+        self.publish_controls(session, plan)
+    }
+
+    /// The follow controls' changes over the rows already published (PX-017).
+    fn follow_view_effects(&self) -> Vec<Planned> {
+        follow_view_effects(&self.follow.view(&self.rows), &self.follow_published)
     }
 
     /// Publishes one detail result (PX-013), if it answers the inspector's
@@ -1931,9 +2059,58 @@ pub fn selection_changed(
     let item = srui_semantic_tree::Event::try_from(event.clone())
         .ok()
         .and_then(|event| event.item_id_arg());
-    if let Err(error) = lock_view(view).select_item(session, item) {
+    // The revision the client held when the user selected (§7.7): follow
+    // restores a selection a later promotion replaced (PX-017).
+    let observed = event.observed_revision;
+    if let Err(error) = lock_view(view).select_item_at(session, item, observed) {
         eprintln!("srtop: inspector not published: {error}");
     }
+}
+
+/// Dispatches one `VALUE_CHANGED` on the follow toggle to the shared view
+/// (PX-017). Only the event's boolean argument is read.
+pub fn follow_toggled(
+    view: &std::sync::Mutex<ProcessView>,
+    session: &Session,
+    event: &srui_protocol::Event,
+) {
+    let on = srui_semantic_tree::Event::try_from(event.clone())
+        .ok()
+        .and_then(|event| event.bool_arg());
+    if let Err(error) = lock_view(view).set_follow(session, on) {
+        eprintln!("srtop: follow not published: {error}");
+    }
+}
+
+/// Follow's plan for a client that will hold `rows` out of the server-side
+/// collection `unfiltered` (PX-017): the followed row's promotion when it
+/// changed row, and the follow controls' changes. Follow stops, and never
+/// moves to another row, when its process is not among `rows`.
+fn follow_effects(
+    follow: &mut Follow,
+    published: &FollowView,
+    rows: &[Row],
+    unfiltered: &[Row],
+) -> Vec<Planned> {
+    let mut plan: Vec<Planned> = follow
+        .track(rows, unfiltered)
+        .map(|row| Planned::new(Effect::Promote(Box::new(row))))
+        .into_iter()
+        .collect();
+    plan.extend(follow_view_effects(&follow.view(rows), published));
+    plan
+}
+
+/// The follow controls' changes from `published` to `target` (PX-017).
+fn follow_view_effects(target: &FollowView, published: &FollowView) -> Vec<Planned> {
+    let mut plan = Vec::new();
+    if target.checked != published.checked {
+        plan.push(Planned::new(Effect::FollowValue(target.checked)));
+    }
+    if target.status != published.status {
+        plan.push(Planned::new(Effect::FollowStatus(target.status.clone())));
+    }
+    plan
 }
 
 /// Starts the inspector's detail worker over `details` and installs it in
@@ -2158,6 +2335,7 @@ fn count(plan: &[Planned], result: &mut Refreshed) {
             | Effect::SamplingLabel(_)
             | Effect::SamplingEnabled(_)
             | Effect::SamplingValue(_) => result.controls += 1,
+            Effect::FollowValue(_) | Effect::FollowStatus(_) => result.controls += 1,
             Effect::Delete(_) if planned.moving => {}
             Effect::Insert(_, rows) if planned.moving => result.moved += rows.len(),
             Effect::Delete(ids) => result.deleted += ids.len(),
@@ -2243,6 +2421,14 @@ fn commit(
         }) {
             Ok(()) => {
                 record_committed(chunk, published);
+                // A promotion replaces a client's local selection (PX-017):
+                // remember when, to tell an earlier selection from a later.
+                if chunk
+                    .iter()
+                    .any(|planned| matches!(planned.effect, Effect::Promote(_)))
+                {
+                    *published.last_promotion = session.current_revision();
+                }
                 // Settlement may have cleared the promotion in this commit, when
                 // its row left the model: the store is the record (PX-011).
                 *published.promoted = session.with_store(|store| {
@@ -2378,7 +2564,8 @@ fn rows_word(count: usize) -> &'static str {
 /// and the user filter [`OWNER_RESERVE_BYTES`] rather than its own (PX-012),
 /// and the inspector [`INSPECTOR_RESERVE_BYTES`] rather than its own (PX-013),
 /// and its command-line view [`COMMAND_RESERVE_BYTES`] rather than its own (PX-014),
-/// and the sampling controls [`SAMPLING_RESERVE_BYTES`] rather than their own (PX-015), so
+/// and the sampling controls [`SAMPLING_RESERVE_BYTES`] rather than their own (PX-015),
+/// and the follow controls [`FOLLOW_RESERVE_BYTES`] rather than their own (PX-017), so
 /// the rows that fit are a function of the rows alone. A status or summary that
 /// grew because a scan or a collector failed therefore cannot shrink the row
 /// budget and delete a row no scan said had ended.
@@ -2399,7 +2586,8 @@ fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
             + OWNER_RESERVE_BYTES
             + INSPECTOR_RESERVE_BYTES
             + COMMAND_RESERVE_BYTES
-            + SAMPLING_RESERVE_BYTES,
+            + SAMPLING_RESERVE_BYTES
+            + FOLLOW_RESERVE_BYTES,
     );
     let mut spent = 0usize;
     let mut kept = 0usize;
@@ -2610,6 +2798,10 @@ enum Effect {
     SamplingEnabled(bool),
     /// The interval field's value set to what the server keeps (PX-015).
     SamplingValue(String),
+    /// The follow toggle's value set to what the server holds (PX-017).
+    FollowValue(bool),
+    /// The follow status text set (PX-017).
+    FollowStatus(String),
     Delete(Vec<ItemId>),
     Insert(u64, Vec<Row>),
     Update(Vec<Row>),
@@ -2630,12 +2822,16 @@ struct Published<'a> {
     search: &'a mut SearchView,
     /// The table's promoted selection as the store holds it (PX-011).
     promoted: &'a mut Option<ItemId>,
+    /// The revision of the latest committed promotion (PX-017).
+    last_promotion: &'a mut u64,
     /// The user-filter controls as announced (PX-012).
     owner: &'a mut OwnerView,
     /// The inspector's lines as announced (PX-013).
     inspector: &'a mut InspectorView,
     /// The sampling controls as announced (PX-015).
     sampling: &'a mut SamplingView,
+    /// The follow controls as announced (PX-017).
+    follow: &'a mut FollowView,
 }
 
 /// The planned operations that turn the `published` summary into `target`:
@@ -2714,6 +2910,12 @@ impl Planned {
             Effect::SamplingValue(value) => {
                 Operation::set_property(INTERVAL_INPUT, VALUE, Value::String(value.clone()))
             }
+            Effect::FollowValue(on) => {
+                Operation::set_property(FOLLOW_TOGGLE, VALUE, Value::Bool(*on))
+            }
+            Effect::FollowStatus(text) => {
+                Operation::set_property(FOLLOW_STATUS, TEXT, Value::String(text.clone()))
+            }
             Effect::Delete(ids) => Operation::model_delete_items(MODEL, ids.iter().copied()),
             Effect::Insert(index, rows) => {
                 Operation::model_insert(MODEL, *index, rows.iter().map(Row::to_model_item))
@@ -2780,7 +2982,10 @@ impl Effect {
             Self::SamplingStatus(text) | Self::SamplingLabel(text) | Self::SamplingValue(text) => {
                 VALUE_FRAMING_BYTES + text.len()
             }
-            Self::SamplingEnabled(_) => VALUE_FRAMING_BYTES + SCALAR_VALUE_BYTES,
+            Self::SamplingEnabled(_) | Self::FollowValue(_) => {
+                VALUE_FRAMING_BYTES + SCALAR_VALUE_BYTES
+            }
+            Self::FollowStatus(text) => VALUE_FRAMING_BYTES + text.len(),
             Self::SearchStatus(text) => VALUE_FRAMING_BYTES + text.len(),
             Self::SearchValue { value, .. } => VALUE_FRAMING_BYTES + value.len(),
             // The `SET_PROPERTY` of the item ID, and a whole second operation:
@@ -2809,9 +3014,11 @@ impl Effect {
             columns,
             search,
             promoted,
+            last_promotion: _,
             owner,
             inspector,
             sampling,
+            follow,
         } = published;
         match self {
             Self::InspectorText { node, text } => {
@@ -2840,6 +3047,8 @@ impl Effect {
             Self::SamplingStatus(text) => sampling.status.clone_from(text),
             Self::SamplingLabel(label) => sampling.pause_label.clone_from(label),
             Self::SamplingEnabled(enabled) => sampling.refresh_enabled = *enabled,
+            Self::FollowValue(checked) => follow.checked = *checked,
+            Self::FollowStatus(text) => follow.status.clone_from(text),
             Self::Promote(row) => **promoted = Some(row.item_id),
             Self::Status(text) => status.clone_from(text),
             Self::FilterStatus(text) => filter_status.clone_from(text),
@@ -4015,7 +4224,8 @@ mod tests {
                 + OWNER_RESERVE_BYTES
                 + INSPECTOR_RESERVE_BYTES
                 + COMMAND_RESERVE_BYTES
-                + SAMPLING_RESERVE_BYTES);
+                + SAMPLING_RESERVE_BYTES
+                + FOLLOW_RESERVE_BYTES);
         let mut published = Vec::new();
         for system in [
             SystemSample::not_provided(),
@@ -4321,6 +4531,17 @@ mod tests {
                     "\u{20000}".repeat(crate::sampling::MAX_INTERVAL_INPUT_BYTES / 4),
                 )?;
                 ui.set(SAMPLING_PAUSE, LABEL, crate::sampling::RESUME_LABEL)?;
+                // PX-017: the follow status at its widest, cut mark
+                // included, with follow on.
+                ui.set(
+                    crate::FOLLOW_STATUS,
+                    TEXT,
+                    crate::bounded(
+                        &"\u{20000}".repeat(crate::follow::MAX_FOLLOW_STATUS_BYTES / 4 + 1),
+                        crate::follow::MAX_FOLLOW_STATUS_BYTES,
+                    ),
+                )?;
+                ui.set(crate::FOLLOW_TOGGLE, VALUE, true)?;
                 // PX-016: the filter field at its cap, so the filter group
                 // below is measured with its value at its widest.
                 ui.set(
@@ -4369,6 +4590,11 @@ mod tests {
             INSPECTOR_METRICS,
         ]);
         let command = encoded(&[INSPECTOR_COMMAND]);
+        let follow = encoded(&[
+            crate::FOLLOW_ROW,
+            crate::FOLLOW_TOGGLE,
+            crate::FOLLOW_STATUS,
+        ]);
         let sampling = encoded(&[
             crate::SAMPLING_ROW,
             SAMPLING_PAUSE,
@@ -4470,6 +4696,14 @@ mod tests {
             "the reserve must be measured against sampling controls that really are wide: {sampling}"
         );
         assert!(
+            follow <= FOLLOW_RESERVE_BYTES,
+            "the widest follow controls encode to {follow} bytes, above their {FOLLOW_RESERVE_BYTES} byte reserve"
+        );
+        assert!(
+            follow > FOLLOW_RESERVE_BYTES / 2,
+            "the reserve must be measured against follow controls that really are wide: {follow}"
+        );
+        assert!(
             command <= COMMAND_RESERVE_BYTES,
             "the widest command line encodes to {command} bytes, above its {COMMAND_RESERVE_BYTES} byte reserve"
         );
@@ -4512,6 +4746,7 @@ mod tests {
                     + INSPECTOR_RESERVE_BYTES
                     + COMMAND_RESERVE_BYTES
                     + SAMPLING_RESERVE_BYTES
+                    + FOLLOW_RESERVE_BYTES
                     + TRANSACTION_ENVELOPE_BYTES,
             "a snapshot with no row is {frame} bytes, above the allowances the row budget \
              leaves for it"
@@ -4527,6 +4762,7 @@ mod tests {
                 + INSPECTOR_RESERVE_BYTES
                 + COMMAND_RESERVE_BYTES
                 + SAMPLING_RESERVE_BYTES
+                + FOLLOW_RESERVE_BYTES
         );
         println!(
             "PX-013 inspector at its widest: encoded={inspector} reserve={INSPECTOR_RESERVE_BYTES}"
@@ -4536,6 +4772,9 @@ mod tests {
         );
         println!(
             "PX-015 sampling controls at their widest: encoded={sampling} reserve={SAMPLING_RESERVE_BYTES}"
+        );
+        println!(
+            "PX-017 follow controls at their widest: encoded={follow} reserve={FOLLOW_RESERVE_BYTES}"
         );
         println!(
             "PX-016 shortcuts: {} bound, {shortcut_bytes} bytes; filter={filter}/{FILTER_RESERVE_BYTES} \

@@ -1,4 +1,4 @@
-//! Model-backed collection widget handles and builders (§7.2, §7.3 Required Tier, §8).
+//! Model-backed collection widget handles and builders, including server-promoted selection (§6.3, §7.2, §7.3 Required Tier, §8).
 
 use crate::widgets::*;
 use crate::StoreMut;
@@ -295,3 +295,42 @@ impl_string_prop!(
 );
 impl_common_state_props!(Tree, TreeBuilder);
 impl_common_layout_props!(Tree, TreeBuilder);
+
+// =============================================================================
+// 4. Server-promoted selection (§6.3, §7.6, §8; see `crate::selection`)
+// =============================================================================
+
+macro_rules! impl_promoted_selection {
+    ($widget:ident) => {
+        impl $widget {
+            /// Promotes `item` to this collection's semantic selection (§6.3, §8).
+            ///
+            /// See [`crate::UiTransaction::promote_selection`] for the recorded operations and
+            /// the explicit errors; an unknown `ItemId` never falls back to a row index.
+            pub fn promote_selection(
+                &self,
+                ui: &mut crate::UiTransaction,
+                item: impl Into<ItemId>,
+            ) -> Result<(), StoreError> {
+                ui.promote_selection(self.id(), item)
+            }
+
+            /// Withdraws this collection's promoted selection, returning the item it named.
+            pub fn clear_promoted_selection(
+                &self,
+                ui: &mut crate::UiTransaction,
+            ) -> Result<Option<ItemId>, StoreError> {
+                ui.clear_promoted_selection(self.id())
+            }
+
+            /// Returns this collection's promoted selection, if any (§6.3).
+            pub fn promoted_selection(&self, store: &SemanticStore) -> Option<ItemId> {
+                store.get_node(self.id())?.promoted_selection()
+            }
+        }
+    };
+}
+
+impl_promoted_selection!(List);
+impl_promoted_selection!(Table);
+impl_promoted_selection!(Tree);

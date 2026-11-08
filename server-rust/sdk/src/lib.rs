@@ -1,8 +1,10 @@
 //! SRUI Server SDK
 //!
 //! Provides high-level typed builder, accessor, session, transaction, and event routing
-//! abstractions on top of the core SRUI semantic tree and transaction engine (§7.1–§7.7, §12, §29).
+//! abstractions on top of the core SRUI semantic tree and transaction engine (§6.3, §7.1–§7.7, §8,
+//! §12, §29). [`selection`] lets a server promote a collection's selection to semantic state.
 
+pub mod selection;
 pub mod session;
 pub mod widgets;
 

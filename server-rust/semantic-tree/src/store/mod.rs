@@ -1,4 +1,11 @@
-//! Mutable authoritative in-memory semantic graph store (§6.2, §6.3, §13, §26).
+//! Mutable authoritative in-memory semantic graph store (§6.2, §6.3, §8, §13, §26).
+//!
+//! A `List`, `Table` or `Tree` may carry a server-promoted selection in its standard `value`
+//! property (§6.3 "explicitly promoted to semantic state", §7.6, §8). The store enforces only the
+//! cache-independent rules, identically on every replica: the value is an `ItemId` (never a row
+//! index), and it is held only while `selection_mode` is `single` or `multiple`. Whether the item
+//! exists is not checked here, because a sparse replica may legitimately not cache it; the SDK
+//! refuses an unknown item against the authoritative store instead.
 
 pub mod error;
 pub mod limits;
@@ -11,7 +18,7 @@ pub use limits::{
 };
 pub use node::Node;
 
-use crate::ids::{ItemId, ModelId, NodeId, PropertyRef, TypeRef};
+use crate::ids::{ItemId, ModelId, NodeId, PropertyRef, StandardSelectionMode, TypeRef};
 use crate::model::{Model, ModelItem};
 use crate::transaction::{Operation, Revision};
 use crate::value::Value;
@@ -23,6 +30,52 @@ pub const DEFAULT_MAX_TREE_DEPTH: usize = 64;
 pub const DEFAULT_MAX_NODE_COUNT: usize = 100_000;
 /// Default maximum allowed property string length in bytes (§26).
 pub const DEFAULT_MAX_STRING_LENGTH: usize = 1024 * 1024; // 1 MiB
+
+/// Returns `true` for the collection node types whose `value` is a promoted selection (§7.6, §8).
+pub fn is_selectable_collection(node_type: TypeRef) -> bool {
+    node_type == TypeRef::LIST || node_type == TypeRef::TABLE || node_type == TypeRef::TREE
+}
+
+/// Validates the promoted-selection invariant of one collection node's resulting properties.
+///
+/// `value` and `selection_mode` are the values the node would hold after the mutation. Both
+/// rules are cache-independent so every replica reaches the same verdict (§12.1).
+fn validate_collection_selection(
+    node_id: NodeId,
+    node_type: TypeRef,
+    value: Option<&Value>,
+    selection_mode: Option<&Value>,
+) -> Result<(), StoreError> {
+    if !is_selectable_collection(node_type) {
+        return Ok(());
+    }
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if !matches!(value, Value::ItemId(_)) {
+        return Err(StoreError::InvalidCollectionSelection {
+            node_id,
+            reason: "a promoted selection must be an ItemId, never a row index or other value"
+                .to_string(),
+        });
+    }
+    let selectable = selection_mode
+        .and_then(Value::as_enum_token)
+        .and_then(|token| StandardSelectionMode::try_from(token).ok())
+        .is_some_and(|mode| mode != StandardSelectionMode::None);
+    if !selectable {
+        return Err(StoreError::InvalidCollectionSelection {
+            node_id,
+            reason: "selection_mode is none or absent, so no selection can be promoted".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Last value assigned to `prop` in an ordered property list (later entries win, as on insert).
+fn last_assigned(props: &[(PropertyRef, Value)], prop: PropertyRef) -> Option<&Value> {
+    props.iter().rev().find(|(p, _)| *p == prop).map(|(_, v)| v)
+}
 
 /// Authoritative in-memory semantic node graph holding the session's active UI tree (§6.2, §6.3, §12).
 ///
@@ -181,6 +234,11 @@ impl SemanticStore {
         hashes
     }
 
+    /// Iterates every active node in unspecified order.
+    pub fn iter_nodes(&self) -> impl Iterator<Item = &Node> + '_ {
+        self.nodes.values()
+    }
+
     /// Returns a mutable reference to the node with the given ID.
     pub fn get_node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
         self.nodes.get_mut(&id)
@@ -285,6 +343,12 @@ impl SemanticStore {
             self.limits.validate_value(val)?;
             self.validate_property_references(*prop, val)?;
         }
+        validate_collection_selection(
+            id,
+            node_type,
+            last_assigned(&prop_list, PropertyRef::VALUE),
+            last_assigned(&prop_list, PropertyRef::SELECTION_MODE),
+        )?;
 
         // 5. Validate insertion index if parent specified
         if let Some(pid) = parent_id {
@@ -405,6 +469,13 @@ impl SemanticStore {
             .nodes
             .get_mut(&id)
             .ok_or(StoreError::NodeNotFound(id))?;
+        if prop == PropertyRef::VALUE {
+            let mode = node.get_property(PropertyRef::SELECTION_MODE);
+            validate_collection_selection(id, node.node_type, Some(&val), mode)?;
+        } else if prop == PropertyRef::SELECTION_MODE {
+            let value = node.get_property(PropertyRef::VALUE);
+            validate_collection_selection(id, node.node_type, value, Some(&val))?;
+        }
         Ok(node.properties.insert(prop, val))
     }
 
@@ -418,6 +489,10 @@ impl SemanticStore {
             .nodes
             .get_mut(&id)
             .ok_or(StoreError::NodeNotFound(id))?;
+        if prop == PropertyRef::SELECTION_MODE {
+            let value = node.get_property(PropertyRef::VALUE);
+            validate_collection_selection(id, node.node_type, value, None)?;
+        }
         Ok(node.properties.remove(&prop))
     }
 
@@ -431,6 +506,13 @@ impl SemanticStore {
         for (prop, val) in &prop_list {
             self.limits.validate_value(val)?;
             self.validate_property_references(*prop, val)?;
+        }
+        if let Some(node) = self.nodes.get(&id) {
+            let value = last_assigned(&prop_list, PropertyRef::VALUE)
+                .or_else(|| node.get_property(PropertyRef::VALUE));
+            let mode = last_assigned(&prop_list, PropertyRef::SELECTION_MODE)
+                .or_else(|| node.get_property(PropertyRef::SELECTION_MODE));
+            validate_collection_selection(id, node.node_type, value, mode)?;
         }
 
         let node = self

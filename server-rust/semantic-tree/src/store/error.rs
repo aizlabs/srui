@@ -53,6 +53,9 @@ pub enum StoreError {
     ModelIndexOutOfBounds { index: u64, count: u64 },
     /// Attempted to insert a duplicate ItemId into the collection model.
     DuplicateItemId { model_id: ModelId, item_id: ItemId },
+    /// A List/Table/Tree promoted selection (`value`) is not an `ItemId`, or is held while the
+    /// node's `selection_mode` is absent or `none` (§6.3, §7.4, §8).
+    InvalidCollectionSelection { node_id: NodeId, reason: String },
     /// Generic operation error when applying a wire operation.
     OperationError(String),
 }
@@ -154,6 +157,11 @@ impl fmt::Display for StoreError {
                 "duplicate item ID {} in model {}",
                 item_id, model_id
             ),
+            Self::InvalidCollectionSelection { node_id, reason } => write!(
+                f,
+                "invalid promoted selection on collection node {}: {}",
+                node_id, reason
+            ),
             Self::OperationError(msg) => write!(f, "operation application error: {}", msg),
         }
     }
@@ -188,6 +196,7 @@ impl StoreError {
             Self::ItemNotFound(_) => "item_not_found",
             Self::ModelIndexOutOfBounds { .. } => "model_index_out_of_bounds",
             Self::DuplicateItemId { .. } => "duplicate_item_id",
+            Self::InvalidCollectionSelection { .. } => "invalid_collection_selection",
             Self::OperationError(_) => "operation_error",
         }
     }

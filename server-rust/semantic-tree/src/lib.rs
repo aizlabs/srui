@@ -4,7 +4,8 @@
 //! - §4: Architectural invariants (§4 inv. 13 unknown required semantics fail explicitly)
 //! - §6.1: Core object list ([`Event`], [`CapabilitySet`])
 //! - §6.2: Node identity ([`NodeId`])
-//! - §6.3: State ownership ([`SemanticStore`])
+//! - §6.3: State ownership ([`SemanticStore`]); a List/Table/Tree `value` holding an `ItemId` is a
+//!   selection explicitly promoted to semantic state ([`Node::promoted_selection`])
 //! - §6.4: Type and property references, namespaces ([`TypeRef`], [`PropertyRef`], [`STANDARD_NAMESPACE_ID`])
 //! - §6.5: Typed value representation ([`Value`], semantic tuples, lists, small records)
 //! - §7.6: Standard events ([`Event`], [`STANDARD_EVENTS`])
@@ -12,6 +13,8 @@
 //! - §12: Persistent object graph and mutation stream
 //! - §12.1: Revisions and transactions ([`Revision`], [`Transaction`], [`Operation`])
 //! - §12.2: Commits are state-consistency boundaries, not render frames
+//! - §8: Collection models ([`Model`]) and the cache-independent promoted-selection rules
+//!   ([`is_selectable_collection`], [`StoreError::InvalidCollectionSelection`])
 //! - §13: Core mutation operations ([`SemanticStore`])
 //! - §14: Resource model (large blobs are resources, not properties)
 //! - §15: Capability negotiation ([`CapabilitySet`], [`Profile`], [`ServerCapabilities`])
@@ -53,9 +56,10 @@ pub use ids::{
 pub use model::{Model, ModelItem};
 
 pub use store::{
-    Node, SemanticStore, StoreError, StoreLimits, DEFAULT_MAX_CACHED_ITEMS_PER_MODEL,
-    DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION, DEFAULT_MAX_MODEL_COUNT, DEFAULT_MAX_NODE_COUNT,
-    DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TRANSACTION_OPERATIONS, DEFAULT_MAX_TREE_DEPTH,
+    is_selectable_collection, Node, SemanticStore, StoreError, StoreLimits,
+    DEFAULT_MAX_CACHED_ITEMS_PER_MODEL, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
+    DEFAULT_MAX_MODEL_COUNT, DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH,
+    DEFAULT_MAX_TRANSACTION_OPERATIONS, DEFAULT_MAX_TREE_DEPTH,
 };
 
 pub use transaction::{

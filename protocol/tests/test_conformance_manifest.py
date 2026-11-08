@@ -195,11 +195,28 @@ def test_every_suite_has_a_readme(manifest: dict) -> None:
     )
 
 
+# Suite 1 vectors added after the pre-split corpus, each named so it cannot hide a lost original.
+STATE_MACHINE_VECTORS_ADDED_AFTER_SPLIT = (
+    # PX-011-G01: server-promoted collection selection (§6.3, §7.6, §8).
+    "50_collection_selection_promotion_success.json",
+    "51_collection_selection_mode_none_rejected.json",
+    "52_collection_selection_row_index_rejected.json",
+    "53_collection_selection_disable_while_promoted_rejected.json",
+)
+
+
 def test_the_49_original_state_machine_vectors_are_all_still_present(manifest: dict) -> None:
     """Suites 1 and 3 together must still hold every vector from the pre-split layout."""
     suite_one = next(s for s in manifest["suites"] if s["id"] == 1)
     suite_three = next(s for s in manifest["suites"] if s["id"] == 3)
-    total = suite_one["vectors"]["count"] + suite_three["vectors"]["count"]
+    suite_one_dir = VECTORS_DIR / suite_one["vectors"]["dir"]
+    for name in STATE_MACHINE_VECTORS_ADDED_AFTER_SPLIT:
+        assert (suite_one_dir / name).is_file(), f"declared post-split vector {name} is missing"
+    total = (
+        suite_one["vectors"]["count"]
+        + suite_three["vectors"]["count"]
+        - len(STATE_MACHINE_VECTORS_ADDED_AFTER_SPLIT)
+    )
     assert total == 49, f"the core state-machine corpus is 49 vectors, manifest accounts for {total}"
 
 

@@ -299,6 +299,9 @@ fn commit_ops_locked(
         ui.apply_op(op)
             .map_err(|error| ModelRangeError::Session(SessionError::Store(error).to_string()))?;
     }
+    // Same promoted-selection settlement as every other commit (§6.3, §8).
+    ui.settle_promoted_selections()
+        .map_err(|error| ModelRangeError::Session(SessionError::Store(error).to_string()))?;
     let (staged, recorded) = ui.into_staged_and_ops();
     let commit = AuthoritativeCommit::new(base_revision, recorded);
     let permit = guard.journal.prepare(&commit).map_err(SessionError::from)?;

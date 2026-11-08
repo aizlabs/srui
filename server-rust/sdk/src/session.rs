@@ -1,6 +1,10 @@
-//! Ergonomic Session API, transaction coordination, and in-process event dispatching (§6.1, §7.6, §7.7, §12.1, §12.2, §13, §27, §29).
+//! Ergonomic Session API, transaction coordination, and in-process event dispatching (§6.1, §6.3, §7.6, §7.7, §12.1, §12.2, §13, §27, §29).
 //!
 //! # Architecture & Design Invariants
+//!
+//! - **§6.3 Promoted selection**: every commit calls [`UiTransaction::settle_promoted_selections`]
+//!   (see [`crate::selection`]) so a promotion whose item the transaction deleted is cleared in the
+//!   same commit.
 //!
 //! - **§29 Reference Server SDK Contract**: The application developer interacts with high-level
 //!   semantic transactions (`session.transaction(|ui| { ... })`) and event handlers (`session.on(node, EVENT, handler)`).
@@ -21,6 +25,7 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::selection::PromotionTracker;
 use srui_resources::{PublishOutcome, ResourceEntry, ResourceError, ResourceStore};
 use srui_semantic_tree::{
     Event, EventValidationError, Node, NodeId, Operation, PropertyRef, ResourceHash, Revision,
@@ -144,10 +149,12 @@ impl StoreMut for SemanticStore {
 /// and [`UiTransaction::delete`].
 #[derive(Debug)]
 pub struct UiTransaction {
-    staged: SemanticStore,
+    pub(crate) staged: SemanticStore,
     operations: Vec<Operation>,
     op_count: usize,
     max_ops: usize,
+    /// Promoted collection selections whose item a `MODEL_DELETE` removed (§6.3, §8).
+    pub(crate) promotions: PromotionTracker,
 }
 
 impl UiTransaction {
@@ -158,6 +165,7 @@ impl UiTransaction {
             operations: Vec::new(),
             op_count: 0,
             max_ops,
+            promotions: PromotionTracker::default(),
         }
     }
 
@@ -288,6 +296,7 @@ impl UiTransaction {
     pub fn apply_op(&mut self, op: &Operation) -> Result<(), StoreError> {
         self.record_op()?;
         self.operations.push(op.clone());
+        self.promotions.observe(&self.staged, op);
         op.apply(&mut self.staged)
     }
 }
@@ -312,6 +321,7 @@ impl StoreMut for UiTransaction {
     ) -> Result<(), StoreError> {
         let props: Vec<(PropertyRef, Value)> = properties.into_iter().collect();
         self.record_op()?;
+        self.promotions.invalidate();
         self.operations.push(Operation::create_node(
             id,
             node_type,
@@ -330,6 +340,7 @@ impl StoreMut for UiTransaction {
         val: Value,
     ) -> Result<Option<Value>, StoreError> {
         self.record_op()?;
+        self.promotions.invalidate();
         self.operations
             .push(Operation::set_property(node, prop, val.clone()));
         self.staged.set_property(node, prop, val)
@@ -341,12 +352,14 @@ impl StoreMut for UiTransaction {
         prop: PropertyRef,
     ) -> Result<Option<Value>, StoreError> {
         self.record_op()?;
+        self.promotions.invalidate();
         self.operations.push(Operation::clear_property(node, prop));
         self.staged.clear_property(node, prop)
     }
 
     fn delete_node(&mut self, node: NodeId) -> Result<Vec<NodeId>, StoreError> {
         self.record_op()?;
+        self.promotions.invalidate();
         self.operations.push(Operation::delete_node(node));
         self.staged.delete_node(node)
     }
@@ -530,7 +543,9 @@ impl Session {
         let max_ops = guard.store.limits().max_transaction_operations;
         let mut ui = UiTransaction::new(guard.store.clone_staging(), max_ops);
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut ui)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            f(&mut ui).and_then(|val| ui.settle_promoted_selections().map(|()| val))
+        }));
 
         match result {
             Ok(Ok(val)) => {
@@ -571,6 +586,9 @@ impl Session {
 
         match result {
             Ok(Ok(val)) => {
+                if let Err(store_err) = ui.settle_promoted_selections() {
+                    return Err(SdkError::Store(store_err));
+                }
                 let new_rev = base_revision.next();
                 guard.store.commit_staging(ui.into_staged(), new_rev);
                 Ok(val)

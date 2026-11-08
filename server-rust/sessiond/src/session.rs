@@ -8,6 +8,9 @@
 //! enters deduplication state or an outbound message. It is replaced by a bounded, digest-derived
 //! marker that keeps two distinct oversized identifiers distinct.
 //!
+//! Every commit settles server-promoted collection selections (§6.3, §8) before it is journaled:
+//! a promotion whose item the transaction deleted is cleared in that same commit.
+//!
 //! Conforms strictly to [`async-no-lock-await`](rules/async-no-lock-await.md):
 //! internal locks are held only for fast in-memory operations and never across `.await` points.
 //! Conforms to [`async-bounded-channel`](rules/async-bounded-channel.md):
@@ -922,8 +925,11 @@ impl Session {
         let max_ops = guard.store.limits().max_transaction_operations;
         let mut ui = UiTransaction::new(guard.store.clone_staging(), max_ops);
 
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut ui, revisions)));
+        // A promoted selection whose item this transaction deleted is cleared in the same commit
+        // so resync never restores a dangling promotion (§6.3, §8).
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            f(&mut ui, revisions).and_then(|value| ui.settle_promoted_selections().map(|()| value))
+        }));
 
         match result {
             Ok(Ok(value)) => {

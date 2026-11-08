@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-013",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "A server-side selected-process inspector: the standard table SELECTION_CHANGED (and PX-011 search promotions) select one process instance, resolved by ItemId against the published rows; four standard status Texts show its name, PID, owner, state, parent, start time and current CPU/RSS; state, parent and start time load asynchronously on one bounded worker, tagged with ProcessKey and selection generation; Linux details come through the pinned /proc/<pid> directory and are bound to the key's start-time token; no process action, no protocol, SDK, renderer or client source change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX013-001",
+      "feature": "Selection input is untrusted: the process table's SELECTION_CHANGED handler reads only the event's ItemId argument and resolves it only against the item IDs of the rows the server currently publishes, never as a PID; an unknown, stale, filtered-out or malformed selection (no argument, a number, a string) is refused under a new selection generation with a defined inspector state and no detail-collector call; the PX-008 audit admits exactly the bare TABLE/SELECTION_CHANGED pair and keeps every other refusal and bypass self-test",
+      "scope": "PX-013/refresh (src/refresh.rs) ProcessView::select_item, selection_changed; lib (src/lib.rs) install_inspector; tests/no_process_control_test.rs is_table_selection, TABLE_SELECTION",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-013",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-013.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX013-002",
+      "feature": "Details are loaded asynchronously on one bounded worker and bound to their target: every read is tagged with the target's ProcessKey and SelectionGeneration and its result is dropped unless both still name the current target, so a deliberately delayed read of an earlier selection never overwrites a later one; at most one read runs and one waits (a newer request replaces the waiting one); a panicking read is an unreadable record; the worker holds the view and session weakly and ends once the view is dropped and its current read returns",
+      "scope": "PX-013/inspector (src/inspector.rs) DetailReads, DetailReadsIdle, DetailRequest, Inspector::completed; refresh (src/refresh.rs) start_inspector, ProcessView::details_read",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-013",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-013.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX013-003",
+      "feature": "One current target with a monotonic generation: a user's click and a PX-011 search promotion both select, the later one wins in server order (a click after a promotion replaces it), and a filter that hides the target, which lets PX-011-G01 settlement clear the promotion, shows that same instance as not shown, never another process",
+      "scope": "PX-013/refresh (src/refresh.rs) ProcessView::publish_search, inspector_effects; inspector (src/inspector.rs) Inspector::select, Inspector::view",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-013",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-013.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX013-004",
+      "feature": "Linux on-demand details: state (/proc/<pid>/stat field 3, one printable character named per proc_pid_stat(5), otherwise unrecognized) and parent PID (field 4, 0 meaning the kernel) are read through the record's pinned /proc/<pid> directory and accepted only if the line's start time equals the key's LinuxBootTicks creation token, so a reused PID reads as ended; the start time is derived from that same token as the root stat's btime plus the ticks at the mount's AT_CLKTCK; unreadable, denied, ill-formed or missing values stay distinct and are never 0, root or 1970",
+      "scope": "PX-013/procfs (src/procfs.rs) ProcFsDetails, parse_stat state and parent, read_boot_time, read_auxv_entry; source (src/source.rs) ProcessSource::details; inspector (src/inspector.rs) ProcessState, StartTime, ProcessDetails, DetailRead",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-013",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-013.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX013-005",
+      "feature": "The inspector follows its item ID wherever a sort or refresh moves its row, re-reads its details on every sample that confirms the row, and publishes distinct states for no selection, loading, permission denied, details unavailable, not provided by this source, not shown, and ended (row gone or the reader reports another instance under the PID); a reused PID's new record is a new item that the inspector never adopts or reads",
+      "scope": "PX-013/inspector (src/inspector.rs) Inspector::view, Inspector::reread; refresh (src/refresh.rs) ProcessView::apply, set_sort, republish, publish_status_only",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-013",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-013.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX013-006",
+      "feature": "Five new shell nodes (INSPECTOR 55 Column, INSPECTOR_STATUS 56, INSPECTOR_PROCESS 57, INSPECTOR_DETAILS 58, INSPECTOR_METRICS 59 Texts) under the table, each line bounded to 1024 bytes plus the cut mark, charged a fixed 6144-byte INSPECTOR_RESERVE_BYTES against the catch-up snapshot and measured on the encoder at maximum width; fixtures state details for --fake-source and --fake-sequence; native AppKit over SSH shows A then B, B kept across a sort that moves its row, denied details, no selection and an ended process",
+      "scope": "PX-013/lib (src/lib.rs) shell nodes; refresh (src/refresh.rs) INSPECTOR_RESERVE_BYTES; client-macos/Tests/SRUITests/ProcessExplorerShellTests.swift",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-013",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-013.md"
+      ]
+    }
+  ]
+}

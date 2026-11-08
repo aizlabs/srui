@@ -1,7 +1,7 @@
 //! Existing sessiond runtime/SSH bridge host for the PX-001 shell (§§12, 20, 27, 29).
 use srui_process_explorer::{
-    initialize, install_column_handlers, install_filter_handlers, install_owner_handlers,
-    install_search_handlers, install_sort_handlers,
+    initialize, install_column_handlers, install_filter_handlers, install_inspector,
+    install_owner_handlers, install_search_handlers, install_sort_handlers,
     procfs::ProcFsSource,
     refresh::{poll, DEFAULT_REFRESH_INTERVAL, MAX_REFRESH_INTERVAL, MIN_REFRESH_INTERVAL},
     source::{
@@ -56,6 +56,9 @@ where
     install_column_handlers(session, &view);
     install_search_handlers(session, &view);
     install_owner_handlers(session, &view);
+    // The inspector reads details through its own reader of the source's
+    // records, on its own bounded worker (PX-013).
+    install_inspector(session, &view, source.details());
     let session = Arc::clone(session);
     let shutdown = shutdown.child_token();
     connections.spawn(poll(view, source, session, interval, shutdown));

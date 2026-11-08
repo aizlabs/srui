@@ -6,6 +6,9 @@
 //! `/proc` cases are compiled for Linux, where they must run for real. This
 //! suite must run unprivileged, like the app itself: the denied-record case
 //! relies on mode 0 being unreadable.
+use srui_process_explorer::inspector::{
+    DetailRead, DetailSource, ProcessDetails, ProcessState, StartTime,
+};
 use srui_process_explorer::procfs::{
     parse_pid, parse_stat, MonotonicClock, ProcFsSource, WallClock, LIVE_STATUS_TEXT,
     MAX_FILE_BYTES,
@@ -13,8 +16,8 @@ use srui_process_explorer::procfs::{
 use srui_process_explorer::published_status;
 use srui_process_explorer::source::{
     Completeness, CpuInterval, CpuUsage, CreationToken, DisplayName, FigureGap, IssueScope,
-    LoadAverages, MemoryFigures, MissingReason, Observed, ProcessSource, Retention, SourceId,
-    SwapFigures, SystemCpu, SystemCpuInterval, FAKE_STATUS_TEXT, MAX_RECORDED_ISSUES,
+    LoadAverages, MemoryFigures, MissingReason, Observed, ProcessKey, ProcessSource, Retention,
+    SourceId, SwapFigures, SystemCpu, SystemCpuInterval, FAKE_STATUS_TEXT, MAX_RECORDED_ISSUES,
 };
 use srui_process_explorer::summary;
 use std::collections::BTreeSet;
@@ -2663,6 +2666,235 @@ fn a_live_source_without_a_process_filesystem_publishes_no_figure() {
     }
 }
 
+/// A `stat` line with `state` and `parent` written verbatim as fields 3 and
+/// 4, and `ticks` as field 22 (PX-013).
+fn stat_line_with_state(pid: u32, comm: &[u8], state: &str, parent: &str, ticks: u64) -> Vec<u8> {
+    let mut line = format!("{pid} (").into_bytes();
+    line.extend_from_slice(comm);
+    line.extend_from_slice(format!(") {state} {parent}").as_bytes());
+    // Fields 5 through 21.
+    for filler in 5..=21 {
+        line.extend_from_slice(format!(" {filler}").as_bytes());
+    }
+    line.extend_from_slice(format!(" {ticks} 4096 {STAT_RSS_DECOY} 0\n").as_bytes());
+    line
+}
+
+/// PX-013: the state is field 3 and the parent field 4, located after the
+/// last `)` like every other field, so a hostile name cannot shift them; a
+/// field that is not exactly one printable character, or not a plain count
+/// within `u32`, is unread, never guessed and never 0.
+#[test]
+fn the_state_and_parent_are_stat_fields_3_and_4_and_an_unusable_one_is_unread() {
+    let hostile = parse_stat(7, &stat_line(7, b"x) Z 9 (y", 55)).unwrap();
+    assert_eq!(
+        hostile.state,
+        Observed::Known(ProcessState::from_code(b'S').unwrap())
+    );
+    assert_eq!(hostile.parent, Observed::Known(1));
+    assert_eq!(hostile.start_ticks, 55);
+    let kernel = parse_stat(2, &stat_line_with_state(2, b"kthreadd", "S", "0", 9)).unwrap();
+    assert_eq!(
+        kernel.parent,
+        Observed::Known(0),
+        "PID 0 is the kernel's, and stays 0"
+    );
+    let unknown = parse_stat(2, &stat_line_with_state(2, b"odd", "Q", "1", 9)).unwrap();
+    assert_eq!(
+        unknown.state,
+        Observed::Known(ProcessState::from_code(b'Q').unwrap())
+    );
+    for (state, parent) in [
+        ("SS", "1"),
+        ("\u{e9}", "1"),
+        ("S", "-1"),
+        ("S", "4294967296"),
+        ("S", "1x"),
+        ("S", "+1"),
+    ] {
+        let stat = parse_stat(3, &stat_line_with_state(3, b"w", state, parent, 9))
+            .expect("the record is still identified by its start time");
+        if state == "S" {
+            assert_eq!(
+                stat.parent,
+                Observed::Missing(MissingReason::Unavailable),
+                "parent {parent:?}"
+            );
+        } else {
+            assert_eq!(
+                stat.state,
+                Observed::Missing(MissingReason::Unavailable),
+                "state {state:?}"
+            );
+        }
+        assert_eq!(stat.start_ticks, 9);
+    }
+}
+
+/// PX-013: the inspector reads one instance on demand, from its own record's
+/// `stat`: state and parent from that line, and the start time from the key's
+/// own creation token at the mount's tick rate after its `btime`. A line whose
+/// start time is not the key's — a reused PID — or a record that is gone is an
+/// ended instance, and none of its fields is returned; a denied record says so;
+/// a key this source did not mint is never read.
+#[test]
+fn details_are_read_for_the_keys_own_instance_and_never_from_a_reused_pid() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .clock_ticks(100)
+        .process(42, b"worker", 12_345)
+        .raw(43, &stat_line_with_state(43, b"init", "Z", "0", 7))
+        .system_file(
+            "stat",
+            b"cpu  1 0 0 3 0 0 0 0 0 0\ncpu0 1 0 0 3 0 0 0 0 0 0\nintr 9 1 2\nctxt 4\nbtime 1800000000\nprocesses 9\n",
+        );
+    let mut source = fixture.source();
+    let snapshot = source.snapshot();
+    let key_of = |pid: u32| {
+        snapshot
+            .records
+            .iter()
+            .find(|record| record.key.pid == Observed::Known(pid))
+            .expect("the fixture lists this record")
+            .key
+            .clone()
+    };
+    let (worker, init) = (key_of(42), key_of(43));
+    let details = source.details_reader();
+    let boot = Observed::Known(1_800_000_000);
+    assert_eq!(
+        details.read_details(&worker),
+        DetailRead::Read(ProcessDetails {
+            state: Observed::Known(ProcessState::from_code(b'S').unwrap()),
+            parent: Observed::Known(1),
+            started: Observed::Known(StartTime::from_ticks(12_345, 100, boot.clone())),
+        })
+    );
+    assert_eq!(
+        details.read_details(&init),
+        DetailRead::Read(ProcessDetails {
+            state: Observed::Known(ProcessState::from_code(b'Z').unwrap()),
+            parent: Observed::Known(0),
+            started: Observed::Known(StartTime::from_ticks(7, 100, boot)),
+        })
+    );
+    // The source's own reader, as the inspector is given it.
+    let provided = source.details().expect("a procfs source reads details");
+    assert_eq!(
+        provided.read_details(&worker),
+        details.read_details(&worker)
+    );
+
+    // A key this source did not mint, or one without a PID or a Linux token,
+    // names no record of this tree: nothing is read for it, so even a record
+    // that is gone is not reported as ended.
+    fs::remove_dir_all(fixture.0.join("43")).unwrap();
+    let unread = DetailRead::Unreadable(MissingReason::Unavailable);
+    for foreign in [
+        ProcessKey {
+            source: SourceId("elsewhere".into()),
+            ..init.clone()
+        },
+        ProcessKey {
+            pid: Observed::Missing(MissingReason::Unavailable),
+            ..init.clone()
+        },
+        ProcessKey {
+            creation: CreationToken::Opaque("7".into()),
+            ..init.clone()
+        },
+    ] {
+        assert_eq!(details.read_details(&foreign), unread);
+    }
+    assert_eq!(
+        details.read_details(&init),
+        DetailRead::Ended,
+        "gone is ended"
+    );
+
+    // A denied record is denied, never ended and never a value.
+    fixture.denied(44);
+    let denied = ProcessKey {
+        pid: Observed::Known(44),
+        creation: CreationToken::LinuxBootTicks(500),
+        ..worker.clone()
+    };
+    assert_eq!(
+        details.read_details(&denied),
+        DetailRead::Unreadable(MissingReason::Denied)
+    );
+
+    // PID 42 reused by a newcomer with another start time: the instance the
+    // key names has ended, and the newcomer's fields are not returned.
+    fixture.process(42, b"newcomer", 99_999);
+    assert_eq!(details.read_details(&worker), DetailRead::Ended);
+}
+
+/// PX-013: the start time needs the mount's own tick rate, and its wall-clock
+/// time needs exactly one `btime` line, found past an `intr` line of any
+/// length the scan bound allows. Anything else is unread, never 1970.
+#[test]
+fn the_start_time_needs_the_mounts_tick_rate_and_states_an_unread_boot_time() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .clock_ticks(250)
+        .process(42, b"worker", 1_000);
+    let mut source = fixture.source();
+    let key = source.snapshot().records[0].key.clone();
+    let details = source.details_reader();
+    let started = || match details.read_details(&key) {
+        DetailRead::Read(read) => read.started,
+        other => panic!("{other:?}"),
+    };
+    // No `stat` at the root: the start after boot is known, its time is not.
+    assert_eq!(
+        started(),
+        Observed::Known(StartTime::from_ticks(
+            1_000,
+            250,
+            Observed::Missing(MissingReason::Unavailable)
+        ))
+    );
+    // A very long `intr` line before `btime` is skipped, not misread.
+    let mut stat = b"cpu  1 0 0 3 0 0 0 0 0 0\nintr".to_vec();
+    for interrupt in 0..40_000 {
+        stat.extend_from_slice(format!(" {interrupt}").as_bytes());
+    }
+    stat.extend_from_slice(b"\nbtime 1700000000\nprocesses 1\n");
+    fixture.system_file("stat", &stat);
+    assert_eq!(
+        started(),
+        Observed::Known(StartTime::from_ticks(
+            1_000,
+            250,
+            Observed::Known(1_700_000_000)
+        ))
+    );
+    for refused in [
+        &b"btime 1\nbtime 2\n"[..],
+        b"btime -1\n",
+        b"btime 17x\n",
+        b"btime\n",
+    ] {
+        fixture.system_file("stat", refused);
+        assert_eq!(
+            started(),
+            Observed::Known(StartTime::from_ticks(
+                1_000,
+                250,
+                Observed::Missing(MissingReason::Unavailable)
+            )),
+            "{}",
+            String::from_utf8_lossy(refused)
+        );
+    }
+    // No tick rate: no start time at all, rather than a guessed rate.
+    fixture.page_size(FIXTURE_PAGE_SIZE);
+    assert_eq!(started(), Observed::Missing(MissingReason::Unavailable));
+}
+
 #[cfg(target_os = "linux")]
 mod live {
     use super::*;
@@ -3691,6 +3923,87 @@ mod live {
             "PX-012 live evidence: worker_pid={pid} owner_uid={me} name={name:?} \
              absent_pid={absent} status={status:?} records={} with_owner={read}",
             snapshot.records.len()
+        );
+    }
+
+    /// PX-013: the inspector's details of a bounded, disposable, test-owned
+    /// worker, read for the key the live scan minted, through its record
+    /// directory: its parent is this test process, it sleeps, and its start
+    /// time is its creation token at the kernel's tick rate after `btime`.
+    /// Once the worker has ended, the same key reads as ended.
+    #[test]
+    fn a_test_owned_workers_parent_state_and_start_time_are_read_for_its_key() {
+        use std::time::SystemTime;
+        let before = SystemTime::now();
+        let worker = Worker::start();
+        let pid = worker.pid();
+        let source = {
+            let mut source = ProcFsSource::live();
+            let snapshot = source.snapshot();
+            (source, snapshot)
+        };
+        let (source, snapshot) = source;
+        let key = snapshot
+            .records
+            .iter()
+            .find(|record| record.key.pid == Observed::Known(pid))
+            .expect("the owned worker is listed")
+            .key
+            .clone();
+        let CreationToken::LinuxBootTicks(ticks) = key.creation else {
+            panic!("a live key carries the kernel's start time: {key:?}")
+        };
+        let details = source.details().expect("the live source reads details");
+        let read = match details.read_details(&key) {
+            DetailRead::Read(read) => read,
+            other => panic!("the owned worker's details: {other:?}"),
+        };
+        assert_eq!(read.parent, Observed::Known(std::process::id()));
+        assert_eq!(
+            read.state,
+            Observed::Known(ProcessState::from_code(b'S').unwrap()),
+            "a ready worker sleeps"
+        );
+        // The same derivation, from the kernel's own files read here.
+        let rate: u64 = String::from_utf8(
+            Command::new("getconf")
+                .arg("CLK_TCK")
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .expect("getconf runs")
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+        let btime: u64 = std::fs::read_to_string("/proc/stat")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("btime "))
+            .expect("a kernel writes btime")
+            .trim()
+            .parse()
+            .unwrap();
+        let expected = StartTime::from_ticks(ticks, rate, Observed::Known(btime));
+        assert_eq!(read.started, Observed::Known(expected.clone()));
+        let Observed::Known(at) = expected.at else {
+            unreachable!()
+        };
+        // `btime` is whole seconds, so the start is within a second or two of
+        // the moment this test spawned the worker.
+        assert!(
+            at + Duration::from_secs(2) >= before
+                && at <= SystemTime::now() + Duration::from_secs(2),
+            "started {at:?}, spawned after {before:?}"
+        );
+        drop(worker);
+        assert_eq!(details.read_details(&key), DetailRead::Ended);
+        println!(
+            "PX-013 live evidence: worker_pid={pid} parent={:?} state={:?} start_ticks={ticks} \
+             clk_tck={rate} btime={btime} started={:?} after_exit=Ended",
+            read.parent, read.state, read.started
         );
     }
 

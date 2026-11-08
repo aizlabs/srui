@@ -40,6 +40,14 @@
 //! UID on `status`'s `Uid:` line ([`parse_status_uid`]). An owner that cannot
 //! be read is unread, never UID 0, and the record is still published.
 //!
+//! The inspector's details (PX-013) are read on demand, for one selected
+//! instance, by [`ProcFsDetails`]: its record directory is opened (pinned where
+//! the reader can pin it), and its `stat` is accepted only if its start time is
+//! the creation token of the key it was asked for, so a reused PID is an ended
+//! instance and never lends its state, parent or start time. The start time is
+//! derived from that same token: the root's `stat` `btime` plus the token's
+//! clock ticks at the mount's own `AT_CLKTCK`.
+//!
 //! The system-wide figures (PX-007) are read beside the records, from the
 //! scanned root's own `stat`, `meminfo`, `uptime` and `loadavg`, so a fixture
 //! tree states its own and is deterministic on any host. Each file is read, and
@@ -49,6 +57,7 @@
 //! two consecutive successful reads. The sample time is taken on an injected
 //! [`WallClock`], so a fixture's sample time, which the freshness line
 //! publishes, is a fact of the test rather than of the moment it ran.
+use crate::inspector::{DetailRead, DetailSource, ProcessDetails, ProcessState, StartTime};
 use crate::owner::Accounts;
 use crate::source::{
     record_issue, BootId, CappedRecords, Completeness, CpuInterval, CpuUsage, CreationToken,
@@ -161,6 +170,17 @@ const MAX_STAT_CPU_BYTES: u64 = 2 * 1024 * 1024;
 /// are ten counts of at most twenty digits; a longer line is examined only this
 /// far and found not to be one.
 const MAX_STAT_CPU_LINE_BYTES: u64 = 4 * 1024;
+/// The most of a `stat` file read while looking for its `btime` line (PX-013):
+/// the same bound as its `cpu` lines, so a host whose `intr` line is very long
+/// reports its boot time unavailable rather than reading without limit.
+const MAX_BOOT_TIME_SCAN_BYTES: u64 = MAX_STAT_CPU_BYTES + MAX_FILE_BYTES;
+/// The most of one `stat` line examined as a candidate `btime` line: `btime `,
+/// twenty digits and a newline fit well inside it.
+const BOOT_TIME_LINE_BYTES: u64 = 64;
+/// `/proc/<pid>/stat` field 3 (state) and field 4 (parent PID) are the first
+/// and second fields after `comm` (`proc_pid_stat(5)`; PX-013).
+const STATE_FIELD_AFTER_COMM: usize = 0;
+const PPID_FIELD_AFTER_COMM: usize = 1;
 
 /// A monotonic clock, as elapsed time since an arbitrary fixed origin.
 ///
@@ -662,12 +682,16 @@ impl ProcFsSource {
     }
 
     fn auxv_entry(&self, parse: fn(&[u8]) -> Option<u64>) -> Observed<u64> {
-        match read_bounded(&self.root.join("self/auxv")) {
-            Ok(bytes) => match parse(&bytes) {
-                Some(value) => Observed::Known(value),
-                None => Observed::Missing(MissingReason::Unavailable),
-            },
-            Err(error) => Observed::Missing(reason_for(&error)),
+        read_auxv_entry(&self.root, parse)
+    }
+
+    /// The on-demand detail reader over this source's own tree (PX-013): it
+    /// reads only keys this source minted.
+    pub fn details_reader(&self) -> ProcFsDetails {
+        ProcFsDetails {
+            root: self.root.clone(),
+            source: self.source.clone(),
+            anchored: self.anchored,
         }
     }
 
@@ -825,6 +849,10 @@ impl ProcessSource for ProcFsSource {
 
     fn accounts(&self) -> Accounts {
         self.accounts.clone()
+    }
+
+    fn details(&self) -> Option<Arc<dyn DetailSource>> {
+        Some(Arc::new(self.details_reader()))
     }
 
     fn snapshot(&mut self) -> ProcessSnapshot {
@@ -1218,6 +1246,129 @@ impl ProcFsSource {
     }
 }
 
+/// Reads the inspector's details of one instance this source listed (PX-013).
+///
+/// Nothing here enumerates: a key names the one record directory that is
+/// opened, and only a key this source minted, with a known PID and a Linux
+/// creation token, is read at all. The directory is opened once — pinned where
+/// the reader's own procfs can name an open directory (see `RecordAccess`) —
+/// and its `stat` is read through it. That line is the instance asked for only
+/// if its start time (field 22) equals the key's creation token; any other line
+/// is a newcomer under a reused PID, reported as the asked-for instance having
+/// ended, and none of its fields is shown. State (field 3) and parent (field 4)
+/// come from that same line, and the start time from the token itself.
+#[derive(Debug, Clone)]
+pub struct ProcFsDetails {
+    root: PathBuf,
+    source: SourceId,
+    anchored: bool,
+}
+
+impl DetailSource for ProcFsDetails {
+    fn read_details(&self, target: &ProcessKey) -> DetailRead {
+        if !self.anchored || target.source != self.source {
+            return DetailRead::Unreadable(MissingReason::Unavailable);
+        }
+        let (Observed::Known(pid), CreationToken::LinuxBootTicks(start_ticks)) =
+            (&target.pid, &target.creation)
+        else {
+            return DetailRead::Unreadable(MissingReason::Unavailable);
+        };
+        let directory =
+            match RecordDir::open(self.root.join(pid.to_string()), record_access(&self.root)) {
+                Ok(directory) => directory,
+                Err(error) if ended(&error) => return DetailRead::Ended,
+                Err(error) => return DetailRead::Unreadable(reason_for(&error)),
+            };
+        let bytes = match directory.read("stat") {
+            Ok(bytes) => bytes,
+            Err(error) if ended(&error) => return DetailRead::Ended,
+            Err(error) => return DetailRead::Unreadable(reason_for(&error)),
+        };
+        let Some(stat) = parse_stat(*pid, &bytes) else {
+            return DetailRead::Unreadable(MissingReason::Unavailable);
+        };
+        if stat.start_ticks != *start_ticks {
+            return DetailRead::Ended;
+        }
+        let started = match read_auxv_entry(&self.root, parse_clock_ticks) {
+            Observed::Known(rate) => Observed::Known(StartTime::from_ticks(
+                stat.start_ticks,
+                rate,
+                read_boot_time(&self.root.join("stat")),
+            )),
+            Observed::Missing(reason) => Observed::Missing(reason),
+        };
+        DetailRead::Read(ProcessDetails {
+            state: stat.state,
+            parent: stat.parent,
+            started,
+        })
+    }
+}
+
+/// One entry of `root`'s own `self/auxv`, as `parse` reads it.
+fn read_auxv_entry(root: &Path, parse: fn(&[u8]) -> Option<u64>) -> Observed<u64> {
+    match read_bounded(&root.join("self/auxv")) {
+        Ok(bytes) => match parse(&bytes) {
+            Some(value) => Observed::Known(value),
+            None => Observed::Missing(MissingReason::Unavailable),
+        },
+        Err(error) => Observed::Missing(reason_for(&error)),
+    }
+}
+
+/// The boot time, in seconds since the epoch, on the `btime` line of the
+/// `stat` file at `path` (`proc_stat(5)`; `show_stat`, fs/proc/stat.c).
+///
+/// The line follows the `cpu`, `intr` and `ctxt` lines, and `intr` grows with
+/// the interrupt count, so the file is read line by line through one bound
+/// ([`MAX_BOOT_TIME_SCAN_BYTES`]) and only the first [`BOOT_TIME_LINE_BYTES`]
+/// of each line are examined. Exactly one `btime` line with one plain count is
+/// accepted; anything else is unavailable, never zero.
+fn read_boot_time(path: &Path) -> Observed<u64> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) => return Observed::Missing(reason_for(&error)),
+    };
+    let mut reader = BufReader::new(file.take(MAX_BOOT_TIME_SCAN_BYTES));
+    let mut found = None;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match (&mut reader)
+            .take(BOOT_TIME_LINE_BYTES)
+            .read_until(b'\n', &mut line)
+        {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) => return Observed::Missing(reason_for(&error)),
+        }
+        if !line.ends_with(b"\n") {
+            // Longer than any `btime` line, or cut by the scan bound: skip the
+            // rest of it.
+            if let Err(error) = reader.skip_until(b'\n') {
+                return Observed::Missing(reason_for(&error));
+            }
+            continue;
+        }
+        let Some(rest) = line.strip_prefix(b"btime ") else {
+            continue;
+        };
+        if found.is_some() {
+            return Observed::Missing(MissingReason::Unavailable);
+        }
+        match parse_count(trim_ascii(rest)) {
+            Some(seconds) => found = Some(seconds),
+            None => return Observed::Missing(MissingReason::Unavailable),
+        }
+    }
+    found.map_or(
+        Observed::Missing(MissingReason::Unavailable),
+        Observed::Known,
+    )
+}
+
 /// Whether `self/ns/pid` — always the *reader's* active namespace — describes
 /// the records of the scanned mount. Both proofs are required, and each rules
 /// out a different real configuration: a mount that does not number this process
@@ -1428,10 +1579,16 @@ pub struct StatFields {
     /// is an unread metric of an identified process, not a missing process, and
     /// it is reported unread rather than as zero.
     pub cpu_ticks: Option<u64>,
+    /// Field 3: one printable character (PX-013). A field that is not exactly
+    /// one is unread, never guessed.
+    pub state: Observed<ProcessState>,
+    /// Field 4: the parent PID, 0 for a task the kernel started (PX-013). A
+    /// field that is not a plain count within `u32` is unread, never 0.
+    pub parent: Observed<u32>,
 }
 
-/// Parses `comm`, the creation token and the CPU counters out of one
-/// `/proc/<pid>/stat` line.
+/// Parses `comm`, the creation token, the CPU counters, the state and the
+/// parent PID out of one `/proc/<pid>/stat` line.
 ///
 /// `comm` is raw bytes wrapped in parentheses and may itself contain spaces,
 /// parentheses, control characters and invalid UTF-8 (K1). Fields are therefore
@@ -1468,10 +1625,28 @@ pub fn parse_stat(pid: u32, bytes: &[u8]) -> Option<StatFields> {
     let cpu_ticks = count(UTIME_FIELD_AFTER_COMM)
         .zip(count(STIME_FIELD_AFTER_COMM))
         .and_then(|(user, system)| user.checked_add(system));
+    let state = match fields.get(STATE_FIELD_AFTER_COMM) {
+        Some([code]) => ProcessState::from_code(*code),
+        _ => None,
+    }
+    .map_or(
+        Observed::Missing(MissingReason::Unavailable),
+        Observed::Known,
+    );
+    let parent = fields
+        .get(PPID_FIELD_AFTER_COMM)
+        .and_then(|field| parse_count(field))
+        .and_then(|parent| u32::try_from(parent).ok())
+        .map_or(
+            Observed::Missing(MissingReason::Unavailable),
+            Observed::Known,
+        );
     Some(StatFields {
         display_name: DisplayName::sanitize(&bytes[open + 1..close]),
         start_ticks,
         cpu_ticks,
+        state,
+        parent,
     })
 }
 

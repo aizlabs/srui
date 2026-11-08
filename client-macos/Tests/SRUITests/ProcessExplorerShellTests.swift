@@ -1,4 +1,4 @@
-// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
+// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012/PX-013: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
 import Testing
 import Foundation
 import AppKit
@@ -874,6 +874,187 @@ struct ProcessExplorerShellTests {
         #expect(renderer.registry.handle(for: NodeId(Self.ownerStatusID)) === statusHandle)
         print("PX-012 native SSH evidence: window \(window.windowNumber); itemIDs=\(identities) unchanged=\(Self.modelItemIDs(applier) == identities); rows=\(Self.nativeRows(table)); statuses=\(trace); revision=\(applier.lastAppliedRevision.value)")
         await controller.stop()
+    }
+
+    /// PX-013: clicking a native row sends a standard `SELECTION_CHANGED`; the server resolves
+    /// the row's item ID against the rows it publishes and describes that process instance in
+    /// four standard status lines under the table. The native highlight stays the client's: the
+    /// server selects nothing. Clicking A then B shows B; a sort that moves B's row keeps the
+    /// inspector on B, because it follows the item ID, not the position; and a process whose
+    /// details are denied says so.
+    @Test(.timeLimit(.minutes(1)))
+    @MainActor
+    func inspectorDescribesTheClickedProcessAndStaysOnItWhenASortMovesItsRow() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-source"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer over SSH with its inspector") {
+            applier.lastAppliedRevision == Revision(1)
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(Self.inspectorMetricsID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
+        let table = try #require((tableHandle.view as? NSScrollView)?.documentView as? NSTableView)
+        let lineHandles = try Self.inspectorLineIDs.map { id in
+            try #require(renderer.registry.handle(for: NodeId(id)), "inspector line \(id)")
+        }
+        let lines = try lineHandles.map { handle in try #require(handle.view as? NSTextField) }
+        let sortByName = try #require(renderer.registry.handle(for: NodeId(Self.sortButtonIDs[1]))?.view as? NSButton)
+        func native() -> [String] { lines.map(\.stringValue) }
+        var trace: [[String]] = []
+        func waitFor(_ expected: [String], _ step: String) async throws {
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: step) {
+                native() == expected
+            }
+            #expect(Self.inspectorLines(applier) == expected, "\(step): the model holds what is drawn")
+            trace.append(native())
+        }
+
+        // No selection.
+        #expect(Self.nativeRows(table) == Self.fakeRows)
+        #expect(table.selectedRowIndexes.isEmpty)
+        try await waitFor(["Selected process: none · select a row to inspect it", "", "", ""], "no selection")
+
+        // A: the first worker, owned by the fixture's own account.
+        let workerA = [
+            "Selected process: PID 4101 · worker",
+            "Name: worker · PID 4101 · Owner: UID 1000 (alice)",
+            "State: S (sleeping) · Parent: PID 1 · Started: 2027-01-15 06:20:00 UTC (server clock)",
+            "CPU: 250.0% · Resident: 1.1 MiB",
+        ]
+        table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        try await waitFor(workerA, "A selected")
+        let revisionAfterA = applier.lastAppliedRevision.value
+
+        // Then B: the second worker, under another account; A never comes back.
+        let workerB = [
+            "Selected process: PID 4102 · worker",
+            "Name: worker · PID 4102 · Owner: UID 1001 (bob)",
+            "State: R (running) · Parent: PID 4101 · Started: 2027-01-15 07:43:20 UTC (server clock)",
+            "CPU: 0.0% · Resident: 0 B",
+        ]
+        table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        try await waitFor(workerB, "B selected")
+        #expect(applier.lastAppliedRevision.value > revisionAfterA)
+        #expect(table.selectedRowIndexes == IndexSet(integer: 1), "the highlight is the client's own")
+
+        // A sort by name moves B from row 1 to row 2; the highlight and the inspector follow B.
+        let identities = Self.modelItemIDs(applier)
+        NativeActivation.click(sortByName)
+        let byName = [Self.fakeRows[2], Self.fakeRows[0], Self.fakeRows[1]]
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the order by name") {
+            Self.nativeRows(table) == byName && sortByName.title == "Sort by Name \u{2191}"
+        }
+        #expect(table.selectedRowIndexes == IndexSet(integer: 2), "the highlight followed B")
+        #expect(Self.modelItemIDs(applier)[2] == identities[1], "B kept its item ID")
+        #expect(native() == workerB, "the inspector stayed on B after its row moved")
+        #expect(Self.inspectorLines(applier) == workerB)
+        trace.append(native())
+
+        // The helper, now on row 0: no PID, a denied owner and denied details, each said so.
+        table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        try await waitFor([
+            "Selected process: PID unavailable · helper · details: permission denied",
+            "Name: helper · PID unavailable · Owner: permission denied",
+            "State, parent and start time: permission denied",
+            "CPU: Warming up · Resident: Denied",
+        ], "denied details")
+
+        // Every change happened inside the native controls built once.
+        #expect(renderer.registry.handle(for: NodeId(5)) === tableHandle)
+        for (handle, id) in zip(lineHandles, Self.inspectorLineIDs) {
+            #expect(renderer.registry.handle(for: NodeId(id)) === handle, "inspector line \(id) was rebuilt")
+        }
+        print("PX-013 native SSH evidence: window \(window.windowNumber); itemIDs=\(identities) rowsByName=\(Self.nativeRows(table)); selectedRow=\(table.selectedRow); inspector=\(trace); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
+    /// PX-013: a selected process that ends is reported as ended, with no details and no
+    /// metrics, and the inspector stays on that instance: when the scripted fixture brings a
+    /// process back under the same PID, it is a new row with a new item ID, and the inspector
+    /// never shows it.
+    @Test(.timeLimit(.minutes(1)))
+    @MainActor
+    func inspectorReportsASelectedProcessThatEndedAndNeverItsPIDsNextRecord() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-sequence", "--refresh-interval-ms", "400"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the scripted explorer over SSH") {
+            controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(Self.inspectorMetricsID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        let table = try #require((renderer.registry.handle(for: NodeId(5))?.view as? NSScrollView)?.documentView as? NSTableView)
+        let lines = try Self.inspectorLineIDs.map { id in
+            try #require(renderer.registry.handle(for: NodeId(id))?.view as? NSTextField)
+        }
+        func native() -> [String] { lines.map(\.stringValue) }
+        func row4102() -> Int? { Self.nativeRows(table).firstIndex { $0.first == "4102" } }
+        let selected = "Selected process: PID 4102 · worker"
+
+        // Click PID 4102 while the script shows it. A click that lands after the script has
+        // already ended it names an item the server no longer shows, which is refused and
+        // explained; the test then waits for the next cycle and clicks again.
+        var clickedItem: UInt64?
+        for attempt in 1...6 {
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "PID 4102 shown (attempt \(attempt))") {
+                row4102() != nil
+            }
+            let row = try #require(row4102())
+            let item = Self.modelItemIDs(applier)[row]
+            table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the click resolved") {
+                native()[0].hasPrefix(selected) || native()[0].contains("is not a row this server shows")
+            }
+            if native()[0].hasPrefix(selected) {
+                clickedItem = item
+                break
+            }
+        }
+        let item = try #require(clickedItem, "PID 4102 was selected while shown")
+
+        // The script ends PID 4102: the inspector says so, and shows nothing of any other record.
+        let ended = [
+            "Selected process: PID 4102 · worker · this process has ended; select another row",
+            "Name: worker · PID 4102 · Owner: unavailable",
+            "State, parent and start time: none: the process has ended",
+            "CPU and resident memory: none: the process has ended",
+        ]
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "PID 4102 ended") {
+            native() == ended
+        }
+        #expect(Self.inspectorLines(applier) == ended)
+        #expect(!Self.modelItemIDs(applier).contains(item))
+
+        // The next cycle lists PID 4102 again under a new item ID: another instance as far as
+        // identity goes, which the inspector does not adopt.
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "PID 4102 listed again") {
+            row4102() != nil
+        }
+        let again = Self.modelItemIDs(applier)[try #require(row4102())]
+        #expect(again != item, "a returning record is a new row")
+        #expect(native() == ended, "the inspector never shows the PID's next record")
+        print("PX-013 native SSH evidence (ended): window \(window.windowNumber); selected item \(item); returning item \(again); inspector=\(native()); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
+    // PX-013: the inspector's four lines.
+    fileprivate static let inspectorMetricsID: UInt64 = 59
+    fileprivate static let inspectorLineIDs: [UInt64] = [56, 57, 58, 59]
+
+    /// The inspector lines the client holds (PX-013).
+    @MainActor
+    fileprivate static func inspectorLines(_ applier: TransactionApplier) -> [String] {
+        inspectorLineIDs.map { modelText(applier, NodeId($0)) }
     }
 
     // PX-012: the user-filter controls.

@@ -222,6 +222,8 @@ fn assert_only_search_controls_changed(
                 let (id, value) = &before[start_index as usize];
                 assert_eq!((items[0].item_id, &items[0].value), (*id, value));
             }
+            // Since PX-013 the inspector follows a promotion, so its lines
+            // change with it; it is no row.
             Operation::SetProperty { id, .. } => assert!(
                 [
                     SEARCH_STATUS,
@@ -229,7 +231,11 @@ fn assert_only_search_controls_changed(
                     SEARCH_NEXT,
                     PID_GO,
                     SEARCH_INPUT,
-                    PID_INPUT
+                    PID_INPUT,
+                    srui_process_explorer::INSPECTOR_STATUS,
+                    srui_process_explorer::INSPECTOR_PROCESS,
+                    srui_process_explorer::INSPECTOR_DETAILS,
+                    srui_process_explorer::INSPECTOR_METRICS,
                 ]
                 .contains(&id),
                 "search touched node {id:?}"

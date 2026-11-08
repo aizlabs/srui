@@ -855,7 +855,37 @@ pub trait ProcessSource {
     fn accounts(&self) -> crate::owner::Accounts {
         crate::owner::Accounts::not_provided()
     }
+
+    /// The inspector's on-demand reader of one instance's state, parent and
+    /// start time (PX-013), or `None` for a source that provides none. It must
+    /// read only keys this source minted, and must report an instance whose
+    /// PID now names another one as ended.
+    fn details(&self) -> Option<std::sync::Arc<dyn crate::inspector::DetailSource>> {
+        None
+    }
 }
+
+/// A fixture detail that was read: `state`, `parent`, and a start
+/// `after_boot` seconds after a boot at [`FIXTURE_BOOT_TIME`] (PX-013).
+fn fixture_read(state: u8, parent: u32, after_boot: u64) -> crate::inspector::DetailRead {
+    use crate::inspector::{DetailRead, ProcessDetails, ProcessState, StartTime};
+    DetailRead::Read(ProcessDetails {
+        state: ProcessState::from_code(state).map_or(
+            Observed::Missing(MissingReason::Unavailable),
+            Observed::Known,
+        ),
+        parent: Observed::Known(parent),
+        started: Observed::Known(StartTime::from_ticks(
+            after_boot * 100,
+            100,
+            Observed::Known(FIXTURE_BOOT_TIME),
+        )),
+    })
+}
+
+/// The fixtures' boot time, in seconds since the epoch (PX-013): some hours
+/// before their sample time.
+pub const FIXTURE_BOOT_TIME: u64 = 1_799_990_000;
 
 #[derive(Debug, Default)]
 pub struct FakeProcessSource;
@@ -916,6 +946,22 @@ impl ProcessSource for FakeProcessSource {
 
     fn accounts(&self) -> crate::owner::Accounts {
         crate::owner::Accounts::fixed(Self::CURRENT_UID, &Self::ACCOUNT_NAMES)
+    }
+
+    /// The fixture's details (PX-013): PID 4101 sleeps under PID 1, PID 4102
+    /// runs under PID 4101, and the helper's details are denied.
+    fn details(&self) -> Option<std::sync::Arc<dyn crate::inspector::DetailSource>> {
+        Some(std::sync::Arc::new(crate::inspector::FixtureDetails::new(
+            Self::SOURCE,
+            vec![
+                ("worker-a", fixture_read(b'S', 1, 4_000)),
+                ("worker-b", fixture_read(b'R', 4101, 9_000)),
+                (
+                    "helper",
+                    crate::inspector::DetailRead::Unreadable(MissingReason::Denied),
+                ),
+            ],
+        )))
     }
 
     fn snapshot(&mut self) -> ProcessSnapshot {
@@ -1217,6 +1263,19 @@ impl ScriptedFakeSource {
 impl ProcessSource for ScriptedFakeSource {
     fn status_text(&self) -> &str {
         Self::STATUS_TEXT
+    }
+
+    /// The script's details (PX-013), constant per process like its metrics.
+    fn details(&self) -> Option<std::sync::Arc<dyn crate::inspector::DetailSource>> {
+        Some(std::sync::Arc::new(crate::inspector::FixtureDetails::new(
+            Self::SOURCE,
+            vec![
+                ("worker-a", fixture_read(b'S', 1, 4_000)),
+                ("worker-b", fixture_read(b'S', 4101, 9_000)),
+                ("helper", fixture_read(b'S', 1, 2_000)),
+                ("builder", fixture_read(b'R', 4101, 9_500)),
+            ],
+        )))
     }
 
     fn snapshot(&mut self) -> ProcessSnapshot {

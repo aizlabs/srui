@@ -5,7 +5,7 @@ Edition 1.2 · 12 September 2026. Use the authoritative SRUI v0.6 design and the
 ## PX-018 — Add parent/child process tree navigation
 
 **Phase:** B · **Scope size:** M · **Status:** planned · **Gate:** none
-**Dependencies:** PX-017
+**Dependencies:** PX-017, PX-018-G01
 **Read:** D1 §§6.2, 8, 22.7; D2 T28
 
 ### Standing execution contract

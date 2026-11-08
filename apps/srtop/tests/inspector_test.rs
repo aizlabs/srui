@@ -208,11 +208,29 @@ fn start(records: Vec<ProcessRecord>, probe: Option<&Arc<Probe>>) -> Harness {
     start_limited(records, probe, usize::MAX)
 }
 
+/// Asks the account-name cache (PX-012) about every owner in `records` and
+/// waits for its worker to answer them all, before anything is selected. The
+/// inspector's owner text then names each owner as the fixture database
+/// answers it (`alice`, or `no account name`) on its first publication and
+/// every later one, instead of depending on whether that worker answered
+/// before or after a given commit. No test here is about name-lookup delay;
+/// that is PX-012's `a_delayed_name_lookup_never_stalls_publication`.
+fn settle_names(view: &ProcessView, records: &[ProcessRecord]) {
+    let names = view.owner_filter().names();
+    for record in records {
+        if let Observed::Known(uid) = record.owner {
+            let _ = names.name(uid);
+        }
+    }
+    assert!(names.wait_idle(WAIT), "the fixture names were answered");
+}
+
 /// [`start`] with the published-row ceiling lowered to `limit`.
 fn start_limited(records: Vec<ProcessRecord>, probe: Option<&Arc<Probe>>, limit: usize) -> Harness {
     let session = Arc::new(Session::mint());
     let mut source = Fixture { records };
     let (view, _) = start_from_source(&session, &mut source).unwrap();
+    settle_names(&view, &source.records);
     let view = view.with_published_limit(limit);
     let view: SharedView = Arc::new(Mutex::new(view));
     install_search_handlers(&session, &view);
@@ -425,6 +443,12 @@ fn the_inspector_stays_on_its_process_when_sorting_moves_its_row_and_never_shows
     harness.idle();
     let selected = harness.lines();
     assert_eq!(selected[0], "Selected process: PID 200 · beta");
+    // The fixture database has no entry for UID 1001, answered before the
+    // selection (`settle_names`), so this line cannot change under the sort.
+    assert_eq!(
+        selected[1],
+        "Name: beta · PID 200 · Owner: UID 1001 (no account name)"
+    );
     let ids_before: Vec<ItemId> = harness.rows().iter().map(|(id, _)| *id).collect();
     assert_eq!(ids_before.iter().position(|id| *id == b), Some(1));
 

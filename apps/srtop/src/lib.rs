@@ -1,11 +1,12 @@
 //! Read-only Process Explorer shell using existing SRUI widgets and transactions
 //! (design §§6–8, 12, 22, 29; PX-001/PX-002/PX-003/PX-004, PX-007 system
 //! summary, PX-009 server-authoritative sorting, PX-010 filtering, PX-068
-//! column chooser, PX-011 find-next/find-previous and jump to PID). No process
+//! column chooser, PX-011 find-next/find-previous and jump to PID, PX-015
+//! sampling interval, Pause view/Resume view and manual refresh). No process
 //! is ever opened for control: the only client-input handlers are the sort
-//! buttons', the filter input's, the column chooser buttons' and the search
-//! controls', which reorder, filter, re-lay out or locate the published rows
-//! and touch no process.
+//! buttons', the filter input's, the column chooser buttons', the search
+//! controls' and the sampling controls', which reorder, filter, re-lay out,
+//! locate, freeze or re-sample the published rows and touch no process.
 
 pub mod catalogue;
 pub mod command;
@@ -17,6 +18,7 @@ pub mod owner;
 pub mod procfs;
 mod projection;
 pub mod refresh;
+pub mod sampling;
 pub mod search;
 pub mod sort;
 pub mod source;
@@ -138,6 +140,18 @@ pub const INSPECTOR_COMMAND_LABEL: &str = "Command line and executable";
 pub const INSPECTOR_COMMAND_DESCRIPTION: &str =
     "The selected process's arguments, one per line, then its executable and working directory, as the server reads them. Text only: nothing here is run, opened or resolved on this computer.";
 pub const INSPECTOR_NODE_COUNT: usize = 6;
+/// The sampling controls (PX-015): a Row under the system summary holding the
+/// Pause view/Resume view and Refresh now buttons, the interval field with its
+/// Apply interval button, and the sampling status, which states whether the
+/// view is live or paused, since when, at which revision, and whether
+/// collection continues.
+pub const SAMPLING_ROW: NodeId = NodeId::new(61);
+pub const SAMPLING_PAUSE: NodeId = NodeId::new(62);
+pub const SAMPLING_REFRESH: NodeId = NodeId::new(63);
+pub const INTERVAL_INPUT: NodeId = NodeId::new(64);
+pub const INTERVAL_APPLY: NodeId = NodeId::new(65);
+pub const SAMPLING_STATUS: NodeId = NodeId::new(66);
+pub const SAMPLING_NODE_COUNT: usize = 6;
 
 /// What one column chooser button does (PX-068). Each is resolved against the
 /// layout the server holds when the click is applied, never against anything
@@ -222,10 +236,12 @@ pub const STATUS_TEXT: &str = "Read-only · Process collection not started";
 /// (PX-007), which sits between the status line and the filter controls, the three
 /// of the filter bar (PX-010), the sort row with its four buttons (PX-009),
 /// the column chooser's row with its buttons (PX-068), the seven search
-/// controls (PX-011), the six user-filter controls (PX-012) and the six of
-/// the inspector (PX-013, PX-014). Rows are model items, never nodes.
+/// controls (PX-011), the six user-filter controls (PX-012), the six of
+/// the inspector (PX-013, PX-014) and the six sampling controls (PX-015).
+/// Rows are model items, never nodes.
 pub const SHELL_NODE_COUNT: usize = 5
     + summary::NODE_COUNT
+    + SAMPLING_NODE_COUNT
     + FILTER_NODE_COUNT
     + 1
     + SORT_BUTTONS.len()
@@ -407,6 +423,32 @@ pub fn install_inspector(
     idle
 }
 
+/// Installs the sampling controls' handlers (§7.6, §22.6, PX-015): the Pause
+/// view/Resume view, Refresh now and Apply interval buttons' `ACTIVATE`, and
+/// the interval field's `TEXT_EDIT`. Each is applied before the event is
+/// acknowledged. A click names only which button it was; the interval is read
+/// from the text the server kept for the field, never from a click. None
+/// starts a timer or a thread: each records a request on the view and wakes
+/// the one refresh loop, which owns the one ticker. No process is touched.
+pub fn install_sampling_handlers(session: &Session, view: &refresh::SharedView) {
+    let pause = std::sync::Arc::clone(view);
+    session.on(SAMPLING_PAUSE, ACTIVATE, move |session, _| {
+        refresh::pause_toggled(&pause, session);
+    });
+    let now = std::sync::Arc::clone(view);
+    session.on(SAMPLING_REFRESH, ACTIVATE, move |session, _| {
+        refresh::refresh_requested(&now, session);
+    });
+    let interval = std::sync::Arc::clone(view);
+    session.on(INTERVAL_INPUT, TEXT_EDIT, move |session, event| {
+        refresh::interval_edited(&interval, session, event);
+    });
+    let apply = std::sync::Arc::clone(view);
+    session.on(INTERVAL_APPLY, ACTIVATE, move |session, _| {
+        refresh::interval_requested(&apply, session);
+    });
+}
+
 /// One click on `field`'s sort button.
 fn sort_clicked(
     view: &std::sync::Mutex<refresh::ProcessView>,
@@ -433,6 +475,7 @@ pub fn initialize(session: &Session) -> Result<(), SessionError> {
         &summary,
         &owner::OwnerView::uncollected(),
         false,
+        None,
     )
 }
 
@@ -616,6 +659,9 @@ fn plural(count: usize) -> &'static str {
 /// snapshot transaction of exactly this model (§18, §26). The bound is applied
 /// where the rows are chosen, by `refresh::ProcessView::start`, because only
 /// there can the status honestly say how many rows were left out.
+///
+/// `sampling` is the collecting view's sampling state (PX-015), or `None` for
+/// the shell that collects nothing, whose sampling controls are disabled.
 pub(crate) fn initialize_rows(
     session: &Session,
     items: Vec<srui_semantic_tree::ModelItem>,
@@ -623,7 +669,13 @@ pub(crate) fn initialize_rows(
     summary: &summary::Properties,
     owner: &owner::OwnerView,
     sort_enabled: bool,
+    sampling: Option<&sampling::Sampling>,
 ) -> Result<(), SessionError> {
+    let (sampling_view, interval_text) = match sampling {
+        Some(sampling) => (sampling.view(), sampling.input().to_string()),
+        None => (sampling::SamplingView::uncollected(), String::new()),
+    };
+    let sampling_enabled = sampling.is_some();
     // §26 bounds the items in a single model mutation batch, and a live host can
     // hold more processes than that bound. The rows are therefore published as
     // consecutive bounded batches inside the one transaction that creates the
@@ -670,6 +722,50 @@ pub(crate) fn initialize_rows(
         for operation in summary::create_operations(summary) {
             ui.apply_op(&operation)?;
         }
+        // The sampling controls, under the summary whose freshness they
+        // govern: standard Buttons, a TextInput and a status Text in a Row
+        // (PX-015). The status says whether the view is live or paused.
+        Row::builder(SAMPLING_ROW)
+            .parent(COLUMN)
+            .spacing_role(SpacingRole::Normal)
+            .create(ui)?;
+        Button::builder(SAMPLING_PAUSE)
+            .parent(SAMPLING_ROW)
+            .label(sampling_view.pause_label.as_str())
+            .create(ui)?;
+        ui.set(SAMPLING_PAUSE, ENABLED, sampling_enabled)?;
+        Button::builder(SAMPLING_REFRESH)
+            .parent(SAMPLING_ROW)
+            .label(sampling::REFRESH_LABEL)
+            .create(ui)?;
+        ui.set(
+            SAMPLING_REFRESH,
+            ENABLED,
+            sampling_enabled && sampling_view.refresh_enabled,
+        )?;
+        TextInput::builder(INTERVAL_INPUT)
+            .parent(SAMPLING_ROW)
+            .label(sampling::INTERVAL_LABEL)
+            .placeholder(sampling::INTERVAL_PLACEHOLDER)
+            .value(interval_text.as_str())
+            .role(InputRole::Plain)
+            .accessible_description(sampling::INTERVAL_DESCRIPTION)
+            .create(ui)?;
+        ui.set(INTERVAL_INPUT, ENABLED, sampling_enabled)?;
+        Button::builder(INTERVAL_APPLY)
+            .parent(SAMPLING_ROW)
+            .label(sampling::INTERVAL_APPLY_LABEL)
+            .create(ui)?;
+        ui.set(INTERVAL_APPLY, ENABLED, sampling_enabled)?;
+        Text::builder(SAMPLING_STATUS)
+            .parent(SAMPLING_ROW)
+            .text(sampling_view.status.as_str())
+            .role(if sampling_enabled {
+                TextRole::Status
+            } else {
+                TextRole::Caption
+            })
+            .create(ui)?;
         // The filter controls: standard TextInput and Text caption in a Row,
         // between the system summary and the sort controls (PX-010).
         Row::builder(FILTER_ROW)
@@ -1035,9 +1131,40 @@ mod tests {
             // with its four buttons (PX-009), the column chooser's row with
             // its thirteen buttons (PX-068), the seven search controls
             // (PX-011), the six user-filter controls (PX-012) and the six of
-            // the inspector (PX-013, and its command line since PX-014).
-            assert_eq!(store.node_count(), 60);
-            assert_eq!(SHELL_NODE_COUNT, 60);
+            // the inspector (PX-013, and its command line since PX-014) and
+            // the six sampling controls (PX-015).
+            assert_eq!(store.node_count(), 66);
+            assert_eq!(SHELL_NODE_COUNT, 66);
+            assert_eq!(
+                store.children_of(SAMPLING_ROW),
+                Some(
+                    [
+                        SAMPLING_PAUSE,
+                        SAMPLING_REFRESH,
+                        INTERVAL_INPUT,
+                        INTERVAL_APPLY,
+                        SAMPLING_STATUS
+                    ]
+                    .as_slice()
+                )
+            );
+            // A shell that samples nothing has no sampling to pause, refresh
+            // or retime, and says so (PX-015).
+            for node in [
+                SAMPLING_PAUSE,
+                SAMPLING_REFRESH,
+                INTERVAL_INPUT,
+                INTERVAL_APPLY,
+            ] {
+                assert_eq!(
+                    store.get_node(node).unwrap().get_property(ENABLED),
+                    Some(&Value::Bool(false))
+                );
+            }
+            assert_eq!(
+                store.get_node(SAMPLING_STATUS).unwrap().get_property(TEXT),
+                Some(&Value::String(sampling::UNCOLLECTED_SAMPLING_STATUS.into()))
+            );
             assert_eq!(
                 store.children_of(INSPECTOR),
                 Some(
@@ -1063,6 +1190,7 @@ mod tests {
                         HEADING,
                         STATUS,
                         summary::SUMMARY,
+                        SAMPLING_ROW,
                         FILTER_ROW,
                         OWNER_ROW,
                         SEARCH_ROW,
@@ -1168,6 +1296,12 @@ mod tests {
                 (OWNER_INPUT, TypeRef::TEXT_INPUT),
                 (PID_SET_INPUT, TypeRef::TEXT_INPUT),
                 (OWNER_STATUS, TypeRef::TEXT),
+                (SAMPLING_ROW, TypeRef::ROW),
+                (SAMPLING_PAUSE, TypeRef::BUTTON),
+                (SAMPLING_REFRESH, TypeRef::BUTTON),
+                (INTERVAL_INPUT, TypeRef::TEXT_INPUT),
+                (INTERVAL_APPLY, TypeRef::BUTTON),
+                (SAMPLING_STATUS, TypeRef::TEXT),
             ];
             let summary_nodes = summary::LAYOUT.map(|(id, node_type, _)| (id, node_type));
             let chooser = COLUMN_CHOOSER_BUTTONS.map(|(id, _)| (id, TypeRef::BUTTON));
@@ -1368,6 +1502,7 @@ mod tests {
                         HEADING,
                         STATUS,
                         summary::SUMMARY,
+                        SAMPLING_ROW,
                         FILTER_ROW,
                         OWNER_ROW,
                         SEARCH_ROW,

@@ -19,11 +19,9 @@
 //! never a change to the UI, and which §4 invariant 12 allows an idle UI to send.
 //! It is counted and reported, not asserted away. Resource and terminal traffic
 //! would be application traffic too; none may appear either.
-use srui_process_explorer::refresh::{poll, MIN_REFRESH_INTERVAL};
+use srui_process_explorer::refresh::{poll, ProcessView, MIN_REFRESH_INTERVAL};
 use srui_process_explorer::source::{FakeProcessSource, ProcessSnapshot, ProcessSource};
-use srui_process_explorer::{
-    install_sort_handlers, start_from_source, update_title, FIXTURE_TITLE, HEADING, SURFACE,
-};
+use srui_process_explorer::{install_sort_handlers, update_title, FIXTURE_TITLE, HEADING, SURFACE};
 use srui_protocol::{
     decode_framed, encode_framed, operation, srui_message::Msg, ClientHello, SruiMessage,
 };
@@ -163,7 +161,10 @@ async fn a_frozen_fake_source_sends_a_synchronized_client_no_app_ui_mutation_acr
     };
     // As `main` does: publish the first snapshot, install the sort buttons'
     // handlers on the shared view, then poll the same source.
-    let (view, _) = start_from_source(&session, &mut source).expect("the fake source publishes");
+    // The controls state the loop's interval from the first transaction
+    // (PX-015), as `main` starts them.
+    let (view, _) = ProcessView::start_with_interval(&session, &mut source, MIN_REFRESH_INTERVAL)
+        .expect("the fake source publishes");
     let view = Arc::new(Mutex::new(view));
     install_sort_handlers(&session, &view);
     let shutdown = CancellationToken::new();

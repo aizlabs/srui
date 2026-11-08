@@ -1,0 +1,141 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-015",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "A bounded, server-validated sampling interval, a Pause view/Resume view action that freezes this app's published sample view at a defined session revision while session and control traffic keep flowing, and a coalesced manual refresh through the existing refresh path; collection stops while paused and is stated so; one ticker owned by the refresh loop; no process action, no protocol, registry, SDK, renderer or client source change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX015-001",
+      "feature": "Pause freezes publication at a defined revision: Pause view records Frozen { revision, paused_at } with the session revision current when it is applied; from then no sample is published (ProcessView::apply refuses and counts one; the loop takes none), so every row, cell and summary figure stays what that revision held; the pause commit itself changes only the sampling controls, the freshness label and the inspector; Core transaction application and the transport are untouched",
+      "scope": "PX-015/sampling (src/sampling.rs) Sampling::pause, Frozen; refresh (src/refresh.rs) ProcessView::pause_view, ProcessView::apply, ProcessView::frozen; tests/sampling_test.rs pause_freezes_rows_and_figures_while_the_host_changes_and_controls_keep_working",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-015",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-015.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX015-002",
+      "feature": "Collection stops while paused and resume converges without replay: the refresh loop polls no ticker while paused; Resume view advances the epoch and asks for one sample at once, published through the ordinary diff (surviving rows keep their item IDs); a sample taken under an earlier epoch (running across a pause, or a pause and resume) is discarded by apply_sampled",
+      "scope": "PX-015/refresh (src/refresh.rs) poll, ProcessView::resume_view, ProcessView::apply_sampled; sampling (src/sampling.rs) Sampling::accepts, Sampling::resume; tests/sampling_test.rs the_loop_takes_no_sample_while_paused_and_exactly_one_on_resume, a_scan_running_when_the_view_is_paused_never_changes_the_frozen_rows; tests/procfs_test.rs live::a_paused_view_keeps_its_rows_while_test_owned_workers_start_and_end",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-015",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-015.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX015-003",
+      "feature": "Clearly labelled paused view: the sampling status states Paused at <UTC> (server clock), the frozen revision and collection stopped, or Resuming, or Live with the interval; the data-freshness line is prefixed Paused, not live or Resuming, not yet refreshed and never implies live data; filter, user filter, PID set, sort, columns and search re-project the frozen rows and keep their own status; Refresh now is disabled while paused",
+      "scope": "PX-015/sampling (src/sampling.rs) Sampling::status, relabel_freshness, PAUSED_FRESHNESS; refresh (src/refresh.rs) ProcessView::labelled, ProcessView::republish, ProcessView::sampling_effects; lib (src/lib.rs) SAMPLING_ROW..SAMPLING_STATUS",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-015",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-015.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX015-004",
+      "feature": "The inspector reads nothing live while paused: a selection made while paused shows its frozen row and Details::Deferred (not read while the view is paused); a read in flight at the pause is dropped on return; details read before the pause stay; Resume view asks for the current target's details again",
+      "scope": "PX-015/inspector (src/inspector.rs) Inspector::pause, Inspector::resume, Inspector::completed, Details::Deferred; tests/sampling_test.rs a_paused_inspector_reads_nothing_live_and_resume_reads_again",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-015",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-015.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX015-005",
+      "feature": "Bounded, validated interval: whole ASCII-digit milliseconds from 50 to 300000, one validator for --refresh-interval-ms and the interval field; Apply interval reads the text the server kept (at most 32 bytes); empty, signed, fractional, unit-bearing, out-of-range and over-long values are refused with a stated reason and the previous interval is kept; editing the field clears the refusal",
+      "scope": "PX-015/sampling (src/sampling.rs) parse_interval, IntervalError, Sampling::set_input, Sampling::apply_input; main (src/main.rs); tests/sampling_test.rs invalid_intervals_are_refused_with_a_reason_and_the_interval_kept; tests/shutdown.rs an_out_of_range_refresh_interval_is_refused_without_publishing_a_socket",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-015",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-015.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX015-006",
+      "feature": "Manual refresh is one bounded sample through the existing refresh path: Refresh now sets one coalesced request and wakes the loop; presses the loop has not taken are one sample; the next periodic tick follows one interval later; refused while paused (the button is disabled, so event validation rejects it)",
+      "scope": "PX-015/sampling (src/sampling.rs) Sampling::refresh_now, Sampling::take_request; refresh (src/refresh.rs) poll, ProcessView::refresh_now; tests/sampling_test.rs refresh_now_presses_coalesce_into_one_bounded_sample",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-015",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-015.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX015-007",
+      "feature": "One timer, owned by the loop, ended with it: handlers start no timer or thread; an interval change or resume replaces the loop's one ticker (first tick one new interval later: no burst, no second timer); the ticker and the Notify wake end with poll on shutdown in every sampling state; nothing outlives the view; a client disconnect ends only its connection",
+      "scope": "PX-015/refresh (src/refresh.rs) poll, ticker_every; tests/sampling_test.rs an_interval_change_restarts_the_one_ticker_without_a_burst, the_loop_ends_on_shutdown_in_every_sampling_state_and_releases_the_view; tests/shutdown.rs a_paused_or_retimed_instance_stops_and_releases_its_socket",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-015",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-015.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX015-008",
+      "feature": "Audit and budgets: the four new handlers (SAMPLING_PAUSE, SAMPLING_REFRESH, INTERVAL_APPLY with ACTIVATE; INTERVAL_INPUT with TEXT_EDIT) are exact admitted pairs in the PX-008 audit with negative shapes; the six new nodes are charged SAMPLING_RESERVE_BYTES = 2048, measured on the encoder with every value at its widest; the status is bounded to 512 bytes",
+      "scope": "PX-015/tests/no_process_control_test.rs SAMPLING_BUTTON_CONSTANTS, TEXT_INPUT_CONSTANTS; refresh (src/refresh.rs) SAMPLING_RESERVE_BYTES, bound_to_publishable_collection, the_shell_status_and_summary_fit_their_snapshot_allowances",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-015",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-015.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX015-009",
+      "feature": "Native evidence: over real SSH with the unchanged generic client, a paused --fake-sequence view keeps the native table, every summary line and the client revision unchanged for four intervals while the script runs on the server; the native filter still filters the frozen rows and commits its status; an invalid interval is refused natively; Resume view converges the same native table",
+      "scope": "PX-015/client-macos/Tests/SRUITests/ProcessExplorerShellTests.swift pauseFreezesTheNativeTableWhileControlsStillUpdateAndResumeConverges",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-015",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-015.md"
+      ]
+    }
+  ]
+}

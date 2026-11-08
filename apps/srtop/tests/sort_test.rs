@@ -738,8 +738,9 @@ async fn a_click_during_a_running_scan_is_never_overwritten_by_that_scan() {
         last: Vec::new(),
         taken: 0,
     };
-    // As `main` does.
-    let (view, _) = start_from_source(&session, &mut source).unwrap();
+    // As `main` does, the controls stating the loop's interval (PX-015).
+    let (view, _) =
+        ProcessView::start_with_interval(&session, &mut source, MIN_REFRESH_INTERVAL).unwrap();
     let view = Arc::new(Mutex::new(view));
     install_sort_handlers(&session, &view);
     let shutdown = tokio_util::sync::CancellationToken::new();

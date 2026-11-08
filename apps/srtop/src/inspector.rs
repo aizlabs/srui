@@ -39,6 +39,13 @@
 //! selectable `RichText` under the four lines. They are read only here, for
 //! the current target, and are bound to its `(ProcessKey, SelectionGeneration)`
 //! exactly like its state.
+//!
+//! Since PX-015 a paused view reads nothing live. While the view is paused a
+//! new selection describes its frozen row and asks for no details, a read
+//! already in flight is dropped when it returns, and details read before the
+//! pause stay shown: everything the inspector shows is from the frozen view,
+//! never a live read beside frozen rows. Resume view asks for the current
+//! target's details again.
 use crate::catalogue::ProcessField;
 use crate::command::{CommandContext, COMMAND_HEAD, NO_SELECTION_COMMAND, UNCOLLECTED_COMMAND};
 use crate::metric::format_utc;
@@ -382,6 +389,8 @@ enum Details {
     /// No detail worker is installed: this source provides no details.
     NotProvided,
     Loading,
+    /// Not read, because the view is paused (PX-015).
+    Deferred,
     Read(ProcessDetails),
     Ended,
     Unreadable(MissingReason),
@@ -410,8 +419,11 @@ pub struct Inspector {
     generation: SelectionGeneration,
     selection: Selection,
     reads: Option<DetailReads>,
-    /// Results dropped because their target was no longer current.
+    /// Results dropped because their target was no longer current, or
+    /// because they returned while the view was paused (PX-015).
     stale: u64,
+    /// Whether the view is paused: nothing is read live (PX-015).
+    paused: bool,
 }
 
 impl Default for Inspector {
@@ -421,6 +433,7 @@ impl Default for Inspector {
             selection: Selection::None,
             reads: None,
             stale: 0,
+            paused: false,
         }
     }
 }
@@ -553,10 +566,12 @@ impl Inspector {
     /// for its details.
     pub(crate) fn select(&mut self, row: &Row) {
         self.generation = self.generation.next();
-        let details = if self.reads.is_some() {
-            Details::Loading
-        } else {
+        let details = if self.reads.is_none() {
             Details::NotProvided
+        } else if self.paused {
+            Details::Deferred
+        } else {
+            Details::Loading
         };
         self.selection = Selection::Process(Box::new(Selected {
             row: row.clone(),
@@ -573,7 +588,32 @@ impl Inspector {
         self.selection = Selection::Refused(item);
     }
 
+    /// The view is paused (PX-015): a read still loading is deferred, and
+    /// its result is dropped when it returns.
+    pub(crate) fn pause(&mut self) {
+        self.paused = true;
+        if let Selection::Process(selected) = &mut self.selection {
+            if selected.details == Details::Loading {
+                selected.details = Details::Deferred;
+            }
+        }
+    }
+
+    /// The view is live again (PX-015): a deferred read is asked for now.
+    pub(crate) fn resume(&mut self) {
+        self.paused = false;
+        if let Selection::Process(selected) = &mut self.selection {
+            if selected.details == Details::Deferred {
+                selected.details = Details::Loading;
+                self.ask();
+            }
+        }
+    }
+
     fn ask(&self) {
+        if self.paused {
+            return;
+        }
         if let (Some(reads), Selection::Process(selected)) = (&self.reads, &self.selection) {
             reads.request(DetailRequest {
                 key: selected.row.key.clone(),
@@ -603,7 +643,8 @@ impl Inspector {
     pub(crate) fn completed(&mut self, request: &DetailRequest, read: DetailRead) -> bool {
         match &mut self.selection {
             Selection::Process(selected)
-                if selected.generation == request.generation
+                if !self.paused
+                    && selected.generation == request.generation
                     && selected.row.key == request.key
                     && selected.details != Details::Ended =>
             {
@@ -693,6 +734,15 @@ impl Inspector {
                 " · loading details".to_string(),
                 format!("{DETAILS_HEAD}: loading"),
                 format!("{COMMAND_HEAD}: loading"),
+            ),
+            Details::Deferred => (
+                " · details not read while the view is paused".to_string(),
+                format!(
+                    "{DETAILS_HEAD}: not read while the view is paused; Resume view reads them"
+                ),
+                format!(
+                    "{COMMAND_HEAD}: not read while the view is paused; Resume view reads them"
+                ),
             ),
             Details::NotProvided => (
                 " · this source provides no details".to_string(),

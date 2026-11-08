@@ -1,4 +1,4 @@
-// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012/PX-013/PX-014: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
+// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012/PX-013/PX-014/PX-015: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
 import Testing
 import Foundation
 import AppKit
@@ -595,6 +595,158 @@ struct ProcessExplorerShellTests {
 
         print("PX-010 native SSH evidence: window \(window.windowNumber); filterField=\(filterField.stringValue); status=\(statusField.stringValue); rows=\(Self.nativeRows(table)); itemIDs=\(Self.modelItemIDs(applier)); selected item \(selected) at row \(table.selectedRow); revision=\(applier.lastAppliedRevision.value)")
         await controller.stop()
+    }
+
+    /// PX-015: Pause view is a standard native button. While the view is paused the scripted
+    /// source keeps advancing on the server's clock, yet the native table, every summary line and
+    /// the client's revision stay exactly where the pause left them; the filter still works on the
+    /// frozen rows and commits its own state; an invalid interval is refused with its reason; and
+    /// Resume view converges on a current sample in the same native table, rows keeping their
+    /// item IDs.
+    @Test(.timeLimit(.minutes(1)))
+    @MainActor
+    func pauseFreezesTheNativeTableWhileControlsStillUpdateAndResumeConverges() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-sequence", "--refresh-interval-ms", "300"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        renderer.textEditingSession.debounceNanoseconds = 0
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer over SSH with sampling controls") {
+            applier.lastAppliedRevision.value >= 1
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(Self.samplingStatusID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
+        let table = try #require((tableHandle.view as? NSScrollView)?.documentView as? NSTableView)
+        let pause = try #require(renderer.registry.handle(for: NodeId(Self.samplingPauseID))?.view as? NSButton)
+        let refresh = try #require(renderer.registry.handle(for: NodeId(Self.samplingRefreshID))?.view as? NSButton)
+        let apply = try #require(renderer.registry.handle(for: NodeId(Self.intervalApplyID))?.view as? NSButton)
+        let intervalHandle = try #require(renderer.registry.handle(for: NodeId(Self.intervalInputID)))
+        let intervalField = try #require(intervalHandle.view as? NSTextField)
+        let intervalAdapter = try #require(intervalHandle.textAdapter)
+        let status = try #require(renderer.registry.handle(for: NodeId(Self.samplingStatusID))?.view as? NSTextField)
+        let filterHandle = try #require(renderer.registry.handle(for: NodeId(Self.filterInputID)))
+        let filterField = try #require(filterHandle.view as? NSTextField)
+        let filterAdapter = try #require(filterHandle.textAdapter)
+        let filterStatus = try #require(renderer.registry.handle(for: NodeId(Self.filterStatusID))?.view as? NSTextField)
+        let summary = try Self.summaryLines(renderer)
+        let freshness = try #require(summary.last)
+
+        #expect(pause.title == "Pause view")
+        #expect(refresh.title == "Refresh now" && refresh.isEnabled)
+        #expect(apply.title == "Apply interval")
+        #expect(intervalField.stringValue == "300")
+        #expect(status.stringValue == "Live · sampling every 300 ms")
+        // The script is running: its freshness line moves with every sample.
+        let firstFreshness = freshness.stringValue
+        try await AsyncTestSupport.eventually(timeout: .seconds(10), description: "a live sample") {
+            freshness.stringValue != firstFreshness
+        }
+
+        NativeActivation.click(pause)
+        try await AsyncTestSupport.eventually(timeout: .seconds(10), description: "the paused view") {
+            status.stringValue.hasPrefix("Paused at ")
+                && status.stringValue.contains("collection stopped")
+                && pause.title == "Resume view"
+                && !refresh.isEnabled
+                && freshness.stringValue.hasPrefix("Paused, not live · ")
+        }
+        // The pause landed; let a scan that was already running return and be discarded.
+        try await Task.sleep(for: .milliseconds(400))
+        let frozenRevision = applier.lastAppliedRevision
+        let frozenRows = Self.nativeRows(table)
+        let frozenModel = Self.modelRows(applier)
+        let frozenIDs = Self.modelItemIDs(applier)
+        let frozenSummary = summary.map(\.stringValue)
+        #expect(frozenModel == frozenRows)
+        // Four intervals: the server's script would have published four samples.
+        try await Task.sleep(for: .milliseconds(1200))
+        #expect(applier.lastAppliedRevision == frozenRevision, "a paused view sends no app mutation")
+        #expect(Self.nativeRows(table) == frozenRows)
+        #expect(Self.modelItemIDs(applier) == frozenIDs)
+        #expect(summary.map(\.stringValue) == frozenSummary)
+
+        // The filter still works, on the frozen rows, and commits its own status.
+        filterField.stringValue = "worker"
+        filterAdapter.notifyTextDidChangeForTests()
+        filterAdapter.notifyEndEditingForTests()
+        try await AsyncTestSupport.eventually(timeout: .seconds(10), description: "a filter applied while paused") {
+            filterStatus.stringValue.contains("\"worker\"")
+        }
+        let filtered = Self.nativeRows(table)
+        #expect(!filtered.isEmpty && filtered.allSatisfy { frozenRows.contains($0) })
+        #expect(frozenRows.filter { $0[1] == "worker" }.allSatisfy { filtered.contains($0) })
+        #expect(applier.lastAppliedRevision.value > frozenRevision.value, "control traffic flows while paused")
+        filterField.stringValue = ""
+        filterAdapter.notifyTextDidChangeForTests()
+        filterAdapter.notifyEndEditingForTests()
+        try await AsyncTestSupport.eventually(timeout: .seconds(10), description: "the frozen rows restored") {
+            Self.nativeRows(table) == frozenRows && filterStatus.stringValue.contains("showing all")
+        }
+        #expect(Self.modelItemIDs(applier) == frozenIDs)
+        #expect(summary.map(\.stringValue).dropLast() == frozenSummary.dropLast())
+        #expect(freshness.stringValue.hasPrefix("Paused, not live · "))
+
+        // An invalid interval is refused with its reason; the interval is kept.
+        intervalField.stringValue = "fast"
+        intervalAdapter.notifyTextDidChangeForTests()
+        intervalAdapter.notifyEndEditingForTests()
+        try await AsyncTestSupport.eventually(timeout: .seconds(10), description: "the interval text kept by the server") {
+            Self.modelValue(applier, NodeId(Self.intervalInputID)) == "fast"
+        }
+        NativeActivation.click(apply)
+        try await AsyncTestSupport.eventually(timeout: .seconds(10), description: "the refused interval") {
+            status.stringValue.contains("interval \"fast\" refused: not a whole number of milliseconds")
+                && status.stringValue.contains("keeping 300 ms")
+                && status.stringValue.hasPrefix("Paused at ")
+        }
+        #expect(Self.nativeRows(table) == frozenRows)
+        let refusedStatus = status.stringValue
+
+        // Editing the field again clears the refusal of the text it replaced.
+        intervalField.stringValue = "300"
+        intervalAdapter.notifyTextDidChangeForTests()
+        intervalAdapter.notifyEndEditingForTests()
+        try await AsyncTestSupport.eventually(timeout: .seconds(10), description: "the refusal cleared") {
+            !status.stringValue.contains("refused") && status.stringValue.hasPrefix("Paused at ")
+        }
+        // Resume: one current sample in the same native table.
+        NativeActivation.click(pause)
+        try await AsyncTestSupport.eventually(timeout: .seconds(10), description: "the resumed view") {
+            pause.title == "Pause view"
+                && refresh.isEnabled
+                && !status.stringValue.hasPrefix("Paused")
+                && !freshness.stringValue.hasPrefix("Paused")
+                && !freshness.stringValue.hasPrefix("Resuming")
+                && freshness.stringValue != frozenSummary.last
+        }
+        try await AsyncTestSupport.eventually(timeout: .seconds(10), description: "the converged native table") {
+            Self.nativeRows(table) == Self.modelRows(applier) && status.stringValue == "Live · sampling every 300 ms"
+        }
+        // Rows that survived the pause kept their item IDs.
+        let resumedIDs = Set(Self.modelItemIDs(applier))
+        #expect(!resumedIDs.isDisjoint(with: frozenIDs), "surviving rows keep their item IDs")
+        #expect(renderer.registry.handle(for: NodeId(5)) === tableHandle)
+        print("PX-015 native SSH evidence: window \(window.windowNumber); frozen at client revision \(frozenRevision.value) for 1.2 s with no app mutation; frozenRows=\(frozenRows); filtered while paused=\(filtered); refused=\(refusedStatus); resumed status=\(status.stringValue); freshness=\(freshness.stringValue); rows=\(Self.nativeRows(table)); itemIDs=\(Self.modelItemIDs(applier)); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
+    // PX-015: the sampling controls.
+    fileprivate static let samplingPauseID: UInt64 = 62
+    fileprivate static let samplingRefreshID: UInt64 = 63
+    fileprivate static let intervalInputID: UInt64 = 64
+    fileprivate static let intervalApplyID: UInt64 = 65
+    fileprivate static let samplingStatusID: UInt64 = 66
+
+    /// The string `id` holds as its `VALUE` on the client.
+    @MainActor
+    fileprivate static func modelValue(_ applier: TransactionApplier, _ id: NodeId) -> String {
+        guard case .string(let text)? = applier.store.getNode(id)?.getProperty(.value) else { return "" }
+        return text
     }
 
     /// PX-011 (with PX-011-G01): search is a standard native text field, two standard buttons

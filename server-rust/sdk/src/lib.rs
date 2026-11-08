@@ -3,6 +3,8 @@
 //! Provides high-level typed builder, accessor, session, transaction, and event routing
 //! abstractions on top of the core SRUI semantic tree and transaction engine (§6.3, §7.1–§7.7, §8,
 //! §12, §29). [`selection`] lets a server promote a collection's selection to semantic state.
+//! [`keep_visible`] lets it hint, without touching selection, which collection item the client
+//! keeps in view (the standard `keep_visible` property).
 //! Admitted widgets (`Button`, `Toggle`, `TextInput`, `TextArea`, `List`, `Table`, `Tree`,
 //! `RichText`) expose the standard `shortcut` property through `shortcut`/`set_shortcut`/
 //! `clear_shortcut`, validated by the store against [`Shortcut`] (§4 inv. 13, §7.7, §22.5, §26).
@@ -10,6 +12,7 @@
 //! with `tree_depth`/`descendant_count`, bounded by `max_model_tree_depth`, §8, §26); `Tree` reads
 //! `columns` and reports local disclosure through [`Tree::on_expansion_changed`] (§7.6, §22.5).
 
+pub mod keep_visible;
 pub mod selection;
 pub mod session;
 pub mod tree_model;
@@ -87,6 +90,8 @@ pub const COLUMNS: PropertyRef = PropertyRef::COLUMNS;
 pub const PRESENTATION_HINT: PropertyRef = PropertyRef::PRESENTATION_HINT;
 /// Property reference for `selection_mode` (§7.4).
 pub const SELECTION_MODE: PropertyRef = PropertyRef::SELECTION_MODE;
+/// Property reference for `keep_visible` (§6.3, §8, §22.7).
+pub const KEEP_VISIBLE: PropertyRef = PropertyRef::KEEP_VISIBLE;
 /// Property reference for `horizontal_alignment` (§7.4).
 pub const HORIZONTAL_ALIGNMENT: PropertyRef = PropertyRef::HORIZONTAL_ALIGNMENT;
 /// Property reference for `vertical_alignment` (§7.4).

@@ -83,12 +83,12 @@ Design-doc tier groupings for reference:
 > **Admission Rule for Standard Widgets (§7.2)**: A widget belongs in the Standard Profile only if its meaning and state machine are stable across multiple major desktop toolkit families (AppKit, WinUI, GTK, SWT), its behavior is specified without reference to a particular drawing API, and it supports accessibility mapping.
 
 ### 4.2 Common Properties (§7.4, §8)
-The canonical registry defines 33 standard properties in five categories:
+The canonical registry defines 34 standard properties in five categories:
 1. **Identity & Accessibility** (§7.4)
 2. **Common State** (§7.4)
 3. **Content** (§7.4)
 4. **Layout Intent** (§7.4)
-5. **Control-Specific & Semantic Metadata** (§7.7, §8): `presentation_hint`, `action_key`, `columns`, `selection_mode`, `shortcut`, and the model item properties `tree_depth`, `descendant_count`
+5. **Control-Specific & Semantic Metadata** (§7.7, §8): `presentation_hint`, `action_key`, `columns`, `selection_mode`, `shortcut`, and the model item properties `tree_depth`, `descendant_count`, and `keep_visible`
 
 Each property entry includes `value_type` metadata validated by the registry tool.
 
@@ -125,6 +125,14 @@ Each property entry includes `value_type` metadata validated by the registry too
 - **Columns:** `Tree` reads `columns` exactly as `Table` does, with the outline column first and a visible header.
 - **SDK:** `TreeModel` flattens a server-side forest into preorder items, stamps both properties and refuses a forest deeper than the limit (`TreeModelError::DepthLimitExceeded`) before anything reaches a transaction.
 - **Fallback (§4 inv. 13 optional semantics):** a client without support renders the preorder flat, with correct identity and selection.
+
+**`keep_visible` — server-hinted keep-in-view item (§4 inv. 13, §6.3, §8, §12.1, §22.5, §22.7).** On a model-backed `List`, `Table` or `Tree`, `keep_visible` names one item the client keeps in view. It is presentation guidance from the server, never selection state:
+
+- **Value:** an `ItemId` (`Value.item_id_value`) only, never a row index. Absent means no hint.
+- **Validity (every replica, `invalid_keep_visible`):** held only by a `List`, `Table` or `Tree` that has a `model_ref`, evaluated on the resulting property set of `CREATE_NODE`, `SET_PROPERTY`, `CLEAR_PROPERTY` and `BATCH_PROPERTY_SET`; any other node type, any other value type, a collection without `model_ref`, and clearing `model_ref` while the hint is held are refused and the whole transaction is discarded. Item presence is not a replica rule, because sparse caches may omit the item. It is independent of `value` and `selection_mode`.
+- **Authoritative settlement (same paths as the promoted selection):** a set naming an `ItemId` the collection's model does not hold is refused with `item_not_found`; a commit that removes the named item from the model (delete, range reset, positional update, `model_ref` change) clears the hint in the same commit; a pre-built sessiond `commit_transaction` that would leave it dangling is refused with `item_not_found`. Settling a hint never touches `value`, and settling a promotion never touches `keep_visible`.
+- **Rendering:** setting, changing or clearing it never selects, deselects or replaces a local selection, posts no selection notification and emits no event. When a commit sets it (even to the same item) or changes the row index at which the item is shown, the client scrolls the minimum needed to make that row visible; a commit that leaves the row index unchanged never scrolls, so a local pan persists until the item moves. An uncached item (or one without a displayed row) is not scrolled to and nothing is requested for it; it is revealed when it arrives through range data. A newly mounted collection view has no local viewport to keep, so it starts with the hinted row revealed. Local selection, scrolling and keyboard navigation never clear or override the hint.
+- **Fallback (§4 inv. 13 optional semantics):** a client without support ignores it and keeps its viewport where the user put it.
 
 ### 4.3 Standard Enums (§7.5, §7.2, §7.4, §8)
 The canonical registry defines 12 standard enum types with monotonic type IDs ($1 \ldots 12$) and contiguous value IDs within each enum.

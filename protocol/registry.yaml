@@ -426,6 +426,12 @@ properties:
     value_type: uint64
     description: "Model item property: the size of the item's subtree excluding the item itself, so its descendants occupy indices index+1 through index+descendant_count of the preorder (§8). Absent means 0. index + descendant_count < item_count; every cached item inside the span is deeper than the item and keeps its own span inside it, and a cached item right after the span is no deeper than the item. Disclosure is local (§22.5): collapsing an item hides exactly its span. A violation fails the whole transaction explicitly (§4 inv. 13, §12.1). Fallback: a client without support renders the preorder flat."
 
+  - id: 34
+    name: keep_visible
+    category: control_specific
+    value_type: value
+    description: "Server-hinted keep-in-view item of a model-backed List, Table or Tree (§6.3, §8, §22.7): an ItemId the client keeps in view. Presentation guidance, never selection state: setting, changing or clearing it never selects, deselects or replaces a local selection, posts no selection notification and emits no event. When a commit sets it, or changes the row index at which the named item is shown, the client scrolls the minimum needed to make that row visible; a commit that leaves the row index unchanged never scrolls, so a local pan persists until the item moves. An uncached item is revealed when it arrives through range data; the client requests nothing for it. Valid only as an ItemId on a List, Table or Tree that has a model_ref (clearing model_ref while it is held is refused). Authoritative sessions refuse an ItemId the collection's model does not hold and clear the property in the commit that removes the item. Fallback: a client without support keeps its viewport where the user put it (§4 inv. 13, §22.5)."
+
 enums:
   - id: 1
     name: TextRole

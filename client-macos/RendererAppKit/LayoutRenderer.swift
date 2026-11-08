@@ -14,6 +14,10 @@ public enum LayoutRendererError: Error, Equatable, Sendable {
 /// A committed operation on a List/Table/Tree `value` is a server promotion of its selection
 /// (§6.3): it is applied after that commit's model refresh and reveals the row once. Other commits
 /// and remounts restore the selection without revealing (`CollectionSelectionPromotion.swift`).
+///
+/// A List/Table/Tree `keep_visible` is a server hint, never selection (§6.3, §22.7): after the
+/// model refresh (and after any promotion) each refreshed or hinted collection reveals the hinted
+/// row when the commit set the property or moved the item (`CollectionKeepVisibleRendering.swift`).
 @MainActor
 public final class LayoutRenderer {
     public let registry: RenderRegistry
@@ -46,7 +50,8 @@ public final class LayoutRenderer {
     public func mount(
         store: SemanticStore,
         preserveLocalText: Bool = false,
-        promotedNodeIDs: Set<NodeId> = []
+        promotedNodeIDs: Set<NodeId> = [],
+        keepVisibleNodeIDs: Set<NodeId> = []
     ) throws {
         RendererDiagnostics.log(
             "mount begin revision=\(store.revision) roots=\(store.rootIDs.count)"
@@ -73,6 +78,7 @@ public final class LayoutRenderer {
         recalculateKeyViewLoops()
         let present = Set(registry.allHandles.map(\.nodeID))
         applyPromotedSelections(store: store, explicit: promotedNodeIDs, only: nil)
+        applyKeepVisible(store: store, explicit: keepVisibleNodeIDs, only: nil)
         controlFactory.pruneCollectionSelectionMemory(keeping: present)
         controlFactory.textEditingSession.syncPresentNodes(present)
         Task {
@@ -88,12 +94,18 @@ public final class LayoutRenderer {
     ) throws -> [DirtyClassification] {
         let classifications = DirtyClassifier.classify(transaction)
         let promotedNodeIDs = Self.promotionTargets(of: transaction, in: newStore)
+        let keepVisibleNodeIDs = Self.keepVisibleTargets(of: transaction, in: newStore)
         shortcutRouter.store = newStore
         if classifications.contains(where: \.isStructureAffecting) {
             RendererDiagnostics.log(
                 "transaction revision=\(transaction.newRevision) structural; remounting"
             )
-            try mount(store: newStore, preserveLocalText: true, promotedNodeIDs: promotedNodeIDs)
+            try mount(
+                store: newStore,
+                preserveLocalText: true,
+                promotedNodeIDs: promotedNodeIDs,
+                keepVisibleNodeIDs: keepVisibleNodeIDs
+            )
             return classifications
         }
 
@@ -121,6 +133,8 @@ public final class LayoutRenderer {
                     affectedCollectionNodeIDs.insert(nodeID)
                 } else if promotedNodeIDs.contains(nodeID), property == .value {
                     continue
+                } else if keepVisibleNodeIDs.contains(nodeID), property == .keepVisible {
+                    continue
                 } else {
                     try apply(property: property, nodeID: nodeID, store: newStore)
                 }
@@ -134,6 +148,8 @@ public final class LayoutRenderer {
                     if isCollectionProperty(property.property) {
                         affectedCollectionNodeIDs.insert(nodeID)
                     } else if promotedNodeIDs.contains(nodeID), property.property == .value {
+                        continue
+                    } else if keepVisibleNodeIDs.contains(nodeID), property.property == .keepVisible {
                         continue
                     } else {
                         try apply(property: property.property, nodeID: nodeID, store: newStore)
@@ -173,8 +189,52 @@ public final class LayoutRenderer {
         if !promotedNodeIDs.isEmpty {
             applyPromotedSelections(store: newStore, explicit: promotedNodeIDs, only: promotedNodeIDs)
         }
+        // Also after the model refresh: a commit that moved the hinted item reveals its new row;
+        // a collection this commit neither refreshed nor hinted cannot have moved it (§6.3, §22.7).
+        let keepVisibleCandidates = affectedCollectionNodeIDs.union(keepVisibleNodeIDs)
+        if !keepVisibleCandidates.isEmpty {
+            applyKeepVisible(store: newStore, explicit: keepVisibleNodeIDs, only: keepVisibleCandidates)
+        }
 
         return classifications
+    }
+
+    /// Collections whose `keep_visible` an operation of `transaction` sets or clears (§6.3).
+    static func keepVisibleTargets(of transaction: Transaction, in store: SemanticStore) -> Set<NodeId> {
+        var targets: Set<NodeId> = []
+        for operation in transaction.operations {
+            let nodeID: NodeId
+            switch operation {
+            case .setProperty(let id, let property, _), .clearProperty(let id, let property):
+                guard property == .keepVisible else { continue }
+                nodeID = id
+            case .batchPropertySet(let id, let properties):
+                guard properties.contains(where: { $0.property == .keepVisible }) else { continue }
+                nodeID = id
+            default:
+                continue
+            }
+            if let node = store.getNode(nodeID), isSelectableCollection(node.nodeType) {
+                targets.insert(nodeID)
+            }
+        }
+        return targets
+    }
+
+    private func applyKeepVisible(
+        store: SemanticStore,
+        explicit: Set<NodeId>,
+        only: Set<NodeId>?
+    ) {
+        for handle in registry.allHandles where isSelectableCollection(handle.nodeType) {
+            if let only, !only.contains(handle.nodeID) { continue }
+            guard let node = store.getNode(handle.nodeID) else { continue }
+            controlFactory.applyKeepVisible(
+                in: handle,
+                for: node,
+                explicit: explicit.contains(handle.nodeID)
+            )
+        }
     }
 
     /// Collections whose promoted selection (`value`) an operation of `transaction` sets or clears.

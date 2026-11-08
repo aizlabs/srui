@@ -154,6 +154,8 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
     public private(set) var pendingPromotion: CollectionPromotion?
     /// The user changed the selection after the last promotion (§22.5).
     public private(set) var localSelectionSincePromotion = false
+    /// Server-hinted keep-in-view item and the row it was last revealed at (§6.3, §22.7).
+    public private(set) var keepVisible = CollectionKeepVisible()
 
     /// Collapsed items of a hierarchical model, by identity (§22.5). Only cached items.
     public private(set) var collapsedItemIDs: Set<ItemId> = []
@@ -563,6 +565,16 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
         guard selectionMode != .none else { return }
         pendingPromotion = CollectionPromotion(itemID: itemID, reveal: reveal)
         resolvePendingPromotion(in: outlineView)
+    }
+
+    /// Applies the tree's `keep_visible` after a commit, with the same rules as
+    /// `TableCollectionAdapter.applyKeepVisible`: it scrolls the hinted row into view and never
+    /// touches the selection or disclosure state: an item without a displayed row is not scrolled
+    /// to and no ancestor is expanded for it. Model-backed trees are flat here.
+    public func applyKeepVisible(_ itemID: ItemId?, explicit: Bool, outlineView: NSOutlineView) {
+        if let row = keepVisible.apply(itemID, explicit: explicit, rowOf: row(of:)) {
+            CollectionPromotion.reveal(row: row, in: outlineView)
+        }
     }
 
     /// Reselects a user's local selection by ItemId without revealing it (§22.5).

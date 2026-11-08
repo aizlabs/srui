@@ -19,6 +19,14 @@
 //! the model ([`SemanticStore::validate_model_tree`]), because a structural edit inside a subtree
 //! needs a `MODEL_INSERT`/`MODEL_DELETE` and the ancestors' `MODEL_UPDATE` together. The §26 limit
 //! `max_model_tree_depth` bounds it.
+//!
+//! The standard `keep_visible` property (§4 inv. 13, §6.3, §8, §22.7) is a server-hinted
+//! keep-in-view item: presentation guidance, never selection. The store enforces its
+//! cache-independent rules on the resulting property set of `CREATE_NODE`, `SET_PROPERTY`,
+//! `CLEAR_PROPERTY` and `BATCH_PROPERTY_SET`: the value is an `ItemId`, and it is held only by a
+//! `List`, `Table` or `Tree` that has a `model_ref`, so clearing `model_ref` while it is held is
+//! refused. As with a promoted selection, item presence is checked only against the
+//! authoritative store, by the SDK.
 
 pub mod error;
 pub mod limits;
@@ -84,6 +92,34 @@ fn validate_collection_selection(
         });
     }
     Ok(())
+}
+
+/// Validates the `keep_visible` invariant of one node's resulting properties (§6.3, §8).
+///
+/// `keep_visible` and `model_ref` are the values the node would hold after the mutation. The
+/// rules are cache-independent so every replica reaches the same verdict (§12.1).
+fn validate_keep_visible(
+    node_id: NodeId,
+    node_type: TypeRef,
+    keep_visible: Option<&Value>,
+    model_ref: Option<&Value>,
+) -> Result<(), StoreError> {
+    let Some(keep_visible) = keep_visible else {
+        return Ok(());
+    };
+    let reason = if !is_selectable_collection(node_type) {
+        "keep_visible is admitted only on a model-backed List, Table or Tree"
+    } else if !matches!(keep_visible, Value::ItemId(_)) {
+        "keep_visible must be an ItemId, never a row index or other value"
+    } else if model_ref.is_none() {
+        "keep_visible names a model item, but the node has no model_ref"
+    } else {
+        return Ok(());
+    };
+    Err(StoreError::InvalidKeepVisible {
+        node_id,
+        reason: reason.to_string(),
+    })
 }
 
 /// Validates one `shortcut` value against the grammar and the node type's admission (§7.4, §26).
@@ -489,6 +525,12 @@ impl SemanticStore {
             last_assigned(&prop_list, PropertyRef::VALUE),
             last_assigned(&prop_list, PropertyRef::SELECTION_MODE),
         )?;
+        validate_keep_visible(
+            id,
+            node_type,
+            last_assigned(&prop_list, PropertyRef::KEEP_VISIBLE),
+            last_assigned(&prop_list, PropertyRef::MODEL_REF),
+        )?;
         for (prop, val) in &prop_list {
             if *prop == PropertyRef::SHORTCUT {
                 validate_shortcut_value(id, node_type, val)?;
@@ -636,6 +678,9 @@ impl SemanticStore {
         } else if prop == PropertyRef::SELECTION_MODE {
             let value = node.get_property(PropertyRef::VALUE);
             validate_collection_selection(id, node.node_type, value, Some(&val))?;
+        } else if prop == PropertyRef::KEEP_VISIBLE {
+            let model_ref = node.get_property(PropertyRef::MODEL_REF);
+            validate_keep_visible(id, node.node_type, Some(&val), model_ref)?;
         }
         Ok(node.properties.insert(prop, val))
     }
@@ -653,6 +698,9 @@ impl SemanticStore {
         if prop == PropertyRef::SELECTION_MODE {
             let value = node.get_property(PropertyRef::VALUE);
             validate_collection_selection(id, node.node_type, value, None)?;
+        } else if prop == PropertyRef::MODEL_REF {
+            let keep_visible = node.get_property(PropertyRef::KEEP_VISIBLE);
+            validate_keep_visible(id, node.node_type, keep_visible, None)?;
         }
         Ok(node.properties.remove(&prop))
     }
@@ -674,6 +722,11 @@ impl SemanticStore {
             let mode = last_assigned(&prop_list, PropertyRef::SELECTION_MODE)
                 .or_else(|| node.get_property(PropertyRef::SELECTION_MODE));
             validate_collection_selection(id, node.node_type, value, mode)?;
+            let keep_visible = last_assigned(&prop_list, PropertyRef::KEEP_VISIBLE)
+                .or_else(|| node.get_property(PropertyRef::KEEP_VISIBLE));
+            let model_ref = last_assigned(&prop_list, PropertyRef::MODEL_REF)
+                .or_else(|| node.get_property(PropertyRef::MODEL_REF));
+            validate_keep_visible(id, node.node_type, keep_visible, model_ref)?;
             for (prop, val) in &prop_list {
                 if *prop == PropertyRef::SHORTCUT {
                     validate_shortcut_value(id, node.node_type, val)?;

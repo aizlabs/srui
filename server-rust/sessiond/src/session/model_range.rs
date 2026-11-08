@@ -299,7 +299,7 @@ fn commit_ops_locked(
         ui.apply_op(op)
             .map_err(|error| ModelRangeError::Session(SessionError::Store(error).to_string()))?;
     }
-    // Same promoted-selection settlement as every other commit (§6.3, §8).
+    // Same promoted-selection and keep_visible settlement as every other commit (§6.3, §8).
     ui.settle_promoted_selections()
         .map_err(|error| ModelRangeError::Session(SessionError::Store(error).to_string()))?;
     let (staged, recorded) = ui.into_staged_and_ops();
@@ -1380,6 +1380,53 @@ mod tests {
         assert!(replayed[0].operations.iter().any(|op| {
             matches!(&op.op, Some(srui_protocol::operation::Op::ClearProperty(clear))
                 if clear.node_id == node_id.get())
+        }));
+    }
+
+    /// PX-017-G01: range fulfilment that replaces the hinted item clears `keep_visible` in the
+    /// journaled commit, exactly like a promotion (§6.3, §8).
+    #[tokio::test]
+    async fn range_fulfilment_that_replaces_the_hinted_item_clears_keep_visible() {
+        let (session, node_id, model_id) = table_and_model(20);
+        session
+            .transaction(|ui| {
+                ui.apply_op(&Operation::model_reset_range(
+                    model_id,
+                    0,
+                    (0..10).map(item_at),
+                    None,
+                ))?;
+                ui.set_keep_visible(node_id, ItemId::new(5))
+            })
+            .expect("hint");
+        let renumbering: ModelRangeProvider = Arc::new(|query: ModelRangeQuery| {
+            Box::pin(async move {
+                Ok((0..query.count)
+                    .map(|offset| {
+                        let index = query.start_index + offset;
+                        ModelItem::with_value(ItemId::new(1_000 + index), format!("row-{index}"))
+                    })
+                    .collect())
+            })
+        });
+        session.register_model_range_provider(model_id, renumbering);
+        let revision = session.current_revision();
+        let outcome = session
+            .fulfill_model_range_request(request(node_id, model_id, 0, 20, revision))
+            .await
+            .expect("fulfil");
+        assert!(matches!(outcome, ModelRangeFulfillment::Committed { .. }));
+        session.with_store(|store| {
+            assert_eq!(store.get_node(node_id).unwrap().keep_visible(), None);
+        });
+        let replayed = session
+            .collect_replayed_transactions(revision)
+            .expect("replay");
+        let keep_visible = srui_semantic_tree::PropertyRef::KEEP_VISIBLE;
+        assert!(replayed[0].operations.iter().any(|op| {
+            matches!(&op.op, Some(srui_protocol::operation::Op::ClearProperty(clear))
+                if clear.node_id == node_id.get()
+                    && clear.property.as_ref().is_some_and(|p| p.local_id == keep_visible.local_id))
         }));
     }
 }

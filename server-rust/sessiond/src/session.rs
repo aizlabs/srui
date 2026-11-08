@@ -927,9 +927,9 @@ impl Session {
         let max_ops = guard.store.limits().max_transaction_operations;
         let mut ui = UiTransaction::new(guard.store.clone_staging(), max_ops);
 
-        // Promotions are settled before journaling: an unknown promoted item is refused and a
-        // removed one is cleared in this commit, so resync never restores a dangling promotion
-        // (§6.3, §8).
+        // Promotions and keep_visible hints are settled before journaling: an unknown item is
+        // refused and a removed one is cleared in this commit, so resync never restores a
+        // dangling promotion or hint (§6.3, §8).
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             f(&mut ui, revisions).and_then(|value| ui.settle_promoted_selections().map(|()| value))
         }));
@@ -1014,17 +1014,15 @@ impl Session {
             // session with `NonContiguousRevision` (§12.1, §18.1, §20.2).
             let staged = guard.store.prepare_commit(&commit)?;
             // A pre-built commit cannot gain the CLEAR_PROPERTY a UiTransaction would settle, so
-            // one that would leave a promotion naming an item its model does not hold is refused
-            // (§6.3, §8): resync never restores a dangling promotion.
+            // one that would leave a promotion or a keep_visible hint naming an item its model
+            // does not hold is refused (§6.3, §8): resync never restores a dangling one.
             if commit
                 .as_transaction()
                 .operations
                 .iter()
                 .any(srui_sdk::selection::affects_promotions)
             {
-                if let Some(&(_, item)) =
-                    srui_sdk::selection::dangling_promotions(staged.store()).first()
-                {
+                if let Some(item) = srui_sdk::selection::first_dangling_item(staged.store()) {
                     return Err(SessionError::Store(StoreError::ItemNotFound(item)));
                 }
             }
@@ -1739,6 +1737,91 @@ mod tests {
             assert_eq!(
                 store.get_node(table).unwrap().promoted_selection(),
                 Some(ItemId::new(3))
+            );
+        });
+    }
+
+    /// PX-017-G01: a pre-built commit that would leave a `keep_visible` hint naming an item the
+    /// model does not hold is refused like a dangling promotion (§6.3, §8); one that keeps the
+    /// item, or names a held one, commits.
+    #[test]
+    fn commit_transaction_refuses_a_dangling_keep_visible_hint() {
+        use srui_semantic_tree::{
+            ItemId, ModelId, ModelItem, Revision, Transaction as DomainTransaction,
+        };
+
+        let session = Session::new("keep-visible-guard");
+        let model = ModelId::new(7);
+        let table = NodeId::new(2);
+        session
+            .transaction(|ui| {
+                ui.create_node(NodeId::new(1), TypeRef::SURFACE, None, None, [])?;
+                ui.apply_op(&Operation::create_model(model, TypeRef::TABLE, 0))?;
+                ui.apply_op(&Operation::model_insert(
+                    model,
+                    0,
+                    (1..=5u64).map(|i| ModelItem::with_value(ItemId::new(i), Value::from(i))),
+                ))?;
+                ui.create_node(
+                    table,
+                    TypeRef::TABLE,
+                    Some(NodeId::new(1)),
+                    None,
+                    [(PropertyRef::MODEL_REF, Value::UnsignedInt(model.get()))],
+                )?;
+                ui.set_keep_visible(table, ItemId::new(3))
+            })
+            .expect("setup");
+        let revision = session.current_revision();
+
+        for ops in [
+            vec![Operation::model_delete_items(model, [ItemId::new(3)])],
+            vec![Operation::model_reset_range(
+                model,
+                2,
+                [ModelItem::with_value(
+                    ItemId::new(50_000),
+                    Value::from(0u64),
+                )],
+                None,
+            )],
+            vec![Operation::set_property(
+                table,
+                PropertyRef::KEEP_VISIBLE,
+                Value::ItemId(ItemId::new(999_999)),
+            )],
+        ] {
+            let wire: Transaction = (&DomainTransaction::new(Revision::new(revision), ops)).into();
+            let err = session
+                .commit_transaction(wire)
+                .expect_err("dangling keep_visible");
+            assert!(
+                matches!(err, SessionError::Store(StoreError::ItemNotFound(_))),
+                "{err:?}"
+            );
+            assert_eq!(session.current_revision(), revision);
+        }
+        session.with_store(|store| {
+            assert_eq!(
+                store.get_node(table).unwrap().keep_visible(),
+                Some(ItemId::new(3))
+            );
+        });
+
+        let wire: Transaction = (&DomainTransaction::new(
+            Revision::new(revision),
+            vec![Operation::set_property(
+                table,
+                PropertyRef::KEEP_VISIBLE,
+                Value::ItemId(ItemId::new(5)),
+            )],
+        ))
+            .into();
+        session.commit_transaction(wire).expect("held item commits");
+        session.with_store(|store| {
+            assert_eq!(
+                store.get_node(table).unwrap().keep_visible(),
+                Some(ItemId::new(5))
             );
         });
     }

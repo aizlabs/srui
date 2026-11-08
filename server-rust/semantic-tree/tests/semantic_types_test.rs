@@ -378,6 +378,10 @@ fn test_standard_registry_lookups() {
         resolve_standard_property("shortcut").unwrap(),
         PropertyRef::SHORTCUT
     );
+    assert_eq!(
+        resolve_standard_property("keep_visible").unwrap(),
+        PropertyRef::KEEP_VISIBLE
+    );
     assert_eq!(PropertyRef::SHORTCUT, PropertyRef::standard(31));
     assert_eq!(
         resolve_standard_property("tree_depth").unwrap(),
@@ -389,7 +393,8 @@ fn test_standard_registry_lookups() {
         PropertyRef::DESCENDANT_COUNT
     );
     assert_eq!(PropertyRef::DESCENDANT_COUNT, PropertyRef::standard(33));
-    assert_eq!(STANDARD_PROPERTIES.len(), 33);
+    assert_eq!(PropertyRef::KEEP_VISIBLE, PropertyRef::standard(34));
+    assert_eq!(STANDARD_PROPERTIES.len(), 34);
 
     // Check all 27 standard node types round-trip with their names
     for (id, name) in STANDARD_NODE_TYPES {

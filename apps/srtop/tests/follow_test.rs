@@ -1,19 +1,22 @@
 //! PX-017 acceptance: follow selected process and a stable viewport (D1
-//! §§6.2–6.3, 7.6, 7.7, 8, 22.5, 22.7; D2 T28).
+//! §§6.2–6.3, 7.6, 8, 22.5, 22.7; D2 T28), on the standard `keep_visible`
+//! hint (PX-017-G01).
 //!
 //! * Follow is an explicit semantic setting: a standard `Toggle` whose
 //!   `VALUE_CHANGED` the server resolves against its own selection, and a
 //!   status line that says whom follow is on, or why it is off.
-//! * Off, no sample promotes anything: ordinary selection preservation is the
-//!   client's, anchored to item IDs, and never scrolls.
-//! * On, a sample, sort or filter that moves the followed process to another
-//!   row ends with its promotion (PX-011-G01), after every row operation; one
-//!   that does not move it promotes nothing, so a pan is kept. No row is ever
-//!   created for it.
-//! * Follow stops, and says why, when the process ends or is hidden; a new
-//!   process that reuses its PID is never followed.
-//! * Selecting another row follows it; a selection a later promotion replaced
-//!   on the client (by its `observed_revision`) is promoted back.
+//! * Follow never promotes. It names the followed item in the table's
+//!   `keep_visible` hint: once at turn-on and once per retarget, never for a
+//!   sample, a sort or a filter, because the client reveals the hinted item
+//!   wherever a commit moves it. So no reply ever replaces a newer local
+//!   selection: rapid arrows and clicks end on the last press.
+//! * Off, nothing is hinted and nothing is promoted: ordinary selection
+//!   preservation is the client's, anchored to item IDs, and never scrolls.
+//! * While follow is on the promoted `value` names the followed process or
+//!   nothing, so a fresh client never restores a selection of another
+//!   process, and its viewport is revealed to the followed one.
+//! * Follow stops, clears its hint and says why when the process ends or is
+//!   hidden; a new process that reuses its PID is never followed.
 
 use srui_process_explorer::catalogue::ProcessField;
 use srui_process_explorer::follow::{FOLLOW_LABEL, OFF_STATUS};
@@ -25,7 +28,8 @@ use srui_process_explorer::{
 };
 use srui_protocol::Event as WireEvent;
 use srui_sdk::{
-    ItemId, NodeId, Operation, PropertyRef, TypeRef, Value, ENABLED, LABEL, TEXT, VALUE,
+    ItemId, NodeId, Operation, PropertyRef, TypeRef, Value, ENABLED, KEEP_VISIBLE, LABEL,
+    MODEL_REF, TEXT, VALUE,
 };
 use srui_semantic_tree::Event as DomainEvent;
 use srui_sessiond::{EventOutcome, Session};
@@ -56,30 +60,135 @@ fn harness() -> Harness {
     }
 }
 
-/// Operations committed since `revision`, as a client receives them.
-fn operations_since(session: &Session, revision: u64) -> Vec<Operation> {
+/// The transactions committed since `revision`, as a client receives them.
+fn transactions_since(session: &Session, revision: u64) -> Vec<Vec<Operation>> {
     session
         .collect_replayed_transactions(revision)
         .expect("the journal holds this run")
         .into_iter()
-        .flat_map(|transaction| transaction.operations)
-        .map(|op| Operation::try_from(op).expect("a committed operation decodes"))
+        .map(|transaction| {
+            transaction
+                .operations
+                .into_iter()
+                .map(|op| Operation::try_from(op).expect("a committed operation decodes"))
+                .collect()
+        })
         .collect()
+}
+
+/// Operations committed since `revision`, as a client receives them.
+fn operations_since(session: &Session, revision: u64) -> Vec<Operation> {
+    transactions_since(session, revision)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// The item IDs every `SET_PROPERTY(TABLE, property)` in `operations` names.
+fn sets_of(operations: &[Operation], property: PropertyRef) -> Vec<ItemId> {
+    operations
+        .iter()
+        .filter_map(|op| match op {
+            Operation::SetProperty {
+                id,
+                property: set,
+                value: Value::ItemId(item),
+            } if *id == TABLE && *set == property => Some(*item),
+            _ => None,
+        })
+        .collect()
+}
+
+/// How many `CLEAR_PROPERTY(TABLE, property)` are in `operations`.
+fn clears_of(operations: &[Operation], property: PropertyRef) -> usize {
+    operations
+        .iter()
+        .filter(|op| matches!(op, Operation::ClearProperty { id, property: cleared } if *id == TABLE && *cleared == property))
+        .count()
 }
 
 /// The item IDs every `SET_PROPERTY(TABLE, VALUE)` since `revision` promoted.
 fn promotions_since(session: &Session, revision: u64) -> Vec<ItemId> {
-    operations_since(session, revision)
-        .into_iter()
-        .filter_map(|op| match op {
+    sets_of(&operations_since(session, revision), VALUE)
+}
+
+/// How many promotions were withdrawn (`CLEAR_PROPERTY(TABLE, VALUE)`) since
+/// `revision`.
+fn withdrawals_since(session: &Session, revision: u64) -> usize {
+    clears_of(&operations_since(session, revision), VALUE)
+}
+
+/// The item IDs every `SET_PROPERTY(TABLE, KEEP_VISIBLE)` since `revision`
+/// hinted.
+fn hints_since(session: &Session, revision: u64) -> Vec<ItemId> {
+    sets_of(&operations_since(session, revision), KEEP_VISIBLE)
+}
+
+/// How many hints were cleared since `revision`.
+fn hint_clears_since(session: &Session, revision: u64) -> usize {
+    clears_of(&operations_since(session, revision), KEEP_VISIBLE)
+}
+
+/// The table as a client that attaches now receives it in its catch-up
+/// snapshot: its promoted selection, which the generic client restores as
+/// the selected row, and its `keep_visible` hint, which it reveals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fresh {
+    selection: Option<ItemId>,
+    hint: Option<ItemId>,
+}
+
+fn fresh_client(session: &Session) -> Fresh {
+    let hello = srui_protocol::ClientHello {
+        core_version: "0.5.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
+        limits: None,
+        client_instance_id: vec![7, 7, 7],
+        client_metadata: Default::default(),
+        known_resource_hashes: vec![],
+    };
+    let snapshot = session
+        .bootstrap_fresh_client(&hello)
+        .expect("a fresh client attaches")
+        .snapshot
+        .expect("a populated session sends a catch-up snapshot");
+    let mut fresh = Fresh {
+        selection: None,
+        hint: None,
+    };
+    for operation in snapshot.operations {
+        match Operation::try_from(operation).expect("a snapshot operation decodes") {
+            Operation::CreateNode { id, properties, .. } if id == TABLE => {
+                for (property, value) in properties {
+                    match value {
+                        Value::ItemId(item) if property == VALUE => fresh.selection = Some(item),
+                        Value::ItemId(item) if property == KEEP_VISIBLE => fresh.hint = Some(item),
+                        _ => {}
+                    }
+                }
+            }
             Operation::SetProperty {
                 id,
                 property,
                 value: Value::ItemId(item),
-            } if id == TABLE && property == VALUE => Some(item),
-            _ => None,
-        })
-        .collect()
+            } if id == TABLE => {
+                if property == VALUE {
+                    fresh.selection = Some(item);
+                } else if property == KEEP_VISIBLE {
+                    fresh.hint = Some(item);
+                }
+            }
+            Operation::ClearProperty { id, property } if id == TABLE => {
+                if property == VALUE {
+                    fresh.selection = None;
+                } else if property == KEEP_VISIBLE {
+                    fresh.hint = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    fresh
 }
 
 impl Harness {
@@ -140,6 +249,13 @@ impl Harness {
             .unwrap_or_else(|| panic!("no shown row has PID {pid}"))
     }
 
+    fn pid_of(&self, item: ItemId) -> Option<u64> {
+        self.rows()
+            .into_iter()
+            .find(|(id, _, _)| *id == item)
+            .map(|(_, pid, _)| pid)
+    }
+
     fn identities(&self) -> BTreeSet<ItemId> {
         self.rows().into_iter().map(|(id, _, _)| id).collect()
     }
@@ -165,11 +281,17 @@ impl Harness {
     }
 
     fn promoted(&self) -> Option<ItemId> {
-        self.session.with_store(|store| {
-            store
-                .get_node(TABLE)
-                .and_then(|node| node.promoted_selection())
-        })
+        match self.property(TABLE, VALUE) {
+            Some(Value::ItemId(item)) => Some(item),
+            _ => None,
+        }
+    }
+
+    fn hinted(&self) -> Option<ItemId> {
+        match self.property(TABLE, KEEP_VISIBLE) {
+            Some(Value::ItemId(item)) => Some(item),
+            _ => None,
+        }
     }
 
     fn send(
@@ -222,26 +344,41 @@ impl Harness {
         );
     }
 
-    /// Sorts by CPU (busiest first), selects `tracked` and turns follow on.
-    fn follow_tracked(&mut self) -> ItemId {
+    /// Sorts by CPU (busiest first), selects `tracked` by a click and turns
+    /// follow on, asserting nothing about how follow reached the wire.
+    fn start_following_tracked(&mut self) -> ItemId {
         self.sort(SORT_CPU);
         let tracked = self.item_of(FollowSource::TRACKED_PID.into());
         assert_eq!(self.row_of(tracked), Some(FollowSource::RANKS[0]));
         self.select(tracked);
-        let before = self.revision();
         self.toggle(true);
         assert!(self.checked());
+        assert_eq!(self.view().follow().following(), Some(tracked));
+        tracked
+    }
+
+    /// [`Self::start_following_tracked`], asserting that turning on hinted
+    /// `tracked` once and promoted nothing.
+    fn follow_tracked(&mut self) -> ItemId {
+        let before = self.revision();
+        let tracked = self.start_following_tracked();
         assert_eq!(
             promotions_since(&self.session, before),
-            vec![tracked],
-            "turning follow on reveals the process at once"
+            Vec::<ItemId>::new(),
+            "turning follow on promotes nothing"
         );
+        assert_eq!(
+            hints_since(&self.session, before),
+            vec![tracked],
+            "turning follow on hints the process once"
+        );
+        assert_eq!(self.hinted(), Some(tracked));
         tracked
     }
 }
 
 /// The follow controls are a standard checkbox and a status line, off at the
-/// start, and the toggle is enabled in a collecting view.
+/// start, and the toggle is enabled in a collecting view. Nothing is hinted.
 #[test]
 fn follow_is_an_explicit_off_by_default_setting() {
     let h = harness();
@@ -254,13 +391,14 @@ fn follow_is_an_explicit_off_by_default_setting() {
     assert_eq!(h.status(), OFF_STATUS);
     assert_eq!(h.view().follow().following(), None);
     assert_eq!(h.view().follow_view().status, OFF_STATUS);
+    assert_eq!(h.hinted(), None);
 }
 
 /// Off, a selected process is kept selected by the client under its item ID
-/// (§22.5) and no sample ever promotes it, however far it moves: the viewport
-/// is the user's.
+/// (§22.5) and no sample ever promotes or hints it, however far it moves: the
+/// viewport is the user's.
 #[test]
-fn non_follow_mode_never_promotes_on_a_sample() {
+fn non_follow_mode_never_promotes_or_hints_on_a_sample() {
     let mut h = harness();
     h.sort(SORT_CPU);
     let tracked = h.item_of(FollowSource::TRACKED_PID.into());
@@ -282,26 +420,60 @@ fn non_follow_mode_never_promotes_on_a_sample() {
         Vec::<ItemId>::new(),
         "follow off: no sample promotes"
     );
+    assert_eq!(hints_since(&h.session, start), Vec::<ItemId>::new());
     assert_eq!(h.promoted(), None);
+    assert_eq!(h.hinted(), None);
     assert!(!h.checked());
     assert_eq!(h.status(), OFF_STATUS);
 }
 
-/// On, every sample that moves the followed process ends with its promotion,
-/// naming its final place; a sample that does not move it promotes nothing,
-/// so a pan is kept; no row is ever created; and a sort that moves it reveals
-/// it too.
+/// Turning follow on follows the user's own selection: one hint, in one
+/// commit with the checkbox, and no promotion or withdrawal, since nothing
+/// else is promoted. A fresh client then restores no selection and is
+/// revealed to the followed process.
 #[test]
-fn cpu_resorting_keeps_the_followed_identity_revealed_without_creating_rows() {
+fn turning_follow_on_hints_the_users_selection_and_promotes_nothing() {
     let mut h = harness();
-    let tracked = h.follow_tracked();
-    let identities = h.identities();
+    h.sort(SORT_CPU);
+    let tracked = h.item_of(FollowSource::TRACKED_PID.into());
+    h.select(tracked);
+    let before = h.revision();
+    h.toggle(true);
+    let transactions = transactions_since(&h.session, before);
+    assert_eq!(transactions.len(), 1, "one commit: {transactions:?}");
+    let operations = &transactions[0];
+    assert_eq!(sets_of(operations, KEEP_VISIBLE), vec![tracked]);
+    assert_eq!(sets_of(operations, VALUE), Vec::<ItemId>::new());
+    assert_eq!(clears_of(operations, VALUE), 0);
+    assert!(operations.iter().any(|op| matches!(op, Operation::SetProperty { id, property, value: Value::Bool(true) } if *id == FOLLOW_TOGGLE && *property == VALUE)));
+    // The hint carries its row, so a sparse replica can place it.
+    assert!(operations.iter().any(|op| matches!(op, Operation::ModelResetRange { start_index: 0, items, .. } if items.len() == 1 && items[0].item_id == tracked)));
+    assert_eq!(h.hinted(), Some(tracked));
+    assert_eq!(h.promoted(), None);
+    assert_eq!(
+        fresh_client(&h.session),
+        Fresh {
+            selection: None,
+            hint: Some(tracked)
+        }
+    );
     assert!(
         h.status()
             .starts_with("Following PID 6010 · tracked · row 1 of 60 · "),
         "{}",
         h.status()
     );
+}
+
+/// On, no sample, sort or filter that moves the followed process puts
+/// anything of follow's on the wire: the hint stays on its item and the
+/// client reveals it wherever it moves. No row is ever created, and the
+/// status names its row.
+#[test]
+fn cpu_resorting_keeps_the_followed_identity_hinted_without_creating_rows() {
+    let mut h = harness();
+    let tracked = h.follow_tracked();
+    let identities = h.identities();
     for step in 1..FollowSource::REUSED_STEP {
         let before = h.revision();
         h.sample();
@@ -312,75 +484,44 @@ fn cpu_resorting_keeps_the_followed_identity_revealed_without_creating_rows() {
             identities,
             "step {step}: no row created or replaced"
         );
-        let moved = rank != FollowSource::RANKS[step - 1];
-        let operations = operations_since(&h.session, before);
-        let promotions = promotions_since(&h.session, before);
-        if moved {
-            assert_eq!(promotions, vec![tracked], "step {step}: one promotion");
-            // The promotion comes after every row operation, and its
-            // one-item range is the row the model already holds there.
-            let set = operations
-                .iter()
-                .rposition(|op| matches!(op, Operation::SetProperty { id, property, .. } if *id == TABLE && *property == VALUE))
-                .unwrap();
-            let last_row_op = operations
-                .iter()
-                .rposition(|op| {
-                    matches!(
-                        op,
-                        Operation::ModelInsert { .. }
-                            | Operation::ModelDelete { .. }
-                            | Operation::ModelUpdate { .. }
-                    )
-                })
-                .unwrap();
-            assert!(last_row_op < set, "step {step}: promoted after the move");
-            let reset = operations
-                .iter()
-                .find_map(|op| match op {
-                    Operation::ModelResetRange {
-                        start_index, items, ..
-                    } => Some((
-                        *start_index,
-                        items.iter().map(|item| item.item_id).collect::<Vec<_>>(),
-                    )),
-                    _ => None,
-                })
-                .expect("the promotion carries its row");
-            assert_eq!(reset, (rank as u64, vec![tracked]), "step {step}");
-            assert!(
-                h.status().starts_with(&format!(
-                    "Following PID 6010 · tracked · row {} of 60 · ",
-                    rank + 1
-                )),
-                "step {step}: {}",
-                h.status()
-            );
-        } else {
-            assert_eq!(
-                promotions,
-                Vec::<ItemId>::new(),
-                "step {step}: not moved, nothing promoted"
-            );
-            assert!(
-                h.revision() > before,
-                "step {step}: the sample itself published"
-            );
-        }
-        assert_eq!(h.promoted(), Some(tracked));
+        assert!(h.revision() > before, "step {step}: the sample published");
+        assert_eq!(
+            promotions_since(&h.session, before),
+            Vec::<ItemId>::new(),
+            "step {step}: no promotion"
+        );
+        assert_eq!(
+            hints_since(&h.session, before),
+            Vec::<ItemId>::new(),
+            "step {step}: the hint is not set again"
+        );
+        assert_eq!(hint_clears_since(&h.session, before), 0, "step {step}");
+        assert_eq!(h.hinted(), Some(tracked), "step {step}");
+        assert_eq!(h.promoted(), None, "step {step}");
+        assert!(
+            h.status().starts_with(&format!(
+                "Following PID 6010 · tracked · row {} of 60 · ",
+                rank + 1
+            )),
+            "step {step}: {}",
+            h.status()
+        );
         assert!(h.checked());
         assert_eq!(h.view().follow().following(), Some(tracked));
     }
-    // A sort that moves it reveals it as well.
+    // A sort that moves it changes nothing of follow's either.
     let before = h.revision();
     h.sort(SORT_PID);
     assert_eq!(h.row_of(tracked), Some(9));
-    assert_eq!(promotions_since(&h.session, before), vec![tracked]);
+    assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(hints_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(h.hinted(), Some(tracked));
     assert_eq!(h.identities(), identities);
 }
 
-/// When the followed process ends, follow stops, says so, and never moves to
-/// the new process that reuses its PID in the same sample, or later.
+/// When the followed process ends, follow stops, says so, clears its hint and
+/// never moves to the new process that reuses its PID in the same sample, or
+/// later.
 #[test]
 fn a_disappeared_process_never_transfers_follow_to_its_reused_pid() {
     let mut h = harness();
@@ -405,7 +546,15 @@ fn a_disappeared_process_never_transfers_follow_to_its_reused_pid() {
         "Follow stopped: PID 6010 · tracked has ended · a new process that reuses its PID is not followed; select a row and turn follow on again"
     );
     assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
-    assert_eq!(h.promoted(), None, "settlement cleared the promotion");
+    assert_eq!(hints_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(h.hinted(), None, "the hint is cleared");
+    assert_eq!(
+        fresh_client(&h.session),
+        Fresh {
+            selection: None,
+            hint: None
+        }
+    );
     match h.property(INSPECTOR_STATUS, TEXT) {
         Some(Value::String(text)) => assert!(text.contains("this process has ended"), "{text}"),
         other => panic!("{other:?}"),
@@ -413,11 +562,12 @@ fn a_disappeared_process_never_transfers_follow_to_its_reused_pid() {
     let after = h.revision();
     h.sample();
     assert_eq!(promotions_since(&h.session, after), Vec::<ItemId>::new());
+    assert_eq!(hints_since(&h.session, after), Vec::<ItemId>::new());
     assert_eq!(h.view().follow().following(), None);
 }
 
-/// A filter that hides the followed process stops follow with its reason;
-/// it is never moved to a shown row.
+/// A filter that hides the followed process stops follow with its reason and
+/// clears its hint; it is never moved to a shown row.
 #[test]
 fn a_filter_that_hides_the_followed_process_stops_follow() {
     let mut h = harness();
@@ -432,16 +582,51 @@ fn a_filter_that_hides_the_followed_process_stops_follow() {
         "Follow stopped: PID 6010 · tracked is no longer shown (filtered out or beyond the row limit); select a row and turn follow on again"
     );
     assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(hints_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(h.hinted(), None);
     // Showing it again does not restart follow.
+    let before = h.revision();
     h.view().set_filter(&h.session, "").unwrap();
     assert!(h.row_of(tracked).is_some());
     assert_eq!(h.view().follow().following(), None);
     assert!(!h.checked());
+    assert_eq!(hints_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(h.hinted(), None);
 }
 
-/// Turning follow on needs a shown selected process; a refusal is explained
-/// and publishes the toggle's value, so the client's checkbox goes back. A
-/// request without a boolean changes nothing and states the value too.
+/// The row ceiling that leaves the followed process out stops follow the
+/// same way, and clears its hint.
+#[test]
+fn the_row_ceiling_that_hides_the_followed_process_stops_follow() {
+    let mut h = harness();
+    let tracked = h.follow_tracked();
+    // Step 1 moves `tracked` to row 56 of 60; a ceiling of 50 then leaves it
+    // out of the published rows.
+    {
+        let mut view = h.view.lock().unwrap();
+        let placeholder = ProcessView::start(&Session::mint(), &mut FollowSource::default())
+            .unwrap()
+            .0;
+        let following = std::mem::replace(&mut *view, placeholder);
+        *view = following.with_published_limit(50);
+    }
+    let before = h.revision();
+    h.sample();
+    assert_eq!(h.row_of(tracked), None, "beyond the row ceiling");
+    assert_eq!(h.view().follow().following(), None);
+    assert!(
+        h.status().starts_with("Follow stopped: PID 6010 · tracked is no longer shown (filtered out or beyond the row limit)"),
+        "{}",
+        h.status()
+    );
+    assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(h.hinted(), None);
+}
+
+/// Turning follow on needs a shown selected process; a refusal is explained,
+/// hints nothing and publishes the toggle's value, so the client's checkbox
+/// goes back. A request without a boolean changes nothing and states the
+/// value too. Turning follow off clears the hint.
 #[test]
 fn turning_follow_on_without_a_shown_selection_is_refused_and_unchecks_the_box() {
     let mut h = harness();
@@ -458,16 +643,19 @@ fn turning_follow_on_without_a_shown_selection_is_refused_and_unchecks_the_box()
         "the refusal states the value: {operations:?}"
     );
     assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(hints_since(&h.session, before), Vec::<ItemId>::new());
 
     let tracked = h.item_of(FollowSource::TRACKED_PID.into());
     h.select(tracked);
     h.view().set_filter(&h.session, "task").unwrap();
+    let before = h.revision();
     h.toggle(true);
     assert!(!h.checked());
     assert_eq!(
         h.status(),
         "Follow: off · PID 6010 · tracked is not shown (filtered out or beyond the row limit); select a shown row first"
     );
+    assert_eq!(hints_since(&h.session, before), Vec::<ItemId>::new());
     h.view().set_filter(&h.session, "").unwrap();
 
     // No boolean: nothing changes, the held value is stated.
@@ -481,85 +669,86 @@ fn turning_follow_on_without_a_shown_selection_is_refused_and_unchecks_the_box()
     assert!(!h.checked());
     assert!(h.revision() > before);
     assert_eq!(h.view().follow().following(), None);
+    assert_eq!(h.hinted(), None);
 
-    // Off by the user: back to the plain off status.
+    // Off by the user: back to the plain off status, and the hint is gone.
     h.select(tracked);
     h.toggle(true);
     assert_eq!(h.view().follow().following(), Some(tracked));
+    assert_eq!(h.hinted(), Some(tracked));
+    let before = h.revision();
     h.toggle(false);
     assert!(!h.checked());
     assert_eq!(h.status(), OFF_STATUS);
     assert_eq!(h.view().follow().following(), None);
+    assert_eq!(hint_clears_since(&h.session, before), 1);
+    assert_eq!(h.hinted(), None);
     let before = h.revision();
     for _ in 0..3 {
         h.sample();
     }
     assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(hints_since(&h.session, before), Vec::<ItemId>::new());
 }
 
-/// Selecting another row follows it, without a promotion: the client already
-/// shows it selected. A selection observed before the latest promotion was
-/// replaced by it on the client, so the server promotes the user's row back.
+/// Selecting another row follows it: one hint per retarget, no promotion, and
+/// nothing for a reselection of the followed row or for a sample that moves
+/// it. A selection that names no shown row stops follow and clears the hint.
 #[test]
-fn selecting_another_row_follows_it_and_a_replaced_selection_is_restored() {
+fn selecting_another_row_retargets_the_hint_and_never_promotes() {
     let mut h = harness();
     let tracked = h.follow_tracked();
-    let promoted_at = h.view().last_promotion();
-    assert_eq!(promoted_at, h.revision());
     let task_03 = h.item_of(6004);
     assert_eq!(h.row_of(task_03), Some(4));
+    let identities = h.identities();
     let before = h.revision();
     h.select(task_03);
     assert_eq!(h.view().follow().following(), Some(task_03));
     assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(hints_since(&h.session, before), vec![task_03]);
+    assert_eq!(
+        withdrawals_since(&h.session, before),
+        0,
+        "nothing to withdraw"
+    );
+    assert_eq!(h.hinted(), Some(task_03));
+    assert_eq!(h.identities(), identities);
     assert!(
         h.status().starts_with("Following PID 6004 · task-03 · "),
         "{}",
         h.status()
     );
+    // Reselecting it touches nothing; each retarget hints once.
+    let before = h.revision();
+    h.select(task_03);
+    assert_eq!(hints_since(&h.session, before), Vec::<ItemId>::new());
+    let task_04 = h.item_of(6005);
+    h.select(task_04);
+    h.select(task_03);
+    assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(hints_since(&h.session, before), vec![task_04, task_03]);
 
     // `tracked` leaves the top for row 56, so task-03 changes row too, one
-    // up: follow promotes task-03, never `tracked`.
+    // up: nothing of follow's is committed, and `tracked` is never hinted.
     let before = h.revision();
     h.sample();
     assert_eq!(h.row_of(task_03), Some(3));
-    assert_eq!(promotions_since(&h.session, before), vec![task_03]);
-
-    // The last row keeps its place through the unchanged step: nothing is
-    // promoted.
-    let task_59 = h.item_of(6060);
-    h.select(task_59);
-    let before = h.revision();
-    h.sample();
-    assert_eq!(h.row_of(task_59), Some(59));
     assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(hints_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(h.hinted(), Some(task_03));
 
-    // Back on tracked; the next sample that moves it promotes it.
-    h.select(tracked);
-    let before = h.revision();
-    h.sample();
-    assert_eq!(h.row_of(tracked), Some(FollowSource::RANKS[3]));
-    assert_eq!(promotions_since(&h.session, before), vec![tracked]);
-    let promoted_at = h.view().last_promotion();
-
-    // The user clicked task-05 before applying that promotion: the client then
-    // replaced the click with it, so the server promotes task-05 back.
+    // A click after a reply the client had not yet applied changes nothing:
+    // there is no reply that could replace it.
     let task_05 = h.item_of(6006);
     let before = h.revision();
-    h.select_at(promoted_at - 1, task_05);
+    h.select_at(before.saturating_sub(3), task_05);
     assert_eq!(h.view().follow().following(), Some(task_05));
-    assert_eq!(promotions_since(&h.session, before), vec![task_05]);
-    assert_eq!(h.promoted(), Some(task_05));
-
-    // A click made after the latest promotion is already what the client shows.
-    let task_07 = h.item_of(6008);
-    let before = h.revision();
-    let latest = h.view().last_promotion();
-    h.select_at(latest, task_07);
-    assert_eq!(h.view().follow().following(), Some(task_07));
     assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(hints_since(&h.session, before), vec![task_05]);
+    assert_ne!(h.hinted(), Some(tracked));
 
-    // A selection that names no shown row stops follow.
+    // A selection that names no shown row stops follow and clears the hint.
+    let before = h.revision();
     h.select(ItemId::new(9_999_999));
     assert_eq!(h.view().follow().following(), None);
     assert!(!h.checked());
@@ -569,62 +758,539 @@ fn selecting_another_row_follows_it_and_a_replaced_selection_is_restored() {
         "{}",
         h.status()
     );
+    assert_eq!(hint_clears_since(&h.session, before), 1);
+    assert_eq!(h.hinted(), None);
 }
 
-/// With follow off, a selection made before a real promotion (here a search
-/// match, PX-011) reached the client is never promoted back: nothing is
-/// promoted on a selection at all, however stale its `observed_revision`.
+/// PR #98 review (`follow.rs:225`): after following A and clicking B, the
+/// table's value still named A, so a relaunched client restored A while
+/// follow described B. A promotion that names another process is withdrawn
+/// whenever follow turns on or retargets, in the same commit as the hint; a
+/// search promotion of the process follow moves to is kept.
 #[test]
-fn non_follow_mode_never_promotes_on_a_selection() {
+fn follow_withdraws_a_promotion_that_names_another_process() {
     let mut h = harness();
-    let tracked = h.item_of(FollowSource::TRACKED_PID.into());
-    h.select(tracked);
+    h.sort(SORT_CPU);
+    // A search promotes task-05 (PX-011), and then the user clicks `tracked`:
+    // the value still names task-05.
     h.view().set_search(&h.session, "task-05").unwrap();
     let task_05 = h.item_of(6006);
-    assert_eq!(h.promoted(), Some(task_05), "the search promoted its match");
-    let promoted_at = h.view().last_promotion();
-    assert!(
-        promoted_at > 0 && promoted_at == h.revision(),
-        "a real promotion"
-    );
-    assert_eq!(h.view().follow().following(), None);
-    // Clicked before the client applied that promotion: the promotion
-    // replaced it on the client, and with follow off it stays replaced.
-    let task_03 = h.item_of(6004);
-    let before = h.revision();
-    h.select_at(promoted_at - 1, task_03);
-    assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
     assert_eq!(h.promoted(), Some(task_05));
-    assert!(!h.checked());
-    assert_eq!(h.status(), OFF_STATUS);
-    // The same after follow was on and turned off again.
+    let tracked = h.item_of(FollowSource::TRACKED_PID.into());
     h.select(tracked);
-    h.toggle(true);
-    h.toggle(false);
-    let promoted_at = h.view().last_promotion();
-    assert_eq!(h.promoted(), Some(tracked), "turning follow on promoted it");
+    assert_eq!(
+        h.promoted(),
+        Some(task_05),
+        "follow off: unchanged (PX-011)"
+    );
+
+    // Turning on withdraws it, in the commit that sets the hint.
     let before = h.revision();
-    h.select_at(promoted_at - 1, task_03);
+    h.toggle(true);
+    let together: Vec<_> = transactions_since(&h.session, before)
+        .into_iter()
+        .filter(|operations| {
+            clears_of(operations, VALUE) == 1 && sets_of(operations, KEEP_VISIBLE) == vec![tracked]
+        })
+        .collect();
+    assert_eq!(together.len(), 1, "withdrawn with the hint");
     assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
-    assert_eq!(h.view().follow().following(), None);
+    assert_eq!(h.promoted(), None);
+    assert_eq!(
+        fresh_client(&h.session),
+        Fresh {
+            selection: None,
+            hint: Some(tracked)
+        }
+    );
+
+    // A search match while following is promoted by the search, and follow
+    // moves to it: the value and the hint name the same process.
+    let before = h.revision();
+    h.view().set_search(&h.session, "task-03").unwrap();
+    let task_03 = h.item_of(6004);
+    assert_eq!(promotions_since(&h.session, before), vec![task_03]);
+    assert_eq!(hints_since(&h.session, before), vec![task_03]);
+    assert_eq!(withdrawals_since(&h.session, before), 0);
+    assert_eq!(
+        fresh_client(&h.session),
+        Fresh {
+            selection: Some(task_03),
+            hint: Some(task_03)
+        }
+    );
+
+    // Clicking another row while following withdraws the search's
+    // promotion, in the commit that moves the hint.
+    let task_07 = h.item_of(6008);
+    let before = h.revision();
+    h.select(task_07);
+    let transactions = transactions_since(&h.session, before);
+    assert_eq!(transactions.len(), 1);
+    assert_eq!(clears_of(&transactions[0], VALUE), 1);
+    assert_eq!(sets_of(&transactions[0], KEEP_VISIBLE), vec![task_07]);
+    assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(
+        fresh_client(&h.session),
+        Fresh {
+            selection: None,
+            hint: Some(task_07)
+        }
+    );
+    // Nothing is withdrawn twice.
+    let before = h.revision();
+    h.select(task_05);
+    assert_eq!(withdrawals_since(&h.session, before), 0);
+}
+
+/// A fresh client never restores a selection of a process follow is not on:
+/// after turn-on, a retarget, a burst of retargets, a search match and a
+/// click after it, the snapshot's promoted value names the followed process
+/// or nothing.
+#[test]
+fn a_fresh_client_never_restores_a_selection_of_another_process() {
+    let mut h = harness();
+    let tracked = h.start_following_tracked();
+    let check = |h: &Harness, step: &str| {
+        let following = h.view().follow().following();
+        assert!(following.is_some(), "{step}: following");
+        let fresh = fresh_client(&h.session);
+        assert!(
+            fresh.selection.is_none() || fresh.selection == following,
+            "{step}: a fresh client restores {:?} (PID {:?}) while follow is on {:?} (PID {:?})",
+            fresh.selection,
+            fresh.selection.and_then(|item| h.pid_of(item)),
+            following,
+            following.and_then(|item| h.pid_of(item)),
+        );
+    };
+    check(&h, "turn-on");
+    let task_03 = h.item_of(6004);
+    h.select(task_03);
+    check(&h, "retarget");
+    // `tracked` moves to row 56; the followed row shifts up one.
+    h.sample();
+    check(&h, "a sample after the retarget");
+    for pid in 6005..6015 {
+        if pid == u64::from(FollowSource::TRACKED_PID) {
+            continue;
+        }
+        h.select(h.item_of(pid));
+        check(&h, &format!("burst, PID {pid}"));
+    }
+    h.sample();
+    check(&h, "a sample after the burst");
+    h.view().set_search(&h.session, "task-20").unwrap();
+    check(&h, "search");
+    h.select(tracked);
+    check(&h, "a click after the search");
+    h.sample();
+    check(&h, "a sample after the click");
+}
+
+/// A fresh client is revealed to the followed process: the snapshot's
+/// `keep_visible` hint names it after turn-on, a retarget, a burst, a search
+/// match and a sample, and names nothing once follow is off.
+#[test]
+fn a_fresh_client_is_revealed_to_the_followed_process() {
+    let mut h = harness();
+    let tracked = h.start_following_tracked();
+    let check = |h: &Harness, step: &str| {
+        let following = h.view().follow().following();
+        assert_eq!(fresh_client(&h.session).hint, following, "{step}");
+    };
+    check(&h, "turn-on");
+    assert_eq!(fresh_client(&h.session).hint, Some(tracked));
+    h.select(h.item_of(6004));
+    check(&h, "retarget");
+    for pid in 6005..6009 {
+        h.select(h.item_of(pid));
+    }
+    check(&h, "burst");
+    h.sample();
+    check(&h, "sample");
+    h.view().set_search(&h.session, "task-20").unwrap();
+    check(&h, "search");
+    assert_eq!(fresh_client(&h.session).hint, Some(h.item_of(6021)));
+    h.toggle(false);
+    assert_eq!(fresh_client(&h.session).hint, None, "off");
+}
+
+/// What a generic client holds for the table, as
+/// `CollectionSelectionPromotion.swift` and `CollectionKeepVisible.swift`
+/// apply it: a promotion replaces the selection; a withdrawal deselects only
+/// an untouched promoted row and otherwise keeps the user's later local
+/// selection (PX-011-G01); the hint never touches the selection
+/// (PX-017-G01).
+#[derive(Debug, Default)]
+struct ClientTable {
+    revision: u64,
+    rows: Vec<ItemId>,
+    selected: Option<ItemId>,
+    promoted: Option<ItemId>,
+    local_since_promotion: bool,
+    hinted: Option<ItemId>,
+    hint_sets: usize,
+}
+
+impl ClientTable {
+    fn select_locally(&mut self, item: ItemId) {
+        self.selected = Some(item);
+        self.local_since_promotion = true;
+    }
+
+    fn apply(&mut self, operations: &[Operation]) {
+        for operation in operations {
+            match operation {
+                Operation::SetProperty {
+                    id,
+                    property,
+                    value: Value::ItemId(item),
+                } if *id == TABLE && *property == VALUE => {
+                    self.selected = Some(*item);
+                    self.promoted = Some(*item);
+                    self.local_since_promotion = false;
+                }
+                Operation::ClearProperty { id, property } if *id == TABLE && *property == VALUE => {
+                    let previous = self.promoted.take();
+                    if !self.local_since_promotion
+                        && previous.is_some()
+                        && self.selected == previous
+                    {
+                        self.selected = None;
+                    }
+                }
+                Operation::SetProperty {
+                    id,
+                    property,
+                    value: Value::ItemId(item),
+                } if *id == TABLE && *property == KEEP_VISIBLE => {
+                    self.hinted = Some(*item);
+                    self.hint_sets += 1;
+                }
+                Operation::ClearProperty { id, property }
+                    if *id == TABLE && *property == KEEP_VISIBLE =>
+                {
+                    self.hinted = None;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// One thing that happens in [`simulate`].
+#[derive(Debug, Clone, Copy)]
+enum Happening {
+    /// The user presses Down: the row after the client's selection.
+    Down,
+    /// The user clicks the row holding this PID.
+    Click(u64),
+    /// The server takes one sample.
+    Sample,
+}
+
+#[derive(Debug, Default)]
+struct Outcome {
+    /// The item each press or click selected, in order.
+    pressed: Vec<ItemId>,
+    /// Deliveries that changed the client's selection.
+    changed_by_commit: usize,
+    /// Deliveries after which the client's selection was a row pressed
+    /// before the latest press.
+    backward_jumps: usize,
+    /// Presses whose starting row was not the row the previous press chose.
+    displaced_presses: usize,
+    final_selected: Option<ItemId>,
+}
+
+/// Runs `script` (time in ms, what happens) against a real view with
+/// `latency` ms each way: every client selection reaches the server
+/// `latency` after it is made, carrying the revision the client held, and
+/// every commit reaches the client `latency` after it is made. The client
+/// starts with `selected` selected. Returns the client's table and the
+/// outcome.
+fn simulate(
+    h: &mut Harness,
+    selected: ItemId,
+    script: &[(u64, Happening)],
+    latency: u64,
+) -> (ClientTable, Outcome) {
+    #[derive(Debug)]
+    enum Event {
+        User(Happening),
+        Server(ItemId, u64),
+        Deliver(u64, Vec<Operation>, Vec<ItemId>),
+    }
+    let mut client = ClientTable {
+        revision: h.revision(),
+        rows: h.rows().into_iter().map(|(id, _, _)| id).collect(),
+        selected: Some(selected),
+        promoted: h.promoted(),
+        hinted: h.hinted(),
+        ..ClientTable::default()
+    };
+    let mut queue: Vec<(u64, usize, Event)> = script
+        .iter()
+        .enumerate()
+        .map(|(order, (time, what))| (*time, order, Event::User(*what)))
+        .collect();
+    let mut order = queue.len();
+    let mut outcome = Outcome::default();
+    while let Some(next) = (0..queue.len()).min_by_key(|index| (queue[*index].0, queue[*index].1)) {
+        let (time, _, event) = queue.remove(next);
+        let mut deliver = |h: &mut Harness, before: u64, queue: &mut Vec<(u64, usize, Event)>| {
+            if h.revision() == before {
+                return;
+            }
+            let operations = operations_since(&h.session, before);
+            let rows = h.rows().into_iter().map(|(id, _, _)| id).collect();
+            queue.push((
+                time + latency,
+                order,
+                Event::Deliver(h.revision(), operations, rows),
+            ));
+            order += 1;
+        };
+        match event {
+            Event::User(Happening::Sample) => {
+                let before = h.revision();
+                h.sample();
+                deliver(h, before, &mut queue);
+            }
+            Event::User(action) => {
+                if outcome
+                    .pressed
+                    .last()
+                    .is_some_and(|last| client.selected != Some(*last))
+                {
+                    outcome.displaced_presses += 1;
+                }
+                let current = client
+                    .selected
+                    .and_then(|item| client.rows.iter().position(|row| *row == item));
+                let target = match action {
+                    Happening::Down => {
+                        current.map_or(0, |row| (row + 1).min(client.rows.len() - 1))
+                    }
+                    Happening::Click(pid) => h.row_of(h.item_of(pid)).unwrap(),
+                    Happening::Sample => unreachable!(),
+                };
+                let item = client.rows[target];
+                client.select_locally(item);
+                outcome.pressed.push(item);
+                queue.push((time + latency, order, Event::Server(item, client.revision)));
+                order += 1;
+            }
+            Event::Server(item, observed) => {
+                let before = h.revision();
+                h.select_at(observed, item);
+                deliver(h, before, &mut queue);
+            }
+            Event::Deliver(revision, operations, rows) => {
+                let before = client.selected;
+                client.rows = rows;
+                client.apply(&operations);
+                client.revision = revision;
+                if client.selected != before {
+                    outcome.changed_by_commit += 1;
+                    let earlier = &outcome.pressed[..outcome.pressed.len().saturating_sub(1)];
+                    if client.selected.is_some_and(|now| earlier.contains(&now)) {
+                        outcome.backward_jumps += 1;
+                    }
+                }
+            }
+        }
+    }
+    outcome.final_selected = client.selected;
+    (client, outcome)
+}
+
+/// Rapid arrow keys while following, with and without samples moving rows
+/// mid-burst (the CPU sort is active, and the first sample moves `tracked`
+/// from the top to row 56, shifting every row between): whatever the key
+/// repeat and the round trip, no commit changes the client's selection, so
+/// every press moves on from the last one and the burst ends on the last
+/// press. The server follows that row, hints each retarget once, promotes
+/// nothing, and a fresh client restores no other process and is revealed to
+/// the last one.
+#[test]
+fn rapid_selections_while_following_end_on_the_last_press_with_samples_mid_burst() {
+    const PRESSES: u64 = 20;
+    let mut cases = Vec::new();
+    for interval in [30, 80] {
+        for rtt in [50, 100] {
+            cases.push((interval, rtt, Vec::new()));
+            // Samples land at press 5 and press 12, while earlier presses are
+            // still in flight.
+            cases.push((interval, rtt, vec![5 * interval + 1, 12 * interval + 1]));
+        }
+    }
+    // Faster and slower edges.
+    cases.push((1, 50, vec![3, 9]));
+    cases.push((10, 100, vec![25, 95]));
+    cases.push((30, 10, vec![61]));
+    let mut measured = Vec::new();
+    for (interval, rtt, samples) in cases {
+        let mut h = harness();
+        let tracked = h.start_following_tracked();
+        let mut script: Vec<(u64, Happening)> = (0..PRESSES)
+            .map(|press| (press * interval, Happening::Down))
+            .collect();
+        script.extend(samples.iter().map(|at| (*at, Happening::Sample)));
+        let start = h.revision();
+        let (client, outcome) = simulate(&mut h, tracked, &script, rtt / 2);
+        let label = format!(
+            "key repeat {interval} ms, RTT {rtt} ms, samples at {samples:?} ms, {PRESSES} presses"
+        );
+        let last = *outcome.pressed.last().unwrap();
+        let promotions = promotions_since(&h.session, start);
+        let hints = hints_since(&h.session, start);
+        let withdrawals = withdrawals_since(&h.session, start);
+        let fresh = fresh_client(&h.session);
+        println!(
+            "PX-017 rapid selections {label}: final PID {:?} last PID {:?} changedByCommit={} backwardJumps={} displacedPresses={} promotions={} hintSets={} withdrawals={} fresh={fresh:?}",
+            outcome.final_selected.and_then(|item| h.pid_of(item)),
+            h.pid_of(last),
+            outcome.changed_by_commit,
+            outcome.backward_jumps,
+            outcome.displaced_presses,
+            promotions.len(),
+            hints.len(),
+            withdrawals,
+        );
+        // The samples really moved rows under the burst.
+        let moved = h.row_of(tracked) != Some(FollowSource::RANKS[0]);
+        assert_eq!(moved, !samples.is_empty(), "{label}");
+        let following = h.view().follow().following();
+        measured.push((
+            label,
+            outcome,
+            last,
+            h.pid_of(last),
+            following,
+            promotions,
+            hints,
+            withdrawals,
+            client.hinted,
+            fresh,
+        ));
+    }
+    // The selection is the user's, in every case, before anything else.
+    for (label, outcome, last, last_pid, following, ..) in &measured {
+        assert_eq!(outcome.changed_by_commit, 0, "{label}: {outcome:?}");
+        let distinct: BTreeSet<ItemId> = outcome.pressed.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            PRESSES as usize,
+            "{label}: each press moved on"
+        );
+        assert_eq!(outcome.backward_jumps, 0, "{label}: {outcome:?}");
+        assert_eq!(outcome.displaced_presses, 0, "{label}: {outcome:?}");
+        assert_eq!(outcome.final_selected, Some(*last), "{label}: {outcome:?}");
+        // Every press is the next row: o_0 … o_19, whose PIDs skip `tracked`.
+        assert_eq!(*last_pid, Some(6021), "{label}");
+        assert_eq!(*following, Some(*last), "{label}");
+    }
+    // Then the wire: no promotion, one hint per retarget, and a fresh client
+    // that restores nothing and is revealed to the last press.
+    for (label, outcome, last, _, _, promotions, hints, withdrawals, hinted, fresh) in &measured {
+        assert_eq!(
+            *promotions,
+            Vec::<ItemId>::new(),
+            "{label}: follow never promotes"
+        );
+        assert_eq!(*hints, outcome.pressed, "{label}: one hint per retarget");
+        assert_eq!(*withdrawals, 0, "{label}");
+        assert_eq!(*hinted, Some(*last), "{label}");
+        assert_eq!(
+            *fresh,
+            Fresh {
+                selection: None,
+                hint: Some(*last)
+            },
+            "{label}"
+        );
+    }
+}
+
+/// With follow off the same bursts are untouched as well: nothing is hinted
+/// or promoted at all.
+#[test]
+fn rapid_selections_with_follow_off_hint_and_promote_nothing() {
+    for (interval, rtt) in [(30, 50), (80, 100)] {
+        let mut h = harness();
+        h.sort(SORT_CPU);
+        let tracked = h.item_of(FollowSource::TRACKED_PID.into());
+        h.select(tracked);
+        let mut script: Vec<(u64, Happening)> = (0..20)
+            .map(|press| (press * interval, Happening::Down))
+            .collect();
+        script.push((5 * interval + 1, Happening::Sample));
+        let start = h.revision();
+        let (_, outcome) = simulate(&mut h, tracked, &script, rtt / 2);
+        assert_eq!(outcome.changed_by_commit, 0);
+        assert_eq!(outcome.final_selected, outcome.pressed.last().copied());
+        assert_eq!(promotions_since(&h.session, start), Vec::<ItemId>::new());
+        assert_eq!(hints_since(&h.session, start), Vec::<ItemId>::new());
+        assert_eq!(h.hinted(), None);
+        println!(
+            "PX-017 rapid selections with follow off, key repeat {interval} ms, RTT {rtt} ms: promotions=0 hintSets=0 changedByCommit={}",
+            outcome.changed_by_commit
+        );
+    }
+}
+
+/// A click that crosses a sample moving the followed process ends on the
+/// click, for this client and a fresh one, at every latency.
+#[test]
+fn a_click_crossing_a_sample_ends_on_the_click() {
+    for latency in [5, 25, 50, 100] {
+        let mut h = harness();
+        let tracked = h.start_following_tracked();
+        // The click on task-59 at 0 ms; the sample that moves `tracked` to
+        // row 56 at 1 ms, before the click reaches the server.
+        let script = [(0, Happening::Click(6060)), (1, Happening::Sample)];
+        let start = h.revision();
+        let (client, outcome) = simulate(&mut h, tracked, &script, latency);
+        let task_59 = h.item_of(6060);
+        assert_eq!(
+            client.selected,
+            Some(task_59),
+            "latency {latency}: {outcome:?}"
+        );
+        assert_eq!(outcome.changed_by_commit, 0, "latency {latency}");
+        assert_eq!(h.view().follow().following(), Some(task_59));
+        assert_eq!(
+            fresh_client(&h.session),
+            Fresh {
+                selection: None,
+                hint: Some(task_59)
+            }
+        );
+        assert_ne!(client.selected, Some(tracked));
+        assert_eq!(promotions_since(&h.session, start), Vec::<ItemId>::new());
+        assert_eq!(hints_since(&h.session, start), vec![task_59]);
+    }
 }
 
 /// Follow and Pause view (PX-015): a paused view publishes no sample, so
-/// nothing is promoted for one; a user sort while paused that moves the
-/// followed row reveals it once; and the first sample after Resume view
-/// promotes nothing unless the row's index changed since it was last shown.
+/// nothing of follow's is committed for one; pause and resume alone commit
+/// nothing of follow's; a user sort while paused that moves the followed row
+/// keeps the hint on it (the client reveals it because it moved) and still
+/// promotes nothing.
 #[test]
-fn follow_promotes_nothing_while_paused_and_after_resume_unless_the_row_moved() {
+fn follow_commits_nothing_while_paused_and_a_paused_sort_keeps_the_hint() {
     let mut h = harness();
     let tracked = h.follow_tracked();
-    // Step 1: `tracked` moves to row 56 and is revealed there.
+    // Step 1: `tracked` moves to row 56.
     let before = h.revision();
     h.sample();
     assert_eq!(h.row_of(tracked), Some(55));
-    assert_eq!(promotions_since(&h.session, before), vec![tracked]);
+    assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
 
     // Pause; a sample that reaches the paused view (step 3 would move the
-    // row to 41) is discarded and promotes nothing.
+    // row to 41) is discarded.
     let before = h.revision();
     h.view().pause_view(&h.session).unwrap();
     assert!(h.view().frozen().is_some());
@@ -633,11 +1299,9 @@ fn follow_promotes_nothing_while_paused_and_after_resume_unless_the_row_moved() 
         .apply(&h.session, FOLLOW_STATUS_TEXT, &paused)
         .unwrap();
     assert_eq!(h.row_of(tracked), Some(55), "a paused view keeps its rows");
-    assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
     assert!(h.checked());
 
-    // Resume; the first sample (step 2) keeps the row at 56: nothing is
-    // promoted, so a pan made meanwhile is kept.
+    // Resume; the first sample (step 2) keeps the row at 56.
     h.view().resume_view(&h.session).unwrap();
     let resumed = snapshot_at(2);
     h.view()
@@ -649,28 +1313,71 @@ fn follow_promotes_nothing_while_paused_and_after_resume_unless_the_row_moved() 
         Vec::<ItemId>::new(),
         "pause and resume alone promote nothing"
     );
+    assert_eq!(hints_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(hint_clears_since(&h.session, before), 0);
 
-    // Pause again; a sort by PID while paused moves the row to 10: revealed
-    // once.
+    // Pause again; a sort by PID while paused moves the row to 10: the hint
+    // stays on it, nothing is promoted or hinted again.
     h.view().pause_view(&h.session).unwrap();
     let before = h.revision();
     h.sort(SORT_PID);
     assert_eq!(h.row_of(tracked), Some(9));
-    assert_eq!(promotions_since(&h.session, before), vec![tracked]);
-    // Resume: the next sample keeps PID order, so the row stays at 10 and
-    // nothing is promoted; a later sample under CPU order moves it.
+    assert!(h.revision() > before, "the sort committed while paused");
+    assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(hints_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(h.hinted(), Some(tracked));
     let before = h.revision();
     h.view().resume_view(&h.session).unwrap();
     h.view()
         .apply(&h.session, FOLLOW_STATUS_TEXT, &snapshot_at(3))
         .unwrap();
     assert_eq!(h.row_of(tracked), Some(9));
-    assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
-    let before = h.revision();
     h.sort(SORT_CPU);
     assert_eq!(h.row_of(tracked), Some(FollowSource::RANKS[3]));
-    assert_eq!(promotions_since(&h.session, before), vec![tracked]);
+    assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(hints_since(&h.session, before), Vec::<ItemId>::new());
     assert_eq!(h.view().follow().following(), Some(tracked));
+    assert_eq!(h.hinted(), Some(tracked));
+}
+
+/// A hint that fails to commit is repaired by the next plan, which sets it
+/// even though the followed row did not move: the turn-on below fails
+/// because the table briefly has no `model_ref`, so the store refuses
+/// `keep_visible` (`invalid_keep_visible`, PX-017-G01).
+#[test]
+fn a_hint_that_did_not_commit_is_set_by_the_next_plan() {
+    let mut h = harness();
+    h.sort(SORT_CPU);
+    let tracked = h.item_of(FollowSource::TRACKED_PID.into());
+    h.select(tracked);
+    let model_ref = h.property(TABLE, MODEL_REF).expect("a model_ref");
+    h.session
+        .transaction(|ui| {
+            ui.clear(TABLE, MODEL_REF)?;
+            Ok(())
+        })
+        .unwrap();
+    let before = h.revision();
+    h.toggle(true);
+    assert_eq!(h.revision(), before, "the turn-on did not commit");
+    assert_eq!(h.view().follow().following(), Some(tracked));
+    assert_eq!(h.hinted(), None);
+    h.session
+        .transaction(|ui| {
+            ui.set(TABLE, MODEL_REF, model_ref.clone())?;
+            Ok(())
+        })
+        .unwrap();
+    let before = h.revision();
+    // Step 1 moves `tracked`; the repair names it at its new row.
+    h.sample();
+    assert_eq!(hints_since(&h.session, before), vec![tracked]);
+    assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(h.hinted(), Some(tracked));
+    assert!(h.checked(), "the checkbox is published too");
+    let before = h.revision();
+    h.sample();
+    assert_eq!(hints_since(&h.session, before), Vec::<ItemId>::new());
 }
 
 /// The fixture's snapshot for `step`, independent of the harness's source.

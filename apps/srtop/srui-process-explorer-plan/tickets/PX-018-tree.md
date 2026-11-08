@@ -58,3 +58,5 @@ Read [BASELINE.md](../BASELINE.md) and [SOURCES.md](../SOURCES.md). Verify versi
 ### Hand-off from PX-017
 
 Per PX-017, follow selected process is bound to the process table, so PX-018 must carry follow into the tree view (following the same item ID) or stop it explicitly with a visible reason when the user switches views.
+
+After the PX-017 rework on `keep_visible` (PX-017-G01): follow names the followed item only through the table's `keep_visible` hint and never promotes. Carrying follow over to the tree means setting `keep_visible` on the tree node to the same item ID (`UiTransaction::set_keep_visible`) and clearing it on the table, in the commit that switches views; while follow is on, a tree `value` naming another process must be withdrawn as srtop does for the table. `keep_visible` on a `Tree` never expands a collapsed ancestor: a followed process under a collapsed parent is not scrolled to until the user expands it and a later commit sets the hint or moves the item, and a local expand or collapse never scrolls (PX-017-G01, observation O1). PX-018 must either say so in the follow status or expand through a promotion, which would select the row.

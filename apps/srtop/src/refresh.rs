@@ -21,9 +21,10 @@
 //! publishes no sample at all, every control keeps re-projecting the frozen
 //! rows, and the refresh loop's one ticker follows the interval the sampling
 //! controls set. Since PX-017 every publication that changes the rows also
-//! re-plans follow ([`crate::follow`]) last, after every row operation: while
-//! follow is on and the followed process changed row, the plan ends with its
-//! promotion, so the client reveals it at its final place.
+//! re-plans follow ([`crate::follow`]) last, after every row operation: the
+//! table's `keep_visible` hint (PX-017-G01) names the followed process while
+//! follow is on and nothing otherwise, so the client reveals it wherever a
+//! commit moves it, and follow never touches the selection.
 //!
 //! Four rules shape this module:
 //!
@@ -123,7 +124,9 @@ use crate::{
     SAMPLING_STATUS, SEARCH_INPUT, SEARCH_NEXT, SEARCH_PREVIOUS, SEARCH_STATUS, STATUS, TABLE,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
-use srui_sdk::{ItemId, NodeId, Operation, Value, COLUMNS, ENABLED, LABEL, TEXT, VALUE};
+use srui_sdk::{
+    ItemId, NodeId, Operation, Value, COLUMNS, ENABLED, KEEP_VISIBLE, LABEL, TEXT, VALUE,
+};
 use srui_semantic_tree::{
     DEFAULT_MAX_CACHED_ITEMS_PER_MODEL, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
 };
@@ -300,14 +303,16 @@ pub const SAMPLING_RESERVE_BYTES: usize = 2048;
 /// Bytes reserved for the follow controls in a catch-up snapshot (PX-017):
 /// the row, the "Follow selected process" `Toggle` with its label,
 /// description, shortcut and value, and the status line at
-/// [`crate::follow::MAX_FOLLOW_STATUS_BYTES`]. Charged at this fixed reserve,
-/// so a long follow status can never shrink the row budget;
+/// [`crate::follow::MAX_FOLLOW_STATUS_BYTES`], and the table's `keep_visible`
+/// hint (one `ItemId`, PX-017-G01). Charged at this fixed reserve, so a long
+/// follow status can never shrink the row budget;
 /// `the_shell_status_and_summary_fit_their_snapshot_allowances` measures it
 /// with the status at its widest.
 pub const FOLLOW_RESERVE_BYTES: usize = 2048;
 
-/// Bytes the `CLEAR_PROPERTY` settlement adds when a commit removes the
-/// promoted row (PX-011-G01): a clear carries no value.
+/// Bytes one `CLEAR_PROPERTY` settlement adds when a commit removes the
+/// promoted row (PX-011-G01) or the hinted row (PX-017-G01): a clear carries
+/// no value.
 const PROMOTION_CLEAR_BYTES: usize = OPERATION_FRAMING_BYTES + OPERATION_HEADER_BYTES;
 
 /// The most of a rejection reason the status quotes. The reason is this app's
@@ -442,13 +447,14 @@ pub struct ProcessView {
     /// refresh. A PID jump never selects one of these (PX-011).
     unconfirmed: HashSet<ItemId>,
     /// The table's promoted selection (PX-011-G01) as the store holds it after
-    /// the last commit: set by an explicit search or by follow (PX-017),
-    /// cleared by settlement when its row leaves the model.
+    /// the last commit: set only by an explicit search, withdrawn by a follow
+    /// retarget that names another process (PX-017), cleared by settlement
+    /// when its row leaves the model.
     promoted: Option<ItemId>,
-    /// The revision of the latest commit that promoted the table's selection
-    /// (PX-017). A client's `SELECTION_CHANGED` observed before it was made
-    /// before that promotion replaced it on the client.
-    last_promotion: u64,
+    /// The table's `keep_visible` hint (PX-017-G01) as the store holds it
+    /// after the last commit: the followed process while follow is on (PX-017),
+    /// cleared by settlement when its row leaves the model.
+    keep_visible: Option<ItemId>,
     /// Follow selected process (PX-017).
     follow: Follow,
     /// The follow controls as the client holds them (PX-017).
@@ -532,7 +538,7 @@ impl ProcessView {
             columns: &mut self.columns,
             search: &mut self.search_published,
             promoted: &mut self.promoted,
-            last_promotion: &mut self.last_promotion,
+            keep_visible: &mut self.keep_visible,
             owner: &mut self.owner_published,
             inspector: &mut self.inspector_published,
             sampling: &mut self.sampling_published,
@@ -541,21 +547,19 @@ impl ProcessView {
     }
 
     /// This store's mutation bounds for a plan that may remove rows. While the
-    /// table holds a promoted selection, the SDK's settlement adds one
-    /// `CLEAR_PROPERTY` to the transaction that removes its row (PX-011-G01),
-    /// and that operation counts against the same operation and frame bounds,
-    /// so one operation and its bytes are left free for it.
+    /// table holds a promoted selection (PX-011-G01) or a `keep_visible` hint
+    /// (PX-017-G01), the SDK's settlement adds one `CLEAR_PROPERTY` for each
+    /// to the transaction that removes its row, and those operations count
+    /// against the same operation and frame bounds, so one operation and its
+    /// bytes are left free for each.
     fn planning_limits(&self, session: &Session) -> (usize, usize, usize) {
         let (batch, max_ops) = mutation_limits(session);
-        if self.promoted.is_some() {
-            (
-                batch,
-                max_ops.saturating_sub(1).max(1),
-                MAX_TRANSACTION_PAYLOAD_BYTES - PROMOTION_CLEAR_BYTES,
-            )
-        } else {
-            (batch, max_ops, MAX_TRANSACTION_PAYLOAD_BYTES)
-        }
+        let held = usize::from(self.promoted.is_some()) + usize::from(self.keep_visible.is_some());
+        (
+            batch,
+            max_ops.saturating_sub(held).max(1),
+            MAX_TRANSACTION_PAYLOAD_BYTES - held * PROMOTION_CLEAR_BYTES,
+        )
     }
 
     /// Publishes the shell and the first snapshot in one transaction, and keeps
@@ -662,7 +666,7 @@ impl ProcessView {
                 search_published: SearchView::initial(true),
                 unconfirmed: HashSet::new(),
                 promoted: None,
-                last_promotion: 0,
+                keep_visible: None,
                 follow: Follow::default(),
                 follow_published: FollowView::initial(true),
                 owner,
@@ -832,13 +836,16 @@ impl ProcessView {
         // and the inspector, whose metrics and state follow them (PX-013).
         plan.extend(self.search_effects(&target, &unfiltered_target, &unconfirmed));
         plan.extend(self.inspector_effects(&target, &unfiltered_target, &unconfirmed));
-        // Follow last of all (PX-017): its promotion names the followed row's
-        // final place, after every row operation of this plan.
+        // Follow last of all (PX-017): it stops when this plan hides or ends
+        // the followed process, and a hint it sets names the row's final
+        // place, after every row operation of this plan.
         plan.extend(follow_effects(
             &mut self.follow,
             &self.follow_published,
             &target,
             &unfiltered_target,
+            self.keep_visible,
+            self.promoted,
         ));
 
         let mut result = Refreshed {
@@ -867,10 +874,6 @@ impl ProcessView {
         let (transactions, outcome) =
             commit(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
-        if outcome.is_err() {
-            // The follow promotion may not have committed: reveal again next.
-            self.follow.forget_shown();
-        }
         // Order values never reach the wire, so every published row takes this
         // sample's whatever committed: a later click sorts by current values,
         // never by the ones a row was first published with.
@@ -1393,12 +1396,15 @@ impl ProcessView {
         plan.extend(self.search_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
         plan.extend(self.inspector_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
         // Follow last (PX-017): a filter that hides the followed process
-        // stops follow; a sort or a filter that moves it reveals it.
+        // stops follow; a sort or a filter that moves it needs nothing, as the
+        // client reveals the hinted item wherever it moves.
         plan.extend(follow_effects(
             &mut self.follow,
             &self.follow_published,
             &target,
             &self.unfiltered_rows,
+            self.keep_visible,
+            self.promoted,
         ));
 
         let mut result = Refreshed::default();
@@ -1414,9 +1420,6 @@ impl ProcessView {
         let (transactions, outcome) =
             commit(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
-        if outcome.is_err() {
-            self.follow.forget_shown();
-        }
         refresh_sort_values(&mut self.rows, &target);
         self.ids.retain(&self.unfiltered_rows);
         self.search.observe(&self.rows);
@@ -1679,11 +1682,13 @@ impl ProcessView {
         if let Some(row) = promoted {
             self.inspector.select(&row);
             // While follow is on, the match is the process followed next
-            // (PX-017); the search's own promotion reveals it.
-            self.follow.selected(Some(&row), &self.rows, false);
+            // (PX-017): the hint moves to it.
+            self.follow.selected(Some(&row));
         }
         plan.extend(self.search_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed));
         plan.extend(self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed));
+        let follow = self.follow_table_effects(&plan);
+        plan.extend(follow);
         plan.extend(self.follow_view_effects());
         self.publish_controls(session, plan)
     }
@@ -1745,38 +1750,28 @@ impl ProcessView {
     /// published, or no item at all — is refused under a new generation too,
     /// so no earlier read can land on it, and nothing is read for it. The
     /// native highlight is the client's; nothing here selects a row.
+    ///
+    /// While follow is on (PX-017), a selection of another shown row makes
+    /// that row the followed process: the table's `keep_visible` hint moves to
+    /// it, and a promoted `value` naming another process is withdrawn in the
+    /// same commit, which keeps the user's later local selection
+    /// (PX-011-G01). A selection that names no shown row stops follow and
+    /// clears the hint. Nothing is ever promoted on a selection, so no reply
+    /// can replace a newer local selection, whatever the round trip.
     pub fn select_item(
         &mut self,
         session: &Session,
         item: Option<ItemId>,
-    ) -> Result<Refreshed, SessionError> {
-        self.select_item_at(session, item, session.current_revision())
-    }
-
-    /// [`Self::select_item`] for a selection the client made while it held
-    /// `observed_revision` (the event's `observed_revision`, §7.7, §18.2).
-    ///
-    /// While follow is on (PX-017), a selection of another shown row makes
-    /// that row the followed process, and one that names no shown row stops
-    /// follow. A selection observed before this view's latest promotion was
-    /// replaced on the client by that promotion (PX-011-G01), so the row is
-    /// promoted now and the user's later choice wins. With follow off nothing
-    /// is promoted, as before.
-    pub fn select_item_at(
-        &mut self,
-        session: &Session,
-        item: Option<ItemId>,
-        observed_revision: u64,
     ) -> Result<Refreshed, SessionError> {
         let row = item.and_then(|item| self.rows.iter().find(|row| row.item_id == item).cloned());
         match &row {
             Some(row) => self.inspector.select(row),
             None => self.inspector.refuse(item),
         }
-        let overridden = observed_revision < self.last_promotion;
-        let restore = self.follow.selected(row.as_ref(), &self.rows, overridden);
+        self.follow.selected(row.as_ref());
         let mut plan = self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
-        plan.extend(restore.map(|row| Planned::new(Effect::Promote(Box::new(row)))));
+        let follow = self.follow_table_effects(&plan);
+        plan.extend(follow);
         plan.extend(self.follow_view_effects());
         self.publish_controls(session, plan)
     }
@@ -1791,36 +1786,31 @@ impl ProcessView {
         &self.follow_published
     }
 
-    /// The revision of the latest commit that promoted the table's selection
-    /// (PX-017).
-    pub fn last_promotion(&self) -> u64 {
-        self.last_promotion
-    }
-
     /// Applies one follow toggle request (PX-017): `Some(true)` turns follow
-    /// on for the process the inspector describes and reveals it at once,
-    /// `Some(false)` turns it off, and `None` (a request without a boolean)
-    /// changes nothing. A selection that is not a shown row is refused with
-    /// its reason. The toggle's value is always published: the client's
-    /// checkbox already shows what was asked, so a refusal puts it back
-    /// (§6.3).
+    /// on for the process the inspector describes, the user's own selection,
+    /// and sets the table's `keep_visible` hint to it, which reveals it at
+    /// once without touching the selection; `Some(false)` turns follow off and
+    /// clears the hint; `None` (a request without a boolean) changes nothing.
+    /// A selection that is not a shown row is refused with its reason. Nothing
+    /// is promoted: a promoted `value` naming another process is withdrawn
+    /// instead (PX-011-G01). The toggle's value is always published: the
+    /// client's checkbox already shows what was asked, so a refusal puts it
+    /// back (§6.3).
     pub fn set_follow(
         &mut self,
         session: &Session,
         on: Option<bool>,
     ) -> Result<Refreshed, SessionError> {
-        let mut plan = Vec::new();
         match on {
             Some(true) => {
                 let selected = self.inspector.selected_row().cloned();
-                let reveal =
-                    self.follow
-                        .turn_on(selected.as_ref(), &self.rows, &self.unfiltered_rows);
-                plan.extend(reveal.map(|row| Planned::new(Effect::Promote(Box::new(row)))));
+                self.follow
+                    .turn_on(selected.as_ref(), &self.rows, &self.unfiltered_rows);
             }
             Some(false) => self.follow.turn_off(),
             None => {}
         }
+        let mut plan = self.follow_table_effects(&[]);
         let target = self.follow.view(&self.rows);
         plan.push(Planned::new(Effect::FollowValue(target.checked)));
         if target.status != self.follow_published.status {
@@ -1832,6 +1822,21 @@ impl ProcessView {
     /// The follow controls' changes over the rows already published (PX-017).
     fn follow_view_effects(&self) -> Vec<Planned> {
         follow_view_effects(&self.follow.view(&self.rows), &self.follow_published)
+    }
+
+    /// Follow's hold on the table once `plan`, which changes no row, commits
+    /// (PX-017): see [`follow_table_effects`]. A search promotion in `plan`
+    /// is the promoted `value` after it.
+    fn follow_table_effects(&self, plan: &[Planned]) -> Vec<Planned> {
+        let promoted = plan
+            .iter()
+            .rev()
+            .find_map(|planned| match &planned.effect {
+                Effect::Promote(row) => Some(row.item_id),
+                _ => None,
+            })
+            .or(self.promoted);
+        follow_table_effects(self.follow.followed(), self.keep_visible, promoted)
     }
 
     /// Publishes one detail result (PX-013), if it answers the inspector's
@@ -2059,10 +2064,7 @@ pub fn selection_changed(
     let item = srui_semantic_tree::Event::try_from(event.clone())
         .ok()
         .and_then(|event| event.item_id_arg());
-    // The revision the client held when the user selected (§7.7): follow
-    // restores a selection a later promotion replaced (PX-017).
-    let observed = event.observed_revision;
-    if let Err(error) = lock_view(view).select_item_at(session, item, observed) {
+    if let Err(error) = lock_view(view).select_item(session, item) {
         eprintln!("srtop: inspector not published: {error}");
     }
 }
@@ -2083,21 +2085,65 @@ pub fn follow_toggled(
 }
 
 /// Follow's plan for a client that will hold `rows` out of the server-side
-/// collection `unfiltered` (PX-017): the followed row's promotion when it
-/// changed row, and the follow controls' changes. Follow stops, and never
-/// moves to another row, when its process is not among `rows`.
+/// collection `unfiltered` (PX-017), while the table holds the hint `hinted`
+/// and the promotion `promoted`: follow's hold on the table
+/// ([`follow_table_effects`]) and the follow controls' changes. Follow stops,
+/// and never moves to another row, when its process is not among `rows`. A
+/// followed row that only moved needs nothing: the client reveals the hinted
+/// item wherever a commit moves it (PX-017-G01), so no sample ever promotes.
 fn follow_effects(
     follow: &mut Follow,
     published: &FollowView,
     rows: &[Row],
     unfiltered: &[Row],
+    hinted: Option<ItemId>,
+    promoted: Option<ItemId>,
 ) -> Vec<Planned> {
-    let mut plan: Vec<Planned> = follow
-        .track(rows, unfiltered)
-        .map(|row| Planned::new(Effect::Promote(Box::new(row))))
-        .into_iter()
-        .collect();
+    follow.track(rows, unfiltered);
+    let mut plan = follow_table_effects(follow.followed(), hinted, promoted);
     plan.extend(follow_view_effects(&follow.view(rows), published));
+    plan
+}
+
+/// Follow's hold on the table (PX-017), from what it holds now: `hinted`, its
+/// `keep_visible` hint, and `promoted`, its promoted `value`.
+///
+/// - While follow is on, the hint names `followed`: set when it names
+///   anything else (a turn-on, a retarget, or the repair of a set that did
+///   not commit), never again for the same item, so a sample never re-sets
+///   it. A promoted `value` naming another process is withdrawn in the same
+///   commit, so a client that attaches later restores no selection of a
+///   process follow is not on; a live client keeps its own later selection
+///   (PX-011-G01).
+/// - While follow is off, no hint is held.
+///
+/// Nothing here ever promotes.
+fn follow_table_effects(
+    followed: Option<&Row>,
+    hinted: Option<ItemId>,
+    promoted: Option<ItemId>,
+) -> Vec<Planned> {
+    let mut plan = Vec::new();
+    match followed {
+        Some(row) => {
+            if hinted != Some(row.item_id) {
+                plan.push(Planned::new(Effect::KeepVisible(Box::new(row.clone()))));
+            }
+            if promoted.is_some_and(|item| item != row.item_id) {
+                plan.push(Planned::new(Effect::Withdraw));
+            }
+        }
+        None => {
+            if hinted.is_some() {
+                plan.push(Planned::new(Effect::ClearKeepVisible));
+            }
+        }
+    }
+    // The hint and the withdrawal commit together, so no client ever holds
+    // the new hint beside a promotion of another process.
+    if let [first, _] = plan.as_mut_slice() {
+        first.joins_next = true;
+    }
     plan
 }
 
@@ -2325,6 +2371,9 @@ fn count(plan: &[Planned], result: &mut Refreshed) {
             | Effect::SearchValue { .. }
             | Effect::Promote(_)
             | Effect::InspectorText { .. } => result.controls += 1,
+            Effect::KeepVisible(_) | Effect::ClearKeepVisible | Effect::Withdraw => {
+                result.controls += 1
+            }
             Effect::OwnerStatus(_) | Effect::OwnerEnabled { .. } | Effect::OwnerValue { .. } => {
                 result.controls += 1
             }
@@ -2379,7 +2428,8 @@ fn commit(
         let mut ops = 0;
         // At least one operation always travels, so a plan always makes
         // progress; the planner keeps any single operation inside `max_bytes`.
-        // A promotion records two operations (PX-011-G01).
+        // A promotion records two operations (PX-011-G01), and so does a
+        // `keep_visible` hint (PX-017-G01).
         while end < plan.len() {
             let cost = plan[end].bytes;
             let weight = plan[end].operations();
@@ -2414,6 +2464,16 @@ fn commit(
                     // Through the SDK, which sends the item with the promotion
                     // and refuses an item the model does not hold (PX-011-G01).
                     Effect::Promote(row) => ui.promote_selection(TABLE, row.item_id)?,
+                    // Likewise for the hint (PX-017-G01).
+                    Effect::KeepVisible(row) => ui.set_keep_visible(TABLE, row.item_id)?,
+                    // A clear that settlement already made earlier in this
+                    // plan records nothing.
+                    Effect::ClearKeepVisible => {
+                        ui.clear_keep_visible(TABLE)?;
+                    }
+                    Effect::Withdraw => {
+                        ui.clear_promoted_selection(TABLE)?;
+                    }
                     _ => ui.apply_op(&planned.op)?,
                 }
             }
@@ -2421,21 +2481,16 @@ fn commit(
         }) {
             Ok(()) => {
                 record_committed(chunk, published);
-                // A promotion replaces a client's local selection (PX-017):
-                // remember when, to tell an earlier selection from a later.
-                if chunk
-                    .iter()
-                    .any(|planned| matches!(planned.effect, Effect::Promote(_)))
-                {
-                    *published.last_promotion = session.current_revision();
-                }
-                // Settlement may have cleared the promotion in this commit, when
-                // its row left the model: the store is the record (PX-011).
-                *published.promoted = session.with_store(|store| {
-                    store
-                        .get_node(TABLE)
-                        .and_then(|node| node.promoted_selection())
+                // Settlement may have cleared the promotion or the hint in this
+                // commit, when its row left the model: the store is the record
+                // (PX-011, PX-017).
+                let (promoted, keep_visible) = session.with_store(|store| {
+                    store.get_node(TABLE).map_or((None, None), |node| {
+                        (node.promoted_selection(), node.keep_visible())
+                    })
                 });
+                *published.promoted = promoted;
+                *published.keep_visible = keep_visible;
                 committed += 1;
             }
             Err(error) => return (committed, Err(error)),
@@ -2773,6 +2828,16 @@ enum Effect {
     /// `UiTransaction::promote_selection`, which records a one-item
     /// `MODEL_RESET_RANGE` carrying the row and `SET_PROPERTY(value = ItemId)`.
     Promote(Box<Row>),
+    /// The table's `keep_visible` hint set to this row's item ID (PX-017,
+    /// PX-017-G01): committed through `UiTransaction::set_keep_visible`, which
+    /// records a one-item `MODEL_RESET_RANGE` carrying the row and
+    /// `SET_PROPERTY(keep_visible = ItemId)`. It never touches the selection.
+    KeepVisible(Box<Row>),
+    /// The table's `keep_visible` hint cleared (PX-017).
+    ClearKeepVisible,
+    /// The table's promoted selection withdrawn (PX-017, PX-011-G01): a
+    /// `CLEAR_PROPERTY(value)`, which keeps a client's later local selection.
+    Withdraw,
     /// The user-filter status text set (PX-012).
     OwnerStatus(String),
     /// One user-filter button enabled or disabled (PX-012).
@@ -2822,8 +2887,8 @@ struct Published<'a> {
     search: &'a mut SearchView,
     /// The table's promoted selection as the store holds it (PX-011).
     promoted: &'a mut Option<ItemId>,
-    /// The revision of the latest committed promotion (PX-017).
-    last_promotion: &'a mut u64,
+    /// The table's `keep_visible` hint as the store holds it (PX-017).
+    keep_visible: &'a mut Option<ItemId>,
     /// The user-filter controls as announced (PX-012).
     owner: &'a mut OwnerView,
     /// The inspector's lines as announced (PX-013).
@@ -2886,6 +2951,13 @@ impl Planned {
             Effect::Promote(row) => {
                 Operation::set_property(TABLE, VALUE, Value::ItemId(row.item_id))
             }
+            // What the hint sets and the clears clear; `commit` records them
+            // through the SDK.
+            Effect::KeepVisible(row) => {
+                Operation::set_property(TABLE, KEEP_VISIBLE, Value::ItemId(row.item_id))
+            }
+            Effect::ClearKeepVisible => Operation::clear_property(TABLE, KEEP_VISIBLE),
+            Effect::Withdraw => Operation::clear_property(TABLE, VALUE),
             Effect::OwnerStatus(text) => {
                 Operation::set_property(OWNER_STATUS, TEXT, Value::String(text.clone()))
             }
@@ -2934,10 +3006,11 @@ impl Planned {
         }
     }
 
-    /// How many operations this entry records: two for a promotion (its item's
-    /// one-item `MODEL_RESET_RANGE` and the `SET_PROPERTY`), one otherwise.
+    /// How many operations this entry records: two for a promotion or a
+    /// `keep_visible` hint (its item's one-item `MODEL_RESET_RANGE` and the
+    /// `SET_PROPERTY`), one otherwise.
     fn operations(&self) -> usize {
-        if matches!(self.effect, Effect::Promote(_)) {
+        if matches!(self.effect, Effect::Promote(_) | Effect::KeepVisible(_)) {
             2
         } else {
             1
@@ -2990,13 +3063,15 @@ impl Effect {
             Self::SearchValue { value, .. } => VALUE_FRAMING_BYTES + value.len(),
             // The `SET_PROPERTY` of the item ID, and a whole second operation:
             // the one-item `MODEL_RESET_RANGE` carrying the row.
-            Self::Promote(row) => {
+            Self::Promote(row) | Self::KeepVisible(row) => {
                 VALUE_FRAMING_BYTES
                     + SCALAR_VALUE_BYTES
                     + OPERATION_FRAMING_BYTES
                     + OPERATION_HEADER_BYTES
                     + row_wire_bytes(row)
             }
+            // A clear carries no value.
+            Self::ClearKeepVisible | Self::Withdraw => 0,
             Self::Delete(ids) => ids.len() * ITEM_ID_BYTES,
             Self::Insert(_, rows) | Self::Update(rows) => rows.iter().map(row_wire_bytes).sum(),
         }
@@ -3014,7 +3089,7 @@ impl Effect {
             columns,
             search,
             promoted,
-            last_promotion: _,
+            keep_visible,
             owner,
             inspector,
             sampling,
@@ -3050,6 +3125,9 @@ impl Effect {
             Self::FollowValue(checked) => follow.checked = *checked,
             Self::FollowStatus(text) => follow.status.clone_from(text),
             Self::Promote(row) => **promoted = Some(row.item_id),
+            Self::KeepVisible(row) => **keep_visible = Some(row.item_id),
+            Self::ClearKeepVisible => **keep_visible = None,
+            Self::Withdraw => **promoted = None,
             Self::Status(text) => status.clone_from(text),
             Self::FilterStatus(text) => filter_status.clone_from(text),
             Self::FilterValue(_)
@@ -4590,11 +4668,28 @@ mod tests {
             INSPECTOR_METRICS,
         ]);
         let command = encoded(&[INSPECTOR_COMMAND]);
+        // PX-017: the follow group, and the table's `keep_visible` hint at
+        // its widest item ID, which the follow reserve also covers.
+        let hint = srui_protocol::framed_payload_len(&srui_protocol::SruiMessage {
+            msg: Some(srui_protocol::srui_message::Msg::Transaction(
+                srui_protocol::Transaction {
+                    base_revision: 0,
+                    new_revision: 0,
+                    priority: 0,
+                    operations: vec![Operation::set_property(
+                        TABLE,
+                        KEEP_VISIBLE,
+                        Value::ItemId(ItemId::new(u64::MAX)),
+                    )
+                    .to_wire()],
+                },
+            )),
+        });
         let follow = encoded(&[
             crate::FOLLOW_ROW,
             crate::FOLLOW_TOGGLE,
             crate::FOLLOW_STATUS,
-        ]);
+        ]) + hint;
         let sampling = encoded(&[
             crate::SAMPLING_ROW,
             SAMPLING_PAUSE,

@@ -507,8 +507,9 @@ pub fn install_sampling_handlers(session: &Session, view: &refresh::SharedView) 
 /// describes, or off. Only that boolean is read; the target is the server's
 /// own resolved selection, never anything the event names. The handler always
 /// publishes the value the server holds, so a refused request puts the
-/// client's checkbox back (§6.3). Follow re-promotes the followed row's item
-/// ID (PX-011-G01) and touches no process.
+/// client's checkbox back (§6.3). Follow names the followed row's item ID in
+/// the table's `keep_visible` hint (PX-017-G01), never promotes a selection,
+/// and touches no process.
 pub fn install_follow_handlers(session: &Session, view: &refresh::SharedView) {
     let follow = std::sync::Arc::clone(view);
     session.on(FOLLOW_TOGGLE, VALUE_CHANGED, move |session, event| {

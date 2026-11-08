@@ -66,7 +66,8 @@ where
     // The sampling controls record requests on the view and wake the one
     // refresh loop below; they start no timer of their own (PX-015).
     install_sampling_handlers(session, &view);
-    // Follow selected process re-promotes the followed row (PX-017).
+    // Follow selected process keeps the followed row in view through the
+    // table's `keep_visible` hint (PX-017, PX-017-G01).
     install_follow_handlers(session, &view);
     // The inspector reads details through its own reader of the source's
     // records, on its own bounded worker (PX-013).

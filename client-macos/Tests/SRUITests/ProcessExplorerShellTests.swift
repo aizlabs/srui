@@ -969,8 +969,10 @@ struct ProcessExplorerShellTests {
     /// `tracked` (PID 6010) moves, to the scripted rank of each sample, and at the sixth sample it
     /// has ended and a new process reuses its PID. Samples are taken only by Refresh now (the
     /// interval is 300 s), so each step is deterministic. With follow on, a resort that moves the
-    /// process off-screen selects and reveals it through the generic promoted selection
-    /// (PX-011-G01); a sample that does not move it keeps the user's pan; with follow off, a resort
+    /// process off-screen reveals it through the generic `keep_visible` hint (PX-017-G01) while the
+    /// client's own selection stays on it, and nothing is ever promoted; a sample that does not move
+    /// it keeps the user's pan; a retarget moves the hint, and a second client that attaches then
+    /// restores no selected row and is revealed to the followed one; with follow off, a resort
     /// moves neither the viewport nor the selection off its process; and when the process ends,
     /// follow stops and says so, and the new process with its PID is neither selected nor revealed.
     @Test(.timeLimit(.minutes(1)))
@@ -1063,7 +1065,10 @@ struct ProcessExplorerShellTests {
         #expect(window.performKeyEquivalent(with: followKey))
         try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "following tracked") {
             toggle.state == .on && status.stringValue.hasPrefix("Following PID 6010 · tracked · row 1 of 60 · ")
+                && applier.store.getNode(NodeId(5))?.keepVisible == ItemId(trackedID)
         }
+        #expect(applier.store.getNode(NodeId(5))?.promotedSelection == nil, "turning follow on promotes nothing")
+        #expect(table.selectedRowIndexes == IndexSet(integer: 0))
         table.scrollRowToVisible(0)
         #expect(!isVisible(40), "the viewport is shorter than the moves it must follow: \(table.rows(in: table.visibleRect))")
 
@@ -1076,7 +1081,8 @@ struct ProcessExplorerShellTests {
         #expect(table.numberOfRows == 60)
         #expect(Set(Self.modelItemIDs(applier)) == identities && Self.modelItemIDs(applier)[55] == trackedID,
                 "the followed row is the same item, and no row was created")
-        #expect(applier.store.getNode(NodeId(5))?.promotedSelection == ItemId(trackedID))
+        #expect(applier.store.getNode(NodeId(5))?.keepVisible == ItemId(trackedID))
+        #expect(applier.store.getNode(NodeId(5))?.promotedSelection == nil, "follow never promotes")
 
         // Pan away: the selection is unchanged, and a sample that does not move the process keeps
         // the viewport where the user put it, with follow still on.
@@ -1114,6 +1120,56 @@ struct ProcessExplorerShellTests {
                 && status.stringValue.contains("row 51 of 60")
         }
 
+        // Retarget: select a visible neighbour while following. Follow moves its hint to it and
+        // promotes nothing, so nothing moves for this client, and a second client that attaches
+        // now restores no selected row, never `tracked`, and is revealed to the neighbour (PR #98
+        // review).
+        let neighbour = isVisible(49) ? 49 : 51
+        #expect(isVisible(neighbour))
+        let neighbourPID = Self.nativeRows(table)[neighbour][0]
+        let neighbourID = Self.modelItemIDs(applier)[neighbour]
+        let beforeRetarget = viewport()
+        table.selectRowIndexes(IndexSet(integer: neighbour), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "retargeted to row \(neighbour + 1)") {
+            status.stringValue.hasPrefix("Following PID \(neighbourPID) · ")
+                && applier.store.getNode(NodeId(5))?.keepVisible == ItemId(neighbourID)
+        }
+        #expect(applier.store.getNode(NodeId(5))?.promotedSelection == nil)
+        #expect(table.selectedRowIndexes == IndexSet(integer: neighbour), "the user's selection is kept")
+        #expect(viewport() == beforeRetarget, "the clicking client does not move")
+        let (secondController, secondApplier, secondRenderer) =
+            Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await secondController.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "a second client") {
+            secondController.isEventDispatchEnabled && secondRenderer.registry.handle(for: NodeId(5)) != nil
+                && secondApplier.lastAppliedRevision == applier.lastAppliedRevision
+        }
+        let secondWindow = try #require(secondRenderer.registry.handle(for: NodeId(1))?.window)
+        SurfacePresentation.forHostApplication().present(secondWindow)
+        secondWindow.contentView?.layoutSubtreeIfNeeded()
+        let secondTable = try #require(
+            (secondRenderer.registry.handle(for: NodeId(5))?.view as? NSScrollView)?.documentView as? NSTableView)
+        let secondStatus = try #require(secondRenderer.registry.handle(for: NodeId(Self.followStatusID))?.view as? NSTextField)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the second client's table, revealed to the neighbour") {
+            secondTable.numberOfRows == 60 && secondStatus.stringValue.hasPrefix("Following PID \(neighbourPID) · ")
+                && NSLocationInRange(neighbour, secondTable.rows(in: secondTable.visibleRect))
+        }
+        #expect(secondApplier.store.getNode(NodeId(5))?.promotedSelection == nil)
+        #expect(secondApplier.store.getNode(NodeId(5))?.keepVisible == ItemId(neighbourID))
+        #expect(secondTable.selectedRowIndexes.isEmpty, "a fresh client restores no row, never the old target")
+        let secondVisible = secondTable.rows(in: secondTable.visibleRect)
+        await secondController.stop()
+        secondWindow.orderOut(nil)
+        secondWindow.close()
+        trace.append("retargeted to row \(neighbour + 1) (PID \(neighbourPID)); a second client selected [] and shows rows \(secondVisible)")
+        // Back on tracked, as the next step expects.
+        table.selectRowIndexes(IndexSet(integer: 50), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "following tracked again") {
+            status.stringValue.hasPrefix("Following PID 6010 · tracked · row 51 of 60")
+                && applier.store.getNode(NodeId(5))?.keepVisible == ItemId(trackedID)
+        }
+        #expect(table.selectedRowIndexes == IndexSet(integer: 50))
+
         // The process ends and a new one reuses PID 6010 in the same sample: follow stops and
         // says why, and the new process is neither selected nor revealed.
         table.scrollRowToVisible(59)
@@ -1129,6 +1185,7 @@ struct ProcessExplorerShellTests {
         #expect(table.selectedRowIndexes.isEmpty, "nothing is selected for the new process")
         #expect(viewport() == bottom, "nothing scrolled to it")
         #expect(applier.store.getNode(NodeId(5))?.promotedSelection == nil)
+        #expect(applier.store.getNode(NodeId(5))?.keepVisible == nil, "the hint is cleared")
         #expect(inspectorStatus.stringValue.contains("this process has ended"))
         try await sample("after the end") { true }
         #expect(table.selectedRowIndexes.isEmpty && viewport() == bottom && toggle.state == .off)
@@ -1136,6 +1193,119 @@ struct ProcessExplorerShellTests {
         #expect(renderer.registry.handle(for: NodeId(5)) === tableHandle)
         #expect(renderer.registry.handle(for: NodeId(Self.followToggleID)) === toggleHandle)
         print("PX-017 native SSH evidence: window \(window.windowNumber); trackedID=\(trackedID); trace=\(trace); status=\(status.stringValue); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
+    /// PX-017 on `keep_visible`: rapid arrow keys while following are never overwritten, even
+    /// when a sample lands mid-burst. Under the CPU sort, each round starts on row 36 and presses
+    /// Down 20 times (real key-down events into the native table), clicking Refresh now after the
+    /// tenth press; the fixture's samples move `tracked` across rows 40–56 (from the top in the
+    /// first round), shifting the rows the burst walks through. Before every press the selection
+    /// is still the row the previous press chose, the burst ends on the last press, nothing is ever
+    /// promoted, and the hint ends on the last press, which is visible.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func rapidArrowKeysWhileFollowingEndOnTheLastPressWithASampleMidBurst() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-follow", "--refresh-interval-ms", "300000"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer over SSH with its follow controls") {
+            applier.lastAppliedRevision.value >= 1
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(Self.followStatusID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        SurfacePresentation.forHostApplication().present(window)
+        window.contentView?.layoutSubtreeIfNeeded()
+        let router = renderer.layoutRenderer.shortcutRouter
+        router.isWindowKey = { $0 === window }
+        func view<T>(_ id: UInt64, as _: T.Type = T.self) throws -> T {
+            try #require(renderer.registry.handle(for: NodeId(id))?.view as? T, "node \(id)")
+        }
+        let table = try #require((renderer.registry.handle(for: NodeId(5))?.view as? NSScrollView)?.documentView as? NSTableView)
+        let status: NSTextField = try view(Self.followStatusID)
+        let refresh: NSButton = try view(Self.samplingRefreshID)
+        let sortByCPU: NSButton = try view(Self.sortButtonIDs[3])
+        let inspectorStatus: NSTextField = try view(Self.inspectorLineIDs[0])
+        let freshness = try #require(try Self.summaryLines(renderer).last)
+        let followKey = try Self.keyEvent("f", [.command, .shift], keyCode: 3, in: window)
+        let down = try Self.keyEvent(Self.functionKey(NSDownArrowFunctionKey), [.numericPad, .function], keyCode: 125, in: window)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "all 60 rows") {
+            table.numberOfRows == 60 && refresh.isEnabled
+        }
+        func selectedPID() -> String? {
+            table.selectedRow >= 0 ? Self.nativeRows(table)[table.selectedRow][0] : nil
+        }
+        func isVisible(_ row: Int) -> Bool {
+            NSLocationInRange(row, table.rows(in: table.visibleRect))
+        }
+        func node() -> Node? { applier.store.getNode(NodeId(5)) }
+
+        NativeActivation.click(sortByCPU)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the order by CPU") {
+            sortByCPU.title == "Sort by CPU \u{2193}" && Self.nativeRows(table).first?.first == "6010"
+                && Self.nativeRows(table) == Self.modelRows(applier)
+        }
+        table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on tracked") {
+            inspectorStatus.stringValue.hasPrefix("Selected process: PID 6010 · tracked")
+        }
+        #expect(window.performKeyEquivalent(with: followKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "following tracked") {
+            status.stringValue.hasPrefix("Following PID 6010 · tracked · row 1 of 60 · ")
+        }
+
+        var results: [String] = []
+        for (label, gap) in [("yield", 0), ("1 ms", 1), ("30 ms key repeat", 30), ("80 ms key repeat", 80)] {
+            // Start on row 36 with a click: follow retargets to it.
+            table.selectRowIndexes(IndexSet(integer: 35), byExtendingSelection: false)
+            let startPID = try #require(selectedPID())
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "\(label): following row 36") {
+                status.stringValue.hasPrefix("Following PID \(startPID) · ")
+            }
+            let before = freshness.stringValue
+            var lastPressed = startPID
+            var pressed: [String] = []
+            var displaced: [String] = []
+            var promoted = 0
+            var selectedHiddenAfterGap = 0
+            for press in 1...20 {
+                if selectedPID() != lastPressed {
+                    displaced.append("press \(press): \(selectedPID() ?? "none") instead of \(lastPressed)")
+                }
+                window.makeFirstResponder(table)
+                table.keyDown(with: down)
+                lastPressed = try #require(selectedPID())
+                pressed.append(lastPressed)
+                if press == 10 { NativeActivation.click(refresh) }
+                if gap == 0 { await Task.yield() } else { try await Task.sleep(for: .milliseconds(gap)) }
+                if node()?.promotedSelection != nil { promoted += 1 }
+                if table.selectedRow >= 0, !isVisible(table.selectedRow) { selectedHiddenAfterGap += 1 }
+            }
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "\(label): the sample and the last retarget") {
+                freshness.stringValue != before && Self.nativeRows(table) == Self.modelRows(applier)
+                    && status.stringValue.hasPrefix("Following PID \(lastPressed) · ")
+            }
+            // Let any reply still in flight land.
+            try await Task.sleep(for: .milliseconds(300))
+            let final = selectedPID()
+            let hinted = node()?.keepVisible
+            let finalID = table.selectedRow >= 0 ? ItemId(Self.modelItemIDs(applier)[table.selectedRow]) : nil
+            results.append("\(label): pressed \(pressed.count) distinct \(Set(pressed).count), final PID \(final ?? "none"), last PID \(lastPressed), displaced \(displaced), promoted \(promoted), selected row hidden after \(selectedHiddenAfterGap) gaps, final row \(table.selectedRow + 1) visible \(table.selectedRow >= 0 && isVisible(table.selectedRow)), tracked row \((Self.nativeRows(table).firstIndex { $0.first == "6010" } ?? -1) + 1)")
+            // A sample can move `tracked` ahead of the burst, so the same process may be pressed
+            // twice; every press still moves on from the one before.
+            #expect(zip([startPID] + pressed, pressed).allSatisfy { $0 != $1 }, "\(label): each press moved on: \(pressed)")
+            #expect(displaced.isEmpty, "\(label): no commit changed the selection: \(displaced)")
+            #expect(final == lastPressed, "\(label): the burst ends on the last press")
+            #expect(promoted == 0 && node()?.promotedSelection == nil, "\(label): follow never promotes")
+            #expect(hinted != nil && hinted == finalID, "\(label): the hint ends on the last press")
+            #expect(table.selectedRow >= 0 && isVisible(table.selectedRow), "\(label): the last press is in view")
+        }
+        print("PX-017 rapid arrows native SSH evidence: \(results)")
         await controller.stop()
     }
 

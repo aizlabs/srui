@@ -17,8 +17,10 @@
 //   It is revealed when it arrives through range data at a row other than the last one shown.
 //   The same holds for any item the adapter cannot map to a displayed row (for example one
 //   under a collapsed Tree ancestor): the hint never expands anything, it just does not scroll.
-//   A local disclosure change re-evaluates the hint with the commit rule: the row is revealed
-//   once if it differs from the last revealed row, and otherwise left alone.
+// - A local expand or collapse never scrolls, even when it expands the hinted item's own
+//   ancestor or shifts the hinted row: it only re-baselines the last revealed row to the item's
+//   new displayed row, or to "not shown" when the change hides it. The next commit that sets
+//   the hint, or changes the displayed row relative to that baseline, reveals it as above.
 // - Clearing the hint never scrolls. Local selection, scrolling and keyboard navigation never
 //   clear or override it; only the server does.
 //
@@ -57,5 +59,15 @@ public struct CollectionKeepVisible: Equatable, Sendable {
         guard let row = rowOf(itemID), row != shownRow else { return nil }
         shownRow = row
         return row
+    }
+
+    /// Re-baselines after a local disclosure change, which never scrolls (§22.5).
+    ///
+    /// The last revealed row becomes the item's current displayed row, or `nil` ("not shown")
+    /// when it has none, so only a later commit that sets the hint or moves the item relative to
+    /// this baseline reveals it.
+    public mutating func rebaseline(rowOf: (ItemId) -> Int?) {
+        guard let itemID else { return }
+        shownRow = rowOf(itemID)
     }
 }

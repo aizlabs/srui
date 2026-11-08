@@ -452,23 +452,34 @@ struct KeepVisibleRenderingTests {
         #expect(adapter.keepVisible.shownRow == nil)
         #expect(harness.interactions.isEmpty, "no EXPANSION_CHANGED, no SELECTION_CHANGED")
 
-        // The user expands the parent: the item now has a row it was never revealed at.
+        // The user expands the item's own parent: a local action never scrolls; it only
+        // re-baselines the hint to the row the item is now shown at.
         #expect(adapter.setExpanded(true, itemID: root2, outlineView: outline))
         let row = try #require(adapter.row(of: hinted))
         #expect(row == 1_402)
-        #expect(harness.visibleRows.contains(row))
+        #expect(outline.visibleRect == origin, "a local expand never scrolls")
+        #expect(harness.visibleRows.contains(row) == false)
         #expect(adapter.keepVisible.shownRow == row)
+
+        // An unrelated commit leaves it there; the next commit that moves the item reveals it.
+        try harness.commit([.setProperty(id: Self.tableID, property: .label, value: .string("Tree"))])
+        #expect(outline.visibleRect == origin)
+        try harness.commit(Self.treeMove(hinted, to: 1_100))
+        #expect(adapter.row(of: hinted) == 1_100)
+        #expect(harness.visibleRows.contains(1_100))
         #expect(outline.selectedRowIndexes.isEmpty)
         #expect(harness.notifications.isEmpty)
 
-        // Collapse, pan away and expand again: the row equals the last revealed one, so the
-        // user's viewport stays; the next unrelated commit does not scroll either.
+        // Collapse (hides it: baseline "not shown"), pan away and expand again: neither local
+        // action scrolls, and the next unrelated commit does not scroll either.
         #expect(adapter.setExpanded(false, itemID: root2, outlineView: outline))
+        #expect(adapter.keepVisible.shownRow == nil)
         harness.pan(to: 0)
         let panned = outline.visibleRect
         #expect(adapter.setExpanded(true, itemID: root2, outlineView: outline))
         #expect(outline.visibleRect == panned)
-        try harness.commit([.setProperty(id: Self.tableID, property: .label, value: .string("Tree"))])
+        #expect(adapter.keepVisible.shownRow == 1_100)
+        try harness.commit([.setProperty(id: Self.tableID, property: .label, value: .string("Tree 2"))])
         #expect(outline.visibleRect == panned)
         #expect(harness.store.getNode(Self.tableID)?.keepVisible == hinted)
     }
@@ -485,18 +496,19 @@ struct KeepVisibleRenderingTests {
         harness.pan(to: 0)
 
         // A re-sort inside root 2's subtree moves the leaf from index 1,402 to index 1,053.
-        try harness.commit([
-            .modelDelete(id: Self.modelID, index: nil, count: nil, itemIds: [hinted]),
-            .modelInsert(id: Self.modelID, index: 1_053, items: [Self.treeItem(1_053, depth: 1, descendants: 0, id: 1_403)]),
-        ])
+        try harness.commit(Self.treeMove(hinted, to: 1_053))
         #expect(adapter.row(of: hinted) == 1_053)
         #expect(harness.visibleRows.contains(1_053))
 
-        // With root 0 collapsed locally the mapped row drops by 500, so that local change reveals
-        // it once at row 553; a later sibling-content commit that keeps it there never scrolls.
+        // Collapsing root 0 locally drops the mapped row by 500: no scroll, only a re-baseline
+        // to row 553; a later sibling-content commit that keeps it there never scrolls. The
+        // viewport sits where it stays inside the shorter document, so AppKit does not clamp it.
+        harness.pan(to: 600)
+        let beforeCollapse = outline.visibleRect
         #expect(adapter.setExpanded(false, itemID: root0, outlineView: outline))
         #expect(adapter.row(of: hinted) == 553)
-        #expect(harness.visibleRows.contains(553))
+        #expect(outline.visibleRect == beforeCollapse, "a local collapse never scrolls")
+        #expect(adapter.keepVisible.shownRow == 553)
         harness.pan(to: 0)
         let panned = outline.visibleRect
         try harness.commit([
@@ -506,10 +518,7 @@ struct KeepVisibleRenderingTests {
 
         // A move inside the subtree while root 0 is collapsed reveals the hidden-interval row,
         // never the raw model index.
-        try harness.commit([
-            .modelDelete(id: Self.modelID, index: nil, count: nil, itemIds: [hinted]),
-            .modelInsert(id: Self.modelID, index: 1_300, items: [Self.treeItem(1_300, depth: 1, descendants: 0, id: 1_403)]),
-        ])
+        try harness.commit(Self.treeMove(hinted, to: 1_300))
         #expect(adapter.row(of: hinted) == 800)
         #expect(harness.visibleRows.contains(800))
         #expect(harness.visibleRows.contains(1_300) == false)
@@ -517,6 +526,46 @@ struct KeepVisibleRenderingTests {
         #expect(adapter.collapsedItemIDs == [root0])
         #expect(harness.notifications.isEmpty)
         #expect(harness.interactions == [.expansionChanged(nodeID: Self.tableID, itemID: root0, expanded: false)])
+    }
+
+    /// Verifier observation O1: collapsing an unrelated parent above the hinted row while the
+    /// viewport sits elsewhere scrolled about 382 rows to the hint. It must scroll 0 px.
+    @Test
+    func collapsingAnUnrelatedParentAboveTheHintNeverScrolls() throws {
+        let harness = try Harness(store: Self.hierarchicalStore())
+        defer { harness.tearDown() }
+        let outline = try #require(harness.tableView as? NSOutlineView)
+        let adapter = try #require(harness.handle.modelAdapter as? OutlineCollectionAdapter)
+        let root0 = ItemId(1), hinted = ItemId(1_403)
+        try harness.commit([.setProperty(id: Self.tableID, property: .keepVisible, value: .itemID(hinted))])
+        #expect(adapter.keepVisible.shownRow == 1_402)
+        harness.pan(to: 509)
+        let viewport = outline.visibleRect
+        #expect(harness.visibleRows.contains(1_402) == false)
+
+        #expect(adapter.setExpanded(false, itemID: root0, outlineView: outline))
+        #expect(outline.visibleRect == viewport, "0 px: a local collapse never follows the hint")
+        #expect(adapter.row(of: hinted) == 902)
+        #expect(adapter.keepVisible.shownRow == 902)
+
+        // Expanding it again does not scroll either.
+        #expect(adapter.setExpanded(true, itemID: root0, outlineView: outline))
+        #expect(outline.visibleRect == viewport)
+        #expect(adapter.keepVisible.shownRow == 1_402)
+
+        // The next commit that moves the item reveals it.
+        try harness.commit(Self.treeMove(hinted, to: 1_200))
+        #expect(harness.visibleRows.contains(1_200))
+        #expect(outline.selectedRowIndexes.isEmpty)
+        #expect(harness.notifications.isEmpty)
+    }
+
+    /// A re-sort of a depth-1 leaf inside its parent's subtree: delete, then insert at `index`.
+    private static func treeMove(_ id: ItemId, to index: UInt64) -> [SemanticModel.Operation] {
+        [
+            .modelDelete(id: modelID, index: nil, count: nil, itemIds: [id]),
+            .modelInsert(id: modelID, index: index, items: [treeItem(index, depth: 1, descendants: 0, id: id.value)]),
+        ]
     }
 
     @Test

@@ -392,7 +392,7 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
         onCollapsedItemsChanged?(nodeID, modelID, collapsedItemIDs)
         onExpansionChanged?(nodeID, itemID, expanded)
         resolvePendingPromotion(in: outlineView)
-        followKeepVisibleAfterDisclosureChange(in: outlineView)
+        rebaselineKeepVisibleAfterDisclosureChange()
         emitRequestsAfterDisclosureChange(in: outlineView)
         return true
     }
@@ -579,18 +579,15 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
         }
     }
 
-    /// Re-evaluates `keep_visible` after a local disclosure change (§22.5).
+    /// Re-baselines `keep_visible` after a local disclosure change (§22.5). Never scrolls.
     ///
-    /// A collapse or expand remaps rows, so the hinted item's displayed row can change without a
-    /// commit. The same rule applies as for a commit that does not set the hint: the row is
-    /// revealed once when it differs from the row last revealed (for example when expanding the
-    /// collapsed ancestor of an item that was never shown); an unchanged row, or an item that a
-    /// collapse just hid, scrolls nothing. Re-baselining here keeps the next unrelated commit
-    /// from scrolling because of the user's own disclosure change.
-    private func followKeepVisibleAfterDisclosureChange(in outlineView: NSOutlineView) {
-        guard let itemID = keepVisible.itemID,
-              let row = keepVisible.apply(itemID, explicit: false, rowOf: row(of:)) else { return }
-        CollectionPromotion.reveal(row: row, in: outlineView)
+    /// A collapse or expand is the user's own action and the item did not move in the model, so
+    /// it must not trigger a server-hinted scroll, even when it expands the hinted item's
+    /// ancestor or shifts its row. The last revealed row becomes the item's new displayed row,
+    /// or "not shown" when the change hides it; the next commit that sets the hint or moves the
+    /// item relative to that baseline reveals it.
+    private func rebaselineKeepVisibleAfterDisclosureChange() {
+        keepVisible.rebaseline(rowOf: row(of:))
     }
 
     /// Reselects a user's local selection by ItemId without revealing it (§22.5).

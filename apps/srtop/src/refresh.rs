@@ -7,7 +7,10 @@
 //! collection can also be sorted ([`crate::sort`]): a sort request reorders the
 //! published rows, and every later refresh publishes in the active order. A row
 //! that changes place keeps its item identity: it is moved, never replaced —
-//! see [`plan_moves`].
+//! see [`plan_moves`]. Since PX-011 every publication that changes the rows
+//! also re-counts the active search ([`crate::search`]) against the rows the
+//! client is about to hold, in the same plan, so the search status never
+//! describes a different collection than the one published with it.
 //!
 //! Four rules shape this module:
 //!
@@ -88,13 +91,14 @@
 use crate::catalogue::{ColumnLayout, LayoutError, ProcessField};
 use crate::filter::{FilterGeneration, FilterQuery, PendingFilter};
 use crate::projection::{Row, SessionItemIds};
+use crate::search::{Search, SearchStep, SearchView};
 use crate::sort::{self, SortOrder};
 use crate::source::{ProcessSnapshot, ProcessSource, Retention};
 use crate::summary::{self, CollectorError, Sample};
 use crate::{
     bounded, initialize_rows, published_status_from, sort_button_of, ColumnAction, ScanReport,
-    COLUMN_CHOOSER_BUTTONS, FILTER_INPUT, FILTER_STATUS, MAX_PUBLISHED_LABEL_BYTES, MODEL, STATUS,
-    TABLE,
+    COLUMN_CHOOSER_BUTTONS, FILTER_INPUT, FILTER_STATUS, MAX_PUBLISHED_LABEL_BYTES, MODEL, PID_GO,
+    PID_INPUT, SEARCH_INPUT, SEARCH_NEXT, SEARCH_PREVIOUS, SEARCH_STATUS, STATUS, TABLE,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
 use srui_sdk::{ItemId, NodeId, Operation, Value, COLUMNS, ENABLED, LABEL, TEXT, VALUE};
@@ -224,6 +228,15 @@ const SUMMARY_RESERVE_BYTES: usize = 8 * 1024;
 /// one `TextInput` and one status `Text` with their properties and max query/status lengths.
 pub const FILTER_RESERVE_BYTES: usize = 2048;
 
+/// Bytes reserved for the search controls in a catch-up snapshot (PX-011): the
+/// row, the search and PID `TextInput`s with their labels and bounded values,
+/// the three buttons and the status line at
+/// [`crate::search::MAX_SEARCH_STATUS_BYTES`]. Charged at this fixed reserve,
+/// like the status and the filter, so a long search status can never shrink
+/// the row budget. `the_shell_status_and_summary_fit_their_snapshot_allowances`
+/// measures it with every search value at its widest.
+pub const SEARCH_RESERVE_BYTES: usize = 4096;
+
 /// The most of a rejection reason the status quotes. The reason is this app's
 /// own error text, not a record's, and it is bounded all the same so that the
 /// status stays inside [`MAX_STATUS_CLAUSE_BYTES`] whatever a later error says.
@@ -345,6 +358,16 @@ pub struct ProcessView {
     /// The visible columns the table's headings and every row's cells are
     /// published in (PX-068). Every refresh projects its rows in it.
     columns: ColumnLayout,
+    /// The server's search state (PX-011): query, PID field and the current
+    /// match, held by item ID.
+    search: Search,
+    /// The search controls as the client holds them (PX-011).
+    search_published: SearchView,
+    /// Item IDs of the server-side rows the latest scan did not confirm (they
+    /// are retained from an earlier scan). Bounded by the collection, which is
+    /// bounded by [`MAX_PUBLISHED_ROWS`]; replaced, never grown, on every
+    /// refresh. A PID jump never selects one of these (PX-011).
+    unconfirmed: HashSet<ItemId>,
 }
 
 /// Why a column layout request was not published (PX-068).
@@ -393,6 +416,7 @@ impl ProcessView {
             sort: &mut self.sort,
             filter_status: &mut self.filter_status,
             columns: &mut self.columns,
+            search: &mut self.search_published,
         }
     }
 
@@ -473,6 +497,9 @@ impl ProcessView {
                 filter_generation: FilterGeneration::INITIAL,
                 pending_filter: None,
                 columns,
+                search: Search::default(),
+                search_published: SearchView::initial(true),
+                unconfirmed: HashSet::new(),
             },
             snapshot,
         ))
@@ -570,6 +597,13 @@ impl ProcessView {
         if confirmed_empty && retention.is_global() {
             return self.publish_status_only(session, source_status, snapshot, rejected, summary);
         }
+        // The rows this scan did not confirm, which a PID jump never selects
+        // (PX-011): bounded by the collection, and replaced on every refresh.
+        let unconfirmed: HashSet<ItemId> = unfiltered_target
+            .iter()
+            .map(|row| row.item_id)
+            .filter(|id| !confirmed_ids.contains(id))
+            .collect();
         // A client receives the status and the rows in the same catch-up
         // snapshot, so the status is charged against the frame before the rows
         // are — at its fixed reserve, never at this tick's length, so no clause a
@@ -628,6 +662,9 @@ impl ProcessView {
             batch,
             MAX_TRANSACTION_PAYLOAD_BYTES,
         ));
+        // Last, the search re-counted against the rows this plan publishes, so
+        // it commits with the final rows rather than ahead of them (PX-011).
+        plan.extend(self.search_effects(&target, &unfiltered_target, &unconfirmed));
 
         let mut result = Refreshed {
             retained,
@@ -646,6 +683,8 @@ impl ProcessView {
             refresh_sort_values(&mut self.unfiltered_rows, &unfiltered_target);
             self.unfiltered_rows = unfiltered_target;
             self.ids.retain(&self.unfiltered_rows);
+            self.unconfirmed = unconfirmed;
+            self.search.observe(&self.rows);
             return Ok(result);
         }
 
@@ -664,6 +703,8 @@ impl ProcessView {
         refresh_sort_values(&mut self.unfiltered_rows, &unfiltered_target);
         self.unfiltered_rows = unfiltered_target;
         self.ids.retain(&self.unfiltered_rows);
+        self.unconfirmed = unconfirmed;
+        self.search.observe(&self.rows);
         outcome.map(|()| result)
     }
 
@@ -750,6 +791,9 @@ impl ProcessView {
             target.iter().map(|row| row.item_id).collect::<Vec<_>>()
         );
         plan.extend(moved.plan);
+        // The search's positions follow the new order (PX-011); its target is
+        // the same item ID wherever it moved.
+        plan.extend(self.search_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
         let mut result = Refreshed::default();
         count(&plan, &mut result);
         let (transactions, outcome) = commit(
@@ -762,6 +806,7 @@ impl ProcessView {
         result.transactions = transactions;
         refresh_sort_values(&mut self.rows, &target);
         self.ids.retain(&self.unfiltered_rows);
+        self.search.observe(&self.rows);
         outcome.map(|()| result)
     }
 
@@ -964,6 +1009,12 @@ impl ProcessView {
         }
         plan.extend(summary_effects(&self.summary, &summary));
         result.summary = plan.len() - usize::from(result.status_changed);
+        // This scan confirmed no row, so none is the currently observed
+        // instance a PID jump may select (PX-011). The rows themselves stand.
+        self.unconfirmed = self.unfiltered_rows.iter().map(|row| row.item_id).collect();
+        let search = self.search_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
+        result.controls += search.len();
+        plan.extend(search);
         if plan.is_empty() {
             // An identical failure republishes nothing at all.
             self.ids.retain(&self.unfiltered_rows);
@@ -1120,6 +1171,9 @@ impl ProcessView {
             batch,
             MAX_TRANSACTION_PAYLOAD_BYTES,
         ));
+        // The search counts the newly filtered rows; a target the filter hid
+        // is reported as no longer shown, never replaced (PX-011).
+        plan.extend(self.search_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
 
         let mut result = Refreshed::default();
         count(&plan, &mut result);
@@ -1127,6 +1181,7 @@ impl ProcessView {
         if plan.is_empty() {
             refresh_sort_values(&mut self.rows, &target);
             self.ids.retain(&self.unfiltered_rows);
+            self.search.observe(&self.rows);
             return Ok(result);
         }
 
@@ -1140,6 +1195,7 @@ impl ProcessView {
         result.transactions = transactions;
         refresh_sort_values(&mut self.rows, &target);
         self.ids.retain(&self.unfiltered_rows);
+        self.search.observe(&self.rows);
         outcome.map(|()| result)
     }
 
@@ -1197,6 +1253,145 @@ impl ProcessView {
     pub(crate) fn unfiltered_rows(&self) -> &[Row] {
         &self.unfiltered_rows
     }
+
+    /// The server's search state (PX-011).
+    pub fn search(&self) -> &Search {
+        &self.search
+    }
+
+    /// The search status text this view last published (PX-011).
+    pub fn search_status(&self) -> &str {
+        &self.search_published.status
+    }
+
+    /// Replaces the search query (PX-011): parsed by the filter's rules under a
+    /// new monotonic generation, and targeting the first match in published
+    /// order. No row is hidden, moved or changed: only the search controls are
+    /// published.
+    pub fn set_search(
+        &mut self,
+        session: &Session,
+        query: &str,
+    ) -> Result<Refreshed, SessionError> {
+        self.search.set_query(query, &self.rows);
+        let raw = self.search.query().raw().to_string();
+        let mut plan = Vec::new();
+        if input_value(session, SEARCH_INPUT) != raw {
+            plan.push(Planned::new(Effect::SearchValue {
+                node: SEARCH_INPUT,
+                value: raw,
+            }));
+        }
+        self.publish_search(session, plan)
+    }
+
+    /// Applies one Next or Previous click (PX-011).
+    pub fn step_search(
+        &mut self,
+        session: &Session,
+        step: SearchStep,
+    ) -> Result<Refreshed, SessionError> {
+        self.search.step(step, &self.rows);
+        self.publish_search(session, Vec::new())
+    }
+
+    /// Keeps the PID field's text (PX-011). Typing never moves the target; it
+    /// only enables Go to PID when the text is a PID.
+    pub fn set_pid_input(
+        &mut self,
+        session: &Session,
+        text: &str,
+    ) -> Result<Refreshed, SessionError> {
+        let kept = self.search.set_pid_input(text).to_string();
+        let mut plan = Vec::new();
+        if input_value(session, PID_INPUT) != kept {
+            plan.push(Planned::new(Effect::SearchValue {
+                node: PID_INPUT,
+                value: kept,
+            }));
+        }
+        self.publish_search(session, plan)
+    }
+
+    /// Applies one Go to PID click (PX-011): an explicit new search that
+    /// resolves the PID field to the published row the latest scan confirmed
+    /// with that PID.
+    pub fn go_to_pid(&mut self, session: &Session) -> Result<Refreshed, SessionError> {
+        self.search.go_to_pid(&self.rows, &self.unconfirmed);
+        self.publish_search(session, Vec::new())
+    }
+
+    /// Types `text` into the PID field and clicks Go to PID (PX-011).
+    pub fn jump_to_pid(
+        &mut self,
+        session: &Session,
+        text: &str,
+    ) -> Result<Refreshed, SessionError> {
+        self.set_pid_input(session, text)?;
+        self.go_to_pid(session)
+    }
+
+    /// The search controls' changes when the client holds `rows` (PX-011).
+    fn search_effects(
+        &self,
+        rows: &[Row],
+        unfiltered: &[Row],
+        unconfirmed: &HashSet<ItemId>,
+    ) -> Vec<Planned> {
+        let target = self.search.view(rows, unfiltered, unconfirmed);
+        let published = &self.search_published;
+        let mut plan = Vec::new();
+        if target.status != published.status {
+            plan.push(Planned::new(Effect::SearchStatus(target.status)));
+        }
+        for (node, was, now) in [
+            (SEARCH_PREVIOUS, published.previous, target.previous),
+            (SEARCH_NEXT, published.next, target.next),
+            (PID_GO, published.go, target.go),
+        ] {
+            if was != now {
+                plan.push(Planned::new(Effect::SearchEnabled { node, enabled: now }));
+            }
+        }
+        plan
+    }
+
+    /// Publishes `plan` and the search controls' changes over the rows already
+    /// published (PX-011). The rows are not touched.
+    fn publish_search(
+        &mut self,
+        session: &Session,
+        mut plan: Vec<Planned>,
+    ) -> Result<Refreshed, SessionError> {
+        plan.extend(self.search_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed));
+        let mut result = Refreshed::default();
+        if plan.is_empty() {
+            return Ok(result);
+        }
+        count(&plan, &mut result);
+        let max_ops = session.with_store(|store| store.limits().max_transaction_operations.max(1));
+        let (transactions, outcome) = commit(
+            session,
+            &plan,
+            max_ops,
+            MAX_TRANSACTION_PAYLOAD_BYTES,
+            &mut self.published(),
+        );
+        result.transactions = transactions;
+        outcome.map(|()| result)
+    }
+}
+
+/// The string `node` holds as its `VALUE`, or the empty string.
+fn input_value(session: &Session, node: NodeId) -> String {
+    session.with_store(|store| {
+        store
+            .get_node(node)
+            .and_then(|n| n.get_property(VALUE))
+            .and_then(Value::as_string)
+            .unwrap_or("")
+            .to_string()
+    })
 }
 
 /// Filters `unfiltered` rows according to `filter`, preserving their active order,
@@ -1219,29 +1414,62 @@ fn project_visible_rows(
     (matching, total_matches, truncated)
 }
 
+/// The text a `TEXT_EDIT` event on `node` carries, or else the value the store
+/// holds for it.
+fn edited_text(session: &Session, event: &srui_protocol::Event, node: NodeId) -> String {
+    srui_semantic_tree::Event::try_from(event.clone())
+        .ok()
+        .and_then(|e| e.text_arg().map(|s| s.to_string()))
+        .unwrap_or_else(|| input_value(session, node))
+}
+
 /// Dispatches a `TEXT_EDIT` event on the filter input to the shared view (PX-010).
 pub fn filter_edited(
     view: &std::sync::Mutex<ProcessView>,
     session: &Session,
     event: &srui_protocol::Event,
 ) {
-    let text = srui_semantic_tree::Event::try_from(event.clone())
-        .ok()
-        .and_then(|e| e.text_arg().map(|s| s.to_string()))
-        .unwrap_or_else(|| {
-            session
-                .with_store(|store| {
-                    store.get_node(crate::FILTER_INPUT).and_then(|node| {
-                        match node.properties.get(&srui_sdk::VALUE) {
-                            Some(srui_sdk::Value::String(s)) => Some(s.clone()),
-                            _ => None,
-                        }
-                    })
-                })
-                .unwrap_or_default()
-        });
+    let text = edited_text(session, event, FILTER_INPUT);
     if let Err(error) = lock_view(view).handle_client_text_edit(session, &text) {
         eprintln!("srtop: filter not published: {error}");
+    }
+}
+
+/// Dispatches a `TEXT_EDIT` event on the search input to the shared view (PX-011).
+pub fn search_edited(
+    view: &std::sync::Mutex<ProcessView>,
+    session: &Session,
+    event: &srui_protocol::Event,
+) {
+    let text = edited_text(session, event, SEARCH_INPUT);
+    if let Err(error) = lock_view(view).set_search(session, &text) {
+        eprintln!("srtop: search not published: {error}");
+    }
+}
+
+/// Dispatches a `TEXT_EDIT` event on the PID field to the shared view (PX-011).
+pub fn pid_edited(
+    view: &std::sync::Mutex<ProcessView>,
+    session: &Session,
+    event: &srui_protocol::Event,
+) {
+    let text = edited_text(session, event, PID_INPUT);
+    if let Err(error) = lock_view(view).set_pid_input(session, &text) {
+        eprintln!("srtop: PID field not published: {error}");
+    }
+}
+
+/// Dispatches one Next or Previous click to the shared view (PX-011).
+pub fn search_stepped(view: &std::sync::Mutex<ProcessView>, session: &Session, step: SearchStep) {
+    if let Err(error) = lock_view(view).step_search(session, step) {
+        eprintln!("srtop: search step not published: {error}");
+    }
+}
+
+/// Dispatches one Go to PID click to the shared view (PX-011).
+pub fn pid_requested(view: &std::sync::Mutex<ProcessView>, session: &Session) {
+    if let Err(error) = lock_view(view).go_to_pid(session) {
+        eprintln!("srtop: PID search not published: {error}");
     }
 }
 
@@ -1271,6 +1499,9 @@ fn count(plan: &[Planned], result: &mut Refreshed) {
             Effect::Summary(_) => result.summary += 1,
             Effect::SortLabel { .. } => result.controls += 1,
             Effect::FilterStatus(_) | Effect::FilterValue(_) => result.controls += 1,
+            Effect::SearchStatus(_) | Effect::SearchEnabled { .. } | Effect::SearchValue { .. } => {
+                result.controls += 1
+            }
             Effect::Columns(_) | Effect::ChooserLabel { .. } | Effect::ChooserEnabled { .. } => {
                 result.controls += 1
             }
@@ -1473,7 +1704,8 @@ fn rows_word(count: usize) -> &'static str {
 ///
 /// The status is charged [`STATUS_RESERVE_BYTES`] rather than its own length,
 /// the system summary [`SUMMARY_RESERVE_BYTES`] rather than its own (PX-007), and
-/// the command filter controls [`FILTER_RESERVE_BYTES`] rather than their own (PX-010), so
+/// the command filter controls [`FILTER_RESERVE_BYTES`] rather than their own (PX-010), and
+/// the search controls [`SEARCH_RESERVE_BYTES`] rather than their own (PX-011), so
 /// the rows that fit are a function of the rows alone. A status or summary that
 /// grew because a scan or a collector failed therefore cannot shrink the row
 /// budget and delete a row no scan said had ended.
@@ -1486,7 +1718,11 @@ fn rows_word(count: usize) -> &'static str {
 /// nothing.
 fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
     let budget = MAX_TRANSACTION_PAYLOAD_BYTES.saturating_sub(
-        SNAPSHOT_SHELL_BYTES + STATUS_RESERVE_BYTES + SUMMARY_RESERVE_BYTES + FILTER_RESERVE_BYTES,
+        SNAPSHOT_SHELL_BYTES
+            + STATUS_RESERVE_BYTES
+            + SUMMARY_RESERVE_BYTES
+            + FILTER_RESERVE_BYTES
+            + SEARCH_RESERVE_BYTES,
     );
     let mut spent = 0usize;
     let mut kept = 0usize;
@@ -1655,6 +1891,18 @@ enum Effect {
         node: NodeId,
         enabled: bool,
     },
+    /// The search status text set (PX-011).
+    SearchStatus(String),
+    /// One search button enabled or disabled (PX-011).
+    SearchEnabled {
+        node: NodeId,
+        enabled: bool,
+    },
+    /// A search text field's value set to what the server keeps (PX-011).
+    SearchValue {
+        node: NodeId,
+        value: String,
+    },
     Delete(Vec<ItemId>),
     Insert(u64, Vec<Row>),
     Update(Vec<Row>),
@@ -1671,6 +1919,8 @@ struct Published<'a> {
     filter_status: &'a mut String,
     /// The column layout the headings announce (PX-068).
     columns: &'a mut ColumnLayout,
+    /// The search controls as announced (PX-011).
+    search: &'a mut SearchView,
 }
 
 /// The planned operations that turn the `published` summary into `target`:
@@ -1711,6 +1961,15 @@ impl Planned {
             }
             Effect::ChooserEnabled { node, enabled } => {
                 Operation::set_property(*node, ENABLED, Value::Bool(*enabled))
+            }
+            Effect::SearchStatus(text) => {
+                Operation::set_property(SEARCH_STATUS, TEXT, Value::String(text.clone()))
+            }
+            Effect::SearchEnabled { node, enabled } => {
+                Operation::set_property(*node, ENABLED, Value::Bool(*enabled))
+            }
+            Effect::SearchValue { node, value } => {
+                Operation::set_property(*node, VALUE, Value::String(value.clone()))
             }
             Effect::Delete(ids) => Operation::model_delete_items(MODEL, ids.iter().copied()),
             Effect::Insert(index, rows) => {
@@ -1759,7 +2018,11 @@ impl Effect {
                         .sum::<usize>()
             }
             Self::ChooserLabel { label, .. } => VALUE_FRAMING_BYTES + label.len(),
-            Self::ChooserEnabled { .. } => VALUE_FRAMING_BYTES + SCALAR_VALUE_BYTES,
+            Self::ChooserEnabled { .. } | Self::SearchEnabled { .. } => {
+                VALUE_FRAMING_BYTES + SCALAR_VALUE_BYTES
+            }
+            Self::SearchStatus(text) => VALUE_FRAMING_BYTES + text.len(),
+            Self::SearchValue { value, .. } => VALUE_FRAMING_BYTES + value.len(),
             Self::Delete(ids) => ids.len() * ITEM_ID_BYTES,
             Self::Insert(_, rows) | Self::Update(rows) => rows.iter().map(row_wire_bytes).sum(),
         }
@@ -1775,11 +2038,25 @@ impl Effect {
             sort,
             filter_status,
             columns,
+            search,
         } = published;
         match self {
             Self::Status(text) => status.clone_from(text),
             Self::FilterStatus(text) => filter_status.clone_from(text),
-            Self::FilterValue(_) | Self::ChooserLabel { .. } | Self::ChooserEnabled { .. } => {}
+            Self::FilterValue(_)
+            | Self::ChooserLabel { .. }
+            | Self::ChooserEnabled { .. }
+            | Self::SearchValue { .. } => {}
+            Self::SearchStatus(text) => search.status.clone_from(text),
+            Self::SearchEnabled { node, enabled } => {
+                if *node == SEARCH_PREVIOUS {
+                    search.previous = *enabled;
+                } else if *node == SEARCH_NEXT {
+                    search.next = *enabled;
+                } else if *node == PID_GO {
+                    search.go = *enabled;
+                }
+            }
             Self::Columns(layout) => columns.clone_from(layout),
             Self::Summary(change) => {
                 let key = (change.node, change.property);
@@ -2878,7 +3155,8 @@ mod tests {
             - (SNAPSHOT_SHELL_BYTES
                 + STATUS_RESERVE_BYTES
                 + SUMMARY_RESERVE_BYTES
-                + FILTER_RESERVE_BYTES);
+                + FILTER_RESERVE_BYTES
+                + SEARCH_RESERVE_BYTES);
         let mut published = Vec::new();
         for system in [
             SystemSample::not_provided(),
@@ -3091,6 +3369,28 @@ mod tests {
         let session = srui_sessiond::Session::mint();
         let status = "\u{20000}".repeat(STATUS_RESERVE_BYTES / 4);
         crate::initialize_rows(&session, Vec::new(), &status, &widest_summary(), false).unwrap();
+        // PX-011: every search value at its widest — the status at its bound,
+        // the query at the filter's cap and the PID field at its own.
+        session
+            .transaction(|ui| {
+                ui.set(
+                    SEARCH_STATUS,
+                    TEXT,
+                    "\u{20000}".repeat(crate::search::MAX_SEARCH_STATUS_BYTES / 4),
+                )?;
+                ui.set(
+                    SEARCH_INPUT,
+                    VALUE,
+                    "\u{20000}".repeat(crate::filter::MAX_FILTER_QUERY_BYTES / 4),
+                )?;
+                ui.set(
+                    PID_INPUT,
+                    VALUE,
+                    "9".repeat(crate::search::MAX_PID_INPUT_BYTES),
+                )?;
+                Ok(())
+            })
+            .unwrap();
         let hello = srui_protocol::ClientHello {
             core_version: "0.5.0".to_string(),
             profiles: vec!["org.srui.standard-widgets/1".to_string()],
@@ -3113,6 +3413,7 @@ mod tests {
                     + STATUS_RESERVE_BYTES
                     + SUMMARY_RESERVE_BYTES
                     + FILTER_RESERVE_BYTES
+                    + SEARCH_RESERVE_BYTES
                     + TRANSACTION_ENVELOPE_BYTES,
             "a snapshot with no row is {frame} bytes, above the allowances the row budget \
              leaves for it"
@@ -3123,6 +3424,7 @@ mod tests {
                 + STATUS_RESERVE_BYTES
                 + SUMMARY_RESERVE_BYTES
                 + FILTER_RESERVE_BYTES
+                + SEARCH_RESERVE_BYTES
         );
     }
 

@@ -1,10 +1,11 @@
 //! Read-only Process Explorer shell using existing SRUI widgets and transactions
 //! (design §§6–8, 12, 22, 29; PX-001/PX-002/PX-003/PX-004, PX-007 system
 //! summary, PX-009 server-authoritative sorting, PX-010 filtering, PX-068
-//! column chooser). No process is ever opened for control: the only
-//! client-input handlers are the sort buttons', the filter input's and the
-//! column chooser buttons', which reorder, filter or re-lay out the published
-//! rows and touch no process.
+//! column chooser, PX-011 find-next/find-previous and jump to PID). No process
+//! is ever opened for control: the only client-input handlers are the sort
+//! buttons', the filter input's, the column chooser buttons' and the search
+//! controls', which reorder, filter, re-lay out or locate the published rows
+//! and touch no process.
 
 pub mod catalogue;
 pub mod filter;
@@ -13,6 +14,7 @@ pub mod on_demand;
 pub mod procfs;
 mod projection;
 pub mod refresh;
+pub mod search;
 pub mod sort;
 pub mod source;
 pub mod summary;
@@ -69,6 +71,32 @@ pub const COLUMN_EARLIER_CPU: NodeId = NodeId::new(39);
 pub const COLUMN_LATER_CPU: NodeId = NodeId::new(40);
 /// The button that restores the default columns (PX-068).
 pub const COLUMNS_RESTORE: NodeId = NodeId::new(41);
+/// The search controls' row, between the filter controls and the sort controls
+/// (PX-011).
+pub const SEARCH_ROW: NodeId = NodeId::new(42);
+/// The native search text field: locates rows, hides none (PX-011).
+pub const SEARCH_INPUT: NodeId = NodeId::new(43);
+/// The buttons that move to the previous and the next match (PX-011).
+pub const SEARCH_PREVIOUS: NodeId = NodeId::new(44);
+pub const SEARCH_NEXT: NodeId = NodeId::new(45);
+/// The native PID text field and the button that resolves it (PX-011).
+pub const PID_INPUT: NodeId = NodeId::new(46);
+pub const PID_GO: NodeId = NodeId::new(47);
+/// The search status line: matches, current match and every explanation
+/// (PX-011).
+pub const SEARCH_STATUS: NodeId = NodeId::new(48);
+pub const SEARCH_LABEL: &str = "Find processes";
+pub const SEARCH_PLACEHOLDER: &str = "Find by name or command (| for OR); rows stay visible";
+pub const SEARCH_DESCRIPTION: &str =
+    "Locates matching rows on the server without hiding any row. Previous match and Next match move between them.";
+pub const SEARCH_PREVIOUS_LABEL: &str = "Previous match";
+pub const SEARCH_NEXT_LABEL: &str = "Next match";
+pub const PID_LABEL: &str = "PID to find";
+pub const PID_PLACEHOLDER: &str = "PID";
+pub const PID_DESCRIPTION: &str =
+    "A numeric PID. Go to PID selects the process the latest scan observed with it.";
+pub const PID_GO_LABEL: &str = "Go to PID";
+pub const SEARCH_NODE_COUNT: usize = 7;
 
 /// What one column chooser button does (PX-068). Each is resolved against the
 /// layout the server holds when the click is applied, never against anything
@@ -152,14 +180,15 @@ pub const STATUS_TEXT: &str = "Read-only · Process collection not started";
 /// Every node of the shell: the five above, the fourteen of the system summary
 /// (PX-007), which sits between the status line and the filter controls, the three
 /// of the filter bar (PX-010), the sort row with its four buttons (PX-009),
-/// and the column chooser's row with its buttons (PX-068). Rows are model
-/// items, never nodes.
+/// the column chooser's row with its buttons (PX-068) and the seven search
+/// controls (PX-011). Rows are model items, never nodes.
 pub const SHELL_NODE_COUNT: usize = 5
     + summary::NODE_COUNT
     + FILTER_NODE_COUNT
     + 1
     + SORT_BUTTONS.len()
-    + COLUMN_CHOOSER_NODE_COUNT;
+    + COLUMN_CHOOSER_NODE_COUNT
+    + SEARCH_NODE_COUNT;
 
 /// The sort button that orders `field`.
 pub fn sort_button_of(field: catalogue::ProcessField) -> NodeId {
@@ -257,6 +286,35 @@ pub fn install_filter_handlers(session: &Session, view: &refresh::SharedView) {
 /// Alias for [`install_filter_handlers`].
 pub fn register_filter_handlers(session: &Session, view: &refresh::SharedView) {
     install_filter_handlers(session, view);
+}
+
+/// Installs the search controls' handlers (§7.6, §22.6, PX-011): the search
+/// and PID fields' `TEXT_EDIT`, and the Previous match, Next match and Go to
+/// PID buttons' `ACTIVATE`. Each is applied before the event is acknowledged.
+/// The PID is read from the text the server kept for the PID field, never from
+/// a click; a click names only which button it was. No row is hidden or
+/// changed and no process is touched: a search only locates published rows.
+pub fn install_search_handlers(session: &Session, view: &refresh::SharedView) {
+    let edited = std::sync::Arc::clone(view);
+    session.on(SEARCH_INPUT, TEXT_EDIT, move |session, event| {
+        refresh::search_edited(&edited, session, event);
+    });
+    let previous = std::sync::Arc::clone(view);
+    session.on(SEARCH_PREVIOUS, ACTIVATE, move |session, _| {
+        refresh::search_stepped(&previous, session, search::SearchStep::Previous);
+    });
+    let next = std::sync::Arc::clone(view);
+    session.on(SEARCH_NEXT, ACTIVATE, move |session, _| {
+        refresh::search_stepped(&next, session, search::SearchStep::Next);
+    });
+    let pid = std::sync::Arc::clone(view);
+    session.on(PID_INPUT, TEXT_EDIT, move |session, event| {
+        refresh::pid_edited(&pid, session, event);
+    });
+    let go = std::sync::Arc::clone(view);
+    session.on(PID_GO, ACTIVATE, move |session, _| {
+        refresh::pid_requested(&go, session);
+    });
 }
 
 /// One click on `field`'s sort button.
@@ -548,6 +606,57 @@ pub(crate) fn initialize_rows(
                 TextRole::Caption
             })
             .create(ui)?;
+        // The search controls: standard TextInputs, Buttons and a status Text in
+        // a Row, between the filter controls and the sort controls (PX-011).
+        // Search locates rows and hides none; its buttons start disabled
+        // because nothing has been searched for yet.
+        let search = search::SearchView::initial(sort_enabled);
+        Row::builder(SEARCH_ROW)
+            .parent(COLUMN)
+            .spacing_role(SpacingRole::Normal)
+            .create(ui)?;
+        TextInput::builder(SEARCH_INPUT)
+            .parent(SEARCH_ROW)
+            .label(SEARCH_LABEL)
+            .placeholder(SEARCH_PLACEHOLDER)
+            .value("")
+            .role(InputRole::Search)
+            .accessible_description(SEARCH_DESCRIPTION)
+            .create(ui)?;
+        ui.set(SEARCH_INPUT, ENABLED, sort_enabled)?;
+        for (button, label, enabled) in [
+            (SEARCH_PREVIOUS, SEARCH_PREVIOUS_LABEL, search.previous),
+            (SEARCH_NEXT, SEARCH_NEXT_LABEL, search.next),
+        ] {
+            Button::builder(button)
+                .parent(SEARCH_ROW)
+                .label(label)
+                .create(ui)?;
+            ui.set(button, ENABLED, enabled)?;
+        }
+        TextInput::builder(PID_INPUT)
+            .parent(SEARCH_ROW)
+            .label(PID_LABEL)
+            .placeholder(PID_PLACEHOLDER)
+            .value("")
+            .role(InputRole::Plain)
+            .accessible_description(PID_DESCRIPTION)
+            .create(ui)?;
+        ui.set(PID_INPUT, ENABLED, sort_enabled)?;
+        Button::builder(PID_GO)
+            .parent(SEARCH_ROW)
+            .label(PID_GO_LABEL)
+            .create(ui)?;
+        ui.set(PID_GO, ENABLED, search.go)?;
+        Text::builder(SEARCH_STATUS)
+            .parent(SEARCH_ROW)
+            .text(search.status)
+            .role(if sort_enabled {
+                TextRole::Status
+            } else {
+                TextRole::Caption
+            })
+            .create(ui)?;
         // The sort controls: standard Buttons in a Row, one per catalogued
         // column, whose labels state the active order and whose activation is
         // the only client input this app handles (PX-009).
@@ -736,10 +845,11 @@ mod tests {
         session.with_store(|store| {
             // The five shell nodes, the fourteen of the system summary
             // (PX-007), the three of the filter bar (PX-010), the sort row
-            // with its four buttons (PX-009) and the column chooser's row with
-            // its thirteen buttons (PX-068).
-            assert_eq!(store.node_count(), 41);
-            assert_eq!(SHELL_NODE_COUNT, 41);
+            // with its four buttons (PX-009), the column chooser's row with
+            // its thirteen buttons (PX-068) and the seven search controls
+            // (PX-011).
+            assert_eq!(store.node_count(), 48);
+            assert_eq!(SHELL_NODE_COUNT, 48);
             assert_eq!(store.root_ids(), &[SURFACE]);
             assert_eq!(store.children_of(SURFACE), Some([COLUMN].as_slice()));
             assert_eq!(
@@ -750,6 +860,7 @@ mod tests {
                         STATUS,
                         summary::SUMMARY,
                         FILTER_ROW,
+                        SEARCH_ROW,
                         SORT_ROW,
                         COLUMN_CHOOSER_ROW,
                         TABLE
@@ -760,6 +871,20 @@ mod tests {
             assert_eq!(
                 store.children_of(FILTER_ROW),
                 Some([FILTER_INPUT, FILTER_STATUS].as_slice())
+            );
+            assert_eq!(
+                store.children_of(SEARCH_ROW),
+                Some(
+                    [
+                        SEARCH_INPUT,
+                        SEARCH_PREVIOUS,
+                        SEARCH_NEXT,
+                        PID_INPUT,
+                        PID_GO,
+                        SEARCH_STATUS
+                    ]
+                    .as_slice()
+                )
             );
             assert_eq!(
                 store.children_of(SORT_ROW),
@@ -811,6 +936,13 @@ mod tests {
                 (SORT_CPU, TypeRef::BUTTON),
                 (COLUMN_CHOOSER_ROW, TypeRef::ROW),
                 (TABLE, TypeRef::TABLE),
+                (SEARCH_ROW, TypeRef::ROW),
+                (SEARCH_INPUT, TypeRef::TEXT_INPUT),
+                (SEARCH_PREVIOUS, TypeRef::BUTTON),
+                (SEARCH_NEXT, TypeRef::BUTTON),
+                (PID_INPUT, TypeRef::TEXT_INPUT),
+                (PID_GO, TypeRef::BUTTON),
+                (SEARCH_STATUS, TypeRef::TEXT),
             ];
             let summary_nodes = summary::LAYOUT.map(|(id, node_type, _)| (id, node_type));
             let chooser = COLUMN_CHOOSER_BUTTONS.map(|(id, _)| (id, TypeRef::BUTTON));
@@ -838,6 +970,22 @@ mod tests {
             assert_eq!(
                 filter_status.get_property(TEXT),
                 Some(&Value::String(UNCOLLECTED_FILTER_STATUS.into()))
+            );
+            // So are the search controls, and their status says why (PX-011).
+            for (node, label) in [
+                (SEARCH_INPUT, SEARCH_LABEL),
+                (SEARCH_PREVIOUS, SEARCH_PREVIOUS_LABEL),
+                (SEARCH_NEXT, SEARCH_NEXT_LABEL),
+                (PID_INPUT, PID_LABEL),
+                (PID_GO, PID_GO_LABEL),
+            ] {
+                let node = store.get_node(node).unwrap();
+                assert_eq!(node.get_property(LABEL), Some(&Value::String(label.into())));
+                assert_eq!(node.get_property(ENABLED), Some(&Value::Bool(false)));
+            }
+            assert_eq!(
+                store.get_node(SEARCH_STATUS).unwrap().get_property(TEXT),
+                Some(&Value::String(search::UNCOLLECTED_STATUS.into()))
             );
             // The sort buttons of a shell that samples nothing are disabled:
             // there is no collection for them to order, and a disabled control
@@ -984,6 +1132,7 @@ mod tests {
                         STATUS,
                         summary::SUMMARY,
                         FILTER_ROW,
+                        SEARCH_ROW,
                         SORT_ROW,
                         COLUMN_CHOOSER_ROW,
                         TABLE

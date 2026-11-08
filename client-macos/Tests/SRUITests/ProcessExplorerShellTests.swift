@@ -597,6 +597,125 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
+    /// PX-011: search is a standard native text field, two standard buttons that step between
+    /// matches, a PID field and a Go to PID button. Every one sends a standard `TEXT_EDIT` or
+    /// `ACTIVATE`; the server keeps the current match by item ID and publishes it on the search
+    /// status line. The native table keeps every row throughout: search locates, never hides.
+    @Test(.timeLimit(.minutes(1)))
+    @MainActor
+    func searchLocatesMatchesWithoutHidingRowsAndJumpsToAPID() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-source"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        renderer.textEditingSession.debounceNanoseconds = 0
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer over SSH with search controls") {
+            applier.lastAppliedRevision == Revision(1)
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(Self.searchStatusID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
+        let table = try #require((tableHandle.view as? NSScrollView)?.documentView as? NSTableView)
+        let searchHandle = try #require(renderer.registry.handle(for: NodeId(Self.searchInputID)))
+        let searchField = try #require(searchHandle.view as? NSTextField)
+        let searchAdapter = try #require(searchHandle.textAdapter)
+        let pidHandle = try #require(renderer.registry.handle(for: NodeId(Self.pidInputID)))
+        let pidField = try #require(pidHandle.view as? NSTextField)
+        let pidAdapter = try #require(pidHandle.textAdapter)
+        let previous = try #require(renderer.registry.handle(for: NodeId(Self.searchPreviousID))?.view as? NSButton)
+        let next = try #require(renderer.registry.handle(for: NodeId(Self.searchNextID))?.view as? NSButton)
+        let go = try #require(renderer.registry.handle(for: NodeId(Self.pidGoID))?.view as? NSButton)
+        let statusHandle = try #require(renderer.registry.handle(for: NodeId(Self.searchStatusID)))
+        let statusField = try #require(statusHandle.view as? NSTextField)
+        let identities = Self.modelItemIDs(applier)
+        #expect(identities.count == 3)
+
+        #expect(searchField.isEditable && pidField.isEditable)
+        #expect(searchField.placeholderString == "Find by name or command (| for OR); rows stay visible")
+        #expect(previous.title == "Previous match" && next.title == "Next match" && go.title == "Go to PID")
+        #expect(!previous.isEnabled && !next.isEnabled && !go.isEnabled)
+        #expect(statusField.stringValue == "Search: none · search never hides rows")
+
+        func type(_ text: String, into field: NSTextField, _ adapter: NativeTextEditorAdapter) {
+            field.stringValue = text
+            adapter.notifyTextDidChangeForTests()
+            adapter.notifyEndEditingForTests()
+        }
+        /// Every row is still in the native table, in the same order, under the same item IDs.
+        func expectEveryRowShown(_ step: String) {
+            #expect(table.numberOfRows == 3, "\(step): search hides no row")
+            #expect(Self.nativeRows(table) == Self.fakeRows, "\(step)")
+            #expect(Self.modelItemIDs(applier) == identities, "\(step)")
+        }
+        var trace: [String] = []
+        func waitForStatus(_ fragment: String) async throws {
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "search status contains \(fragment)") {
+                statusField.stringValue.contains(fragment)
+            }
+            trace.append(statusField.stringValue)
+        }
+
+        // Two identical names: the first match is selected by the new search, then Next and
+        // Previous cycle predictably and wrap in both directions.
+        type("worker", into: searchField, searchAdapter)
+        try await waitForStatus("\"worker\": 2 matches in 3 shown rows · match 1 of 2 at row 1 of 3 · PID 4101 · worker")
+        #expect(previous.isEnabled && next.isEnabled)
+        expectEveryRowShown("first match")
+        for (button, nth, pid) in [(next, 2, 4102), (next, 1, 4101), (previous, 2, 4102), (previous, 1, 4101)] {
+            NativeActivation.click(button)
+            try await waitForStatus("match \(nth) of 2 at row \(nth) of 3 · PID \(pid) · worker")
+            expectEveryRowShown("\(button.title) to match \(nth)")
+        }
+
+        // No match: a visible explanation, navigation disabled, every row still shown.
+        type("zzz", into: searchField, searchAdapter)
+        try await waitForStatus("no match for \"zzz\" in 3 shown rows; search hides no rows")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "navigation disabled") {
+            !previous.isEnabled && !next.isEnabled
+        }
+        expectEveryRowShown("no match")
+        type("", into: searchField, searchAdapter)
+        try await waitForStatus("Search: none")
+
+        // Jump to a PID: Go to PID is enabled only once the server holds a PID.
+        type("4102", into: pidField, pidAdapter)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "Go to PID enabled") { go.isEnabled }
+        NativeActivation.click(go)
+        try await waitForStatus("PID 4102 found at row 2 of 3 · worker")
+        expectEveryRowShown("PID jump")
+        // A PID no shown process has is explained, not silently ignored.
+        type("9999", into: pidField, pidAdapter)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "PID field held") {
+            applier.store.getNode(NodeId(Self.pidInputID))?.getProperty(.value) == .string("9999") && go.isEnabled
+        }
+        NativeActivation.click(go)
+        try await waitForStatus("no shown process has PID 9999")
+        // A malformed PID cannot be submitted, and the status says why.
+        type("41a", into: pidField, pidAdapter)
+        try await waitForStatus("PID field: digits only")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "Go to PID disabled") { !go.isEnabled }
+        expectEveryRowShown("malformed PID")
+
+        // Native handles were built once and kept throughout.
+        #expect(renderer.registry.handle(for: NodeId(5)) === tableHandle)
+        #expect(renderer.registry.handle(for: NodeId(Self.searchInputID)) === searchHandle)
+        #expect(renderer.registry.handle(for: NodeId(Self.searchStatusID)) === statusHandle)
+        print("PX-011 native SSH evidence: window \(window.windowNumber); rows=\(Self.nativeRows(table)); itemIDs=\(Self.modelItemIDs(applier)); statuses=\(trace); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
+    // PX-011: the search controls.
+    fileprivate static let searchInputID: UInt64 = 43
+    fileprivate static let searchPreviousID: UInt64 = 44
+    fileprivate static let searchNextID: UInt64 = 45
+    fileprivate static let pidInputID: UInt64 = 46
+    fileprivate static let pidGoID: UInt64 = 47
+    fileprivate static let searchStatusID: UInt64 = 48
+
     /// PX-068: the column chooser is a set of standard native buttons; a click is a standard
     /// `ACTIVATE`, the server republishes the table's `columns` and every row's cells in the
     /// chosen sequence, and the generic client shows them in the same native table with the

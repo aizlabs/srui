@@ -7,7 +7,7 @@ use srui_process_explorer::source::*;
 use srui_process_explorer::summary::{FRESHNESS_TEXT, LAYOUT, SUMMARY};
 use srui_process_explorer::{
     start_from_source, COLUMN, COLUMN_CHOOSER_ROW, FILTER_ROW, FILTER_STATUS, HEADING, MODEL,
-    SHELL_NODE_COUNT, SORT_ROW, STATUS, SURFACE, TABLE,
+    SEARCH_ROW, SHELL_NODE_COUNT, SORT_ROW, STATUS, SURFACE, TABLE,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
 use srui_sdk::{EnumToken, ItemId, NodeId, Operation, TextRole, Value, ROLE, TEXT};
@@ -117,6 +117,7 @@ fn assert_shell_intact(session: &Session) {
                     STATUS,
                     SUMMARY,
                     FILTER_ROW,
+                    SEARCH_ROW,
                     SORT_ROW,
                     COLUMN_CHOOSER_ROW,
                     TABLE

@@ -672,8 +672,15 @@ impl ProcessView {
         // Retention is bounded by construction, whatever a scan can and cannot
         // enumerate: the rows carried forward are evicted down to what the
         // published-row ceiling leaves once this scan's own rows are counted.
-        let evicted =
+        let evicted_ids =
             evict_unconfirmed_beyond(&mut unfiltered_target, &confirmed_ids, self.published_limit);
+        let evicted = evicted_ids.len();
+        // The inspector learns what this scan established about its target
+        // before anything is planned (PX-013 review round): its latest row, or
+        // that retention dropped it unconfirmed, which is not an exit, or that
+        // a scan entitled to say so found it gone.
+        self.inspector
+            .observe_scan(&unfiltered_target, &evicted_ids, &retention);
         // Every filter is applied to the collection together (PX-012): the
         // user filter, the PID set and the text filter.
         let visible = self.visible(&unfiltered_target);
@@ -2161,9 +2168,9 @@ fn evict_unconfirmed_beyond(
     rows: &mut Vec<Row>,
     confirmed: &HashSet<ItemId>,
     limit: usize,
-) -> usize {
+) -> HashSet<ItemId> {
     if rows.len() <= limit {
-        return 0;
+        return HashSet::new();
     }
     let mut excess = rows.len() - limit;
     let mut evicted: HashSet<ItemId> = HashSet::new();
@@ -2176,11 +2183,10 @@ fn evict_unconfirmed_beyond(
             excess -= 1;
         }
     }
-    if evicted.is_empty() {
-        return 0;
+    if !evicted.is_empty() {
+        rows.retain(|row| !evicted.contains(&row.item_id));
     }
-    rows.retain(|row| !evicted.contains(&row.item_id));
-    evicted.len()
+    evicted
 }
 
 /// Keeps rows the scan did not confirm and could not account for, in the
@@ -2565,9 +2571,7 @@ impl Effect {
                 for row in rows.iter_mut() {
                     if let Some(update) = values.get(&row.item_id) {
                         row.value = update.value.clone();
-                        row.cells = update.cells.clone();
-                        row.sort = update.sort.clone();
-                        row.display_name = update.display_name.clone();
+                        row.adopt_sample(update);
                     }
                 }
             }
@@ -2769,15 +2773,7 @@ fn refresh_sort_values(rows: &mut [Row], target: &[Row]) {
     let current: HashMap<ItemId, &Row> = target.iter().map(|row| (row.item_id, row)).collect();
     for row in rows.iter_mut() {
         if let Some(latest) = current.get(&row.item_id) {
-            if row.sort != latest.sort {
-                row.sort = latest.sort.clone();
-            }
-            if row.cells != latest.cells {
-                row.cells = latest.cells.clone();
-            }
-            if row.display_name != latest.display_name {
-                row.display_name = latest.display_name.clone();
-            }
+            row.adopt_sample(latest);
         }
     }
 }
@@ -4057,7 +4053,10 @@ mod tests {
         let confirmed: HashSet<ItemId> = [rows[1].item_id, rows[8].item_id].into_iter().collect();
 
         let mut inside = rows.clone();
-        assert_eq!(evict_unconfirmed_beyond(&mut inside, &confirmed, 10), 0);
+        assert_eq!(
+            evict_unconfirmed_beyond(&mut inside, &confirmed, 10).len(),
+            0
+        );
         assert_eq!(
             ids(&inside),
             ids(&rows),
@@ -4066,7 +4065,7 @@ mod tests {
 
         let mut bounded_rows = rows.clone();
         assert_eq!(
-            evict_unconfirmed_beyond(&mut bounded_rows, &confirmed, 6),
+            evict_unconfirmed_beyond(&mut bounded_rows, &confirmed, 6).len(),
             4
         );
         assert_eq!(
@@ -4084,13 +4083,13 @@ mod tests {
         // Repeating the same eviction is the same eviction: nothing here depends
         // on iteration order or on when a row was last seen.
         let mut again = rows.clone();
-        assert_eq!(evict_unconfirmed_beyond(&mut again, &confirmed, 6), 4);
+        assert_eq!(evict_unconfirmed_beyond(&mut again, &confirmed, 6).len(), 4);
         assert_eq!(ids(&again), ids(&bounded_rows));
 
         let every: HashSet<ItemId> = rows.iter().map(|row| row.item_id).collect();
         let mut confirmed_only = rows.clone();
         assert_eq!(
-            evict_unconfirmed_beyond(&mut confirmed_only, &every, 3),
+            evict_unconfirmed_beyond(&mut confirmed_only, &every, 3).len(),
             0,
             "a row this scan confirmed is never evicted"
         );

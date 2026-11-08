@@ -1742,4 +1742,59 @@ mod tests {
             );
         });
     }
+
+    /// PR review: a callback that calls settlement, swallows its refusal and returns `Ok` is still
+    /// refused by the sessiond commit path, and nothing is journaled (§6.3, §12.1).
+    #[test]
+    fn swallowed_settlement_refusal_is_refused_again_by_sessiond() {
+        use srui_semantic_tree::{EnumToken, ItemId, ModelId, ModelItem};
+
+        let session = Session::new("swallowed-refusal");
+        let model = ModelId::new(7);
+        let table = NodeId::new(2);
+        session
+            .transaction(|ui| {
+                ui.create_node(NodeId::new(1), TypeRef::SURFACE, None, None, [])?;
+                ui.apply_op(&Operation::create_model(model, TypeRef::TABLE, 0))?;
+                ui.apply_op(&Operation::model_insert(
+                    model,
+                    0,
+                    [ModelItem::with_value(ItemId::new(1), Value::from(1u64))],
+                ))?;
+                ui.create_node(
+                    table,
+                    TypeRef::TABLE,
+                    Some(NodeId::new(1)),
+                    None,
+                    [
+                        (PropertyRef::MODEL_REF, Value::UnsignedInt(model.get())),
+                        (
+                            PropertyRef::SELECTION_MODE,
+                            Value::EnumToken(EnumToken::SELECTION_MODE_SINGLE),
+                        ),
+                    ],
+                )
+            })
+            .expect("setup");
+        let revision = session.current_revision();
+        let err = session
+            .transaction(|ui| {
+                ui.set(
+                    table,
+                    PropertyRef::VALUE,
+                    Value::ItemId(ItemId::new(999_999)),
+                )?;
+                let _ignored = ui.settle_promoted_selections();
+                Ok(())
+            })
+            .expect_err("refused again at commit");
+        assert!(
+            matches!(err, SessionError::Store(StoreError::ItemNotFound(_))),
+            "{err:?}"
+        );
+        assert_eq!(session.current_revision(), revision);
+        session.with_store(|store| {
+            assert_eq!(store.get_node(table).unwrap().promoted_selection(), None);
+        });
+    }
 }

@@ -469,3 +469,75 @@ fn transaction_custom_settles_promotions_too() {
     assert_eq!(session.current_revision(), revision);
     assert_eq!(promoted(&session), None);
 }
+
+// -----------------------------------------------------------------------------------------------
+// PR review: a refused settlement swallowed by the callback must still refuse the commit.
+// -----------------------------------------------------------------------------------------------
+
+/// Promotes an unknown item, calls settlement, swallows its refusal and reports success.
+fn promote_unknown_and_swallow_refusal(ui: &mut UiTransaction) -> Result<(), StoreError> {
+    ui.set(TABLE, LABEL, "renamed")?;
+    ui.set(TABLE, VALUE, Value::ItemId(ItemId::new(999_999)))?;
+    assert!(matches!(
+        ui.settle_promoted_selections(),
+        Err(StoreError::ItemNotFound(_))
+    ));
+    Ok(())
+}
+
+fn assert_refused_and_rolled_back(session: &Session, revision: Revision, err: SdkError) {
+    assert!(
+        matches!(err, SdkError::Store(StoreError::ItemNotFound(id)) if id == ItemId::new(999_999)),
+        "{err:?}"
+    );
+    assert_eq!(session.current_revision(), revision);
+    assert_eq!(promoted(session), None);
+    session.with_store(|store| {
+        assert!(!store
+            .get_node(NodeId::new(TABLE))
+            .unwrap()
+            .has_property(LABEL));
+    });
+}
+
+#[test]
+fn swallowed_settlement_refusal_is_refused_again_by_transaction() {
+    let session = session(SelectionMode::Single);
+    let revision = session.current_revision();
+    let err = session
+        .transaction(promote_unknown_and_swallow_refusal)
+        .expect_err("the commit path settles again");
+    assert_refused_and_rolled_back(&session, revision, err);
+}
+
+#[test]
+fn swallowed_settlement_refusal_is_refused_again_by_transaction_custom() {
+    let session = session(SelectionMode::Single);
+    let revision = session.current_revision();
+    let err = session
+        .transaction_custom(|ui| promote_unknown_and_swallow_refusal(ui).map_err(|e| e.to_string()))
+        .expect_err("the commit path settles again");
+    assert_refused_and_rolled_back(&session, revision, err);
+}
+
+#[test]
+fn a_failed_clear_leaves_the_transaction_unsettled() {
+    // Op budget: the delete fits, the settlement's CLEAR_PROPERTY does not.
+    let session = session(SelectionMode::Single);
+    session
+        .transaction(|ui| ui.promote_selection(TABLE, ItemId::new(3)))
+        .unwrap();
+    session.with_store(|store| {
+        let mut ui = UiTransaction::new(store.clone_staging(), 1);
+        ui.apply_op(&Operation::model_delete_items(MODEL, [ItemId::new(3)]))
+            .unwrap();
+        assert!(
+            ui.settle_promoted_selections().is_err(),
+            "the clear exceeds the op budget"
+        );
+        assert!(
+            ui.settle_promoted_selections().is_err(),
+            "still unsettled after a failed clear"
+        );
+    });
+}

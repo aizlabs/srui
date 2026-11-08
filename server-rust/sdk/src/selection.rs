@@ -224,24 +224,28 @@ impl UiTransaction {
     /// [`StoreError::ItemNotFound`], so the whole transaction is discarded — or cleared in this
     /// same commit, when the promotion predates the transaction and this transaction removed its
     /// item (delete, range reset, positional update, `model_ref` change). A move under sorting
-    /// keeps the promotion because the item is present again at commit. Called by every SDK and
-    /// sessiond commit path; calling it again is a no-op.
+    /// keeps the promotion because the item is present again at commit. Every SDK and sessiond
+    /// commit path calls it.
+    ///
+    /// The tracking state is reset only after success. A refusal, or a clear that fails part-way
+    /// (for example at `max_transaction_operations`), leaves it in place, so a caller that calls
+    /// this method, ignores the error and lets the transaction commit is refused again by the
+    /// commit path's own settlement. After a success, calling it again is a no-op.
     pub fn settle_promoted_selections(&mut self) -> Result<(), StoreError> {
-        let tracker = std::mem::take(&mut self.promotions);
-        if !tracker.dirty {
+        if !self.promotions.dirty {
             return Ok(());
         }
         let dangling = dangling_promotions(&self.staged);
         if let Some(&(_, item)) = dangling
             .iter()
-            .find(|(node, _)| tracker.assigned.contains(node))
+            .find(|(node, _)| self.promotions.assigned.contains(node))
         {
             return Err(StoreError::ItemNotFound(item));
         }
         for (node_id, _) in dangling {
+            // Recording the clear re-marks the tracker dirty; on error it stays dirty.
             self.clear(node_id, PropertyRef::VALUE)?;
         }
-        // The clears above were recorded through `clear`, which only re-marks the tracker.
         self.promotions = PromotionTracker::default();
         Ok(())
     }

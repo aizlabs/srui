@@ -3408,17 +3408,25 @@ pub async fn poll<S>(
     let mut paused = false;
     loop {
         // The first snapshot is already published, so the first periodic
-        // sample is one interval from now.
-        let ticked = tokio::select! {
+        // sample is one interval from now. `biased`, so a ready shutdown always
+        // wins; which of the wake and the tick is taken when both are ready
+        // decides nothing, because the request read below does: a tick of a
+        // ticker the request retires is ignored either way (PR #95 review, F2).
+        let mut ticked = tokio::select! {
+            biased;
             _ = shutdown.cancelled() => return,
-            _ = ticker.tick(), if !paused => true,
             _ = wake.notified() => false,
+            _ = ticker.tick(), if !paused => true,
         };
         let request = lock_view(&view).sampling.take_request();
         paused = request.paused;
         if request.retime || request.interval != interval {
             interval = request.interval;
             ticker = ticker_every(interval);
+            // That tick belonged to the ticker just retired. Only an explicit
+            // request (Resume view) samples now; a new interval waits one new
+            // interval, however long the scan before it ran.
+            ticked = false;
         }
         if paused || !(ticked || request.sample_now) {
             continue;

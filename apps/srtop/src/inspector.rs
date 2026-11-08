@@ -589,9 +589,12 @@ impl Inspector {
     }
 
     /// The view is paused (PX-015): a read still loading is deferred, and
-    /// its result is dropped when it returns.
+    /// the current target moves to a new generation, so the result of any
+    /// read asked for before the pause is dropped whenever it returns —
+    /// during the pause or after a resume (PR #95 review, F1).
     pub(crate) fn pause(&mut self) {
         self.paused = true;
+        self.renew();
         if let Selection::Process(selected) = &mut self.selection {
             if selected.details == Details::Loading {
                 selected.details = Details::Deferred;
@@ -599,14 +602,26 @@ impl Inspector {
         }
     }
 
-    /// The view is live again (PX-015): a deferred read is asked for now.
+    /// The view is live again (PX-015): the current target moves to another
+    /// new generation, and a deferred read is asked for under it. Only a
+    /// read asked for from here on can land.
     pub(crate) fn resume(&mut self) {
         self.paused = false;
+        self.renew();
         if let Selection::Process(selected) = &mut self.selection {
             if selected.details == Details::Deferred {
                 selected.details = Details::Loading;
                 self.ask();
             }
+        }
+    }
+
+    /// Moves the current target to a new generation, keeping its row and
+    /// details: every read asked for under an earlier one is stale.
+    fn renew(&mut self) {
+        if let Selection::Process(selected) = &mut self.selection {
+            self.generation = self.generation.next();
+            selected.generation = self.generation;
         }
     }
 

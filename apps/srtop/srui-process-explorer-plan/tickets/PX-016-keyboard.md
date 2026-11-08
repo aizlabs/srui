@@ -5,7 +5,7 @@ Edition 1.2 · 12 September 2026. Use the authoritative SRUI v0.6 design and the
 ## PX-016 — Make the basic workflow keyboard accessible
 
 **Phase:** B · **Scope size:** M · **Status:** planned · **Gate:** none
-**Dependencies:** PX-015
+**Dependencies:** PX-015, PX-016-G01
 **Read:** D1 §§7.6, 22.5–22.9; D2 T16, T33, T35
 
 ### Standing execution contract

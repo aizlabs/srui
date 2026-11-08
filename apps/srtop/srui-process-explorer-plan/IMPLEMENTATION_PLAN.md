@@ -764,10 +764,34 @@ Apply the standing completion contract. Record evidence in `docs/process-explore
 
 ---
 
+#### PX-016-G01 — Platform-neutral semantic keyboard shortcuts
+
+**Phase:** B · **Scope size:** M · **Status:** planned · **Gate:** R1-prerequisite
+**Dependencies:** PX-015
+**Read:** D1 §§4 inv. 13, 7.2, 7.4, 7.6, 7.7, 22.5, 22.6, 22.8, 22.9, 26, 32; D2 T9, T16, T33, T35
+
+##### Build
+
+Add one standard property `shortcut`: a string in a closed canonical grammar `[primary+][shift+][alt+]<key>`, where `<key>` is one ASCII letter or digit or one of a small closed set of named keys, bounded at 32 bytes; `primary` is Command on macOS and Control elsewhere. Unknown tokens, duplicate or misordered modifiers, and over-length values fail explicitly at decode and apply (§4 inv. 13). Semantics by node type: Button dispatches ACTIVATE through the same path as a click; Toggle changes its value through the normal VALUE_CHANGED path; TextInput, TextArea, List, Table, Tree and selectable RichText move local focus only and send no event (§22.5); any other node type is refused. A printable key requires `primary`, so a bare letter never competes with a text editor. The client never dispatches while the first responder has marked text (IME), or for a disabled, hidden or collapsed node, or when its window is not key; the server still refuses a forged event to a disabled node. A shortcut in the platform's reserved table is never bound and yields a renderer diagnostic (macOS: Cmd-Q, Cmd-W, Cmd-H, Opt-Cmd-H, Cmd-M, Cmd-Tab, Cmd-`, Cmd-comma, Cmd-C, Cmd-V, Cmd-X, Cmd-A, Cmd-Z, Shift-Cmd-Z, Cmd-Space, Ctrl-Cmd-F, Cmd-?). Duplicate shortcuts within one Surface are refused at apply. The platform-formatted shortcut is discoverable in the tooltip, accessibility help and the T35 inspection snapshot. SDK builder/set/clear on the admitted widgets. Registry, spec/registries.md, build.rs count asserts and generated Swift tables updated through codegen; DirtyClassifier treats it as an in-place update. The generic client shell gains a standard Edit menu (Undo, Redo, Cut, Copy, Paste, Select All) and keeps the Surface window's key-view loop recalculated after remounts. No application-specific client path.
+
+##### Out of scope
+
+No Menu or Toolbar node types, user-customizable bindings, multi-key chords, global hotkeys, external IPC, local policy engine, or Process Explorer feature work (PX-016 adopts this separately).
+
+##### Verification / acceptance criteria
+
+Rust and Swift tests plus conformance vectors: suite 2 (accepted on admitted types, refused on others), suite 5 (a shortcut ACTIVATE is byte-identical to a click; a disabled node gets no event and a forged one is refused with NodeDisabled; a focus shortcut emits no event), suite 6 (a bare printable key is refused; no dispatch with marked text; letters typed into a TextInput never trigger a shortcut), suite 9 (negative malformed vectors for over-length, unknown token and duplicate modifier on both Rust and Swift decode paths), suites 10 and 12 (maps to keyEquivalent and modifier mask; a reserved combination stays unbound with a diagnostic; SET and CLEAR update in place; duplicates refused) and suite 11 (shortcut in the inspection snapshot). Native AppKit tests with real NSEvents: a Command shortcut activates a Button; the same key does nothing for a disabled Button or during IME composition; Cmd-C in a TextInput copies through the new Edit menu and is not overridden; Tab order survives a remount.
+
+##### Handoff and completion
+
+Apply the standing completion contract. Record evidence in `docs/process-explorer/completions/PX-016-G01.md`, update the individual feature ledger, and commit only this bounded change after required checks pass. A gate remains open if a required behavior or native test is missing.
+
+---
+
 #### PX-016 — Make the basic workflow keyboard accessible
 
 **Phase:** B · **Scope size:** M · **Status:** planned · **Gate:** none
-**Dependencies:** PX-015
+**Dependencies:** PX-015, PX-016-G01
 **Read:** D1 §§7.6, 22.5–22.9; D2 T16, T33, T35
 
 ##### Build

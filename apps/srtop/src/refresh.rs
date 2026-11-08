@@ -231,11 +231,16 @@ pub const FILTER_RESERVE_BYTES: usize = 2048;
 /// Bytes reserved for the search controls in a catch-up snapshot (PX-011): the
 /// row, the search and PID `TextInput`s with their labels and bounded values,
 /// the three buttons and the status line at
-/// [`crate::search::MAX_SEARCH_STATUS_BYTES`]. Charged at this fixed reserve,
+/// [`crate::search::MAX_SEARCH_STATUS_BYTES`], and the table's promoted
+/// selection (one `ItemId` `value`, PX-011-G01). Charged at this fixed reserve,
 /// like the status and the filter, so a long search status can never shrink
 /// the row budget. `the_shell_status_and_summary_fit_their_snapshot_allowances`
 /// measures it with every search value at its widest.
 pub const SEARCH_RESERVE_BYTES: usize = 4096;
+
+/// Bytes the `CLEAR_PROPERTY` settlement adds when a commit removes the
+/// promoted row (PX-011-G01): a clear carries no value.
+const PROMOTION_CLEAR_BYTES: usize = OPERATION_FRAMING_BYTES + OPERATION_HEADER_BYTES;
 
 /// The most of a rejection reason the status quotes. The reason is this app's
 /// own error text, not a record's, and it is bounded all the same so that the
@@ -368,6 +373,10 @@ pub struct ProcessView {
     /// bounded by [`MAX_PUBLISHED_ROWS`]; replaced, never grown, on every
     /// refresh. A PID jump never selects one of these (PX-011).
     unconfirmed: HashSet<ItemId>,
+    /// The table's promoted selection (PX-011-G01) as the store holds it after
+    /// the last commit: set by an explicit search, cleared by settlement when
+    /// its row leaves the model.
+    promoted: Option<ItemId>,
 }
 
 /// Why a column layout request was not published (PX-068).
@@ -417,6 +426,25 @@ impl ProcessView {
             filter_status: &mut self.filter_status,
             columns: &mut self.columns,
             search: &mut self.search_published,
+            promoted: &mut self.promoted,
+        }
+    }
+
+    /// This store's mutation bounds for a plan that may remove rows. While the
+    /// table holds a promoted selection, the SDK's settlement adds one
+    /// `CLEAR_PROPERTY` to the transaction that removes its row (PX-011-G01),
+    /// and that operation counts against the same operation and frame bounds,
+    /// so one operation and its bytes are left free for it.
+    fn planning_limits(&self, session: &Session) -> (usize, usize, usize) {
+        let (batch, max_ops) = mutation_limits(session);
+        if self.promoted.is_some() {
+            (
+                batch,
+                max_ops.saturating_sub(1).max(1),
+                MAX_TRANSACTION_PAYLOAD_BYTES - PROMOTION_CLEAR_BYTES,
+            )
+        } else {
+            (batch, max_ops, MAX_TRANSACTION_PAYLOAD_BYTES)
         }
     }
 
@@ -500,6 +528,7 @@ impl ProcessView {
                 search: Search::default(),
                 search_published: SearchView::initial(true),
                 unconfirmed: HashSet::new(),
+                promoted: None,
             },
             snapshot,
         ))
@@ -632,7 +661,7 @@ impl ProcessView {
             unfiltered_target.len(),
         );
 
-        let (batch, max_ops) = mutation_limits(session);
+        let (batch, max_ops, max_bytes) = self.planning_limits(session);
 
         let mut plan = Vec::new();
         if status != self.status {
@@ -648,20 +677,9 @@ impl ProcessView {
         plan.extend(summary_effects(&self.summary, &summary));
         // Then the rows that changed place, each moved under its own item ID
         // (PX-009), and only then what really appeared, ended or changed.
-        let moved = plan_moves(
-            &self.rows,
-            &target,
-            batch,
-            max_ops,
-            MAX_TRANSACTION_PAYLOAD_BYTES,
-        );
+        let moved = plan_moves(&self.rows, &target, batch, max_ops, max_bytes);
         plan.extend(moved.plan);
-        plan.extend(diff(
-            &moved.rows,
-            &target,
-            batch,
-            MAX_TRANSACTION_PAYLOAD_BYTES,
-        ));
+        plan.extend(diff(&moved.rows, &target, batch, max_bytes));
         // Last, the search re-counted against the rows this plan publishes, so
         // it commits with the final rows rather than ahead of them (PX-011).
         plan.extend(self.search_effects(&target, &unfiltered_target, &unconfirmed));
@@ -688,13 +706,8 @@ impl ProcessView {
             return Ok(result);
         }
 
-        let (transactions, outcome) = commit(
-            session,
-            &plan,
-            max_ops,
-            MAX_TRANSACTION_PAYLOAD_BYTES,
-            &mut self.published(),
-        );
+        let (transactions, outcome) =
+            commit(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
         // Order values never reach the wire, so every published row takes this
         // sample's whatever committed: a later click sorts by current values,
@@ -765,7 +778,7 @@ impl ProcessView {
             &self.committed_filter,
             self.published_limit,
         );
-        let (batch, max_ops) = mutation_limits(session);
+        let (batch, max_ops, max_bytes) = self.planning_limits(session);
         let mut plan = Vec::new();
         if let Some(previous) = self.sort.filter(|previous| previous.field != order.field) {
             plan.push(Planned::new(Effect::SortLabel {
@@ -779,13 +792,7 @@ impl ProcessView {
             label: sort::sort_button_label(order.field, Some(order.direction)),
             activates: Some(order),
         }));
-        let moved = plan_moves(
-            &self.rows,
-            &target,
-            batch,
-            max_ops,
-            MAX_TRANSACTION_PAYLOAD_BYTES,
-        );
+        let moved = plan_moves(&self.rows, &target, batch, max_ops, max_bytes);
         debug_assert_eq!(
             moved.rows.iter().map(|row| row.item_id).collect::<Vec<_>>(),
             target.iter().map(|row| row.item_id).collect::<Vec<_>>()
@@ -796,13 +803,8 @@ impl ProcessView {
         plan.extend(self.search_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
         let mut result = Refreshed::default();
         count(&plan, &mut result);
-        let (transactions, outcome) = commit(
-            session,
-            &plan,
-            max_ops,
-            MAX_TRANSACTION_PAYLOAD_BYTES,
-            &mut self.published(),
-        );
+        let (transactions, outcome) =
+            commit(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
         refresh_sort_values(&mut self.rows, &target);
         self.ids.retain(&self.unfiltered_rows);
@@ -874,7 +876,7 @@ impl ProcessView {
             return Ok(Refreshed::default());
         }
         let target: Vec<Row> = self.rows.iter().map(|row| row.laid_out(&layout)).collect();
-        let (batch, max_ops) = mutation_limits(session);
+        let (batch, max_ops, max_bytes) = self.planning_limits(session);
         let mut plan = vec![Planned::new(Effect::Columns(layout.clone()))];
         for (node, action) in COLUMN_CHOOSER_BUTTONS {
             let label = action.label(&layout);
@@ -886,14 +888,9 @@ impl ProcessView {
                 plan.push(Planned::new(Effect::ChooserEnabled { node, enabled }));
             }
         }
-        plan.extend(diff(
-            &self.rows,
-            &target,
-            batch,
-            MAX_TRANSACTION_PAYLOAD_BYTES,
-        ));
+        plan.extend(diff(&self.rows, &target, batch, max_bytes));
         let bytes: usize = plan.iter().map(|planned| planned.bytes).sum();
-        if plan.len() <= max_ops && bytes <= MAX_TRANSACTION_PAYLOAD_BYTES {
+        if plan.len() <= max_ops && bytes <= max_bytes {
             let last = plan.len() - 1;
             for planned in &mut plan[..last] {
                 planned.joins_next = true;
@@ -906,13 +903,8 @@ impl ProcessView {
             (0, 0, 0),
             "a layout change only updates rows in place"
         );
-        let (transactions, outcome) = commit(
-            session,
-            &plan,
-            max_ops,
-            MAX_TRANSACTION_PAYLOAD_BYTES,
-            &mut self.published(),
-        );
+        let (transactions, outcome) =
+            commit(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
         // The server-side rows follow whatever layout committed, so a later
         // sort, filter or refresh publishes from cells in that layout.
@@ -1135,7 +1127,7 @@ impl ProcessView {
             self.unfiltered_rows.len(),
         );
 
-        let (batch, max_ops) = mutation_limits(session);
+        let (batch, max_ops, max_bytes) = self.planning_limits(session);
         let mut plan = Vec::new();
 
         let current_input_val = session.with_store(|store| {
@@ -1157,20 +1149,9 @@ impl ProcessView {
         }
         plan.extend(summary_effects(&self.summary, &summary));
 
-        let moved = plan_moves(
-            &self.rows,
-            &target,
-            batch,
-            max_ops,
-            MAX_TRANSACTION_PAYLOAD_BYTES,
-        );
+        let moved = plan_moves(&self.rows, &target, batch, max_ops, max_bytes);
         plan.extend(moved.plan);
-        plan.extend(diff(
-            &moved.rows,
-            &target,
-            batch,
-            MAX_TRANSACTION_PAYLOAD_BYTES,
-        ));
+        plan.extend(diff(&moved.rows, &target, batch, max_bytes));
         // The search counts the newly filtered rows; a target the filter hid
         // is reported as no longer shown, never replaced (PX-011).
         plan.extend(self.search_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
@@ -1185,13 +1166,8 @@ impl ProcessView {
             return Ok(result);
         }
 
-        let (transactions, outcome) = commit(
-            session,
-            &plan,
-            max_ops,
-            MAX_TRANSACTION_PAYLOAD_BYTES,
-            &mut self.published(),
-        );
+        let (transactions, outcome) =
+            commit(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
         refresh_sort_values(&mut self.rows, &target);
         self.ids.retain(&self.unfiltered_rows);
@@ -1273,7 +1249,7 @@ impl ProcessView {
         session: &Session,
         query: &str,
     ) -> Result<Refreshed, SessionError> {
-        self.search.set_query(query, &self.rows);
+        let selected = self.search.set_query(query, &self.rows);
         let raw = self.search.query().raw().to_string();
         let mut plan = Vec::new();
         if input_value(session, SEARCH_INPUT) != raw {
@@ -1282,6 +1258,7 @@ impl ProcessView {
                 value: raw,
             }));
         }
+        plan.extend(self.promotion(selected));
         self.publish_search(session, plan)
     }
 
@@ -1291,8 +1268,9 @@ impl ProcessView {
         session: &Session,
         step: SearchStep,
     ) -> Result<Refreshed, SessionError> {
-        self.search.step(step, &self.rows);
-        self.publish_search(session, Vec::new())
+        let selected = self.search.step(step, &self.rows);
+        let plan = self.promotion(selected).into_iter().collect();
+        self.publish_search(session, plan)
     }
 
     /// Keeps the PID field's text (PX-011). Typing never moves the target; it
@@ -1317,8 +1295,25 @@ impl ProcessView {
     /// resolves the PID field to the published row the latest scan confirmed
     /// with that PID.
     pub fn go_to_pid(&mut self, session: &Session) -> Result<Refreshed, SessionError> {
-        self.search.go_to_pid(&self.rows, &self.unconfirmed);
-        self.publish_search(session, Vec::new())
+        let selected = self.search.go_to_pid(&self.rows, &self.unconfirmed);
+        let plan = self.promotion(selected).into_iter().collect();
+        self.publish_search(session, plan)
+    }
+
+    /// The promotion of the row an explicit search just `selected` (PX-011,
+    /// PX-011-G01). Promoting the item already promoted is a new promotion and
+    /// reveals it again. A search that selected nothing plans nothing, so the
+    /// promotion — and the client's native selection — stay as they were.
+    fn promotion(&self, selected: Option<ItemId>) -> Option<Planned> {
+        let item = selected?;
+        let row = self.rows.iter().find(|row| row.item_id == item)?;
+        Some(Planned::new(Effect::Promote(Box::new(row.clone()))))
+    }
+
+    /// The item the table's promoted selection names, as the store holds it
+    /// after the last commit (PX-011).
+    pub fn promoted_selection(&self) -> Option<ItemId> {
+        self.promoted
     }
 
     /// Types `text` into the PID field and clicks Go to PID (PX-011).
@@ -1499,9 +1494,10 @@ fn count(plan: &[Planned], result: &mut Refreshed) {
             Effect::Summary(_) => result.summary += 1,
             Effect::SortLabel { .. } => result.controls += 1,
             Effect::FilterStatus(_) | Effect::FilterValue(_) => result.controls += 1,
-            Effect::SearchStatus(_) | Effect::SearchEnabled { .. } | Effect::SearchValue { .. } => {
-                result.controls += 1
-            }
+            Effect::SearchStatus(_)
+            | Effect::SearchEnabled { .. }
+            | Effect::SearchValue { .. }
+            | Effect::Promote(_) => result.controls += 1,
             Effect::Columns(_) | Effect::ChooserLabel { .. } | Effect::ChooserEnabled { .. } => {
                 result.controls += 1
             }
@@ -1545,14 +1541,18 @@ fn commit(
     while start < plan.len() {
         let mut end = start;
         let mut bytes = 0;
+        let mut ops = 0;
         // At least one operation always travels, so a plan always makes
         // progress; the planner keeps any single operation inside `max_bytes`.
-        while end < plan.len() && end - start < max_ops {
+        // A promotion records two operations (PX-011-G01).
+        while end < plan.len() {
             let cost = plan[end].bytes;
-            if end > start && bytes + cost > max_bytes {
+            let weight = plan[end].operations();
+            if end > start && (ops + weight > max_ops || bytes + cost > max_bytes) {
                 break;
             }
             bytes += cost;
+            ops += weight;
             end += 1;
         }
         // Never end a transaction inside a joined unit: end before it instead,
@@ -1575,12 +1575,24 @@ fn commit(
         let chunk = &plan[start..end];
         match session.transaction(|ui| {
             for planned in chunk {
-                ui.apply_op(&planned.op)?;
+                match &planned.effect {
+                    // Through the SDK, which sends the item with the promotion
+                    // and refuses an item the model does not hold (PX-011-G01).
+                    Effect::Promote(row) => ui.promote_selection(TABLE, row.item_id)?,
+                    _ => ui.apply_op(&planned.op)?,
+                }
             }
             Ok(())
         }) {
             Ok(()) => {
                 record_committed(chunk, published);
+                // Settlement may have cleared the promotion in this commit, when
+                // its row left the model: the store is the record (PX-011).
+                *published.promoted = session.with_store(|store| {
+                    store
+                        .get_node(TABLE)
+                        .and_then(|node| node.promoted_selection())
+                });
                 committed += 1;
             }
             Err(error) => return (committed, Err(error)),
@@ -1903,6 +1915,11 @@ enum Effect {
         node: NodeId,
         value: String,
     },
+    /// The table's semantic selection promoted to this row's item ID
+    /// (PX-011, PX-011-G01): committed through
+    /// `UiTransaction::promote_selection`, which records a one-item
+    /// `MODEL_RESET_RANGE` carrying the row and `SET_PROPERTY(value = ItemId)`.
+    Promote(Box<Row>),
     Delete(Vec<ItemId>),
     Insert(u64, Vec<Row>),
     Update(Vec<Row>),
@@ -1921,6 +1938,8 @@ struct Published<'a> {
     columns: &'a mut ColumnLayout,
     /// The search controls as announced (PX-011).
     search: &'a mut SearchView,
+    /// The table's promoted selection as the store holds it (PX-011).
+    promoted: &'a mut Option<ItemId>,
 }
 
 /// The planned operations that turn the `published` summary into `target`:
@@ -1971,6 +1990,10 @@ impl Planned {
             Effect::SearchValue { node, value } => {
                 Operation::set_property(*node, VALUE, Value::String(value.clone()))
             }
+            // What the promotion sets; `commit` records it through the SDK.
+            Effect::Promote(row) => {
+                Operation::set_property(TABLE, VALUE, Value::ItemId(row.item_id))
+            }
             Effect::Delete(ids) => Operation::model_delete_items(MODEL, ids.iter().copied()),
             Effect::Insert(index, rows) => {
                 Operation::model_insert(MODEL, *index, rows.iter().map(Row::to_model_item))
@@ -1986,6 +2009,16 @@ impl Planned {
             bytes,
             joins_next: false,
             moving: false,
+        }
+    }
+
+    /// How many operations this entry records: two for a promotion (its item's
+    /// one-item `MODEL_RESET_RANGE` and the `SET_PROPERTY`), one otherwise.
+    fn operations(&self) -> usize {
+        if matches!(self.effect, Effect::Promote(_)) {
+            2
+        } else {
+            1
         }
     }
 
@@ -2023,6 +2056,15 @@ impl Effect {
             }
             Self::SearchStatus(text) => VALUE_FRAMING_BYTES + text.len(),
             Self::SearchValue { value, .. } => VALUE_FRAMING_BYTES + value.len(),
+            // The `SET_PROPERTY` of the item ID, and a whole second operation:
+            // the one-item `MODEL_RESET_RANGE` carrying the row.
+            Self::Promote(row) => {
+                VALUE_FRAMING_BYTES
+                    + SCALAR_VALUE_BYTES
+                    + OPERATION_FRAMING_BYTES
+                    + OPERATION_HEADER_BYTES
+                    + row_wire_bytes(row)
+            }
             Self::Delete(ids) => ids.len() * ITEM_ID_BYTES,
             Self::Insert(_, rows) | Self::Update(rows) => rows.iter().map(row_wire_bytes).sum(),
         }
@@ -2039,8 +2081,10 @@ impl Effect {
             filter_status,
             columns,
             search,
+            promoted,
         } = published;
         match self {
+            Self::Promote(row) => **promoted = Some(row.item_id),
             Self::Status(text) => status.clone_from(text),
             Self::FilterStatus(text) => filter_status.clone_from(text),
             Self::FilterValue(_)
@@ -3165,7 +3209,7 @@ mod tests {
         ] {
             let session = srui_sessiond::Session::mint();
             let mut source = HostWith(Host::new(58_000, 48), system);
-            let (view, snapshot) = ProcessView::start(&session, &mut source).unwrap();
+            let (mut view, snapshot) = ProcessView::start(&session, &mut source).unwrap();
             // Every row of this host costs the same, so the rows that fit are a
             // function of the budget alone.
             let cost = row_wire_bytes(&view.rows[0]);
@@ -3191,6 +3235,13 @@ mod tests {
             );
             published.push(view.row_count());
             if system == widest {
+                // PX-011: the table's promoted selection travels in the same
+                // snapshot and is covered by the search reserve.
+                let Observed::Known(pid) = view.rows[view.rows.len() - 1].key.pid else {
+                    panic!("the host's rows have PIDs")
+                };
+                view.jump_to_pid(&session, &pid.to_string()).unwrap();
+                assert!(view.promoted.is_some());
                 let hello = srui_protocol::ClientHello {
                     core_version: "0.5.0".to_string(),
                     profiles: vec!["org.srui.standard-widgets/1".to_string()],
@@ -3508,6 +3559,54 @@ mod tests {
     /// A plan that does not fit in one transaction commits as several, and a
     /// plan that stops partway leaves the view holding exactly what the store
     /// holds — never a row it failed to publish.
+    /// PX-011: while the table holds a promoted selection, a plan that may
+    /// remove rows leaves one operation and its bytes free for the
+    /// `CLEAR_PROPERTY` the SDK's settlement adds, a promotion weighs its two
+    /// operations in chunking, and its planned bytes cover what is encoded.
+    #[test]
+    fn a_promotion_is_budgeted_as_what_it_records_and_what_settlement_adds() {
+        let session = srui_sessiond::Session::mint();
+        let (mut view, _) = ProcessView::start(&session, &mut FakeProcessSource).unwrap();
+        let (_, max_ops) = mutation_limits(&session);
+        let (_, ops, bytes) = view.planning_limits(&session);
+        assert_eq!((ops, bytes), (max_ops, MAX_TRANSACTION_PAYLOAD_BYTES));
+        view.jump_to_pid(&session, "4102").unwrap();
+        assert_eq!(view.promoted, Some(view.rows[1].item_id));
+        let (_, ops, bytes) = view.planning_limits(&session);
+        assert_eq!(ops, max_ops - 1);
+        assert_eq!(bytes, MAX_TRANSACTION_PAYLOAD_BYTES - PROMOTION_CLEAR_BYTES);
+
+        let promote = Planned::new(Effect::Promote(Box::new(view.rows[0].clone())));
+        assert_eq!(promote.operations(), 2);
+        let planned = promote.bytes;
+        let revision = session.current_revision();
+        let plan = vec![promote, Planned::new(Effect::SearchStatus("x".into()))];
+        let (transactions, outcome) = commit(
+            &session,
+            &plan,
+            2,
+            MAX_TRANSACTION_PAYLOAD_BYTES,
+            &mut view.published(),
+        );
+        assert!(outcome.is_ok());
+        assert_eq!(
+            transactions, 2,
+            "a promotion fills a two-operation transaction"
+        );
+        assert_eq!(view.promoted, Some(view.rows[0].item_id));
+        let committed = session.collect_replayed_transactions(revision).unwrap();
+        assert_eq!(committed[0].operations.len(), 2);
+        let encoded = srui_protocol::framed_payload_len(&srui_protocol::SruiMessage {
+            msg: Some(srui_protocol::srui_message::Msg::Transaction(
+                committed[0].clone(),
+            )),
+        });
+        assert!(
+            encoded <= planned + TRANSACTION_ENVELOPE_BYTES,
+            "planned {planned} bytes but the encoder emitted {encoded}"
+        );
+    }
+
     #[test]
     fn a_plan_is_committed_in_bounded_transactions_and_recorded_as_it_commits() {
         let session = srui_sessiond::Session::mint();

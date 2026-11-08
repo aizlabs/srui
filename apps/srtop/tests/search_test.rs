@@ -23,7 +23,7 @@ use srui_process_explorer::sort::SortOrder;
 use srui_process_explorer::source::*;
 use srui_process_explorer::{
     install_filter_handlers, install_search_handlers, start_from_source, MODEL, PID_GO, PID_INPUT,
-    SEARCH_INPUT, SEARCH_NEXT, SEARCH_PREVIOUS, SEARCH_STATUS,
+    SEARCH_INPUT, SEARCH_NEXT, SEARCH_PREVIOUS, SEARCH_STATUS, TABLE,
 };
 use srui_protocol::Event as WireEvent;
 use srui_sdk::{ItemId, NodeId, Operation, Value, ENABLED, TEXT, VALUE};
@@ -172,11 +172,55 @@ fn operations_since(session: &Session, revision: u64) -> Vec<Operation> {
         .collect()
 }
 
-/// Every operation since `revision` touches only the search controls: no model
-/// mutation, no other node.
-fn assert_only_search_controls_changed(session: &Session, revision: u64) {
+/// The table's promoted selection as the store holds it (PX-011-G01).
+fn promoted(session: &Session) -> Option<ItemId> {
+    session.with_store(|store| {
+        store
+            .get_node(TABLE)
+            .and_then(|node| node.promoted_selection())
+    })
+}
+
+/// Whether any operation since `revision` cleared the table's promotion.
+fn promotion_cleared_since(session: &Session, revision: u64) -> bool {
+    operations_since(session, revision).iter().any(|op| {
+        matches!(op, Operation::ClearProperty { id, property } if *id == TABLE && *property == VALUE)
+    })
+}
+
+/// Every operation since `revision` touches only the search controls and the
+/// table's promoted selection: no row is added, removed, moved or changed. A
+/// promotion carries its row in a one-item `MODEL_RESET_RANGE` whose item is
+/// exactly the row the model already holds at that index.
+fn assert_only_search_controls_changed(
+    session: &Session,
+    revision: u64,
+    before: &[(ItemId, Value)],
+) {
     for op in operations_since(session, revision) {
         match op {
+            Operation::SetProperty {
+                id,
+                property,
+                value,
+            } if id == TABLE => {
+                assert_eq!(
+                    property, VALUE,
+                    "search set only the table's promoted selection"
+                );
+                assert!(matches!(value, Value::ItemId(_)), "{value:?}");
+            }
+            Operation::ModelResetRange {
+                id: model,
+                start_index,
+                items,
+                ..
+            } => {
+                assert_eq!(model, MODEL);
+                assert_eq!(items.len(), 1, "a promotion carries exactly its own row");
+                let (id, value) = &before[start_index as usize];
+                assert_eq!((items[0].item_id, &items[0].value), (*id, value));
+            }
             Operation::SetProperty { id, .. } => assert!(
                 [
                     SEARCH_STATUS,
@@ -223,6 +267,9 @@ fn three_identical_names_cycle_forward_and_backward_without_changing_rows() {
         );
         assert_eq!(rows(&session), before, "search never changes a row");
         assert_eq!(view.row_count(), 5);
+        // The match is promoted to the table's selection, by item ID.
+        assert_eq!(promoted(&session), Some(workers[nth - 1]));
+        assert_eq!(view.promoted_selection(), Some(workers[nth - 1]));
     };
     expect(&view, 1);
     assert!(enabled(&session, SEARCH_NEXT) && enabled(&session, SEARCH_PREVIOUS));
@@ -236,7 +283,7 @@ fn three_identical_names_cycle_forward_and_backward_without_changing_rows() {
         view.step_search(&session, SearchStep::Previous).unwrap();
         expect(&view, nth);
     }
-    assert_only_search_controls_changed(&session, revision);
+    assert_only_search_controls_changed(&session, revision, &before);
 
     // A query is case-folded and `|`-split by the filter's own rules.
     view.set_search(&session, "NGINX|systemd").unwrap();
@@ -252,11 +299,14 @@ fn the_cycle_follows_the_published_order_and_the_target_keeps_its_identity() {
     let session = Session::mint();
     let mut source = Fixture::new(three_workers());
     let (mut view, _) = start_from_source(&session, &mut source).unwrap();
+    let first = item_of(&session, 100);
     let middle = item_of(&session, 101);
     view.set_search(&session, "worker").unwrap();
-    view.step_search(&session, SearchStep::Next).unwrap();
-    assert_eq!(view.search().target(), Some(middle));
-    // Sorting by PID descending moves PID 101 to row 3; the target stays on it.
+    assert_eq!(view.search().target(), Some(first));
+    assert!(status(&session, &view).ends_with("match 1 of 3 at row 2 of 5 · PID 100 · worker"));
+    // Sorting by PID descending moves PID 100 from row 2 to row 4, and from the
+    // first match to the last: the search is re-published with the sort, and
+    // the target and its promotion stay on the same item ID.
     view.set_sort(
         &session,
         SortOrder {
@@ -265,20 +315,35 @@ fn the_cycle_follows_the_published_order_and_the_target_keeps_its_identity() {
         },
     )
     .unwrap();
-    assert_eq!(view.search().target(), Some(middle));
+    assert_eq!(view.search().target(), Some(first));
+    assert_eq!(
+        promoted(&session),
+        Some(first),
+        "a sort keeps the promotion"
+    );
     assert_eq!(
         status(&session, &view),
-        "Search: \"worker\": 3 matches in 5 shown rows · match 2 of 3 at row 3 of 5 · PID 101 · worker"
+        "Search: \"worker\": 3 matches in 5 shown rows · match 3 of 3 at row 4 of 5 · PID 100 · worker"
     );
-    // Next now follows the new order: PID 100 is the next match below.
+    // Next now follows the new order: from the last match it wraps to PID 102
+    // at row 2; Previous comes back.
     view.step_search(&session, SearchStep::Next).unwrap();
-    assert_eq!(view.search().target(), Some(item_of(&session, 100)));
+    assert_eq!(view.search().target(), Some(item_of(&session, 102)));
+    view.step_search(&session, SearchStep::Previous).unwrap();
+    assert_eq!(view.search().target(), Some(first));
     view.step_search(&session, SearchStep::Previous).unwrap();
     assert_eq!(view.search().target(), Some(middle));
+    assert_eq!(promoted(&session), Some(middle));
 
-    // The filter hides the target: the search says so and moves nowhere.
+    // The filter hides the target: the search says so and moves nowhere, and
+    // the SDK's settlement clears the promotion in the commit that removed
+    // its row.
+    let revision = session.current_revision();
     view.set_filter(&session, "nginx").unwrap();
     assert_eq!(view.search().target(), Some(middle));
+    assert_eq!(promoted(&session), None);
+    assert_eq!(view.promoted_selection(), None);
+    assert!(promotion_cleared_since(&session, revision));
     assert_eq!(
         status(&session, &view),
         "Search: no match for \"worker\" in 1 shown row; search hides no rows · 3 more matches not shown (filtered out or beyond the row limit) · PID 101 · worker is no longer shown; the search moved to no other process"
@@ -289,6 +354,116 @@ fn the_cycle_follows_the_published_order_and_the_target_keeps_its_identity() {
     view.set_filter(&session, "").unwrap();
     assert_eq!(view.search().target(), Some(middle));
     assert!(status(&session, &view).contains("match 2 of 3 at row 3 of 5 · PID 101"));
+    // A row shown again is not re-promoted by a refresh or a filter change:
+    // only an explicit search moves the native selection.
+    assert_eq!(promoted(&session), None);
+    view.step_search(&session, SearchStep::Next).unwrap();
+    assert_eq!(promoted(&session), Some(first));
+}
+
+/// The native fixture's three identical names, as the native test reads them:
+/// the promotion cycles 10 → 30 → 50 → 10 and back, the rows untouched.
+#[test]
+fn the_repeated_name_fixture_cycles_its_three_workers() {
+    let session = Session::mint();
+    let (mut view, _) = start_from_source(&session, &mut RepeatedNamesSource).unwrap();
+    let before = rows(&session);
+    assert_eq!(before.len(), RepeatedNamesSource::RECORDS);
+    let workers = RepeatedNamesSource::WORKER_ROWS.map(|row| before[row].0);
+    view.set_search(&session, "worker").unwrap();
+    let mut seen = vec![promoted(&session)];
+    for _ in 0..3 {
+        view.step_search(&session, SearchStep::Next).unwrap();
+        seen.push(promoted(&session));
+    }
+    for _ in 0..3 {
+        view.step_search(&session, SearchStep::Previous).unwrap();
+        seen.push(promoted(&session));
+    }
+    let [a, b, c] = workers.map(Some);
+    assert_eq!(seen, [a, b, c, a, c, b, a]);
+    assert!(status(&session, &view).ends_with("match 1 of 3 at row 10 of 60 · PID 5010 · worker"));
+    // A refresh of the constant fixture publishes nothing and keeps the promotion.
+    let revision = session.current_revision();
+    view.refresh(&session, &mut RepeatedNamesSource).unwrap();
+    assert_eq!(session.current_revision(), revision);
+    assert_eq!(promoted(&session), a);
+    assert_eq!(rows(&session), before);
+}
+
+#[test]
+fn next_and_previous_from_a_target_that_is_no_longer_shown_continue_from_its_place() {
+    let session = Session::mint();
+    let mut source = Fixture::new(three_workers());
+    let (mut view, _) = start_from_source(&session, &mut source).unwrap();
+    let middle = item_of(&session, 101);
+    view.set_search(&session, "worker").unwrap();
+    view.step_search(&session, SearchStep::Next).unwrap();
+    assert_eq!(view.search().target(), Some(middle));
+    assert_eq!(promoted(&session), Some(middle));
+    // PID 101 exits: rows are now PID 1, 100, 102, 200, and the target last
+    // held row 3 (index 2), which PID 102 now occupies.
+    source.records.remove(2);
+    let revision = session.current_revision();
+    view.refresh(&session, &mut source).unwrap();
+    assert_eq!(view.search().target(), Some(middle));
+    assert_eq!(
+        promoted(&session),
+        None,
+        "settlement clears a promotion whose row ended"
+    );
+    assert!(promotion_cleared_since(&session, revision));
+    assert!(status(&session, &view)
+        .ends_with("PID 101 · worker is no longer shown; the search moved to no other process"));
+    // Next continues at the place it held: PID 102, the row now there.
+    view.step_search(&session, SearchStep::Next).unwrap();
+    assert_eq!(view.search().target(), Some(item_of(&session, 102)));
+    assert_eq!(promoted(&session), Some(item_of(&session, 102)));
+
+    // Previous from a lost target goes to the match before its place.
+    view.step_search(&session, SearchStep::Previous).unwrap();
+    assert_eq!(view.search().target(), Some(item_of(&session, 100)));
+    view.step_search(&session, SearchStep::Next).unwrap();
+    let last = item_of(&session, 102);
+    assert_eq!(view.search().target(), Some(last));
+    source.records.remove(2);
+    view.refresh(&session, &mut source).unwrap();
+    // PID 102 last held row 3 (index 2), now nginx's; no match is at or after
+    // it, so Next wraps to the first match.
+    view.step_search(&session, SearchStep::Next).unwrap();
+    assert_eq!(view.search().target(), Some(item_of(&session, 100)));
+}
+
+#[test]
+fn a_search_that_selects_nothing_leaves_the_promotion_as_it_was() {
+    let session = Session::mint();
+    let mut source = Fixture::new(three_workers());
+    let (mut view, _) = start_from_source(&session, &mut source).unwrap();
+    view.jump_to_pid(&session, "101").unwrap();
+    let held = item_of(&session, 101);
+    assert_eq!(promoted(&session), Some(held));
+    let revision = session.current_revision();
+    for nothing in ["zzz", ""] {
+        view.set_search(&session, nothing).unwrap();
+        assert_eq!(promoted(&session), Some(held), "{nothing:?}");
+    }
+    view.step_search(&session, SearchStep::Next).unwrap();
+    view.jump_to_pid(&session, "9999").unwrap();
+    view.set_pid_input(&session, "12a").unwrap();
+    assert_eq!(promoted(&session), Some(held));
+    assert!(!promotion_cleared_since(&session, revision));
+    assert!(operations_since(&session, revision)
+        .iter()
+        .all(|op| !matches!(
+            op,
+            Operation::SetProperty { id, .. } if *id == TABLE
+        )));
+    // Going to the PID already promoted is a new promotion: it reveals again.
+    view.jump_to_pid(&session, "101").unwrap();
+    assert!(operations_since(&session, revision).iter().any(|op| matches!(
+        op,
+        Operation::SetProperty { id, value: Value::ItemId(item), .. } if *id == TABLE && *item == held
+    )));
 }
 
 #[test]
@@ -377,8 +552,10 @@ fn a_reused_pid_selects_the_new_record_only_through_an_explicit_new_search() {
     view.refresh(&session, &mut source).unwrap();
     let new = item_of(&session, 300);
     assert_ne!(new, old, "a reused PID is a different process instance");
-    // The search stays on the old instance, which is gone, and says so.
+    // The search stays on the old instance, which is gone, and says so. Its
+    // promotion was cleared with the row; the new instance never inherits it.
     assert_eq!(view.search().target(), Some(old));
+    assert_eq!(promoted(&session), None);
     assert_eq!(
         status(&session, &view),
         "Search: PID 300 · job is no longer shown; the search moved to no other process · a different process now has PID 300: Go to PID selects it"
@@ -386,10 +563,12 @@ fn a_reused_pid_selects_the_new_record_only_through_an_explicit_new_search() {
     // Another refresh still does not retarget.
     view.refresh(&session, &mut source).unwrap();
     assert_eq!(view.search().target(), Some(old));
+    assert_eq!(promoted(&session), None);
 
     // Only an explicit new search selects the new live record.
     view.go_to_pid(&session).unwrap();
     assert_eq!(view.search().target(), Some(new));
+    assert_eq!(promoted(&session), Some(new));
     assert_eq!(
         status(&session, &view),
         "Search: PID 300 found at row 2 of 3 · job"
@@ -402,12 +581,14 @@ fn a_reused_pid_selects_the_new_record_only_through_an_explicit_new_search() {
     view.refresh(&session, &mut source).unwrap();
     let third = item_of(&session, 300);
     assert_eq!(view.search().target(), Some(new));
+    assert_eq!(promoted(&session), None);
     assert!(status(&session, &view)
         .contains("PID 300 · job is no longer shown; the search moved to no other process"));
     assert!(!status(&session, &view).contains("Go to PID selects it"));
     // Next is explicit: it continues from the place the old target held.
     view.step_search(&session, SearchStep::Next).unwrap();
     assert_eq!(view.search().target(), Some(third));
+    assert_eq!(promoted(&session), Some(third));
 }
 
 #[test]
@@ -434,6 +615,7 @@ fn a_pid_shown_only_from_an_earlier_scan_is_not_selected() {
     assert_eq!(rows(&session).len(), 2, "the unreadable row is retained");
     view.jump_to_pid(&session, "300").unwrap();
     assert_eq!(view.search().target(), None);
+    assert_eq!(promoted(&session), None, "a retained row is never promoted");
     assert_eq!(
         status(&session, &view),
         "Search: PID 300 is shown only from an earlier scan and was not selected"
@@ -590,6 +772,7 @@ fn the_search_controls_are_driven_by_standard_client_events() {
         view.lock().unwrap().search().target(),
         Some(item_of(&session, 200))
     );
+    assert_eq!(promoted(&session), Some(item_of(&session, 200)));
     // A malformed PID disables Go to PID; a click is then refused.
     processed(
         session

@@ -929,6 +929,70 @@ impl ProcessSource for FakeProcessSource {
     }
 }
 
+/// Status label of the repeated-name fixture (PX-011). Like every source, it
+/// states what its data is.
+pub const REPEATED_NAMES_STATUS_TEXT: &str = "Read-only · Fake repeated-name snapshot";
+
+/// A constant fixture of [`RepeatedNamesSource::RECORDS`] processes, three of
+/// them named exactly `worker`, at rows [`RepeatedNamesSource::WORKER_ROWS`]
+/// (PX-011). Far enough apart that the later ones start outside an ordinary
+/// viewport, so selecting a match must also reveal it. Every value is a
+/// constant, so a refresh publishes nothing.
+#[derive(Debug, Default)]
+pub struct RepeatedNamesSource;
+
+impl RepeatedNamesSource {
+    pub const SOURCE: &'static str = "fake-repeated-names-v1";
+    /// How many processes the fixture lists.
+    pub const RECORDS: usize = 60;
+    /// The zero-based rows of the three `worker` processes, in PID order.
+    pub const WORKER_ROWS: [usize; 3] = [9, 29, 49];
+    /// The first PID; the record at row `r` has PID `FIRST_PID + r`.
+    pub const FIRST_PID: u32 = 5001;
+}
+
+impl ProcessSource for RepeatedNamesSource {
+    fn status_text(&self) -> &str {
+        REPEATED_NAMES_STATUS_TEXT
+    }
+
+    fn snapshot(&mut self) -> ProcessSnapshot {
+        let records = (0..Self::RECORDS)
+            .map(|row| {
+                let pid = Self::FIRST_PID + row as u32;
+                let (name, command) = if Self::WORKER_ROWS.contains(&row) {
+                    ("worker".to_string(), format!("worker --shard={row}"))
+                } else {
+                    let name = format!("idle-{row:02}");
+                    (name.clone(), name)
+                };
+                ProcessRecord {
+                    key: ProcessKey {
+                        source: SourceId(Self::SOURCE.into()),
+                        ..FakeProcessSource::key(&format!("repeated-{row}"), Observed::Known(pid))
+                    },
+                    display_name: DisplayName::from(name.as_str()).with_command(command.as_bytes()),
+                    resident: Observed::Known(4096),
+                    cpu: CpuUsage::Measured(CpuInterval {
+                        ticks: 1,
+                        ticks_per_second: 100,
+                        elapsed: Duration::from_secs(1),
+                    }),
+                }
+            })
+            .collect();
+        ProcessSnapshot {
+            source: SourceId(Self::SOURCE.into()),
+            sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
+            records,
+            vanished: 0,
+            capped: CappedRecords::none(),
+            completeness: Completeness::Complete,
+            system: FakeProcessSource::system(),
+        }
+    }
+}
+
 /// Status label of the scripted fixture sequence. Like every source, it states
 /// what its data is: a script, never a host.
 pub const SEQUENCE_STATUS_TEXT: &str = "Read-only · Fake process sequence";

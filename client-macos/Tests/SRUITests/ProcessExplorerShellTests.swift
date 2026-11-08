@@ -597,14 +597,17 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
-    /// PX-011: search is a standard native text field, two standard buttons that step between
-    /// matches, a PID field and a Go to PID button. Every one sends a standard `TEXT_EDIT` or
-    /// `ACTIVATE`; the server keeps the current match by item ID and publishes it on the search
-    /// status line. The native table keeps every row throughout: search locates, never hides.
+    /// PX-011 (with PX-011-G01): search is a standard native text field, two standard buttons
+    /// that step between matches, a PID field and a Go to PID button. Every one sends a standard
+    /// `TEXT_EDIT` or `ACTIVATE`; the server keeps the current match by item ID, publishes it on
+    /// the search status line and promotes it to the table's semantic selection, so the generic
+    /// client selects the row and scrolls it into view. The fixture lists 60 processes, three
+    /// named exactly `worker` at rows 10, 30 and 50, so the later matches start outside the
+    /// viewport. The native table keeps every row throughout: search locates, never hides.
     @Test(.timeLimit(.minutes(1)))
     @MainActor
-    func searchLocatesMatchesWithoutHidingRowsAndJumpsToAPID() async throws {
-        let harness = try await Self.launch(arguments: ["--fake-source"])
+    func searchSelectsAndRevealsMatchesWithoutHidingRowsAndJumpsToAPID() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-repeated-names"])
         defer { Self.shutDown(harness) }
         _ = NSApplication.shared
         let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
@@ -631,8 +634,21 @@ struct ProcessExplorerShellTests {
         let go = try #require(renderer.registry.handle(for: NodeId(Self.pidGoID))?.view as? NSButton)
         let statusHandle = try #require(renderer.registry.handle(for: NodeId(Self.searchStatusID)))
         let statusField = try #require(statusHandle.view as? NSTextField)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "all 60 rows") {
+            table.numberOfRows == 60
+        }
         let identities = Self.modelItemIDs(applier)
-        #expect(identities.count == 3)
+        let initialRows = Self.nativeRows(table)
+        #expect(identities.count == 60)
+        let workerRows = [9, 29, 49]
+        for row in workerRows {
+            #expect(initialRows[row][0] == String(5001 + row) && initialRows[row][1] == "worker")
+        }
+        #expect(initialRows.filter { $0[1] == "worker" }.count == 3)
+        let initiallyVisible = table.rows(in: table.visibleRect)
+        #expect(initiallyVisible.length > 0, "the table has a viewport")
+        #expect(!NSLocationInRange(49, initiallyVisible), "row 50 starts outside the viewport: \(initiallyVisible)")
+        #expect(table.selectedRowIndexes.isEmpty)
 
         #expect(searchField.isEditable && pidField.isEditable)
         #expect(searchField.placeholderString == "Find by name or command (| for OR); rows stay visible")
@@ -647,64 +663,106 @@ struct ProcessExplorerShellTests {
         }
         /// Every row is still in the native table, in the same order, under the same item IDs.
         func expectEveryRowShown(_ step: String) {
-            #expect(table.numberOfRows == 3, "\(step): search hides no row")
-            #expect(Self.nativeRows(table) == Self.fakeRows, "\(step)")
+            #expect(table.numberOfRows == 60, "\(step): search hides no row")
             #expect(Self.modelItemIDs(applier) == identities, "\(step)")
         }
+        func isVisible(_ row: Int) -> Bool {
+            NSLocationInRange(row, table.rows(in: table.visibleRect))
+        }
         var trace: [String] = []
-        func waitForStatus(_ fragment: String) async throws {
-            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "search status contains \(fragment)") {
+        var selections: [Int] = []
+        /// Waits for the status to say `fragment` and the native table to select `row`, alone,
+        /// with the row scrolled into view.
+        func waitFor(_ fragment: String, selected row: Int) async throws {
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "\(fragment) with row \(row) selected and visible") {
                 statusField.stringValue.contains(fragment)
+                    && table.selectedRowIndexes == IndexSet(integer: row)
+                    && isVisible(row)
             }
             trace.append(statusField.stringValue)
+            selections.append(table.selectedRow)
+            expectEveryRowShown(fragment)
         }
 
-        // Two identical names: the first match is selected by the new search, then Next and
-        // Previous cycle predictably and wrap in both directions.
+        // Three identical names: a new search selects and reveals the first; Next and Previous
+        // move the native selection 1 → 2 → 3 → 1 and back, wrapping in both directions.
         type("worker", into: searchField, searchAdapter)
-        try await waitForStatus("\"worker\": 2 matches in 3 shown rows · match 1 of 2 at row 1 of 3 · PID 4101 · worker")
+        try await waitFor("\"worker\": 3 matches in 60 shown rows · match 1 of 3 at row 10 of 60 · PID 5010 · worker", selected: 9)
         #expect(previous.isEnabled && next.isEnabled)
-        expectEveryRowShown("first match")
-        for (button, nth, pid) in [(next, 2, 4102), (next, 1, 4101), (previous, 2, 4102), (previous, 1, 4101)] {
+        for (button, nth) in [(next, 2), (next, 3), (next, 1), (previous, 3), (previous, 2), (previous, 1)] {
             NativeActivation.click(button)
-            try await waitForStatus("match \(nth) of 2 at row \(nth) of 3 · PID \(pid) · worker")
-            expectEveryRowShown("\(button.title) to match \(nth)")
+            let row = workerRows[nth - 1]
+            try await waitFor("match \(nth) of 3 at row \(row + 1) of 60 · PID \(5001 + row) · worker", selected: row)
         }
+        #expect(selections == [9, 29, 49, 9, 49, 29, 9])
 
-        // No match: a visible explanation, navigation disabled, every row still shown.
-        type("zzz", into: searchField, searchAdapter)
-        try await waitForStatus("no match for \"zzz\" in 3 shown rows; search hides no rows")
-        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "navigation disabled") {
-            !previous.isEnabled && !next.isEnabled
+        // A local click on another row stays local across a commit that promotes nothing, and
+        // Next continues from the server's current match (match 1), not from the clicked row.
+        table.selectRowIndexes(IndexSet(integer: 3), byExtendingSelection: false)
+        type("1", into: pidField, pidAdapter)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "PID field held") {
+            applier.store.getNode(NodeId(Self.pidInputID))?.getProperty(.value) == .string("1") && go.isEnabled
         }
+        #expect(table.selectedRowIndexes == IndexSet(integer: 3), "an unrelated commit keeps the local selection")
+        NativeActivation.click(next)
+        try await waitFor("match 2 of 3 at row 30 of 60 · PID 5030 · worker", selected: 29)
+
+        // No match: a visible explanation, navigation disabled, the native selection unchanged.
+        type("zzz", into: searchField, searchAdapter)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "no match explained") {
+            statusField.stringValue.contains("no match for \"zzz\" in 60 shown rows; search hides no rows")
+                && !previous.isEnabled && !next.isEnabled
+        }
+        trace.append(statusField.stringValue)
+        #expect(table.selectedRowIndexes == IndexSet(integer: 29), "no match leaves the selection unchanged")
         expectEveryRowShown("no match")
         type("", into: searchField, searchAdapter)
-        try await waitForStatus("Search: none")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "search cleared") {
+            statusField.stringValue.contains("Search: none")
+        }
+        #expect(table.selectedRowIndexes == IndexSet(integer: 29))
 
-        // Jump to a PID: Go to PID is enabled only once the server holds a PID.
-        type("4102", into: pidField, pidAdapter)
-        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "Go to PID enabled") { go.isEnabled }
+        // Jump to a PID: Go to PID is enabled only once the server holds a PID; it selects and
+        // reveals the row, here the last worker, back from the top of the table.
+        table.scrollRowToVisible(0)
+        type("5050", into: pidField, pidAdapter)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "PID field held") {
+            applier.store.getNode(NodeId(Self.pidInputID))?.getProperty(.value) == .string("5050") && go.isEnabled
+        }
         NativeActivation.click(go)
-        try await waitForStatus("PID 4102 found at row 2 of 3 · worker")
-        expectEveryRowShown("PID jump")
-        // A PID no shown process has is explained, not silently ignored.
+        try await waitFor("PID 5050 found at row 50 of 60 · worker", selected: 49)
+        type("5004", into: pidField, pidAdapter)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "PID field held") {
+            applier.store.getNode(NodeId(Self.pidInputID))?.getProperty(.value) == .string("5004") && go.isEnabled
+        }
+        NativeActivation.click(go)
+        try await waitFor("PID 5004 found at row 4 of 60 · idle-03", selected: 3)
+        // A PID no shown process has is explained, and the selection is unchanged.
         type("9999", into: pidField, pidAdapter)
         try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "PID field held") {
             applier.store.getNode(NodeId(Self.pidInputID))?.getProperty(.value) == .string("9999") && go.isEnabled
         }
         NativeActivation.click(go)
-        try await waitForStatus("no shown process has PID 9999")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "missing PID explained") {
+            statusField.stringValue.contains("no shown process has PID 9999")
+        }
+        trace.append(statusField.stringValue)
+        #expect(table.selectedRowIndexes == IndexSet(integer: 3))
         // A malformed PID cannot be submitted, and the status says why.
         type("41a", into: pidField, pidAdapter)
-        try await waitForStatus("PID field: digits only")
-        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "Go to PID disabled") { !go.isEnabled }
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "Go to PID disabled") {
+            statusField.stringValue.contains("PID field: digits only") && !go.isEnabled
+        }
+        trace.append(statusField.stringValue)
+        #expect(table.selectedRowIndexes == IndexSet(integer: 3))
         expectEveryRowShown("malformed PID")
+        #expect(Self.nativeRows(table) == initialRows, "every row kept its cells")
 
         // Native handles were built once and kept throughout.
         #expect(renderer.registry.handle(for: NodeId(5)) === tableHandle)
         #expect(renderer.registry.handle(for: NodeId(Self.searchInputID)) === searchHandle)
         #expect(renderer.registry.handle(for: NodeId(Self.searchStatusID)) === statusHandle)
-        print("PX-011 native SSH evidence: window \(window.windowNumber); rows=\(Self.nativeRows(table)); itemIDs=\(Self.modelItemIDs(applier)); statuses=\(trace); revision=\(applier.lastAppliedRevision.value)")
+        print("PX-011 native SSH evidence: window \(window.windowNumber); rows=\(table.numberOfRows); initially visible=\(initiallyVisible); selections=\(selections); final selection=\(table.selectedRow) visible=\(table.rows(in: table.visibleRect)); itemIDs unchanged=\(Self.modelItemIDs(applier) == identities); statuses=\(trace); revision=\(applier.lastAppliedRevision.value)")
         await controller.stop()
     }
 

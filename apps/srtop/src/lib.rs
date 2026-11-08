@@ -88,13 +88,13 @@ pub const SEARCH_STATUS: NodeId = NodeId::new(48);
 pub const SEARCH_LABEL: &str = "Find processes";
 pub const SEARCH_PLACEHOLDER: &str = "Find by name or command (| for OR); rows stay visible";
 pub const SEARCH_DESCRIPTION: &str =
-    "Locates matching rows on the server without hiding any row. Previous match and Next match move between them.";
+    "Locates matching rows on the server without hiding any row. A new search, Previous match and Next match select the match in the process table and scroll it into view.";
 pub const SEARCH_PREVIOUS_LABEL: &str = "Previous match";
 pub const SEARCH_NEXT_LABEL: &str = "Next match";
 pub const PID_LABEL: &str = "PID to find";
 pub const PID_PLACEHOLDER: &str = "PID";
 pub const PID_DESCRIPTION: &str =
-    "A numeric PID. Go to PID selects the process the latest scan observed with it.";
+    "Digits only. Go to PID selects and scrolls to the shown row the latest scan confirmed with this PID; a row kept from an earlier scan, a hidden row or a missing PID is explained on the search status instead.";
 pub const PID_GO_LABEL: &str = "Go to PID";
 pub const SEARCH_NODE_COUNT: usize = 7;
 
@@ -696,8 +696,10 @@ pub(crate) fn initialize_rows(
             .columns(refresh::column_headings(&layout))
             // A native selection, local presentation state (§22.5) the client
             // anchors to item IDs, so it follows its process when the rows are
-            // reordered (PX-009). No handler acts on it: the server attaches no
-            // meaning to a selection yet.
+            // reordered (PX-009). No handler acts on a user's selection. An
+            // explicit search promotes its match to the table's semantic
+            // selection (PX-011, PX-011-G01), which the client selects and
+            // reveals; a later user click stays local.
             .selection_mode(SelectionMode::Single)
             .label("Processes")
             .grow(1.0)

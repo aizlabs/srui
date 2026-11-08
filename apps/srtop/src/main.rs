@@ -4,7 +4,10 @@ use srui_process_explorer::{
     install_sort_handlers,
     procfs::ProcFsSource,
     refresh::{poll, DEFAULT_REFRESH_INTERVAL, MAX_REFRESH_INTERVAL, MIN_REFRESH_INTERVAL},
-    source::{FakeProcessSource, ProcessSource, ScriptedFakeSource, SyntheticProcessSource},
+    source::{
+        FakeProcessSource, ProcessSource, RepeatedNamesSource, ScriptedFakeSource,
+        SyntheticProcessSource,
+    },
     start_from_source, update_title, FIXTURE_TITLE,
 };
 use srui_sessiond::{handle_connection, Session};
@@ -25,6 +28,8 @@ enum Collection {
     /// No collection at all: the empty shell fixture.
     None,
     Fake,
+    /// The PX-011 fixture: three processes named exactly `worker`.
+    RepeatedNames,
     Sequence,
     Live,
     Scale(usize),
@@ -61,7 +66,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--socket")) {
         return Err("usage: srtop --socket PATH [--smoke-fixture] \
-             [--fake-source | --fake-sequence | --live-source | --procfs | --scale-source COUNT] \
+             [--fake-source | --fake-repeated-names | --fake-sequence | --live-source | --procfs \
+             | --scale-source COUNT] \
              [--refresh-interval-ms MS | --scale-interval-ms MS]"
             .into());
     }
@@ -73,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(value) = args.next() {
         let select = |current: &mut Collection, chosen| {
             if *current != Collection::None {
-                return Err("choose one of --fake-source, --fake-sequence, --live-source (or --procfs) or --scale-source");
+                return Err("choose one of --fake-source, --fake-repeated-names, --fake-sequence, --live-source (or --procfs) or --scale-source");
             }
             *current = chosen;
             Ok(())
@@ -81,6 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match value.to_str() {
             Some("--smoke-fixture") if !fixture => fixture = true,
             Some("--fake-source") => select(&mut collection, Collection::Fake)?,
+            Some("--fake-repeated-names") => select(&mut collection, Collection::RepeatedNames)?,
             Some("--fake-sequence") => select(&mut collection, Collection::Sequence)?,
             Some("--live-source") | Some("--procfs") => select(&mut collection, Collection::Live)?,
             Some("--scale-source") => {
@@ -137,6 +144,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Collection::Fake => collect(
             &session,
             FakeProcessSource,
+            interval,
+            &shutdown,
+            &mut connections,
+        ),
+        Collection::RepeatedNames => collect(
+            &session,
+            RepeatedNamesSource,
             interval,
             &shutdown,
             &mut connections,

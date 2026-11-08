@@ -30,10 +30,13 @@
 //! the client is about to hold, and Next/Previous from a target that is no
 //! longer shown continue from the place it last held.
 //!
-//! The generic client's native table selection is local presentation state
-//! (§22.5) and the protocol has no server-driven selection or reveal facility,
-//! so the current match is published as semantic text on the search status line
-//! rather than as a native highlight (see the PX-011 completion note).
+//! Each explicit action that sets a current match also *promotes* it to the
+//! table's semantic selection (PX-011-G01, registry property 13 `value` holding
+//! the `ItemId`), so the generic client selects that row and scrolls it into
+//! view. An action that selects nothing leaves the promotion, and so the native
+//! selection, as it was. The promotion is never moved by a refresh: when its
+//! row leaves the model the SDK's settlement clears it in the same commit, and
+//! a sort keeps it on its item ID ([`crate::refresh`] owns the commits).
 
 use crate::filter::{FilterGeneration, FilterQuery};
 use crate::projection::Row;
@@ -208,8 +211,8 @@ impl Search {
 
     /// Replaces the query with `raw` under a new generation, and targets the
     /// first match in published order — an explicit new search. An empty query
-    /// holds no target.
-    pub(crate) fn set_query(&mut self, raw: &str, rows: &[Row]) -> FilterGeneration {
+    /// holds no target. Returns the item the search selected, if any.
+    pub(crate) fn set_query(&mut self, raw: &str, rows: &[Row]) -> Option<ItemId> {
         self.generation = self.generation.next();
         self.query = FilterQuery::parse(raw);
         self.unresolved_pid = None;
@@ -217,17 +220,18 @@ impl Search {
             .matches(rows)
             .first()
             .map(|&index| Target::of(rows, index, Origin::Query));
-        self.generation
+        self.target()
     }
 
     /// Moves the target to the next or previous match, wrapping around. From a
     /// target still shown, the step is relative to its row; from one no longer
     /// shown, relative to the place it last held; with no target, the first or
-    /// last match. Without a query or a match nothing moves.
-    pub(crate) fn step(&mut self, step: SearchStep, rows: &[Row]) {
+    /// last match. Without a query or a match nothing moves. Returns the item
+    /// the step selected, if any.
+    pub(crate) fn step(&mut self, step: SearchStep, rows: &[Row]) -> Option<ItemId> {
         let matches = self.matches(rows);
         let (Some(&first), Some(&last)) = (matches.first(), matches.last()) else {
-            return;
+            return None;
         };
         let place = self.target.as_ref().map(|target| {
             match rows.iter().position(|row| row.item_id == target.item_id) {
@@ -252,6 +256,7 @@ impl Search {
         };
         self.unresolved_pid = None;
         self.target = Some(Target::of(rows, chosen, Origin::Query));
+        self.target()
     }
 
     /// Keeps the PID field's text, bounded to [`MAX_PID_INPUT_BYTES`] on a
@@ -269,11 +274,14 @@ impl Search {
     /// with that PID — an explicit new search — and targets it. A row shown
     /// only because an earlier scan saw it (`unconfirmed`) is not the currently
     /// observed instance and is not selected. When nothing is selected the
-    /// target is cleared and the status explains why.
-    pub(crate) fn go_to_pid(&mut self, rows: &[Row], unconfirmed: &HashSet<ItemId>) {
-        let Some(pid) = parse_pid(&self.pid_input) else {
-            return;
-        };
+    /// target is cleared and the status explains why. Returns the item the jump
+    /// selected, if any.
+    pub(crate) fn go_to_pid(
+        &mut self,
+        rows: &[Row],
+        unconfirmed: &HashSet<ItemId>,
+    ) -> Option<ItemId> {
+        let pid = parse_pid(&self.pid_input)?;
         match rows
             .iter()
             .position(|row| known_pid(row) == Some(pid) && !unconfirmed.contains(&row.item_id))
@@ -287,6 +295,7 @@ impl Search {
                 self.target = None;
             }
         }
+        self.target()
     }
 
     /// Brings the target's last-known place, PID and name up to the rows the

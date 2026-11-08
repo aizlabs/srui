@@ -69,7 +69,7 @@
     },
     {
       "feature_id": "SRUI-PX017G01-005",
-      "feature": "Generic AppKit reveal-without-selection for Table, List and Tree: a commit that sets the hint or changes the item's row index scrolls the minimum to show it; an unchanged row never scrolls; an uncached item waits and is revealed on arrival with nothing requested; clearing never scrolls; it never selects, deselects, posts a selection notification, emits SELECTION_CHANGED or touches promotion memory; 20 rapid keyboard selections while the item moves end on the last selection",
+      "feature": "Generic AppKit reveal-without-selection for Table, List and Tree: a commit that sets the hint or changes the item's row index scrolls the minimum to show it; an unchanged row never scrolls; an uncached item waits and is revealed on arrival with nothing requested; clearing never scrolls; it never selects, deselects, posts a selection notification, emits SELECTION_CHANGED or touches promotion memory; 20 rapid keyboard selections while the item moves end on the last selection; on a hierarchical Tree (PX-018-G01) rows come from the hidden-interval mapping, an item under a collapsed ancestor scrolls nothing and expands nothing, and a local disclosure change reveals the hinted row once only if its mapped row differs from the last revealed one",
       "scope": "PX-017-G01/client-macos Collections/CollectionKeepVisible.swift, TableCollectionAdapter.swift, OutlineCollectionAdapter.swift; RendererAppKit/CollectionKeepVisibleRendering.swift, LayoutRenderer.swift; Tests/RendererAppKitTests/KeepVisibleRenderingTests.swift",
       "source_refs": [
         "D1",

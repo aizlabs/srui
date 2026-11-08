@@ -17,6 +17,8 @@
 //   It is revealed when it arrives through range data at a row other than the last one shown.
 //   The same holds for any item the adapter cannot map to a displayed row (for example one
 //   under a collapsed Tree ancestor): the hint never expands anything, it just does not scroll.
+//   A local disclosure change re-evaluates the hint with the commit rule: the row is revealed
+//   once if it differs from the last revealed row, and otherwise left alone.
 // - Clearing the hint never scrolls. Local selection, scrolling and keyboard navigation never
 //   clear or override it; only the server does.
 //

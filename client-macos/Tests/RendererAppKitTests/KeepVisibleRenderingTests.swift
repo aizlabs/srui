@@ -399,6 +399,126 @@ struct KeepVisibleRenderingTests {
         #expect(harness.tableView.selectedRowIndexes.isEmpty)
     }
 
+    // MARK: - Hierarchical Tree (PX-018-G01 disclosure)
+
+    /// Three roots with 500 leaf children each, in preorder: root r sits at index 501·r and its
+    /// child c at 501·r + 1 + c. ItemIds are index + 1.
+    private static func forest() -> [ModelItem] {
+        (0..<3).flatMap { root -> [ModelItem] in
+            let base = UInt64(root) * 501
+            return [treeItem(base, depth: 0, descendants: 500)]
+                + (1...500).map { treeItem(base + UInt64($0), depth: 1, descendants: 0) }
+        }
+    }
+
+    private static func treeItem(_ index: UInt64, depth: UInt64, descendants: UInt64, id: UInt64? = nil) -> ModelItem {
+        ModelItem(
+            itemID: ItemId(id ?? index + 1),
+            value: .string("node \(id ?? index + 1)"),
+            properties: [.treeDepth: .unsignedInt(depth), .descendantCount: .unsignedInt(descendants)]
+        )
+    }
+
+    private static func hierarchicalStore() throws -> SemanticStore {
+        var store = SemanticStore()
+        try store.apply([
+            .createNode(id: surfaceID, nodeType: .surface, properties: [Property(property: .label, value: .string("Processes"))]),
+            .createModel(id: modelID, modelType: .tree, itemCount: 0),
+            .modelResetRange(id: modelID, startIndex: 0, items: forest(), totalCount: 1_503),
+            .createNode(id: tableID, nodeType: .tree, parentID: surfaceID, properties: [
+                Property(property: .modelRef, value: .unsignedInt(modelID.value)),
+                Property(property: .selectionMode, value: .enumToken(.selectionModeSingle)),
+            ]),
+        ])
+        return store
+    }
+
+    @Test
+    func aHintUnderACollapsedParentNeverExpandsOrScrollsAndIsRevealedOnLocalExpand() throws {
+        let harness = try Harness(store: Self.hierarchicalStore())
+        defer { harness.tearDown() }
+        let outline = try #require(harness.tableView as? NSOutlineView)
+        let adapter = try #require(harness.handle.modelAdapter as? OutlineCollectionAdapter)
+        let root2 = ItemId(1_003), hinted = ItemId(1_403) // root 2's child 400, index 1,402
+        #expect(adapter.setExpanded(false, itemID: root2, outlineView: outline))
+        harness.pan(to: 0)
+        let origin = outline.visibleRect
+        harness.interactions.removeAll()
+
+        try harness.commit([.setProperty(id: Self.tableID, property: .keepVisible, value: .itemID(hinted))])
+        #expect(adapter.row(of: hinted) == nil, "hidden by the collapsed parent")
+        #expect(adapter.collapsedItemIDs == [root2], "the hint expands nothing")
+        #expect(outline.visibleRect == origin, "no row, no scroll")
+        #expect(adapter.keepVisible.shownRow == nil)
+        #expect(harness.interactions.isEmpty, "no EXPANSION_CHANGED, no SELECTION_CHANGED")
+
+        // The user expands the parent: the item now has a row it was never revealed at.
+        #expect(adapter.setExpanded(true, itemID: root2, outlineView: outline))
+        let row = try #require(adapter.row(of: hinted))
+        #expect(row == 1_402)
+        #expect(harness.visibleRows.contains(row))
+        #expect(adapter.keepVisible.shownRow == row)
+        #expect(outline.selectedRowIndexes.isEmpty)
+        #expect(harness.notifications.isEmpty)
+
+        // Collapse, pan away and expand again: the row equals the last revealed one, so the
+        // user's viewport stays; the next unrelated commit does not scroll either.
+        #expect(adapter.setExpanded(false, itemID: root2, outlineView: outline))
+        harness.pan(to: 0)
+        let panned = outline.visibleRect
+        #expect(adapter.setExpanded(true, itemID: root2, outlineView: outline))
+        #expect(outline.visibleRect == panned)
+        try harness.commit([.setProperty(id: Self.tableID, property: .label, value: .string("Tree"))])
+        #expect(outline.visibleRect == panned)
+        #expect(harness.store.getNode(Self.tableID)?.keepVisible == hinted)
+    }
+
+    @Test
+    func aHintMovingInsideAnExpandedSubtreeIsRevealedAtItsMappedRow() throws {
+        let harness = try Harness(store: Self.hierarchicalStore())
+        defer { harness.tearDown() }
+        let outline = try #require(harness.tableView as? NSOutlineView)
+        let adapter = try #require(harness.handle.modelAdapter as? OutlineCollectionAdapter)
+        let root0 = ItemId(1), hinted = ItemId(1_403)
+        try harness.commit([.setProperty(id: Self.tableID, property: .keepVisible, value: .itemID(hinted))])
+        #expect(harness.visibleRows.contains(1_402))
+        harness.pan(to: 0)
+
+        // A re-sort inside root 2's subtree moves the leaf from index 1,402 to index 1,053.
+        try harness.commit([
+            .modelDelete(id: Self.modelID, index: nil, count: nil, itemIds: [hinted]),
+            .modelInsert(id: Self.modelID, index: 1_053, items: [Self.treeItem(1_053, depth: 1, descendants: 0, id: 1_403)]),
+        ])
+        #expect(adapter.row(of: hinted) == 1_053)
+        #expect(harness.visibleRows.contains(1_053))
+
+        // With root 0 collapsed locally the mapped row drops by 500, so that local change reveals
+        // it once at row 553; a later sibling-content commit that keeps it there never scrolls.
+        #expect(adapter.setExpanded(false, itemID: root0, outlineView: outline))
+        #expect(adapter.row(of: hinted) == 553)
+        #expect(harness.visibleRows.contains(553))
+        harness.pan(to: 0)
+        let panned = outline.visibleRect
+        try harness.commit([
+            .modelUpdate(id: Self.modelID, index: 1_054, items: [Self.treeItem(1_054, depth: 1, descendants: 0, id: 1_054)]),
+        ])
+        #expect(outline.visibleRect == panned)
+
+        // A move inside the subtree while root 0 is collapsed reveals the hidden-interval row,
+        // never the raw model index.
+        try harness.commit([
+            .modelDelete(id: Self.modelID, index: nil, count: nil, itemIds: [hinted]),
+            .modelInsert(id: Self.modelID, index: 1_300, items: [Self.treeItem(1_300, depth: 1, descendants: 0, id: 1_403)]),
+        ])
+        #expect(adapter.row(of: hinted) == 800)
+        #expect(harness.visibleRows.contains(800))
+        #expect(harness.visibleRows.contains(1_300) == false)
+        #expect(outline.selectedRowIndexes.isEmpty)
+        #expect(adapter.collapsedItemIDs == [root0])
+        #expect(harness.notifications.isEmpty)
+        #expect(harness.interactions == [.expansionChanged(nodeID: Self.tableID, itemID: root0, expanded: false)])
+    }
+
     @Test
     func treeHintRevealsTheOutlineRowWithoutSelecting() throws {
         let harness = try Harness(store: Self.store(rows: 2_000, nodeType: .tree))

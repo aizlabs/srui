@@ -88,7 +88,7 @@ The canonical registry defines 34 standard properties in five categories:
 2. **Common State** (§7.4)
 3. **Content** (§7.4)
 4. **Layout Intent** (§7.4)
-5. **Control-Specific & Semantic Metadata** (§7.7, §8): `presentation_hint`, `action_key`, `columns`, `selection_mode`, `shortcut`, and the model item properties `tree_depth`, `descendant_count`, and `keep_visible`
+5. **Control-Specific & Semantic Metadata** (§7.7, §8): `presentation_hint`, `action_key`, `columns`, `selection_mode`, `shortcut`, `keep_visible`, and the model item properties `tree_depth`, `descendant_count`
 
 Each property entry includes `value_type` metadata validated by the registry tool.
 

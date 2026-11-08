@@ -392,6 +392,7 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
         onCollapsedItemsChanged?(nodeID, modelID, collapsedItemIDs)
         onExpansionChanged?(nodeID, itemID, expanded)
         resolvePendingPromotion(in: outlineView)
+        followKeepVisibleAfterDisclosureChange(in: outlineView)
         emitRequestsAfterDisclosureChange(in: outlineView)
         return true
     }
@@ -569,12 +570,27 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
 
     /// Applies the tree's `keep_visible` after a commit, with the same rules as
     /// `TableCollectionAdapter.applyKeepVisible`: it scrolls the hinted row into view and never
-    /// touches the selection or disclosure state: an item without a displayed row is not scrolled
-    /// to and no ancestor is expanded for it. Model-backed trees are flat here.
+    /// touches the selection or the disclosure state. Rows come from the hidden-interval mapping
+    /// (`row(of:)`), so an item under a collapsed ancestor has no row: nothing is scrolled and no
+    /// ancestor is expanded for it (expanding for a reveal is a promotion's behaviour only).
     public func applyKeepVisible(_ itemID: ItemId?, explicit: Bool, outlineView: NSOutlineView) {
         if let row = keepVisible.apply(itemID, explicit: explicit, rowOf: row(of:)) {
             CollectionPromotion.reveal(row: row, in: outlineView)
         }
+    }
+
+    /// Re-evaluates `keep_visible` after a local disclosure change (§22.5).
+    ///
+    /// A collapse or expand remaps rows, so the hinted item's displayed row can change without a
+    /// commit. The same rule applies as for a commit that does not set the hint: the row is
+    /// revealed once when it differs from the row last revealed (for example when expanding the
+    /// collapsed ancestor of an item that was never shown); an unchanged row, or an item that a
+    /// collapse just hid, scrolls nothing. Re-baselining here keeps the next unrelated commit
+    /// from scrolling because of the user's own disclosure change.
+    private func followKeepVisibleAfterDisclosureChange(in outlineView: NSOutlineView) {
+        guard let itemID = keepVisible.itemID,
+              let row = keepVisible.apply(itemID, explicit: false, rowOf: row(of:)) else { return }
+        CollectionPromotion.reveal(row: row, in: outlineView)
     }
 
     /// Reselects a user's local selection by ItemId without revealing it (§22.5).

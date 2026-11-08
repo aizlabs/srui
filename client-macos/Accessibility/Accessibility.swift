@@ -53,6 +53,8 @@ public enum SemanticAction: Equatable, Sendable {
     case activate
     case valueChanged(Value)
     case selectionChanged(ItemId)
+    /// A Tree item's disclosure (§7.6, §22.5): the ItemId and whether it is now expanded.
+    case expansionChanged(ItemId, expanded: Bool)
 
     public var eventType: TypeRef {
         switch self {
@@ -62,6 +64,8 @@ public enum SemanticAction: Equatable, Sendable {
             return .EVENT_VALUE_CHANGED
         case .selectionChanged:
             return .EVENT_SELECTION_CHANGED
+        case .expansionChanged:
+            return .EVENT_EXPANSION_CHANGED
         }
     }
 }
@@ -329,6 +333,12 @@ public struct SemanticNodeHandle: Sendable {
     @discardableResult
     public func select(_ itemID: ItemId) async throws -> Event {
         try await perform(.selectionChanged(itemID))
+    }
+
+    /// Reports a Tree item's disclosure through the normal event path (§7.6, §22.5).
+    @discardableResult
+    public func setExpanded(_ itemID: ItemId, _ expanded: Bool) async throws -> Event {
+        try await perform(.expansionChanged(itemID, expanded: expanded))
     }
 }
 

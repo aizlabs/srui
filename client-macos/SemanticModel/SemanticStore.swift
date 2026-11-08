@@ -14,6 +14,11 @@
 // node type's admission, and uniqueness within one tree (the window-owning root Surface and
 // everything under it, nested Surfaces included), including MOVE_NODE into another tree.
 //
+// A hierarchical model's shape (standard item properties 32 `tree_depth` and 33
+// `descendant_count`, §8) and the §26 limit `maxModelTreeDepth` are checked by
+// `validateModelTree(_:)` after the last operation of a transaction that touches the model, with
+// the same rules, order and error codes as the Rust store (`Model.validateTreeShape`).
+//
 // Architectural Invariants (§4):
 // - Invariant 2: The client retains a non-authoritative replica of committed semantic UI state
 //   plus local presentation state. The replica exists only to render, interact, inspect, cache,
@@ -156,6 +161,10 @@ public struct Node: Equatable, Sendable, CustomStringConvertible {
 
 // MARK: - Store Limits (§26)
 
+/// Default maximum number of levels in a hierarchical collection model (§8, §26), matching the
+/// Rust `DEFAULT_MAX_MODEL_TREE_DEPTH`: roots are depth 0 and the deepest item is depth 255.
+public let defaultMaxModelTreeDepth = 256
+
 /// Configurable mandatory runtime safety limits for `SemanticStore` (§26).
 public struct StoreLimits: Equatable, Sendable {
     /// Maximum allowed depth of any node in the hierarchy (root is depth 1). Default: 64.
@@ -188,6 +197,11 @@ public struct StoreLimits: Equatable, Sendable {
     /// Maximum allowed items in a single model mutation batch (§26). Default: 10,000.
     public var maxItemsPerModelOperation: Int
 
+    /// Maximum number of levels in a hierarchical collection model (§8, §26): every cached
+    /// item's `tree_depth` must be below it. Unlike `maxTreeDepth`, which bounds the semantic
+    /// node tree, this bounds model data. Default: 256.
+    public var maxModelTreeDepth: Int
+
     /// Constructs a `StoreLimits` instance with default values (§26).
     public init(
         maxTreeDepth: Int = 64,
@@ -199,7 +213,8 @@ public struct StoreLimits: Equatable, Sendable {
         maxTransactionOperations: Int = 10_000,
         maxModelCount: Int = 1_000,
         maxCachedItemsPerModel: Int = 100_000,
-        maxItemsPerModelOperation: Int = 10_000
+        maxItemsPerModelOperation: Int = 10_000,
+        maxModelTreeDepth: Int = defaultMaxModelTreeDepth
     ) {
         self.maxTreeDepth = maxTreeDepth
         self.maxNodeCount = maxNodeCount
@@ -211,6 +226,7 @@ public struct StoreLimits: Equatable, Sendable {
         self.maxModelCount = maxModelCount
         self.maxCachedItemsPerModel = maxCachedItemsPerModel
         self.maxItemsPerModelOperation = maxItemsPerModelOperation
+        self.maxModelTreeDepth = maxModelTreeDepth
     }
 
     /// Convenience constructor with basic tree and string limits.
@@ -307,6 +323,12 @@ public struct StoreLimits: Equatable, Sendable {
     public func withMaxItemsPerModelOperation(_ max: Int) -> StoreLimits {
         var copy = self
         copy.maxItemsPerModelOperation = max
+        return copy
+    }
+
+    public func withMaxModelTreeDepth(_ max: Int) -> StoreLimits {
+        var copy = self
+        copy.maxModelTreeDepth = max
         return copy
     }
 
@@ -408,6 +430,12 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
     case shortcutNotAdmitted(nodeID: NodeId, nodeType: TypeRef)
     /// Another node in the same Surface already holds this `shortcut` (§7.4).
     case duplicateShortcut(nodeID: NodeId, existing: NodeId, shortcut: String)
+    /// A model item's `tree_depth` reaches the configured `maxModelTreeDepth`, which counts
+    /// levels, so `tree_depth` must stay below it (§8, §26).
+    case maxModelTreeDepthExceeded(modelID: ModelId, index: UInt64, limit: Int, treeDepth: UInt64)
+    /// A model's cached items break the preorder shape declared by `tree_depth` and
+    /// `descendant_count` (§8, §12.1, §26).
+    case invalidModelTree(modelID: ModelId, index: UInt64, violation: ModelTreeViolation)
     /// Generic operation error when applying an operation.
     case operationError(String)
 
@@ -467,6 +495,10 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
             return "node \(nodeID) of type \(nodeType) does not admit a shortcut"
         case .duplicateShortcut(let nodeID, let existing, let shortcut):
             return "shortcut \"\(shortcut)\" on node \(nodeID) is already held by node \(existing) in the same Surface"
+        case .maxModelTreeDepthExceeded(let modelID, let index, let limit, let treeDepth):
+            return "model tree depth limit exceeded: item at index \(index) of model \(modelID) has tree_depth \(treeDepth), but max_model_tree_depth is \(limit) levels"
+        case .invalidModelTree(let modelID, let index, let violation):
+            return "invalid model tree: item at index \(index) of model \(modelID): \(violation)"
         case .operationError(let msg):
             return "operation application error: \(msg)"
         }
@@ -502,6 +534,8 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
         case .invalidShortcut: return "invalid_shortcut"
         case .shortcutNotAdmitted: return "shortcut_not_admitted"
         case .duplicateShortcut: return "duplicate_shortcut"
+        case .maxModelTreeDepthExceeded: return "max_model_tree_depth_exceeded"
+        case .invalidModelTree(_, _, let violation): return violation.conformanceCode
         case .operationError: return "operation_error"
         }
     }
@@ -649,6 +683,20 @@ public enum StoreOperation: Equatable, Sendable {
         }
     }
 
+    /// The collection model this operation edits, if it is a model operation (§8, §13).
+    public var modelID: ModelId? {
+        switch self {
+        case .createModel(let id, _, _),
+             .modelInsert(let id, _, _),
+             .modelDelete(let id, _, _, _),
+             .modelUpdate(let id, _, _),
+             .modelResetRange(let id, _, _, _):
+            return id
+        default:
+            return nil
+        }
+    }
+
     /// Returns `true` if this operation is a scalar `setProperty` mutation (§7.6, §20.2).
     public var isScalarSetProperty: Bool {
         if case .setProperty(_, _, let value) = self {
@@ -660,6 +708,33 @@ public enum StoreOperation: Equatable, Sendable {
 
 /// Convenience alias matching protocol terminology (§13).
 public typealias Operation = StoreOperation
+
+/// Maps the index of the last operation touching each collection model to that model (§8, §12.1).
+///
+/// A model's `tree_depth`/`descendant_count` shape can only be judged once the transaction has
+/// finished editing it: inserting a child needs the `MODEL_INSERT` and the ancestors'
+/// `MODEL_UPDATE` together. Checking after that model's last operation keeps a deterministic
+/// operation index, identical to the Rust store's.
+public struct ModelTreeCheckpoints: Sendable {
+    private let lastTouch: [Int: ModelId]
+
+    public init(_ operations: [StoreOperation]) {
+        var last: [ModelId: Int] = [:]
+        for (idx, op) in operations.enumerated() {
+            if let id = op.modelID { last[id] = idx }
+        }
+        var byIndex: [Int: ModelId] = [:]
+        for (id, idx) in last { byIndex[idx] = id }
+        lastTouch = byIndex
+    }
+
+    /// Validates the model whose last touch is operation `idx`, if any.
+    public func check(_ staged: SemanticStore, afterOperation idx: Int) throws {
+        if let id = lastTouch[idx] {
+            try staged.validateModelTree(id)
+        }
+    }
+}
 
 // MARK: - SemanticStore (§6.2, §6.3, §13, §26)
 
@@ -897,6 +972,10 @@ public struct SemanticStore: Equatable, Sendable {
     /// Applies a single mutation operation directly to this store (§13).
     public mutating func apply(_ operation: StoreOperation) throws {
         try operation.apply(to: &self)
+        // A lone operation is its own last touch of the model it edits (§8).
+        if let model = operation.modelID {
+            try validateModelTree(model)
+        }
     }
 
     /// Applies a list of mutation operations atomically: if any operation fails,
@@ -908,9 +987,11 @@ public struct SemanticStore: Equatable, Sendable {
                 actual: operations.count
             )
         }
+        let checkpoints = ModelTreeCheckpoints(operations)
         var staged = self.cloneStaging()
-        for op in operations {
+        for (idx, op) in operations.enumerated() {
             try op.apply(to: &staged)
+            try checkpoints.check(staged, afterOperation: idx)
         }
         self.commitStaging(staged)
     }
@@ -1525,6 +1606,15 @@ public struct SemanticStore: Equatable, Sendable {
             return nil
         }
         return models[mId]
+    }
+
+    /// Checks a model's hierarchical shape against its cached items and `maxModelTreeDepth`
+    /// (§8, §26); see `Model.validateTreeShape`. A model that does not exist has no shape.
+    ///
+    /// Transaction appliers call this after the last operation of a transaction that touches the
+    /// model, exactly as the Rust store does, so the failure carries that operation's index.
+    public func validateModelTree(_ id: ModelId) throws {
+        try models[id]?.validateTreeShape(maxModelTreeDepth: limitsValue.maxModelTreeDepth)
     }
 
     /// Creates a new collection model in the store (§13 CREATE_MODEL, §8).

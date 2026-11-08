@@ -319,12 +319,17 @@ public struct Event: Equatable, Sendable, CustomStringConvertible {
         )
     }
 
-    /// Convenience constructor for expansion change events (`EXPANSION_CHANGED`, §7.6).
+    /// Convenience constructor for expansion change events (`EXPANSION_CHANGED`, §7.6, §22.5).
+    ///
+    /// Disclosure is local presentation state; the event only reports it. `value` carries the new
+    /// state (`true` expanded) and `items` names exactly the one `ItemId` whose disclosure
+    /// changed, never a row index, matching the Rust `Event::expansion_changed`.
     public static func expansionChanged(
         eventSeq: UInt64,
         eventId: EventId,
         observedRevision: Revision,
         nodeId: NodeId,
+        itemId: ItemId,
         expanded: Bool
     ) -> Event {
         Event(
@@ -333,7 +338,10 @@ public struct Event: Equatable, Sendable, CustomStringConvertible {
             observedRevision: observedRevision,
             nodeId: nodeId,
             eventType: TypeRef.EVENT_EXPANSION_CHANGED,
-            arguments: [PropertyRef.VALUE: .bool(expanded)]
+            arguments: [
+                PropertyRef.VALUE: .bool(expanded),
+                PropertyRef.ITEMS: .list([.itemID(itemId)]),
+            ]
         )
     }
 

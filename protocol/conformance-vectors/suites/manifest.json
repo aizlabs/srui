@@ -18,7 +18,7 @@
       "status": "active",
       "vectors": {
         "dir": "suites/01-core-state-machine/vectors",
-        "count": 68
+        "count": 83
       },
       "rust": [
         [
@@ -74,6 +74,16 @@
           "srui-semantic-tree",
           "--test",
           "shortcut_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-sdk",
+          "--test",
+          "tree_model_test"
         ]
       ],
       "swift": [
@@ -116,17 +126,25 @@
           "client-macos",
           "--filter",
           "ShortcutRoutingTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "HierarchicalTreeTests"
         ]
       ],
       "gaps": [
         {
-          "scenario": "Tree EXPANSION_CHANGED and Surface VIEWPORT_CHANGED are declared in \u00a77.6 but the renderer has no interaction path that can originate them.",
-          "reason": "RendererAppKit/SemanticInteraction.swift models only activate, valueChanged, selectionChanged and textEdit. A required-tier widget can therefore never emit the disclosure or viewport events the registry declares for it.",
-          "future_task": "unowned \u2014 needs a SemanticInteraction case plus the AppKit outline/window wiring",
+          "scenario": "Surface VIEWPORT_CHANGED is declared in \u00a77.6 but the renderer has no interaction path that can originate it.",
+          "reason": "RendererAppKit/SemanticInteraction.swift models activate, valueChanged, selectionChanged, expansionChanged (Tree disclosure, PX-018-G01) and textEdit, but no window-viewport case. A required-tier Surface can therefore never emit the viewport event the registry declares for it.",
+          "future_task": "unowned \u2014 needs a SemanticInteraction case plus the AppKit window wiring (Tree EXPANSION_CHANGED was closed by PX-018-G01)",
           "gap_probe": {
             "file": "client-macos/RendererAppKit/SemanticInteraction.swift",
-            "absent_pattern": "case +(expansionChanged|viewportChanged)",
-            "explanation": "Matches once the renderer can originate disclosure or viewport events. A match means suite 2 must assert the behaviour instead of documenting its absence."
+            "absent_pattern": "case +viewportChanged",
+            "explanation": "Matches once the renderer can originate viewport events. A match means suite 2 must assert the behaviour instead of documenting its absence."
           },
           "languages": [
             "swift"
@@ -614,6 +632,26 @@
           "srui-semantic-tree",
           "--test",
           "shortcut_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-semantic-tree",
+          "--test",
+          "model_tree_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-sdk",
+          "--test",
+          "tree_model_test"
         ]
       ],
       "swift": [
@@ -664,6 +702,14 @@
           "client-macos",
           "--filter",
           "ShortcutStoreTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ModelTreeStoreTests"
         ]
       ]
     },
@@ -726,6 +772,14 @@
           "client-macos",
           "--filter",
           "ShortcutRoutingTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "HierarchicalTreeTests"
         ]
       ],
       "not_applicable": {
@@ -808,6 +862,14 @@
           "client-macos",
           "--filter",
           "ShortcutRoutingTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "HierarchicalTreeTests"
         ]
       ],
       "not_applicable": {

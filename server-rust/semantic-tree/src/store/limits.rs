@@ -9,6 +9,9 @@ pub const DEFAULT_MAX_MODEL_COUNT: usize = 1_000;
 pub const DEFAULT_MAX_CACHED_ITEMS_PER_MODEL: usize = 100_000;
 /// Default maximum allowed items in a single model mutation operation (§26).
 pub const DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION: usize = 10_000;
+/// Default maximum number of levels in a hierarchical collection model (§8, §26): an item's
+/// `tree_depth` must stay below it, so roots are depth 0 and the deepest item is depth 255.
+pub const DEFAULT_MAX_MODEL_TREE_DEPTH: usize = 256;
 
 /// Configurable mandatory runtime safety limits for `SemanticStore` (§26).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +36,10 @@ pub struct StoreLimits {
     pub max_cached_items_per_model: usize,
     /// Maximum allowed items in a single model mutation batch (§26). Default: 10,000.
     pub max_items_per_model_operation: usize,
+    /// Maximum number of levels in a hierarchical collection model (§8, §26): every cached item's
+    /// `tree_depth` must be below it. Unlike `max_tree_depth`, which bounds the semantic node
+    /// tree, this bounds model data. Default: 256.
+    pub max_model_tree_depth: usize,
 }
 
 impl Default for StoreLimits {
@@ -48,6 +55,7 @@ impl Default for StoreLimits {
             max_model_count: DEFAULT_MAX_MODEL_COUNT,
             max_cached_items_per_model: DEFAULT_MAX_CACHED_ITEMS_PER_MODEL,
             max_items_per_model_operation: DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
+            max_model_tree_depth: DEFAULT_MAX_MODEL_TREE_DEPTH,
         }
     }
 }
@@ -70,6 +78,7 @@ impl StoreLimits {
             max_model_count: DEFAULT_MAX_MODEL_COUNT,
             max_cached_items_per_model: DEFAULT_MAX_CACHED_ITEMS_PER_MODEL,
             max_items_per_model_operation: DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
+            max_model_tree_depth: DEFAULT_MAX_MODEL_TREE_DEPTH,
         }
     }
 
@@ -94,10 +103,13 @@ impl StoreLimits {
             max_model_count: DEFAULT_MAX_MODEL_COUNT,
             max_cached_items_per_model: DEFAULT_MAX_CACHED_ITEMS_PER_MODEL,
             max_items_per_model_operation: DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
+            max_model_tree_depth: DEFAULT_MAX_MODEL_TREE_DEPTH,
         }
     }
 
-    /// Creates a new `StoreLimits` with full explicit customization of all 10 store, value, transaction, and model limits (§26).
+    /// Creates a new `StoreLimits` with explicit customization of the 10 store, value, transaction,
+    /// and model item limits (§26); `max_model_tree_depth` keeps its default (see
+    /// [`Self::with_max_model_tree_depth`]).
     #[allow(clippy::too_many_arguments)]
     pub const fn with_all_limits(
         max_tree_depth: usize,
@@ -122,6 +134,7 @@ impl StoreLimits {
             max_model_count,
             max_cached_items_per_model,
             max_items_per_model_operation,
+            max_model_tree_depth: DEFAULT_MAX_MODEL_TREE_DEPTH,
         }
     }
 
@@ -195,6 +208,12 @@ impl StoreLimits {
     /// Returns a copy of `self` with a customized maximum items per model operation limit (§26).
     pub const fn with_max_items_per_model_operation(mut self, max: usize) -> Self {
         self.max_items_per_model_operation = max;
+        self
+    }
+
+    /// Returns a copy of `self` with a customized maximum hierarchical model depth (§8, §26).
+    pub const fn with_max_model_tree_depth(mut self, max: usize) -> Self {
+        self.max_model_tree_depth = max;
         self
     }
 

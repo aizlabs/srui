@@ -326,6 +326,8 @@ private actor ActionRequestRecorder {
             arguments = [.VALUE: value]
         case .selectionChanged(let itemID):
             arguments = [.VALUE: .itemID(itemID)]
+        case .expansionChanged(let itemID, let expanded):
+            arguments = [.VALUE: .bool(expanded), .ITEMS: .list([.itemID(itemID)])]
         }
 
         return Event(

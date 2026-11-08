@@ -67,6 +67,7 @@ struct FixtureLimits {
     max_model_count: Option<usize>,
     max_cached_items_per_model: Option<usize>,
     max_items_per_model_operation: Option<usize>,
+    max_model_tree_depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -561,6 +562,9 @@ fn build_store_limits(fl: &Option<FixtureLimits>) -> StoreLimits {
         if let Some(v) = l.max_items_per_model_operation {
             limits.max_items_per_model_operation = v;
         }
+        if let Some(v) = l.max_model_tree_depth {
+            limits.max_model_tree_depth = v;
+        }
     }
     limits
 }
@@ -866,6 +870,18 @@ pub fn replay_fixture(path: &Path) {
                             "Item value mismatch at index {} in model {} in {:?}",
                             idx, model_id, path
                         );
+                        for (k, v) in &exp_item.properties {
+                            let prop_ref = resolve_property_name(k);
+                            assert_eq!(
+                                item.properties.get(&prop_ref),
+                                Some(&convert_value(v.clone())),
+                                "Item property {} mismatch at index {} in model {} in {:?}",
+                                k,
+                                idx,
+                                model_id,
+                                path
+                            );
+                        }
                     }
                 }
             }

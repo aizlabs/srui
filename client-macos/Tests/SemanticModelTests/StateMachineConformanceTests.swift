@@ -328,6 +328,16 @@ final class StateMachineConformanceTests: XCTestCase {
                             let expVal = try convertValue(expValJson)
                             XCTAssertEqual(item.value, expVal, "[\(fileName)] Item value mismatch at index \(idx)")
                         }
+                        if let expProps = expItem["properties"] as? [String: Any] {
+                            for (name, raw) in expProps {
+                                let propRef = try resolvePropertyName(name)
+                                XCTAssertEqual(
+                                    item.getProperty(propRef),
+                                    try convertValue(raw),
+                                    "[\(fileName)] Item property \(name) mismatch at index \(idx)"
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -353,6 +363,7 @@ final class StateMachineConformanceTests: XCTestCase {
         if let v = try jsonInt(d, "max_model_count", fileName: fileName) { limits.maxModelCount = v }
         if let v = try jsonInt(d, "max_cached_items_per_model", fileName: fileName) { limits.maxCachedItemsPerModel = v }
         if let v = try jsonInt(d, "max_items_per_model_operation", fileName: fileName) { limits.maxItemsPerModelOperation = v }
+        if let v = try jsonInt(d, "max_model_tree_depth", fileName: fileName) { limits.maxModelTreeDepth = v }
         return limits
     }
 
@@ -675,8 +686,10 @@ final class StateMachineConformanceTests: XCTestCase {
             return .null
         }
 
-        if let b = raw as? Bool {
-            return .bool(b)
+        // `NSNumber` 0 and 1 also bridge through `as? Bool`, so a JSON boolean is recognised by its
+        // CFBoolean type only; otherwise an integer 0 or 1 (a `tree_depth`, say) would become a bool.
+        if let num = raw as? NSNumber, CFGetTypeID(num) == CFBooleanGetTypeID() {
+            return .bool(num.boolValue)
         }
 
         if let s = raw as? String {

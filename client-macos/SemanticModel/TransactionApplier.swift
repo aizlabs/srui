@@ -248,10 +248,12 @@ public final class TransactionApplier: @unchecked Sendable {
             return .failure(.maxOperationsExceeded(limit: maxOps, actual: operations.count))
         }
 
+        let checkpoints = ModelTreeCheckpoints(operations)
         var staged = _store.cloneStaging()
         for (idx, op) in operations.enumerated() {
             do {
                 try op.apply(to: &staged)
+                try checkpoints.check(staged, afterOperation: idx)
             } catch let error as StoreError {
                 return .failure(.opFailed(opIndex: idx, source: error))
             } catch {
@@ -434,10 +436,12 @@ public final class TransactionApplier: @unchecked Sendable {
             return .failure(.maxOperationsExceeded(limit: maxOps, actual: record.operations.count))
         }
 
+        let checkpoints = ModelTreeCheckpoints(record.operations)
         var staged = SemanticStore(limits: limits, revision: .initial)
         for (idx, op) in record.operations.enumerated() {
             do {
                 try op.apply(to: &staged)
+                try checkpoints.check(staged, afterOperation: idx)
             } catch let error as StoreError {
                 return .failure(.opFailed(opIndex: idx, source: error))
             } catch {

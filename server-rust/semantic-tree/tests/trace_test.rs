@@ -36,6 +36,7 @@ fn trace_limits() -> StoreLimits {
         max_model_count: 4,
         max_cached_items_per_model: 32,
         max_items_per_model_operation: 8,
+        max_model_tree_depth: srui_semantic_tree::DEFAULT_MAX_MODEL_TREE_DEPTH,
     }
 }
 

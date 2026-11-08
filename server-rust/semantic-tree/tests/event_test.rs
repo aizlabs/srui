@@ -71,9 +71,11 @@ fn test_standard_event_factories() {
     assert_eq!(text_event.text_arg(), Some("hello world"));
 
     // 5. EXPANSION_CHANGED
-    let exp_event = Event::expansion_changed(6, "exp-1", 10, 105, true);
+    let exp_event = Event::expansion_changed(6, "exp-1", 10, 105, 7u64, true);
     assert_eq!(exp_event.event_type, TypeRef::EVENT_EXPANSION_CHANGED);
     assert_eq!(exp_event.bool_arg(), Some(true));
+    assert_eq!(exp_event.expansion_change(), Some((ItemId::new(7), true)));
+    assert_eq!(sel_event.expansion_change(), None);
 
     // 6. VIEWPORT_CHANGED
     let vp_event = Event::viewport_changed(7, "vp-1", 10, 106, Size::new(1024.0, 768.0));

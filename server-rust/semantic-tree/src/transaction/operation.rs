@@ -137,6 +137,18 @@ pub enum Operation {
 }
 
 impl Operation {
+    /// The collection model this operation edits, if it is a model operation (§8, §13).
+    pub fn model_id(&self) -> Option<ModelId> {
+        match self {
+            Self::CreateModel { id, .. }
+            | Self::ModelInsert { id, .. }
+            | Self::ModelDelete { id, .. }
+            | Self::ModelUpdate { id, .. }
+            | Self::ModelResetRange { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+
     /// Convenience constructor for [`Operation::CreateNode`].
     pub fn create_node(
         id: NodeId,

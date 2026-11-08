@@ -1,6 +1,90 @@
 use crate::ids::{ItemId, ModelId, NodeId, TypeRef};
 use std::fmt;
 
+/// How a hierarchical model's cached items break the preorder shape that `tree_depth` and
+/// `descendant_count` declare (§8, §26).
+///
+/// Every check reads cached items only: a sparse replica and the authoritative store reach the
+/// same verdict for the same cache, and an uncached neighbour is never guessed at (§6.3, §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelTreeViolation {
+    /// `tree_depth` or `descendant_count` is not a non-negative integer.
+    InvalidProperty {
+        /// Registry name of the offending property.
+        property: &'static str,
+    },
+    /// `index + descendant_count` reaches or passes `item_count`.
+    DescendantCountOutOfRange {
+        descendant_count: u64,
+        item_count: u64,
+    },
+    /// Index 0 is not a root, or the item is more than one level deeper than the cached item
+    /// immediately before it.
+    DepthJump {
+        tree_depth: u64,
+        /// Depth of the cached item at `index - 1`; `None` at index 0.
+        previous_depth: Option<u64>,
+    },
+    /// The item lies inside a cached item's span without being deeper than it, its own span
+    /// runs past that item's span, or it directly follows a span while being deeper than the
+    /// span's owner.
+    OutsideParentSpan {
+        /// Index of the cached item whose span the item violates.
+        parent_index: u64,
+    },
+}
+
+impl ModelTreeViolation {
+    /// Canonical conformance code (§32).
+    pub fn conformance_code(&self) -> &'static str {
+        match self {
+            Self::InvalidProperty { .. } => "invalid_model_tree_property",
+            Self::DescendantCountOutOfRange { .. } => "model_tree_descendant_count_out_of_range",
+            Self::DepthJump { .. } => "model_tree_depth_jump",
+            Self::OutsideParentSpan { .. } => "model_tree_outside_parent_span",
+        }
+    }
+}
+
+impl fmt::Display for ModelTreeViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidProperty { property } => {
+                write!(f, "{} is not a non-negative integer", property)
+            }
+            Self::DescendantCountOutOfRange {
+                descendant_count,
+                item_count,
+            } => write!(
+                f,
+                "descendant_count {} runs past item_count {}",
+                descendant_count, item_count
+            ),
+            Self::DepthJump {
+                tree_depth,
+                previous_depth: Some(previous),
+            } => write!(
+                f,
+                "tree_depth {} jumps more than one level below the previous item's {}",
+                tree_depth, previous
+            ),
+            Self::DepthJump {
+                tree_depth,
+                previous_depth: None,
+            } => write!(
+                f,
+                "index 0 must be a root, but its tree_depth is {}",
+                tree_depth
+            ),
+            Self::OutsideParentSpan { parent_index } => write!(
+                f,
+                "item breaks the subtree span of the item at index {}",
+                parent_index
+            ),
+        }
+    }
+}
+
 /// Errors returned by `SemanticStore` mutation operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
@@ -65,6 +149,21 @@ pub enum StoreError {
         node_id: NodeId,
         existing: NodeId,
         shortcut: String,
+    },
+    /// A model item's `tree_depth` reaches the configured `max_model_tree_depth`, which counts
+    /// levels, so `tree_depth` must stay below it (§8, §26).
+    MaxModelTreeDepthExceeded {
+        model_id: ModelId,
+        index: u64,
+        limit: usize,
+        tree_depth: u64,
+    },
+    /// A model's cached items break the preorder shape declared by `tree_depth` and
+    /// `descendant_count` (§8, §12.1, §26).
+    InvalidModelTree {
+        model_id: ModelId,
+        index: u64,
+        violation: ModelTreeViolation,
     },
     /// Generic operation error when applying a wire operation.
     OperationError(String),
@@ -189,6 +288,25 @@ impl fmt::Display for StoreError {
                 "shortcut {:?} on node {} is already held by node {} in the same Surface",
                 shortcut, node_id, existing
             ),
+            Self::MaxModelTreeDepthExceeded {
+                model_id,
+                index,
+                limit,
+                tree_depth,
+            } => write!(
+                f,
+                "model tree depth limit exceeded: item at index {} of model {} has tree_depth {}, but max_model_tree_depth is {} levels",
+                index, model_id, tree_depth, limit
+            ),
+            Self::InvalidModelTree {
+                model_id,
+                index,
+                violation,
+            } => write!(
+                f,
+                "invalid model tree: item at index {} of model {}: {}",
+                index, model_id, violation
+            ),
             Self::OperationError(msg) => write!(f, "operation application error: {}", msg),
         }
     }
@@ -227,6 +345,8 @@ impl StoreError {
             Self::InvalidShortcut { .. } => "invalid_shortcut",
             Self::ShortcutNotAdmitted { .. } => "shortcut_not_admitted",
             Self::DuplicateShortcut { .. } => "duplicate_shortcut",
+            Self::MaxModelTreeDepthExceeded { .. } => "max_model_tree_depth_exceeded",
+            Self::InvalidModelTree { violation, .. } => violation.conformance_code(),
             Self::OperationError(_) => "operation_error",
         }
     }

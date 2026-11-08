@@ -83,12 +83,12 @@ Design-doc tier groupings for reference:
 > **Admission Rule for Standard Widgets (§7.2)**: A widget belongs in the Standard Profile only if its meaning and state machine are stable across multiple major desktop toolkit families (AppKit, WinUI, GTK, SWT), its behavior is specified without reference to a particular drawing API, and it supports accessibility mapping.
 
 ### 4.2 Common Properties (§7.4, §8)
-The canonical registry defines 31 standard properties in five categories:
+The canonical registry defines 33 standard properties in five categories:
 1. **Identity & Accessibility** (§7.4)
 2. **Common State** (§7.4)
 3. **Content** (§7.4)
 4. **Layout Intent** (§7.4)
-5. **Control-Specific & Semantic Metadata** (§7.7, §8): `presentation_hint`, `action_key`, `columns`, `selection_mode`, `shortcut`
+5. **Control-Specific & Semantic Metadata** (§7.7, §8): `presentation_hint`, `action_key`, `columns`, `selection_mode`, `shortcut`, and the model item properties `tree_depth`, `descendant_count`
 
 Each property entry includes `value_type` metadata validated by the registry tool.
 
@@ -114,6 +114,18 @@ Each property entry includes `value_type` metadata validated by the registry too
 - **Discoverability (§22.8, §22.9):** the platform-formatted shortcut (macOS `⇧⌘R`) appears in the control's tooltip, its accessibility help and the semantic inspection snapshot.
 - **Fallback (§4 inv. 13 optional semantics):** a client without support ignores the property; the node stays reachable by pointer, Tab and accessibility, and the application's behavior is unchanged.
 
+**Hierarchical models — `tree_depth` and `descendant_count` (properties 32 and 33; §4 inv. 13, §6.3, §7.6, §8, §12.1, §22.5, §22.7, §26).** A `Tree` model's index space is the depth-first preorder of the whole forest. Both are **model item** properties (`uint64`; absent means 0):
+
+- **Shape:** `tree_depth` is 0 for a root; `descendant_count` is the subtree size excluding the item, so item *i*'s descendants are exactly indices *i*+1 … *i*+`descendant_count`.
+- **No new wire messages:** range requests, `MODEL_INSERT`/`MODEL_DELETE`/`MODEL_UPDATE`/`MODEL_RESET_RANGE`, selection promotion and server-pushed ranges keep flat index semantics. A subtree edit is an ordinary flat edit plus a `MODEL_UPDATE` of the affected ancestors' `descendant_count`; hierarchical models should delete by index range, because a sparse replica cannot shift its cached indices for an identity delete of an item it does not cache.
+- **Validation (all-or-nothing, §12.1):** checked on every replica after the **last operation of a transaction that touches the model**, so the whole edit is judged at once and a failure is reported at that operation's index. Items are visited in index order, only cached items are compared, and the first violation wins: (1) both values are non-negative integers (`invalid_model_tree_property`); (2) `tree_depth` < `max_model_tree_depth` (`max_model_tree_depth_exceeded`); (3) `index + descendant_count < item_count` (`model_tree_descendant_count_out_of_range`); (4) index 0 has depth 0 and, where items *i* and *i*+1 are both cached, `tree_depth(i+1) <= tree_depth(i) + 1` (`model_tree_depth_jump`); (5) an item inside the nearest enclosing cached span is deeper than its owner and ends inside it, and a cached item directly after a span is no deeper than the span's owner (`model_tree_outside_parent_span`). `protocol/conformance-vectors/model_tree_shape_cases.json` is the shared Rust/Swift/Python parity table; suite 1 vectors 70–84 replay the transaction semantics.
+- **§26 limit `max_model_tree_depth`:** counts levels, default 256 (`DEFAULT_MAX_MODEL_TREE_DEPTH` / `defaultMaxModelTreeDepth`), so the deepest admitted `tree_depth` is 255. It bounds model data; `max_tree_depth` still bounds the semantic node tree. A model that never held either property is never shape-checked.
+- **Local disclosure (§22.5):** items start expanded. Collapsing an item hides indices *i*+1 … *i*+`descendant_count`; the collapsed set is keyed by `ItemId`, only cached items can be collapsed, and entries whose items leave the cache are dropped. Uncached rows that remain visible show placeholders and are requested asynchronously by their flat indices (§22.7). A promoted selection inside collapsed subtrees expands exactly the collapsed ancestors whose hidden intervals contain it.
+- **`EXPANSION_CHANGED` (§7.6):** a user collapse or expand is reported without awaiting a reply, with `value` = the new state (`true` expanded) and `items` = a list of exactly one `ItemId` (never a row index). The server never drives disclosure; the SDK delivers it through `Tree::on_expansion_changed`, and `Event::expansion_change` reads it.
+- **Columns:** `Tree` reads `columns` exactly as `Table` does, with the outline column first and a visible header.
+- **SDK:** `TreeModel` flattens a server-side forest into preorder items, stamps both properties and refuses a forest deeper than the limit (`TreeModelError::DepthLimitExceeded`) before anything reaches a transaction.
+- **Fallback (§4 inv. 13 optional semantics):** a client without support renders the preorder flat, with correct identity and selection.
+
 ### 4.3 Standard Enums (§7.5, §7.2, §7.4, §8)
 The canonical registry defines 12 standard enum types with monotonic type IDs ($1 \ldots 12$) and contiguous value IDs within each enum.
 On the wire, enum values are represented by `EnumValue(enum_id, value_id)` where `enum_id` references the `StandardEnum` type ID (e.g. `ActionRole = 2`) and `value_id` references the value within that enum (e.g. `destructive = 3`).
@@ -134,6 +146,7 @@ Standard enum types:
 
 ### 4.4 Standard Events (§7.6, §7.7)
 Semantic and coordinate pointer events are defined with `kind` metadata (`semantic` or `coordinate`) with monotonic IDs ($1 \ldots 11$).
+`EXPANSION_CHANGED` (ID 4) carries `value` (bool, the new disclosure state) and `items` (a list of exactly one `ItemId`); see the hierarchical models entry in §4.2.
 
 ### 4.5 Core Mutation Operations (§13)
 Required core, model, and optimization operations are defined with `category` metadata (`required`, `model`, `optimization`) with monotonic IDs ($1 \ldots 13$).

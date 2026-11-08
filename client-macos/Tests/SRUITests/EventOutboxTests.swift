@@ -207,6 +207,50 @@ struct EventOutboxTests {
         await server.close()
     }
 
+    @Test("EventOutbox creates and serializes EXPANSION_CHANGED with value=bool and items=[ItemId]")
+    func expansionChangedEventSerialization() async throws {
+        // PX-018-G01: Tree disclosure is local; the event reports it (§7.6, §22.5).
+        let clientInstanceId = ClientInstanceId(string: "client-test-expansion")
+        let outbox = EventOutbox(clientInstanceId: clientInstanceId)
+        let (client, server) = await PipeTransport.createPair()
+        let binding = await activeBinding(for: outbox)
+
+        let nodeId = NodeId(301)
+        let observedRevision = Revision(76)
+        let itemId = ItemId(4242)
+
+        let event = try await outbox.sendExpansionChanged(
+            nodeId: nodeId,
+            observedRevision: observedRevision,
+            itemId: itemId,
+            expanded: false,
+            binding: binding,
+            via: client
+        )
+
+        #expect(event.eventSeq == 1)
+        #expect(event.nodeId == nodeId)
+        #expect(event.observedRevision == observedRevision)
+        #expect(event.eventType == .EVENT_EXPANSION_CHANGED)
+        #expect(event.arguments == [.VALUE: .bool(false), .ITEMS: .list([.itemID(itemId)])])
+        #expect(event.clientInstanceId == clientInstanceId)
+
+        var msg = SRUIMessage()
+        msg.event = event.toWire()
+        let decodedMsg = try decodeFramedMessage(from: try SRUIFraming.encodeFramed(msg))
+        guard case .event(let wireEvent) = decodedMsg.msg else {
+            Issue.record("Expected event message payload")
+            return
+        }
+        let decodedEvent = try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent)
+        #expect(decodedEvent.eventType == .EVENT_EXPANSION_CHANGED)
+        #expect(decodedEvent.nodeId == nodeId)
+        #expect(decodedEvent.arguments == event.arguments)
+
+        await client.close()
+        await server.close()
+    }
+
     @Test("Mixed event types share contiguous monotonic sequences and are retained")
     func mixedEventTypesContiguousSequences() async throws {
         let (client, server) = await PipeTransport.createPair()

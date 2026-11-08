@@ -62,9 +62,10 @@ extension ControlFactory {
         }
     }
 
-    /// Drops selection memory for collections no longer rendered.
+    /// Drops selection and disclosure memory for collections no longer rendered.
     public func pruneCollectionSelectionMemory(keeping present: Set<NodeId>) {
         collectionSelectionMemory = collectionSelectionMemory.filter { present.contains($0.key) }
+        collectionDisclosureMemory = collectionDisclosureMemory.filter { present.contains($0.key) }
     }
 
     func noteLocalSelection(nodeID: NodeId, itemIDs: [ItemId]) {

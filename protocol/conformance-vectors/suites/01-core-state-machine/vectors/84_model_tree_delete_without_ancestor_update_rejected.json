@@ -1,0 +1,121 @@
+{
+  "name": "model_tree_delete_without_ancestor_update_rejected",
+  "description": "Deleting E's only child F without shrinking E's descendant_count leaves E's span past item_count; refused and rolled back (§8, §12.1).",
+  "spec_sections": [
+    "§4",
+    "§8",
+    "§12.1",
+    "§22.5",
+    "§26"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Files"
+          }
+        },
+        {
+          "type": "CREATE_MODEL",
+          "model_id": 10,
+          "model_type": "Tree",
+          "item_count": 0
+        },
+        {
+          "type": "MODEL_INSERT",
+          "model_id": 10,
+          "index": 0,
+          "items": [
+            {
+              "item_id": 101,
+              "value": "A",
+              "properties": {
+                "tree_depth": 0,
+                "descendant_count": 3
+              }
+            },
+            {
+              "item_id": 102,
+              "value": "B",
+              "properties": {
+                "tree_depth": 1,
+                "descendant_count": 1
+              }
+            },
+            {
+              "item_id": 103,
+              "value": "C",
+              "properties": {
+                "tree_depth": 2,
+                "descendant_count": 0
+              }
+            },
+            {
+              "item_id": 104,
+              "value": "D",
+              "properties": {
+                "tree_depth": 1,
+                "descendant_count": 0
+              }
+            },
+            {
+              "item_id": 105,
+              "value": "E",
+              "properties": {
+                "tree_depth": 0,
+                "descendant_count": 1
+              }
+            },
+            {
+              "item_id": 106,
+              "value": "F",
+              "properties": {
+                "tree_depth": 1,
+                "descendant_count": 0
+              }
+            }
+          ]
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Tree",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "model_ref": 10
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "MODEL_DELETE",
+        "model_id": 10,
+        "index": 5,
+        "count": 1,
+        "item_ids": []
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "model_tree_descendant_count_out_of_range",
+    "failed_op_index": 0,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

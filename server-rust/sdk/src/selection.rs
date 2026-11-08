@@ -231,7 +231,12 @@ impl UiTransaction {
     /// (for example at `max_transaction_operations`), leaves it in place, so a caller that calls
     /// this method, ignores the error and lets the transaction commit is refused again by the
     /// commit path's own settlement. After a success, calling it again is a no-op.
+    ///
+    /// It first runs [`UiTransaction::check_model_trees`], so a transaction that leaves a touched
+    /// hierarchical model malformed is refused on every SDK and sessiond commit path (§8).
     pub fn settle_promoted_selections(&mut self) -> Result<(), StoreError> {
+        // Every commit path settles here, so the hierarchical shape check rides along (§8).
+        self.check_model_trees()?;
         if !self.promotions.dirty {
             return Ok(());
         }

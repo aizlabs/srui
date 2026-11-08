@@ -177,36 +177,38 @@ struct WidgetSemanticsConformanceTests {
     /// coordinate stream, because `SemanticInteraction` models no pointer case. A standard
     /// control cannot send coordinates even by mistake.
     ///
-    /// ## The same enum is also missing two declared semantics, and the manifest says so
+    /// ## The same enum is also missing one declared semantic, and the manifest says so
     ///
     /// §7.6 assigns `EXPANSION_CHANGED` to `Tree` and `VIEWPORT_CHANGED` to `Surface`, both
-    /// required-tier. `SemanticInteraction` carries neither, so the renderer cannot originate
-    /// them. Rather than weakening the claim, the exact shortfall is pinned here and recorded as
-    /// a suite 2 gap with a probe on `SemanticInteraction.swift`.
+    /// required-tier. `SemanticInteraction` carries `EXPANSION_CHANGED` (PX-018-G01) but not
+    /// `VIEWPORT_CHANGED`, so the renderer cannot originate it. Rather than weakening the claim,
+    /// the exact shortfall is pinned here and recorded as a suite 2 gap with a probe on
+    /// `SemanticInteraction.swift`.
     @Test
     func rendererInteractionsAreSemanticAndCoordinateFree() {
         let carried: [SemanticInteraction] = [
             .activate(nodeID: 1),
             .valueChanged(nodeID: 1, value: .bool(true)),
             .selectionChanged(nodeID: 1, itemID: 1),
+            .expansionChanged(nodeID: 1, itemID: 1, expanded: false),
             .textEdit(nodeID: 1, text: "", editSeq: EditSeq(1)!, laneEpoch: 0),
         ]
 
-        // Every case the renderer can produce is one of the four semantic kinds above. If a
+        // Every case the renderer can produce is one of the five semantic kinds above. If a
         // coordinate case is ever added, this stops compiling — which is the intent.
         for interaction in carried {
             switch interaction {
-            case .activate, .valueChanged, .selectionChanged, .textEdit:
+            case .activate, .valueChanged, .selectionChanged, .expansionChanged, .textEdit:
                 break
             }
         }
 
         // §7.6 emissions with no case to carry them. Update the suite 2 manifest gap if this
-        // set changes.
-        let unroutableRequiredEmissions = ["Surface.VIEWPORT_CHANGED", "Tree.EXPANSION_CHANGED"]
+        // set changes. Tree.EXPANSION_CHANGED is carried by `.expansionChanged` (PX-018-G01).
+        let unroutableRequiredEmissions = ["Surface.VIEWPORT_CHANGED"]
         #expect(
-            unroutableRequiredEmissions.count == 2,
-            "§7.6 assigns two required-tier emissions the renderer cannot originate; if that changed, update the suite 2 gap in protocol/conformance-vectors/suites/manifest.json"
+            unroutableRequiredEmissions.count == 1,
+            "§7.6 assigns one required-tier emission the renderer cannot originate; if that changed, update the suite 2 gap in protocol/conformance-vectors/suites/manifest.json"
         )
     }
 }

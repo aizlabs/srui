@@ -1078,6 +1078,12 @@ public final class SessionController: @unchecked Sendable {
                     action: .selectionChanged(itemID),
                     renderer: renderer
                 )
+            case .expansionChanged(let nodeID, let itemID, let expanded):
+                self.enqueueNativeSemanticAction(
+                    nodeID: nodeID,
+                    action: .expansionChanged(itemID, expanded: expanded),
+                    renderer: renderer
+                )
             case .textEdit(let nodeID, let text, let editSeq, let laneEpoch):
                 self.enqueueNativeTextEdit(
                     nodeID: nodeID,
@@ -1454,6 +1460,17 @@ public final class SessionController: @unchecked Sendable {
                         nodeId: request.nodeID,
                         observedRevision: request.observedRevision,
                         itemId: itemID,
+                        binding: ownership.binding,
+                        sessionIncarnation: ownership.sessionIncarnation,
+                        maxFlushGeneration: drainCutoff,
+                        semanticRequest: request
+                    )
+                case .expansionChanged(let itemID, let expanded):
+                    return try await self.sendExpansionChanged(
+                        nodeId: request.nodeID,
+                        observedRevision: request.observedRevision,
+                        itemId: itemID,
+                        expanded: expanded,
                         binding: ownership.binding,
                         sessionIncarnation: ownership.sessionIncarnation,
                         maxFlushGeneration: drainCutoff,
@@ -2573,6 +2590,55 @@ public final class SessionController: @unchecked Sendable {
             nodeId: nodeId,
             observedRevision: observedRevision,
             itemId: itemId,
+            binding: binding,
+            sessionIncarnation: sessionIncarnation,
+            via: transport
+        )
+    }
+
+    /// Dispatches an `EXPANSION_CHANGED` for a Tree item through the shared ordered path (§7.6,
+    /// §22.5). Disclosure is already applied locally; nothing here awaits a reply.
+    @discardableResult
+    private func sendExpansionChanged(
+        nodeId: NodeId,
+        observedRevision: Revision,
+        itemId: ItemId,
+        expanded: Bool,
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation,
+        maxFlushGeneration: UInt64,
+        semanticRequest: SemanticActionRequest? = nil
+    ) async throws -> Event {
+        let incarnation = await MainActor.run { self.interactionIncarnation }
+        try await dispatchUnassignedTextEdits(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation,
+            interactionIncarnation: incarnation,
+            maxFlushGeneration: maxFlushGeneration
+        )
+        try await revalidateSemanticActionForOutbox(
+            semanticRequest,
+            ownership: SemanticActionOwnership(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
+        )
+        guard withStateLock({
+            guard eventDispatchEnabled,
+                  outboxConnectionBinding == binding,
+                  outboxSessionIncarnation == sessionIncarnation else {
+                return false
+            }
+            if case .active = phase { return true }
+            return false
+        }) else {
+            throw SessionDispatchError.resumeNotConfirmed
+        }
+        return try await outbox.sendExpansionChanged(
+            nodeId: nodeId,
+            observedRevision: observedRevision,
+            itemId: itemId,
+            expanded: expanded,
             binding: binding,
             sessionIncarnation: sessionIncarnation,
             via: transport

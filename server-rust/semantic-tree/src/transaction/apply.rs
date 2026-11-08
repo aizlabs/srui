@@ -14,6 +14,12 @@
 //! Only the authoritative form is journalable, and it is the only one a session may commit. The
 //! split exists so that a transport-derived revision span cannot reach an authoritative path by
 //! reusing the same method.
+//!
+//! Every form checks each touched collection model's hierarchical shape (§8, §26) right after the
+//! last operation in the transaction that touches it ([`ModelTreeCheckpoints`]), so an edit inside
+//! a subtree is judged as a whole and a failure is reported at that operation's index.
+
+use std::collections::HashMap;
 
 use super::error::TxnError;
 use super::kinds::{
@@ -21,7 +27,43 @@ use super::kinds::{
 };
 use super::operation::{Operation, Revision};
 use super::record::Transaction;
+use crate::ids::ModelId;
 use crate::store::SemanticStore;
+
+/// Maps the index of the last operation touching each collection model to that model (§8, §12.1).
+///
+/// A model's `tree_depth`/`descendant_count` shape can only be judged once the transaction has
+/// finished editing it: inserting a child needs the `MODEL_INSERT` and the ancestors'
+/// `MODEL_UPDATE` together. Checking after that model's last operation, rather than once after
+/// all operations, keeps a deterministic `op_index` that the Swift replica reports identically.
+struct ModelTreeCheckpoints(HashMap<usize, ModelId>);
+
+impl ModelTreeCheckpoints {
+    fn new<'a>(ops: impl IntoIterator<Item = &'a Operation>) -> Self {
+        let mut last: HashMap<ModelId, usize> = HashMap::new();
+        for (idx, op) in ops.into_iter().enumerate() {
+            if let Some(model) = op.model_id() {
+                last.insert(model, idx);
+            }
+        }
+        Self(last.into_iter().map(|(model, idx)| (idx, model)).collect())
+    }
+
+    /// Validates the model whose last touch is operation `idx`, if any.
+    fn check(&self, staged: &SemanticStore, idx: usize) -> Result<(), TxnError> {
+        match self.0.get(&idx) {
+            Some(&model) => {
+                staged
+                    .validate_model_tree(model)
+                    .map_err(|source| TxnError::OpFailed {
+                        op_index: idx,
+                        source,
+                    })
+            }
+            None => Ok(()),
+        }
+    }
+}
 
 /// A transaction applied to a private staging copy, ready for an infallible commit (§12.1).
 ///
@@ -71,6 +113,7 @@ impl SemanticStore {
             });
         }
 
+        let checkpoints = ModelTreeCheckpoints::new(ops);
         let mut staged = self.clone_staging();
         for (idx, op) in ops.iter().enumerate() {
             if let Err(source) = op.apply(&mut staged) {
@@ -79,6 +122,7 @@ impl SemanticStore {
                     source,
                 });
             }
+            checkpoints.check(&staged, idx)?;
         }
 
         self.commit_staging(staged, new_revision);
@@ -98,6 +142,7 @@ impl SemanticStore {
             });
         }
 
+        let checkpoints = ModelTreeCheckpoints::new(&ops);
         let mut staged = self.clone_staging();
         for (idx, op) in ops.into_iter().enumerate() {
             if let Err(source) = op.apply_owned(&mut staged) {
@@ -106,6 +151,7 @@ impl SemanticStore {
                     source,
                 });
             }
+            checkpoints.check(&staged, idx)?;
         }
 
         self.commit_staging(staged, new_revision);
@@ -265,12 +311,14 @@ impl SemanticStore {
         }
 
         let limits = self.limits().clone();
+        let checkpoints = ModelTreeCheckpoints::new(&txn.operations);
         let mut staged = SemanticStore::with_limits_and_revision(limits.clone(), Revision::INITIAL);
         for (idx, op) in txn.operations.iter().enumerate() {
             op.apply(&mut staged).map_err(|source| TxnError::OpFailed {
                 op_index: idx,
                 source,
             })?;
+            checkpoints.check(&staged, idx)?;
         }
 
         // Swapped in whole rather than merged: a snapshot also resets identity bookkeeping to the
@@ -300,6 +348,7 @@ impl SemanticStore {
             });
         }
 
+        let checkpoints = ModelTreeCheckpoints::new(&txn.operations);
         let mut staged = self.clone_staging();
         for (idx, op) in txn.operations.iter().enumerate() {
             if let Err(source) = op.apply(&mut staged) {
@@ -308,6 +357,7 @@ impl SemanticStore {
                     source,
                 });
             }
+            checkpoints.check(&staged, idx)?;
         }
 
         Ok(StagedCommit {

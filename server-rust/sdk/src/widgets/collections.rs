@@ -1,4 +1,8 @@
 //! Model-backed collection widget handles and builders, including server-promoted selection (§6.3, §7.2, §7.3 Required Tier, §8).
+//!
+//! `Tree` reads `columns` like `Table` (the outline column first) and reports local disclosure
+//! through [`Tree::on_expansion_changed`] (§7.6, §22.5); its model is built by
+//! [`crate::TreeModel`].
 
 use crate::widgets::*;
 use crate::StoreMut;
@@ -231,6 +235,23 @@ impl_widget_boilerplate!(
     "Hierarchical outline collection view with expandable nodes (§7.2, §7.3 Required Tier, §8)."
 );
 impl_model_ref_prop!(Tree, TreeBuilder);
+impl_list_prop!(
+    Tree,
+    TreeBuilder,
+    columns,
+    columns_of,
+    get_columns,
+    set_columns,
+    set_columns_for,
+    op_set_columns,
+    op_set_columns_for,
+    clear_columns,
+    clear_columns_for,
+    op_clear_columns,
+    op_clear_columns_for,
+    PropertyRef::COLUMNS,
+    "Column definitions list, projected like a Table's with the outline column first (§7.4, §8)."
+);
 impl_enum_prop!(
     Tree,
     TreeBuilder,
@@ -349,3 +370,58 @@ macro_rules! impl_promoted_selection {
 impl_promoted_selection!(List);
 impl_promoted_selection!(Table);
 impl_promoted_selection!(Tree);
+
+// =============================================================================
+// 5. Local disclosure reports (§7.6, §22.5)
+// =============================================================================
+
+/// One `EXPANSION_CHANGED` report from a `Tree` (§7.6).
+///
+/// Disclosure is local presentation state (§22.5): the client has already expanded or collapsed
+/// the item and never waits for a reply. The report names the item by identity, never by row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpansionChange {
+    /// The `Tree` node that reported it.
+    pub node: NodeId,
+    /// The item whose disclosure changed.
+    pub item: ItemId,
+    /// `true` when the item is now expanded.
+    pub expanded: bool,
+    /// The revision the client observed when the user acted.
+    pub observed_revision: srui_semantic_tree::Revision,
+}
+
+impl ExpansionChange {
+    /// Reads an `EXPANSION_CHANGED` event; `None` for any other or a malformed event.
+    pub fn from_event(event: &srui_semantic_tree::Event) -> Option<Self> {
+        let (item, expanded) = event.expansion_change()?;
+        Some(Self {
+            node: event.node_id,
+            item,
+            expanded,
+            observed_revision: event.observed_revision,
+        })
+    }
+}
+
+impl Tree {
+    /// Registers `handler` for this tree's `EXPANSION_CHANGED` reports (§7.6, §22.5).
+    ///
+    /// A malformed report (no boolean `value`, or `items` not exactly one `ItemId`) never reaches
+    /// the handler. The handler runs outside the session lock, like every [`crate::Session::on`]
+    /// handler, and may open transactions.
+    pub fn on_expansion_changed<F>(&self, session: &crate::Session, handler: F)
+    where
+        F: Fn(&crate::Session, ExpansionChange) + Send + Sync + 'static,
+    {
+        session.on(
+            self.id(),
+            TypeRef::EVENT_EXPANSION_CHANGED,
+            move |ctx, event| {
+                if let Some(change) = ExpansionChange::from_event(event) {
+                    handler(ctx, change);
+                }
+            },
+        );
+    }
+}

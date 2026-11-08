@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-018-G01",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Generic hierarchical model-backed Tree with local disclosure (§4 inv. 13, §6.3, §7.6, §8, §12.1, §22.5, §22.7, §22.8, §26, §32): a preorder index space described by two standard item properties, an all-or-nothing shape check and a §26 depth limit in both stores, an SDK forest builder and expansion handler, local disclosure, EXPANSION_CHANGED and Tree columns in the AppKit client; no new wire messages, no Process Explorer feature work and no application-specific client path",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX018G01-001",
+      "feature": "Standard registry properties 32 `tree_depth` and 33 `descendant_count` (namespace 0, uint64, control_specific, model item properties) added through protocol/registry.yaml and srui.proto with codegen: build.rs asserts 33 properties, srui.pb.swift and RegistryTables.swift regenerated with no residual diff; spec/registries.md documents the preorder index space, the validation rules and codes, the limit, local disclosure, EXPANSION_CHANGED arguments, Tree columns and the flat fallback",
+      "scope": "PX-018-G01/protocol registry.yaml, srui.proto, generate_proto.sh outputs; server-rust/semantic-tree/build.rs; spec/registries.md; CLAUDE.md count",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX018G01-002",
+      "feature": "§26 limit max_model_tree_depth (default 256 levels, so tree_depth < 256) in Rust StoreLimits (DEFAULT_MAX_MODEL_TREE_DEPTH, with_max_model_tree_depth) and Swift StoreLimits (defaultMaxModelTreeDepth, withMaxModelTreeDepth); enforced at apply with max_model_tree_depth_exceeded at and past the bound",
+      "scope": "PX-018-G01/server-rust/semantic-tree store/limits.rs, store/error.rs; client-macos SemanticModel/SemanticStore.swift; conformance_security_limits_test, model_tree_test, ModelTreeStoreTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX018G01-003",
+      "feature": "Explicit all-or-nothing shape check over cached items, identical in Rust (Model::validate_tree_shape) and Swift (Model.validateTreeShape), run after the last operation of a transaction that touches the model on every apply path (authoritative, delivered, coalesced, resync snapshot, prepared commit, single wire op, Swift batch apply): non-negative integer properties (invalid_model_tree_property), depth limit, index + descendant_count < item_count (model_tree_descendant_count_out_of_range), index 0 a root and depth(i+1) <= depth(i)+1 for cached neighbours (model_tree_depth_jump), children inside the nearest enclosing cached span and no deeper item directly after a span (model_tree_outside_parent_span); a model that never held either property is never checked",
+      "scope": "PX-018-G01/server-rust/semantic-tree model.rs, store/mod.rs validate_model_tree, transaction/apply.rs ModelTreeCheckpoints, transaction/operation.rs model_id; client-macos SemanticModel/Model.swift, SemanticStore.swift ModelTreeCheckpoints, TransactionApplier.swift",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX018G01-004",
+      "feature": "Conformance: suite 1 vectors 70-84 (nested preorder; insert, delete and reset inside a subtree; sparse cache; depth 255 at the default limit; depth over a custom and the default limit; descendant_count past item_count; depth jump; child outside its parent's span; stale ancestor reported at the model's last operation; index 0 not a root; negative depth; delete without ancestor update) replay identically in Rust and Swift, listed as suite 9 negative vectors; the shared table model_tree_shape_cases.json (315 rows) is asserted row for row by Rust, Swift and an independent Python reference; manifest count 68 -> 83",
+      "scope": "PX-018-G01/protocol/conformance-vectors suites/01-core-state-machine/vectors 70-84, model_tree_shape_cases.json, suites/manifest.json, READMEs; protocol/tests test_conformance_manifest.py, test_model_tree_shape_cases.py; semantic-tree tests/common/fixture_replay.rs; Tests/SemanticModelTests/StateMachineConformanceTests.swift",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX018G01-005",
+      "feature": "SDK: TreeModel/TreeNode flatten a server-side forest iteratively into preorder items stamped with tree_depth and descendant_count, refuse a forest deeper than max_model_tree_depth (TreeModelError::DepthLimitExceeded) or with a duplicate ItemId, and build a MODEL_RESET_RANGE; UiTransaction::check_model_trees refuses a commit that leaves a touched model malformed on every SDK and sessiond commit path; Tree reads `columns`; Tree::on_expansion_changed delivers ExpansionChange {node, item, expanded, observed_revision} and never a malformed report; Event::expansion_changed carries value=bool and items=[ItemId], read back by Event::expansion_change",
+      "scope": "PX-018-G01/server-rust/sdk tree_model.rs, session.rs, selection.rs, widgets/collections.rs, lib.rs; semantic-tree event.rs; sdk/tests/tree_model_test.rs",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX018G01-006",
+      "feature": "AppKit client: model-backed Tree renders the preorder with native outline levels from cached tree_depth and local disclosure (items start expanded; collapse hides index+1..index+descendant_count; collapsed set keyed by ItemId, only cached items collapsible, entries dropped when their items leave the cache); a sorted hidden-interval list maps rows to indices so uncached visible rows stay placeholders and request their flat ranges asynchronously; promotion reveal expands only the collapsed ancestors whose hidden intervals contain the promoted index; no native control per item",
+      "scope": "PX-018-G01/client-macos Collections/OutlineCollectionAdapter.swift, CollectionRangeTracker.swift, RendererAppKit/CollectionSelectionPromotion.swift; Tests/RendererAppKitTests/HierarchicalTreeTests.swift",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX018G01-007",
+      "feature": "EXPANSION_CHANGED (§7.6): a new SemanticInteraction.expansionChanged routed through SessionController, SemanticAction and EventOutbox.sendExpansionChanged, emitted without awaiting a reply and only for Tree; the suite 2 manifest gap now covers only Surface VIEWPORT_CHANGED (probe `case +viewportChanged`)",
+      "scope": "PX-018-G01/client-macos RendererAppKit/SemanticInteraction.swift, ControlFactory.swift, Session/SessionController.swift, Session/EventOutbox.swift, Accessibility/Accessibility.swift; Tests/RendererAppKitTests/WidgetSemanticsConformanceTests.swift; protocol/conformance-vectors/suites/manifest.json suite 2 gap",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX018G01-008",
+      "feature": "Tree reads `columns`, reusing the Table column and cell projection with the outline column first and a visible header; a Tree without columns keeps its single outline column",
+      "scope": "PX-018-G01/client-macos RendererAppKit/ControlFactory.swift, Collections/OutlineCollectionAdapter.swift; Tests/RendererAppKitTests/HierarchicalTreeTests.swift",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018-G01.md"
+      ]
+    }
+  ]
+}

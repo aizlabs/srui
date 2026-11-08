@@ -5,6 +5,10 @@
 //! - **§6.3 Promoted selection**: every commit calls [`UiTransaction::settle_promoted_selections`]
 //!   (see [`crate::selection`]): a promotion naming an item its model does not hold is refused when
 //!   this transaction assigned it and cleared in the same commit otherwise.
+//! - **§8 Hierarchical models**: the same settlement first checks the `tree_depth` /
+//!   `descendant_count` shape of every model the transaction touched
+//!   ([`UiTransaction::check_model_trees`]), so a subtree edit is judged as a whole, exactly as a
+//!   wire commit is.
 //!
 //! - **§29 Reference Server SDK Contract**: The application developer interacts with high-level
 //!   semantic transactions (`session.transaction(|ui| { ... })`) and event handlers (`session.on(node, EVENT, handler)`).
@@ -21,15 +25,15 @@
 //! - **Lock-Safety & Reentrancy**: Handler invocations are executed outside internal mutex locks so handlers can freely
 //!   execute nested transactions (`session.transaction(...)`) or dispatch further events without risk of deadlock.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::selection::PromotionTracker;
 use srui_resources::{PublishOutcome, ResourceEntry, ResourceError, ResourceStore};
 use srui_semantic_tree::{
-    Event, EventValidationError, Node, NodeId, Operation, PropertyRef, ResourceHash, Revision,
-    SemanticStore, StoreError, TxnError, TypeRef, Value,
+    Event, EventValidationError, ModelId, Node, NodeId, Operation, PropertyRef, ResourceHash,
+    Revision, SemanticStore, StoreError, TxnError, TypeRef, Value,
 };
 use thiserror::Error;
 
@@ -155,6 +159,8 @@ pub struct UiTransaction {
     max_ops: usize,
     /// Whether this transaction's promoted selections must be settled at commit (§6.3, §8).
     pub(crate) promotions: PromotionTracker,
+    /// Collection models this transaction edited, whose hierarchical shape is checked at commit.
+    touched_models: BTreeSet<ModelId>,
 }
 
 impl UiTransaction {
@@ -166,7 +172,20 @@ impl UiTransaction {
             op_count: 0,
             max_ops,
             promotions: PromotionTracker::default(),
+            touched_models: BTreeSet::new(),
         }
+    }
+
+    /// Checks the hierarchical shape of every model this transaction edited (§8, §26).
+    ///
+    /// Runs at commit from [`Self::settle_promoted_selections`], because a structural edit inside
+    /// a subtree (insert or delete plus the ancestors' `descendant_count` update) is only valid
+    /// as a whole. Models are checked in `ModelId` order, so the reported error is deterministic.
+    pub fn check_model_trees(&self) -> Result<(), StoreError> {
+        for &model in &self.touched_models {
+            self.staged.validate_model_tree(model)?;
+        }
+        Ok(())
     }
 
     /// Records an operation, enforcing the `max_transaction_operations` limit (§26).
@@ -297,6 +316,9 @@ impl UiTransaction {
         self.record_op()?;
         self.operations.push(op.clone());
         self.promotions.observe(op);
+        if let Some(model) = op.model_id() {
+            self.touched_models.insert(model);
+        }
         op.apply(&mut self.staged)
     }
 }

@@ -47,6 +47,8 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
     public private(set) var promotedItemID: ItemId?
     /// Promotion waiting for its item to reach the replica.
     public private(set) var pendingPromotion: CollectionPromotion?
+    /// The user changed the selection after the last promotion (§22.5).
+    public private(set) var localSelectionSincePromotion = false
 
     /// Nested-scroll chrome. Public so `ControlFactory` (RendererAppKit) can
     /// wire collections that now live in a separate module.
@@ -131,12 +133,20 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
 
     // MARK: - Server-promoted selection (§6.3, §7.6, §8, §22.5, §22.7, §22.8)
 
-    /// Applies a promotion or its withdrawal (`nil`); see `TableCollectionAdapter.applyPromotion`.
+    /// Applies a promotion or its withdrawal (`nil`) with the same rules as
+    /// `TableCollectionAdapter.applyPromotion`: a withdrawal keeps a selection the user made after
+    /// the promotion and deselects only an untouched promoted row, emitting no `SELECTION_CHANGED`.
     public func applyPromotion(_ itemID: ItemId?, reveal: Bool, outlineView: NSOutlineView) {
+        let previous = promotedItemID
+        let userChangedSelection = localSelectionSincePromotion
         promotedItemID = itemID
         pendingPromotion = nil
+        localSelectionSincePromotion = false
         guard let itemID else {
-            clearSelectionForPromotion(in: outlineView)
+            if !userChangedSelection, let previous, let row = row(of: previous),
+               outlineView.selectedRowIndexes == IndexSet(integer: row) {
+                clearSelectionForPromotion(in: outlineView)
+            }
             return
         }
         guard selectionMode != .none else { return }
@@ -314,6 +324,7 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
             return item?.itemID
         }
         pendingPromotion = nil
+        localSelectionSincePromotion = true
         onLocalSelection?(nodeID, selected)
         for itemID in selected {
             onSelectionChanged?(nodeID, itemID)

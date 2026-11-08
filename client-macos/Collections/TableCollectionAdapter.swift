@@ -51,6 +51,8 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
     public private(set) var promotedItemID: ItemId?
     /// Promotion waiting for its item to reach the replica, and whether it should reveal.
     public private(set) var pendingPromotion: CollectionPromotion?
+    /// The user changed the selection after the last promotion (§22.5).
+    public private(set) var localSelectionSincePromotion = false
 
     /// Nested-scroll chrome. Public so `ControlFactory` (RendererAppKit) can
     /// wire collections that now live in a separate module.
@@ -335,11 +337,23 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
     /// The promoted row replaces any local selection without emitting `SELECTION_CHANGED`: the
     /// server already knows its own state (§7.6). `reveal` scrolls the row into view once. A
     /// collection with `selection_mode` none ignores the promotion; the store refuses it anyway.
+    ///
+    /// Withdrawal (`nil`) never touches a selection the user made after the promotion: that
+    /// selection is local and was already reported with `SELECTION_CHANGED` (§22.5). Only when the
+    /// user has not changed the selection since the promotion, and the promoted row is still the
+    /// whole selection, is that row deselected. Like any server-driven selection change (a row
+    /// removed by a commit, for example) the deselection emits no `SELECTION_CHANGED`.
     public func applyPromotion(_ itemID: ItemId?, reveal: Bool, tableView: NSTableView) {
+        let previous = promotedItemID
+        let userChangedSelection = localSelectionSincePromotion
         promotedItemID = itemID
         pendingPromotion = nil
+        localSelectionSincePromotion = false
         guard let itemID else {
-            clearSelectionForPromotion(in: tableView)
+            if !userChangedSelection, let previous, let row = row(of: previous),
+               tableView.selectedRowIndexes == IndexSet(integer: row) {
+                clearSelectionForPromotion(in: tableView)
+            }
             return
         }
         guard selectionMode != .none else { return }
@@ -461,6 +475,7 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
         // A user's choice after a promotion stays local and cancels a promotion still waiting
         // for its item (§22.5).
         pendingPromotion = nil
+        localSelectionSincePromotion = true
         onLocalSelection?(nodeID, selectedIDs)
         guard selectedIDs.isEmpty == false else { return }
 

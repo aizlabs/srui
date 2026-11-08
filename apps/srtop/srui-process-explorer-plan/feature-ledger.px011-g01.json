@@ -55,7 +55,7 @@
     },
     {
       "feature_id": "SRUI-PX011G01-004",
-      "feature": "The generic AppKit renderer selects the promoted ItemId's NSTableView/NSOutlineView row and scrolls it into view once per promotion operation, posts the selectedRowsChanged accessibility notification, does not echo SELECTION_CHANGED, keeps a later local click local (SELECTION_CHANGED emitted, not overwritten by unrelated or structural commits), lets a later promotion replace it, maps an absent ItemId to no row and waits until the item arrives through the range machinery, and restores the promotion on remount, resync and reconnect without re-revealing an unchanged one",
+      "feature": "The generic AppKit renderer selects the promoted ItemId's NSTableView/NSOutlineView row and scrolls it into view once per promotion operation, posts the selectedRowsChanged accessibility notification, does not echo SELECTION_CHANGED, keeps a later local click local (SELECTION_CHANGED emitted, not overwritten by unrelated or structural commits, nor by withdrawing the promotion, which deselects only an untouched promoted row), lets a later promotion replace it, maps an absent ItemId to no row and waits until the item arrives through the range machinery, and restores the promotion on remount, resync and reconnect without re-revealing an unchanged one",
       "scope": "PX-011-G01/client-macos Collections TableCollectionAdapter, OutlineCollectionAdapter, CollectionPromotion; RendererAppKit CollectionSelectionPromotion.swift, LayoutRenderer; Tests/RendererAppKitTests/CollectionSelectionPromotionTests.swift",
       "source_refs": [
         "D1",

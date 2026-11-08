@@ -333,4 +333,125 @@ struct CollectionSelectionPromotionTests {
         #expect(posted == [.selectedRowsChanged])
         #expect(harness.interactions.isEmpty)
     }
+
+    // MARK: - Round 2: withdrawal keeps a later local selection (§6.3, §22.5)
+
+    private static let withdrawalKinds: [TypeRef] = [.table, .tree]
+
+    /// Promotes ItemId 41 (row 40) in a 100-row Table or Tree.
+    private static func promotedHarness(_ nodeType: TypeRef) throws -> Harness {
+        let harness = try Harness(store: Self.store(rows: 100, nodeType: nodeType))
+        try harness.commit(Self.promotion(of: 40, total: 100))
+        #expect(harness.tableView.selectedRowIndexes == IndexSet(integer: 40))
+        return harness
+    }
+
+    @Test
+    func withdrawalByDeletionKeepsALaterLocalSelection() throws {
+        for nodeType in Self.withdrawalKinds {
+            let harness = try Self.promotedHarness(nodeType)
+            defer { harness.tearDown() }
+            harness.click(row: 42)
+            #expect(harness.interactions == [.selectionChanged(nodeID: Self.tableID, itemID: ItemId(43))])
+
+            // What the SDK commits when the promoted item is deleted.
+            try harness.commit([
+                .modelDeleteItems(id: Self.modelID, itemIds: [ItemId(41)]),
+                .clearProperty(id: Self.tableID, property: .value),
+            ])
+            // ItemId 43 moved up to row 41 and is still the selection.
+            #expect(harness.tableView.selectedRowIndexes == IndexSet(integer: 41), "\(nodeType)")
+            #expect(harness.interactions.count == 1, "no SELECTION_CHANGED for the withdrawal")
+
+            // The local choice also survives a later structural remount.
+            try harness.commit([.create(id: NodeId(3), nodeType: .text, parentID: Self.surfaceID)])
+            #expect(harness.tableView.selectedRowIndexes == IndexSet(integer: 41), "\(nodeType)")
+        }
+    }
+
+    @Test
+    func explicitWithdrawalKeepsALaterLocalSelection() throws {
+        for nodeType in Self.withdrawalKinds {
+            let harness = try Self.promotedHarness(nodeType)
+            defer { harness.tearDown() }
+            harness.click(row: 42)
+            harness.notifications.removeAll()
+            try harness.commit([.clearProperty(id: Self.tableID, property: .value)])
+            #expect(harness.tableView.selectedRowIndexes == IndexSet(integer: 42), "\(nodeType)")
+            #expect(harness.notifications.isEmpty, "the local selection is never touched")
+            #expect(harness.interactions == [.selectionChanged(nodeID: Self.tableID, itemID: ItemId(43))])
+
+            // Clicking back onto the promoted row is still a local choice and is kept too.
+            let again = try Self.promotedHarness(nodeType)
+            defer { again.tearDown() }
+            again.click(row: 42)
+            again.click(row: 40)
+            try again.commit([.clearProperty(id: Self.tableID, property: .value)])
+            #expect(again.tableView.selectedRowIndexes == IndexSet(integer: 40), "\(nodeType)")
+        }
+    }
+
+    @Test
+    func withdrawalWithoutALocalChangeDeselectsOnlyThePromotedRow() throws {
+        for nodeType in Self.withdrawalKinds {
+            // Explicit clear: the untouched promoted row is deselected.
+            let cleared = try Self.promotedHarness(nodeType)
+            defer { cleared.tearDown() }
+            try cleared.commit([.clearProperty(id: Self.tableID, property: .value)])
+            #expect(cleared.tableView.selectedRowIndexes.isEmpty, "\(nodeType)")
+            #expect(cleared.interactions.isEmpty, "a withdrawal emits no SELECTION_CHANGED")
+
+            // Deletion: the row vanishes with its item; nothing else becomes selected.
+            let deleted = try Self.promotedHarness(nodeType)
+            defer { deleted.tearDown() }
+            try deleted.commit([
+                .modelDeleteItems(id: Self.modelID, itemIds: [ItemId(41)]),
+                .clearProperty(id: Self.tableID, property: .value),
+            ])
+            #expect(deleted.tableView.selectedRowIndexes.isEmpty, "\(nodeType)")
+            #expect(deleted.interactions.isEmpty)
+        }
+    }
+
+    @Test
+    func adaptersKeepALaterLocalSelectionOnWithdrawal() throws {
+        let store = try Self.store(rows: 10)
+        let model = try #require(store.getModel(Self.modelID))
+
+        let table = TableCollectionAdapter(nodeID: Self.tableID, model: model, modelID: Self.modelID, selectionMode: .single)
+        let tableView = NSTableView()
+        TableCollectionAdapter.reconcileColumns(in: tableView, columns: ["PID"], fallbackTitle: "Table")
+        tableView.dataSource = table
+        tableView.delegate = table
+        tableView.reloadData()
+
+        let outline = OutlineCollectionAdapter(nodeID: Self.tableID, model: model, modelID: Self.modelID, selectionMode: .single)
+        let outlineView = NSOutlineView()
+        outlineView.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("tree")))
+        outlineView.dataSource = outline
+        outlineView.delegate = outline
+        outlineView.reloadData()
+
+        // Promote ItemId 4 (row 3), the user picks row 5, then the promotion is withdrawn.
+        table.applyPromotion(ItemId(4), reveal: false, tableView: tableView)
+        tableView.selectRowIndexes(IndexSet(integer: 5), byExtendingSelection: false)
+        #expect(table.localSelectionSincePromotion)
+        table.applyPromotion(nil, reveal: false, tableView: tableView)
+        #expect(tableView.selectedRowIndexes == IndexSet(integer: 5))
+
+        outline.applyPromotion(ItemId(4), reveal: false, outlineView: outlineView)
+        outlineView.selectRowIndexes(IndexSet(integer: 5), byExtendingSelection: false)
+        #expect(outline.localSelectionSincePromotion)
+        outline.applyPromotion(nil, reveal: false, outlineView: outlineView)
+        #expect(outlineView.selectedRowIndexes == IndexSet(integer: 5))
+
+        // Without a local change, only the untouched promoted row is deselected.
+        table.applyPromotion(ItemId(4), reveal: false, tableView: tableView)
+        #expect(table.localSelectionSincePromotion == false)
+        table.applyPromotion(nil, reveal: false, tableView: tableView)
+        #expect(tableView.selectedRowIndexes.isEmpty)
+        outline.applyPromotion(ItemId(4), reveal: false, outlineView: outlineView)
+        outline.applyPromotion(nil, reveal: false, outlineView: outlineView)
+        #expect(outlineView.selectedRowIndexes.isEmpty)
+    }
 }

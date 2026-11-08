@@ -5,8 +5,10 @@
 // Generic rendering of a server-promoted collection selection (§6.3, §7.6, §8, §22.5, §22.7,
 // §22.8). A List/Table/Tree `value` holding an ItemId is the promoted selection. Rules:
 //
-// - A committed operation that sets or clears that `value` is a promotion. It replaces any local
-//   selection and reveals the row once; a withdrawal clears the native selection.
+// - A committed operation that sets that `value` is a promotion. It replaces any local selection
+//   and reveals the row once. Clearing it is a withdrawal: a selection the user made after the
+//   promotion stays (it is local and was already reported); an untouched promoted row is
+//   deselected without emitting SELECTION_CHANGED.
 // - A commit without such an operation never selects or scrolls: the user's local selection
 //   survives unrelated commits, including structural remounts.
 // - A remount (structural commit, resync, reconnect) restores the selection from semantic state
@@ -37,9 +39,16 @@ extension ControlFactory {
         var memory = collectionSelectionMemory[node.id] ?? CollectionSelectionMemory()
         let changed = explicit || memory.promoted != promoted
 
-        if changed {
+        if changed, let promoted {
             memory = CollectionSelectionMemory(promoted: promoted, local: nil)
-            apply(promotion: promoted, reveal: promoted != nil, to: handle)
+            apply(promotion: promoted, reveal: true, to: handle)
+        } else if changed {
+            // Withdrawal: keep the user's later local selection, including across a remount.
+            memory.promoted = nil
+            apply(promotion: nil, reveal: false, to: handle)
+            if let local = memory.local {
+                restore(local: local, to: handle)
+            }
         } else if let local = memory.local {
             restore(local: local, to: handle)
         } else if let promoted {

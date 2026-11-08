@@ -439,3 +439,33 @@ fn promoting_then_deleting_the_item_in_one_transaction_is_refused() {
         .expect_err("a promotion assigned in this transaction must name a held item");
     assert!(matches!(err, SdkError::Store(StoreError::ItemNotFound(_))));
 }
+
+#[test]
+fn transaction_custom_settles_promotions_too() {
+    // Removal is cleared in the same commit.
+    let session = promoted_41();
+    session
+        .transaction_custom(|ui| {
+            ui.apply_op(&Operation::model_delete_items(MODEL, [ItemId::new(41)]))
+                .map_err(|e| e.to_string())
+        })
+        .expect("custom commit");
+    assert_eq!(promoted(&session), None);
+
+    // An unknown raw promotion is refused and rolled back.
+    let session = self::session(SelectionMode::Single);
+    let revision = session.current_revision();
+    let err = session
+        .transaction_custom(|ui| {
+            ui.set(TABLE, VALUE, Value::ItemId(ItemId::new(999_999)))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .expect_err("unknown item");
+    assert!(
+        matches!(err, SdkError::Store(StoreError::ItemNotFound(_))),
+        "{err:?}"
+    );
+    assert_eq!(session.current_revision(), revision);
+    assert_eq!(promoted(&session), None);
+}

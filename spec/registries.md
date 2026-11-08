@@ -96,7 +96,9 @@ Each property entry includes `value_type` metadata validated by the registry too
 
 - **Value:** an `ItemId` (`Value.item_id_value`) only, never a row index. No `value` means no promotion. Every replica refuses any other value type with `invalid_collection_selection`.
 - **Validity:** held only while `selection_mode` is `single` or `multiple`; setting `selection_mode` to `none`, or clearing it, while a promotion is held is refused. A replica does not check that the item is cached, because sparse caches may omit it. An authoritative session refuses a promotion naming an `ItemId` the collection's model does not hold (`item_not_found`), and clears in the same commit an earlier promotion whose item that commit removed.
-- **Rendering:** a committed operation on `value` selects the item's row, replacing local selection, and reveals it once; other commits never move the selection or scroll.
+- **"Absent" means absent from the authoritative model's cache.** A far `MODEL_RESET_RANGE` that evicts the promoted item past `max_cached_items_per_model` therefore clears the promotion. An application promoting an item it has not cached must send the item in the same transaction (for example as a `MODEL_RESET_RANGE`); otherwise the SDK returns `item_not_found`.
+- **Pre-built commits:** a commit submitted through sessiond `commit_transaction` cannot gain the clearing operation, so one whose result would leave a dangling promotion is refused with `item_not_found` rather than cleared.
+- **Rendering:** a committed operation setting `value` selects the item's row, replacing local selection, and reveals it once; other commits never move the selection or scroll. Withdrawing the promotion (clearing `value`) keeps any selection the user made after the promotion; only an untouched promoted row is deselected, without a `SELECTION_CHANGED`.
 - **Fallback (§4 inv. 13 optional semantics):** a client without support ignores the collection `value` and keeps local-only selection, as §6.3 and §22.5 describe; `SELECTION_CHANGED` is still sent for user selections.
 
 ### 4.3 Standard Enums (§7.5, §7.2, §7.4, §8)

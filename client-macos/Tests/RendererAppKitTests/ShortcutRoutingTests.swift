@@ -16,6 +16,7 @@
 
 import AppKit
 import Foundation
+import ObjectiveC
 import SemanticModel
 import Testing
 
@@ -375,6 +376,132 @@ struct ShortcutRoutingTests {
             _ = try apply([.setProperty(id: 3, property: .shortcut, value: .string("primary+r"))], to: &harness)
         }
         #expect(harness.renderer.registry.handle(for: 3)?.shortcutBinding?.displayString == "⇧⌘T")
+    }
+
+    // MARK: - Round 1: nested Surfaces, ambiguity and the click path
+
+    /// Verifier probe (finding F1): a nested Surface is mounted inline into the window-owning
+    /// Surface's window, so a duplicate inside it is refused by the store; with distinct keys
+    /// both shortcuts fire in that one window.
+    @Test
+    func aNestedSurfaceSharesTheWindowsShortcutScope() throws {
+        let outerOnly: [SemanticModel.Operation] = [
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(id: 2, nodeType: .button, parentID: 1, properties: [
+                (.label, .string("Outer")), (.shortcut, .string("primary+r")),
+            ]),
+            .createNode(id: 3, nodeType: .surface, parentID: 1),
+        ]
+        var store = try makeStore(outerOnly)
+        #expect(throws: StoreError.duplicateShortcut(nodeID: 4, existing: 2, shortcut: "primary+r")) {
+            try store.createNode(id: 4, nodeType: .button, parentID: 3, properties: [
+                (.label, .string("Inner")), (.shortcut, .string("primary+r")),
+            ])
+        }
+
+        let harness = try mount(outerOnly + [
+            .createNode(id: 4, nodeType: .button, parentID: 3, properties: [
+                (.label, .string("Inner")), (.shortcut, .string("primary+n")),
+            ]),
+        ])
+        defer {
+            harness.close()
+            harness.renderer.registry.handle(for: 3)?.window?.close()
+        }
+        let inner = try #require(harness.renderer.registry.handle(for: 4))
+        #expect(inner.view.window === harness.window)
+        #expect(inner.shortcutBinding?.displayString == "⌘N")
+        #expect(harness.window.performKeyEquivalent(with: try key("r", [.command], keyCode: 15, in: harness.window)))
+        #expect(harness.window.performKeyEquivalent(with: try key("n", [.command], keyCode: 45, in: harness.window)))
+        #expect(harness.interactions == [.activate(nodeID: 2), .activate(nodeID: 4)])
+    }
+
+    /// If two bound handles in one window ever match (a replica bypass), nothing is dispatched
+    /// and the refusal names both nodes: never a silent first match.
+    @Test
+    func twoMatchingBindingsInOneWindowAreRefusedVisibly() throws {
+        let harness = try mount()
+        defer { harness.close() }
+        let registry = harness.renderer.registry
+        let refresh = try #require(registry.handle(for: 2)?.shortcutBinding)
+        let follow = try #require(registry.handle(for: 3))
+        follow.shortcutBinding = refresh
+        let event = try key("r", [.command], keyCode: 15, in: harness.window)
+        #expect(harness.window.performKeyEquivalent(with: event) == false)
+        #expect(harness.renderer.layoutRenderer.shortcutRouter.lastRefusal == .ambiguous([2, 3]))
+        #expect(harness.interactions.isEmpty)
+    }
+
+    /// Records how a dispatch reaches the control. The click-simulation selector (NSButton's
+    /// `perform…Click:`) is replaced at runtime with a recorder that never calls super, so a
+    /// regression to it is recorded instead of nesting the main run loop; the selector is built
+    /// from a string so this suite never spells the banned call
+    /// (`scripts/check-test-main-runloop-nesting.sh`).
+    final class RecordingButton: NSButton {
+        nonisolated(unsafe) var calls: [String] = []
+
+        static let installClickRecorder: Void = {
+            let selector = NSSelectorFromString("perform" + "Click:")
+            let recorder: @convention(block) (RecordingButton, Any?) -> Void = { button, _ in
+                button.calls.append("click")
+            }
+            class_replaceMethod(
+                RecordingButton.self, selector, imp_implementationWithBlock(recorder), "v@:@"
+            )
+        }()
+
+        override func sendAction(_ action: Selector?, to target: Any?) -> Bool {
+            calls.append("sendAction")
+            return super.sendAction(action, to: target)
+        }
+    }
+
+    /// Mutation S11: Button and Toggle shortcuts dispatch through the control's own
+    /// target/action (`sendAction(_:to:)`), never `performClick(_:)`.
+    @Test
+    func buttonAndToggleShortcutsUseTargetActionNotPerformClick() throws {
+        let renderer = AppKitRenderer()
+        let recorder = Recorder()
+        renderer.onInteraction = { recorder.values.append($0) }
+        let router = renderer.layoutRenderer.shortcutRouter
+        router.isWindowKey = { _ in true }
+        router.store = try makeStore([
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(id: 2, nodeType: .button, parentID: 1),
+            .createNode(id: 3, nodeType: .toggle, parentID: 1),
+        ])
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 100),
+            styleMask: [.titled], backing: .buffered, defer: true
+        )
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+
+        RecordingButton.installClickRecorder
+        let button = RecordingButton(title: "Refresh", target: nil, action: nil)
+        let buttonTrampoline = ActionTrampoline(nodeID: 2) { recorder.values.append($0) }
+        button.target = buttonTrampoline
+        button.action = #selector(ActionTrampoline.performButtonAction(_:))
+        let toggle = RecordingButton(checkboxWithTitle: "Follow", target: nil, action: nil)
+        let toggleTrampoline = ActionTrampoline(nodeID: 3) { recorder.values.append($0) }
+        toggle.target = toggleTrampoline
+        toggle.action = #selector(ActionTrampoline.performToggleAction(_:))
+        window.contentView?.addSubview(button)
+        window.contentView?.addSubview(toggle)
+
+        let buttonHandle = RenderHandle(nodeID: 2, nodeType: .button, view: button, actionTrampoline: buttonTrampoline)
+        buttonHandle.shortcutBinding = AppKitShortcutBinding(try Shortcut(parsing: "primary+r"))
+        let toggleHandle = RenderHandle(nodeID: 3, nodeType: .toggle, view: toggle, actionTrampoline: toggleTrampoline)
+        toggleHandle.shortcutBinding = AppKitShortcutBinding(try Shortcut(parsing: "primary+t"))
+        try renderer.registry.register(buttonHandle)
+        try renderer.registry.register(toggleHandle)
+
+        #expect(router.handleKeyEquivalent(try key("r", [.command], keyCode: 15, in: window), in: window))
+        #expect(router.handleKeyEquivalent(try key("t", [.command], keyCode: 17, in: window), in: window))
+        #expect(button.calls == ["sendAction"])
+        #expect(toggle.calls == ["sendAction"])
+        #expect(toggle.state == .on)
+        #expect(recorder.values == [.activate(nodeID: 2), .valueChanged(nodeID: 3, value: .bool(true))])
     }
 
     @Test

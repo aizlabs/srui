@@ -87,6 +87,54 @@ final class ShortcutStoreTests: XCTestCase {
         XCTAssertEqual(try Shortcut(parsing: "primary+page_up").displayString(for: .other), "Ctrl+Page Up")
     }
 
+    /// The shared Rust/Swift parity table (`protocol/conformance-vectors/shortcut_grammar_cases.json`,
+    /// also asserted by `shortcut_test.rs`): outcome category, offending token and exact message,
+    /// including the round-1 fuzz divergences (a combining mark after `+`, control characters).
+    func testTheSharedGrammarTableMatchesExactly() throws {
+        var dir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        while !FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent("protocol/conformance-vectors").path
+        ) {
+            dir = dir.deletingLastPathComponent()
+            guard dir.path != "/" else { return XCTFail("conformance-vectors not found") }
+        }
+        let url = dir.appendingPathComponent("protocol/conformance-vectors/shortcut_grammar_cases.json")
+        let table = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+        )
+        let cases = try XCTUnwrap(table["cases"] as? [[String: Any]])
+        XCTAssertGreaterThanOrEqual(cases.count, 50)
+        for row in cases {
+            let input = try XCTUnwrap(row["input"] as? String)
+            let outcome = try XCTUnwrap(row["outcome"] as? String)
+            do {
+                let parsed = try Shortcut(parsing: input)
+                XCTAssertEqual(outcome, "ok", "\(input.debugDescription) parsed")
+                XCTAssertEqual(parsed.canonical, row["canonical"] as? String, input.debugDescription)
+            } catch let error as ShortcutError {
+                let category: String
+                let token: String?
+                switch error {
+                case .notAString: (category, token) = ("not_a_string", nil)
+                case .empty: (category, token) = ("empty", nil)
+                case .tooLong: (category, token) = ("too_long", nil)
+                case .unknownToken(let t): (category, token) = ("unknown_token", t)
+                case .duplicateModifier(let m): (category, token) = ("duplicate_modifier", m)
+                case .misorderedModifier(let m): (category, token) = ("misordered_modifier", m)
+                case .missingKey: (category, token) = ("missing_key", nil)
+                case .requiresPrimary(let t): (category, token) = ("requires_primary", t)
+                }
+                XCTAssertEqual(category, outcome, input.debugDescription)
+                // Compare bytes, not canonical equivalence: "e\u{301}" is not "\u{e9}".
+                XCTAssertEqual(token.map { Array($0.utf8) }, (row["token"] as? String).map { Array($0.utf8) },
+                               input.debugDescription)
+                XCTAssertEqual(Array(error.description.utf8),
+                               (row["message"] as? String).map { Array($0.utf8) } ?? [],
+                               input.debugDescription)
+            }
+        }
+    }
+
     // MARK: - Store admission, uniqueness and atomicity (suite 2)
 
     private func surfaceStore() throws -> SemanticStore {
@@ -186,21 +234,35 @@ final class ShortcutStoreTests: XCTestCase {
         }
         XCTAssertNoThrow(try store.setProperty(nodeID: 2, property: .shortcut, value: .string("primary+r")))
 
-        // Another Surface, and a nested Surface, are separate scopes.
+        // Another root Surface is another scope; a nested Surface is rendered inline in the
+        // window-owning Surface and shares its scope (PX-016-G01 round 1, finding F1).
         try store.createNode(id: 10, nodeType: .surface)
         try store.createNode(id: 11, nodeType: .column, parentID: 10)
         try store.createNode(id: 12, nodeType: .button, parentID: 11, properties: [(.shortcut, .string("primary+r"))])
         try store.createNode(id: 20, nodeType: .surface, parentID: 1)
-        try store.createNode(id: 21, nodeType: .button, parentID: 20, properties: [(.shortcut, .string("primary+r"))])
+        XCTAssertThrowsError(try store.createNode(
+            id: 21, nodeType: .button, parentID: 20, properties: [(.shortcut, .string("primary+r"))]
+        )) {
+            XCTAssertEqual($0 as? StoreError, .duplicateShortcut(nodeID: 21, existing: 2, shortcut: "primary+r"))
+        }
+        try store.createNode(id: 21, nodeType: .button, parentID: 20, properties: [(.shortcut, .string("primary+n"))])
+        XCTAssertEqual(code {
+            try store.setProperty(nodeID: 21, property: .shortcut, value: .string("primary+r"))
+        }, "duplicate_shortcut")
 
         XCTAssertThrowsError(try store.moveNode(nodeID: 11, newParentID: 1, newChildIndex: nil)) {
             XCTAssertEqual($0 as? StoreError, .duplicateShortcut(nodeID: 12, existing: 2, shortcut: "primary+r"))
         }
         XCTAssertEqual(store.getNode(11)?.parentID, 10)
+        XCTAssertEqual(code { try store.moveNode(nodeID: 11, newParentID: 20, newChildIndex: nil) },
+                       "duplicate_shortcut")
         try store.createNode(id: 13, nodeType: .column, parentID: 10)
         XCTAssertNoThrow(try store.moveNode(nodeID: 11, newParentID: 13, newChildIndex: nil))
         XCTAssertNoThrow(try store.moveNode(nodeID: 11, newParentID: nil, newChildIndex: nil))
         XCTAssertNoThrow(try store.moveNode(nodeID: 20, newParentID: 10, newChildIndex: nil))
+        try store.createNode(id: 30, nodeType: .button, parentID: 1, properties: [(.shortcut, .string("primary+n"))])
+        XCTAssertEqual(code { try store.moveNode(nodeID: 20, newParentID: 1, newChildIndex: nil) },
+                       "duplicate_shortcut")
         try store.clearProperty(nodeID: 2, property: .shortcut)
         XCTAssertNoThrow(try store.moveNode(nodeID: 11, newParentID: 1, newChildIndex: nil))
     }

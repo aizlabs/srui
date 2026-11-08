@@ -59,8 +59,8 @@ pub use ids::{
 pub use model::{Model, ModelItem};
 
 pub use shortcut::{
-    shortcut_behavior, NamedKey, Shortcut, ShortcutBehavior, ShortcutError, ShortcutKey,
-    MAX_SHORTCUT_BYTES,
+    escape_token, shortcut_behavior, NamedKey, Shortcut, ShortcutBehavior, ShortcutError,
+    ShortcutKey, MAX_SHORTCUT_BYTES,
 };
 
 pub use store::{

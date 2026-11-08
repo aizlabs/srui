@@ -106,13 +106,18 @@ public enum ShortcutDispatchRefusal: Equatable, Sendable {
     case disabled
     case hidden
     case noNativeTarget
+    /// More than one bound node in the window matches the event. The stores refuse duplicates
+    /// within a window-owning Surface, so this signals a replica bypass; nothing is dispatched
+    /// rather than silently picking one (§4 inv. 13).
+    case ambiguous([NodeId])
 }
 
 /// Routes key equivalents of one renderer's Surface windows to the semantic node bound to them.
 ///
 /// Every Surface window's content view asks this router first (`SurfaceContentView`). A match is
 /// dispatched only when the window is key, the first responder holds no marked text, and the
-/// node and its ancestors are enabled and visible in the committed semantic state. A refused
+/// node and its ancestors are enabled and visible in the committed semantic state, and exactly
+/// one bound node in the window matches (two would be `.ambiguous`, never a silent pick). A refused
 /// match returns `false`, so the event continues to the main menu and the first responder
 /// unchanged.
 @MainActor
@@ -129,21 +134,32 @@ public final class ShortcutRouter {
         self.registry = registry
     }
 
-    /// The handle in `window` whose binding matches `event`, if any. The store guarantees at
-    /// most one per Surface.
+    /// Every handle in `window` whose binding matches `event`, in NodeId order. The stores
+    /// guarantee at most one per window-owning Surface.
     ///
     /// lc-debt: linear scan of every mounted handle per key equivalent (key events arrive at human
     /// rate, so this is cheap); a per-window binding table rebuilt on mount/apply would make it O(1).
-    public func boundHandle(for event: NSEvent, in window: NSWindow) -> RenderHandle? {
-        registry.allHandles.first { handle in
-            guard let binding = handle.shortcutBinding, binding.matches(event) else { return false }
-            return handle.view.window === window
-        }
+    public func boundHandles(for event: NSEvent, in window: NSWindow) -> [RenderHandle] {
+        registry.allHandles
+            .filter { handle in
+                guard let binding = handle.shortcutBinding, binding.matches(event) else { return false }
+                return handle.view.window === window
+            }
+            .sorted { $0.nodeID < $1.nodeID }
     }
 
     /// Handles a key equivalent for `window`; `true` when a shortcut was dispatched.
     public func handleKeyEquivalent(_ event: NSEvent, in window: NSWindow) -> Bool {
-        guard let handle = boundHandle(for: event, in: window) else { return false }
+        let matches = boundHandles(for: event, in: window)
+        guard let handle = matches.first else { return false }
+        guard matches.count == 1 else {
+            let ids = matches.map(\.nodeID)
+            lastRefusal = .ambiguous(ids)
+            RendererDiagnostics.log(
+                "shortcut matches \(ids.count) nodes \(ids) in one window; none dispatched"
+            )
+            return false
+        }
         if let refusal = refusal(for: handle, in: window) {
             lastRefusal = refusal
             RendererDiagnostics.log("shortcut node=\(handle.nodeID) not dispatched: \(refusal)")

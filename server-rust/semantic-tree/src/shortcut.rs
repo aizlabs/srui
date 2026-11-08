@@ -20,7 +20,7 @@
 //! the renderer's job. Every key except `f1`–`f12` requires `primary`, so a bare letter, digit or
 //! editing key never competes with a text editor, a collection or the key-view loop. Exactly one
 //! spelling is valid for each combination, so two shortcuts conflict exactly when their strings
-//! are equal. The Swift replica (`client-macos/SemanticModel/Shortcut.swift`) implements the same
+//! are equal. Tokens are split on the `+` byte and compared byte for byte. The Swift replica (`client-macos/SemanticModel/Shortcut.swift`) implements the same
 //! grammar and admission rules with the same error codes.
 
 use crate::ids::TypeRef;
@@ -150,7 +150,9 @@ impl fmt::Display for ShortcutError {
                 f,
                 "a shortcut is at most {MAX_SHORTCUT_BYTES} bytes, got {length}"
             ),
-            Self::UnknownToken(token) => write!(f, "unknown shortcut token {token:?}"),
+            Self::UnknownToken(token) => {
+                write!(f, "unknown shortcut token \"{}\"", escape_token(token))
+            }
             Self::DuplicateModifier(m) => write!(f, "modifier {m:?} appears more than once"),
             Self::MisorderedModifier(m) => write!(
                 f,
@@ -159,13 +161,31 @@ impl fmt::Display for ShortcutError {
             Self::MissingKey => write!(f, "a shortcut must end in a key"),
             Self::RequiresPrimary(key) => write!(
                 f,
-                "key {key:?} requires the primary modifier; only f1-f12 may be bare"
+                "key \"{}\" requires the primary modifier; only f1-f12 may be bare",
+                escape_token(key)
             ),
         }
     }
 }
 
 impl std::error::Error for ShortcutError {}
+
+/// Renders a token for an error message: printable ASCII as itself, `"` and `\` backslash-escaped,
+/// every other Unicode scalar as `\u{hex}`. The Swift replica's `escapedShortcutToken` is
+/// identical, so diagnostics read the same in both languages (Rust's `{:?}` escaping is not
+/// reproducible in Swift, so it is not used).
+pub fn escape_token(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    for c in token.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            ' '..='~' => out.push(c),
+            _ => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+        }
+    }
+    out
+}
 
 const MODIFIERS: [&str; 3] = ["primary", "shift", "alt"];
 

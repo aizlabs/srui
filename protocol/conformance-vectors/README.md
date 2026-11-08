@@ -30,6 +30,7 @@ Fixed binary wire fixtures for cross-language Protobuf conformance checks (§16,
 | `golden_handshake_refused.bin` | Length-prefixed framed `SruiMessage` containing a `ServerHandshakeRefused` with `SNAPSHOT_UNDELIVERABLE` (PX-004-G01 extension; §19.2) |
 | `malformed_shortcut_over_length.bin` | Protobuf-valid framed `Transaction` whose `SET_PROPERTY shortcut` value is 33 bytes, over the 32-byte bound; refused during semantic conversion (PX-016-G01; §4 inv. 13, §26) |
 | `malformed_shortcut_unknown_token.bin` | Protobuf-valid framed `Transaction` setting `shortcut = "cmd+r"`, an unknown token; refused during semantic conversion (PX-016-G01; §4 inv. 13, §26) |
+| `shortcut_grammar_cases.json` | Shared Rust/Swift parser parity table for the `shortcut` grammar: outcome category, offending token and exact message for 50 inputs, including combining marks after `+` and control characters (PX-016-G01 round 1; §4 inv. 13, §26) |
 | `malformed_shortcut_duplicate_modifier.bin` | Protobuf-valid framed `Transaction` setting `shortcut = "primary+primary+r"`, a duplicate modifier; refused during semantic conversion (PX-016-G01; §4 inv. 13, §26) |
 
 See `expected.json` for canonical hex and field declarations.

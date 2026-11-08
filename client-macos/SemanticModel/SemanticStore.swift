@@ -11,8 +11,8 @@
 //
 // Standard property 31 `shortcut` (§4 inv. 13, §7.4, §7.7, §22.5, §26) is checked with the same
 // rules, order and error codes as the Rust store: the canonical grammar (`Shortcut.swift`), the
-// node type's admission, and uniqueness within one Surface (nearest Surface ancestor-or-self, or
-// the root), including MOVE_NODE into another Surface.
+// node type's admission, and uniqueness within one tree (the window-owning root Surface and
+// everything under it, nested Surfaces included), including MOVE_NODE into another tree.
 //
 // Architectural Invariants (§4):
 // - Invariant 2: The client retains a non-authoritative replica of committed semantic UI state
@@ -1000,22 +1000,20 @@ public struct SemanticStore: Equatable, Sendable {
         }
     }
 
-    /// The node that scopes shortcut uniqueness for `id`: its nearest Surface ancestor-or-self, or
-    /// its root when it has no Surface ancestor.
+    /// The node that scopes shortcut uniqueness for `id`: the root of its tree. In the standard
+    /// profile that root is the window-owning Surface; a nested Surface is rendered inline in the
+    /// enclosing window, so it shares the root's scope (same rule as the Rust store).
     private func shortcutScope(_ id: NodeId) -> NodeId {
         var current = id
-        while let node = nodes[current] {
-            if node.nodeType == .surface { return current }
-            guard let parent = node.parentID else { return current }
+        while let parent = nodes[current]?.parentID {
             current = parent
         }
         return current
     }
 
-    /// A node in `scope`, other than those in `exclude`, that already holds `shortcut`. The walk does
-    /// not descend into a nested Surface, which is its own scope.
+    /// A node in `scope`'s subtree, other than those in `exclude`, that already holds `shortcut`.
     ///
-    /// lc-debt: O(nodes in the Surface) per shortcut-setting operation; an index from
+    /// lc-debt: O(nodes in the tree) per shortcut-setting operation; an index from
     /// (scope, shortcut) to NodeId would make it O(1) at the cost of maintaining it on every
     /// MOVE_NODE/DELETE_NODE.
     private func findShortcutHolder(
@@ -1026,7 +1024,6 @@ public struct SemanticStore: Equatable, Sendable {
         var stack = [scope]
         while let id = stack.popLast() {
             guard let node = nodes[id] else { continue }
-            if id != scope && node.nodeType == .surface { continue }
             if !exclude.contains(id), node.properties[.shortcut]?.asString == shortcut {
                 return id
             }
@@ -1044,16 +1041,16 @@ public struct SemanticStore: Equatable, Sendable {
 
     /// Shortcut checks for a MOVE_NODE that would re-parent `id` under `newParentID`.
     private func checkMoveKeepsShortcutsUnique(id: NodeId, newParentID: NodeId?) throws {
-        // A new root is its own scope; a moved Surface keeps its own scope.
-        guard let newParent = newParentID, nodes[id]?.nodeType != .surface else { return }
+        // A new root is its own scope; its subtree's shortcuts were already unique.
+        guard let newParent = newParentID else { return }
         let destination = shortcutScope(newParent)
         guard destination != shortcutScope(id) else { return }
+        // Every shortcut the moved subtree carries joins the destination tree.
         var moved = Set<NodeId>()
         var carried: [(NodeId, String)] = []
         var stack = [id]
         while let current = stack.popLast() {
             guard let node = nodes[current] else { continue }
-            if current != id && node.nodeType == .surface { continue }
             moved.insert(current)
             if let shortcut = node.properties[.shortcut]?.asString {
                 carried.append((current, shortcut))
@@ -1147,7 +1144,7 @@ public struct SemanticStore: Equatable, Sendable {
             try validateShortcutValue(nodeID: id, nodeType: nodeType, value: val)
         }
         if let shortcut = properties.last(where: { $0.0 == .shortcut })?.1, let pid = parentID,
-           nodeType != .surface, nodes[pid] != nil {
+           nodes[pid] != nil {
             try checkShortcutUnique(nodeID: id, scope: shortcutScope(pid), value: shortcut)
         }
 

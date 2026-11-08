@@ -36,18 +36,20 @@ public enum ShortcutNamedKey: Hashable, Sendable {
         ("home", .home), ("end", .end), ("page_up", .pageUp), ("page_down", .pageDown),
     ]
 
-    static func parse(_ token: Substring) -> ShortcutNamedKey? {
-        if let entry = table.first(where: { $0.0 == token }) {
+    /// Matches UTF-8 bytes exactly, never by Unicode canonical equivalence, as Rust does.
+    static func parse(_ token: [UInt8]) -> ShortcutNamedKey? {
+        if let entry = table.first(where: { Array($0.0.utf8) == token }) {
             return entry.1
         }
-        guard token.first == "f" else { return nil }
+        guard token.first == UInt8(ascii: "f") else { return nil }
         let digits = token.dropFirst()
-        guard !digits.isEmpty, digits.first != "0",
-              digits.allSatisfy({ $0.isASCII && $0.isNumber }),
-              let n = Int(digits), (1...12).contains(n) else {
+        guard !digits.isEmpty, digits.first != UInt8(ascii: "0"),
+              digits.allSatisfy({ (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0) }),
+              digits.count <= 2 else {
             return nil
         }
-        return .function(n)
+        let n = digits.reduce(0) { $0 * 10 + Int($1 - UInt8(ascii: "0")) }
+        return (1...12).contains(n) ? .function(n) : nil
     }
 
     /// Canonical token.
@@ -88,15 +90,31 @@ public enum ShortcutError: Error, Equatable, Sendable, CustomStringConvertible {
         case .empty: return "a shortcut must not be empty"
         case .tooLong(let length):
             return "a shortcut is at most \(maxShortcutBytes) bytes, got \(length)"
-        case .unknownToken(let token): return "unknown shortcut token \"\(token)\""
+        case .unknownToken(let token):
+            return "unknown shortcut token \"\(escapedShortcutToken(token))\""
         case .duplicateModifier(let m): return "modifier \"\(m)\" appears more than once"
         case .misorderedModifier(let m):
             return "modifier \"\(m)\" is out of the canonical primary, shift, alt order"
         case .missingKey: return "a shortcut must end in a key"
         case .requiresPrimary(let key):
-            return "key \"\(key)\" requires the primary modifier; only f1-f12 may be bare"
+            return "key \"\(escapedShortcutToken(key))\" requires the primary modifier; only f1-f12 may be bare"
         }
     }
+}
+
+/// Renders a token for an error message exactly as the Rust `escape_token` does: printable ASCII
+/// as itself, `"` and `\` backslash-escaped, every other Unicode scalar as `\u{hex}`.
+public func escapedShortcutToken(_ token: String) -> String {
+    var out = ""
+    for scalar in token.unicodeScalars {
+        switch scalar.value {
+        case 0x22: out += "\\\""
+        case 0x5C: out += "\\\\"
+        case 0x20...0x7E: out.unicodeScalars.append(scalar)
+        default: out += "\\u{" + String(scalar.value, radix: 16) + "}"
+        }
+    }
+    return out
 }
 
 /// What a shortcut does on an admitted node type.
@@ -152,19 +170,27 @@ public struct Shortcut: Hashable, Sendable, CustomStringConvertible {
     public let key: ShortcutKey
 
     private static let modifiers = ["primary", "shift", "alt"]
+    private static let modifierBytes = modifiers.map { Array($0.utf8) }
 
     /// Parses a value in the closed canonical grammar, failing explicitly otherwise (§4 inv. 13).
+    ///
+    /// Works on UTF-8 bytes and splits on the `+` byte, exactly as the Rust parser does, so a
+    /// combining mark after `+` (which Swift would otherwise fold into a `+` grapheme cluster)
+    /// yields the same tokens, error category and message in both languages.
     public init(parsing value: String) throws {
-        let length = value.utf8.count
-        if length > maxShortcutBytes { throw ShortcutError.tooLong(length: length) }
-        if value.isEmpty { throw ShortcutError.empty }
-        let tokens = value.split(separator: "+", omittingEmptySubsequences: false)
+        let bytes = Array(value.utf8)
+        if bytes.count > maxShortcutBytes { throw ShortcutError.tooLong(length: bytes.count) }
+        if bytes.isEmpty { throw ShortcutError.empty }
+        let tokens = bytes.split(separator: UInt8(ascii: "+"), omittingEmptySubsequences: false)
+            .map { Array($0) }
         let keyToken = tokens[tokens.count - 1]
+        // Splitting valid UTF-8 on an ASCII byte keeps every token valid UTF-8.
+        func text(_ token: [UInt8]) -> String { String(decoding: token, as: UTF8.self) }
         var seen = [false, false, false]
         var lastRank: Int?
         for token in tokens.dropLast() {
-            guard let rank = Self.modifiers.firstIndex(where: { $0 == token }) else {
-                throw ShortcutError.unknownToken(String(token))
+            guard let rank = Self.modifierBytes.firstIndex(of: token) else {
+                throw ShortcutError.unknownToken(text(token))
             }
             if seen[rank] { throw ShortcutError.duplicateModifier(Self.modifiers[rank]) }
             if let lastRank, rank < lastRank {
@@ -173,15 +199,15 @@ public struct Shortcut: Hashable, Sendable, CustomStringConvertible {
             seen[rank] = true
             lastRank = rank
         }
-        if let rank = Self.modifiers.firstIndex(where: { $0 == keyToken }) {
+        if let rank = Self.modifierBytes.firstIndex(of: keyToken) {
             if seen[rank] { throw ShortcutError.duplicateModifier(Self.modifiers[rank]) }
             throw ShortcutError.missingKey
         }
         guard let key = Self.parseKey(keyToken) else {
-            throw ShortcutError.unknownToken(String(keyToken))
+            throw ShortcutError.unknownToken(text(keyToken))
         }
         if !seen[0] && !key.isFunctionKey {
-            throw ShortcutError.requiresPrimary(String(keyToken))
+            throw ShortcutError.requiresPrimary(text(keyToken))
         }
         self.primary = seen[0]
         self.shift = seen[1]
@@ -195,10 +221,11 @@ public struct Shortcut: Hashable, Sendable, CustomStringConvertible {
         try self.init(parsing: string)
     }
 
-    private static func parseKey(_ token: Substring) -> ShortcutKey? {
-        if token.utf8.count == 1, let c = token.first, c.isASCII,
-           c.isLowercase || c.isNumber {
-            return .character(c)
+    private static func parseKey(_ token: [UInt8]) -> ShortcutKey? {
+        if token.count == 1,
+           (UInt8(ascii: "a")...UInt8(ascii: "z")).contains(token[0])
+            || (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(token[0]) {
+            return .character(Character(UnicodeScalar(token[0])))
         }
         return ShortcutNamedKey.parse(token).map(ShortcutKey.named)
     }

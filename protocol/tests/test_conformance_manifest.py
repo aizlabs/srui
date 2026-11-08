@@ -216,6 +216,8 @@ STATE_MACHINE_VECTORS_ADDED_AFTER_SPLIT = (
     "64_shortcut_same_value_in_two_surfaces_success.json",
     "65_shortcut_move_into_conflicting_surface_rejected.json",
     "66_shortcut_swap_through_clear_success.json",
+    # PX-016-G01 round 1: a nested Surface shares the window-owning Surface's scope.
+    "67_shortcut_duplicate_across_nested_surface_rejected.json",
 )
 
 

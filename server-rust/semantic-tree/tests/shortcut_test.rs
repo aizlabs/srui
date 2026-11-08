@@ -239,21 +239,35 @@ fn surfaces_scope_uniqueness_and_moves_are_checked_against_the_destination() {
         )
         .expect("another Surface is another scope");
 
-    // A nested Surface is its own scope too.
+    // A nested Surface is rendered inline in the enclosing window, so it shares the window-owning
+    // root's scope: a duplicate there is refused (PX-016-G01 round 1, verifier finding F1).
     let nested = NodeId::new(20);
     store
         .create_node(nested, TypeRef::SURFACE, Some(SURFACE), None, [])
         .unwrap();
     let c = NodeId::new(21);
+    let refused = store.create_node(
+        c,
+        TypeRef::BUTTON,
+        Some(nested),
+        None,
+        [shortcut("primary+r")],
+    );
+    assert!(
+        matches!(refused, Err(StoreError::DuplicateShortcut { existing, .. }) if existing == a),
+        "{refused:?}"
+    );
     store
         .create_node(
             c,
             TypeRef::BUTTON,
             Some(nested),
             None,
-            [shortcut("primary+r")],
+            [shortcut("primary+n")],
         )
-        .expect("a nested Surface does not share its parent's scope");
+        .expect("a distinct key in the nested Surface is accepted");
+    let (p, v) = shortcut("primary+r");
+    assert_eq!(code(store.set_property(c, p, v)), "duplicate_shortcut");
 
     // Moving the subtree carrying primary+r into the first Surface conflicts with node 2.
     let moved = store.move_node(column, Some(SURFACE), None);
@@ -269,19 +283,89 @@ fn surfaces_scope_uniqueness_and_moves_are_checked_against_the_destination() {
         Some(Some(second)),
         "refused move left no trace"
     );
+    // Nor may it move into the nested Surface, which belongs to the same window.
+    assert_eq!(
+        code(store.move_node(column, Some(nested), None)),
+        "duplicate_shortcut"
+    );
 
-    // Within the same Surface, and to a new root, a move never conflicts.
+    // Within the same tree, and to a new root, a move never conflicts.
     let other_column = NodeId::new(13);
     store
         .create_node(other_column, TypeRef::COLUMN, Some(second), None, [])
         .unwrap();
     store.move_node(column, Some(other_column), None).unwrap();
     store.move_node(column, None, None).unwrap();
-    // A whole Surface moves with its own scope intact.
+    // A whole Surface carrying primary+n moves into the second tree; primary+n is free there.
     store.move_node(nested, Some(second), None).unwrap();
+    // Moving a Surface subtree back is checked against the destination too.
+    store
+        .create_node(
+            NodeId::new(30),
+            TypeRef::BUTTON,
+            Some(SURFACE),
+            None,
+            [shortcut("primary+n")],
+        )
+        .unwrap();
+    assert_eq!(
+        code(store.move_node(nested, Some(SURFACE), None)),
+        "duplicate_shortcut"
+    );
     // Once node 2 releases primary+r the subtree may join the first Surface.
     store.clear_property(a, PropertyRef::SHORTCUT).unwrap();
     store.move_node(column, Some(SURFACE), None).unwrap();
+}
+
+#[derive(serde::Deserialize)]
+struct GrammarTable {
+    cases: Vec<GrammarCase>,
+}
+
+#[derive(serde::Deserialize)]
+struct GrammarCase {
+    input: String,
+    outcome: String,
+    token: Option<String>,
+    message: Option<String>,
+    canonical: Option<String>,
+}
+
+/// The shared Rust/Swift parity table (`protocol/conformance-vectors/shortcut_grammar_cases.json`):
+/// outcome category, offending token and exact message, including the round-1 fuzz divergences
+/// (a combining mark after `+`, control and non-ASCII tokens). Swift asserts the same rows.
+#[test]
+fn the_shared_grammar_table_matches_exactly() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../protocol/conformance-vectors/shortcut_grammar_cases.json");
+    let table: GrammarTable =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("table")).expect("json");
+    assert!(table.cases.len() >= 50);
+    for case in &table.cases {
+        let result = Shortcut::parse(&case.input);
+        match (&result, case.outcome.as_str()) {
+            (Ok(parsed), "ok") => {
+                assert_eq!(Some(parsed.canonical()), case.canonical, "{:?}", case.input);
+                continue;
+            }
+            (Err(error), outcome) => {
+                let (category, token) = match error {
+                    ShortcutError::NotAString => ("not_a_string", None),
+                    ShortcutError::Empty => ("empty", None),
+                    ShortcutError::TooLong { .. } => ("too_long", None),
+                    ShortcutError::UnknownToken(t) => ("unknown_token", Some(t.as_str())),
+                    ShortcutError::DuplicateModifier(m) => ("duplicate_modifier", Some(*m)),
+                    ShortcutError::MisorderedModifier(m) => ("misordered_modifier", Some(*m)),
+                    ShortcutError::MissingKey => ("missing_key", None),
+                    ShortcutError::RequiresPrimary(t) => ("requires_primary", Some(t.as_str())),
+                };
+                assert_eq!(category, outcome, "{:?}", case.input);
+                assert_eq!(token, case.token.as_deref(), "{:?}", case.input);
+                assert_eq!(Some(error.to_string()), case.message, "{:?}", case.input);
+            }
+            (Ok(_), outcome) => panic!("{:?} parsed but the table expects {outcome}", case.input),
+        }
+    }
 }
 
 #[test]

@@ -9,9 +9,9 @@
 //!
 //! Standard property 31 `shortcut` (§4 inv. 13, §7.4, §7.7, §22.5, §26) is checked on every
 //! mutation that can set it or change its scope: the value must be in the closed canonical
-//! grammar of [`crate::shortcut`], the node type must admit it, and no two nodes within one
-//! `Surface` (the nearest `Surface` ancestor-or-self, or the root when there is none) may hold
-//! the same shortcut. Checks run per operation, like every other store rule, so the Swift replica
+//! grammar of [`crate::shortcut`], the node type must admit it, and no two nodes of one tree —
+//! the window-owning root `Surface` and everything under it, nested `Surface`s included, since
+//! the renderer mounts those inline in the same window — may hold the same shortcut. Checks run per operation, like every other store rule, so the Swift replica
 //! reaches the same verdict at the same operation index.
 
 pub mod error;
@@ -320,29 +320,23 @@ impl SemanticStore {
         1 + max_child_depth
     }
 
-    /// The node that scopes shortcut uniqueness for `id`: its nearest `Surface` ancestor-or-self,
-    /// or its root when it has no `Surface` ancestor.
+    /// The node that scopes shortcut uniqueness for `id`: the root of its tree.
+    ///
+    /// In the standard profile that root is the window-owning `Surface`. A nested `Surface` is
+    /// rendered inline inside the enclosing window (`LayoutRenderer.attach`), so it shares the
+    /// root's scope: two equal shortcuts there would compete for one window's key equivalents.
     fn shortcut_scope(&self, id: NodeId) -> NodeId {
         let mut current = id;
-        loop {
-            let Some(node) = self.nodes.get(&current) else {
-                return current;
-            };
-            if node.node_type == TypeRef::SURFACE {
-                return current;
-            }
-            match node.parent_id {
-                Some(parent) => current = parent,
-                None => return current,
-            }
+        while let Some(parent) = self.nodes.get(&current).and_then(|n| n.parent_id) {
+            current = parent;
         }
+        current
     }
 
-    /// Finds a node in `scope` other than those in `exclude` that already holds `shortcut`.
+    /// Finds a node in `scope`'s subtree, other than those in `exclude`, that already holds
+    /// `shortcut`.
     ///
-    /// The walk does not descend into a nested `Surface`, which is its own scope.
-    ///
-    /// lc-debt: O(nodes in the Surface) per shortcut-setting operation; an index from
+    /// lc-debt: O(nodes in the tree) per shortcut-setting operation; an index from
     /// (scope, shortcut) to NodeId would make it O(1) at the cost of maintaining it on every
     /// MOVE_NODE/DELETE_NODE.
     fn find_shortcut_holder(
@@ -356,9 +350,6 @@ impl SemanticStore {
             let Some(node) = self.nodes.get(&id) else {
                 continue;
             };
-            if id != scope && node.node_type == TypeRef::SURFACE {
-                continue;
-            }
             if !exclude.contains(&id)
                 && matches!(
                     node.get_property(PropertyRef::SHORTCUT),
@@ -403,18 +394,11 @@ impl SemanticStore {
             // A new root is its own scope; its subtree's shortcuts were already unique.
             return Ok(());
         };
-        let moved_is_surface = self
-            .nodes
-            .get(&id)
-            .is_some_and(|n| n.node_type == TypeRef::SURFACE);
-        if moved_is_surface {
-            return Ok(());
-        }
         let destination = self.shortcut_scope(new_parent);
         if destination == self.shortcut_scope(id) {
             return Ok(());
         }
-        // Shortcuts carried by the moved subtree, outside any nested Surface.
+        // Every shortcut the moved subtree carries joins the destination tree.
         let mut moved = HashSet::new();
         let mut carried = Vec::new();
         let mut stack = vec![id];
@@ -422,9 +406,6 @@ impl SemanticStore {
             let Some(node) = self.nodes.get(&current) else {
                 continue;
             };
-            if current != id && node.node_type == TypeRef::SURFACE {
-                continue;
-            }
             moved.insert(current);
             if let Some(Value::String(s)) = node.get_property(PropertyRef::SHORTCUT) {
                 carried.push((current, s.clone()));
@@ -510,7 +491,7 @@ impl SemanticStore {
         if let (Some(shortcut), Some(pid)) =
             (last_assigned(&prop_list, PropertyRef::SHORTCUT), parent_id)
         {
-            if node_type != TypeRef::SURFACE && self.nodes.contains_key(&pid) {
+            if self.nodes.contains_key(&pid) {
                 self.check_shortcut_unique(id, self.shortcut_scope(pid), shortcut)?;
             }
         }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Has Codex posted a clean-verdict comment for *exactly* this head?
+# Has Codex reviewed *exactly* this head without leaving a review object?
 #
 # Usage: scripts/ci-accept-codex-verdict.sh <pr-number> <head-sha>
 #   exit 0 - a verdict for this head exists; the caller may proceed
@@ -31,14 +31,52 @@ pr=${1:?usage: ci-accept-codex-verdict.sh <pr-number> <head-sha>}
 head=$(printf '%s' "${2:?usage: ci-accept-codex-verdict.sh <pr-number> <head-sha>}" | tr 'A-F' 'a-f')
 repo=${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}
 
+# The review-state record. Since October 2026 a clean review on PR open (or ready-for-review) leaves
+# no review object and no verdict comment: the only evidence is the bot's summary comment, whose
+# second line is a machine-readable state record naming the reviewed commit in full, e.g.
+#   <!-- codex-pull-request-review-summary -->
+#   <!-- codex-review-state:v1 {"code_review":{"commit_sha":"<40 hex>",...,"status":"completed"},...} -->
+# (measured on PR #90). Accepted only from the bot's account, only when the comment *opens* with
+# exactly those two lines, only for a completed code review, and only when the 40-hex sha equals the
+# head in full - no abbreviation, so there is nothing to grind. Findings are not judged here: the
+# gate's next step fails on every unresolved Codex thread.
+state_program='[ .[]
+    | select(.user.id == '"$CODEX_BOT_ID"')
+    | (.body // "")
+    | capture("^<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 (?<state>\\{[^\n]*\\}) -->(\n|$)")?
+    | .state
+    | (try fromjson catch null)
+    | objects
+    | .code_review
+    | objects
+    | select(.status == "completed")
+    | .commit_sha
+    | strings
+    | select(test("^[0-9a-fA-F]{40}$")) # belt and braces: the full-sha equality below already decides
+  ] | .[]'
+state_shas=$(gh api "repos/$repo/issues/$pr/comments" --paginate --jq "$state_program" 2>/dev/null |
+    tr 'A-F' 'a-f' | sort -u)
+for sha in $state_shas; do
+    if [ "$sha" = "$head" ]; then
+        echo "Codex completed a code review of ${head} (review-state record names it in full)."
+        exit 0
+    fi
+done
+
 # Abbreviations captured out of the `**Reviewed commit:**` field of a bot comment whose body *starts*
 # with the clean-verdict sentence. Captured from that field rather than searched for anywhere in the
 # body, so a sha quoted in prose is not a verdict; and the body test excludes the bot's own "Codex
 # Review Summary" comment, which tabulates an abbreviated sha too.
+#
+# Since October 2026 the bot opens that comment with a `<!-- codex-review-receipt:v1 -->` marker line
+# (first seen on PR #88, posted 2026-10-24). Exactly that marker, and only at the very start, is
+# stripped before the test; the sentence must still open what remains, so a quoted or fenced verdict
+# behind the marker is still refused.
 abbrevs=$(gh api "repos/$repo/issues/$pr/comments" --paginate \
     --jq "[ .[]
             | select(.user.id == $CODEX_BOT_ID)
             | (.body // \"\")
+            | sub(\"^<!-- codex-review-receipt:v1 -->\\\\s*\"; \"\")
             | select(startswith(\"Codex Review: Didn't find any major issues.\"))
             | capture(\"Reviewed commit:\\\\*\\\\*\\\\s*\`(?<sha>[0-9a-fA-F]{7,40})\`\").sha
           ] | .[]" 2>/dev/null | tr 'A-F' 'a-f' | sort -u)

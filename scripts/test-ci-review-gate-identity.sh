@@ -203,6 +203,26 @@ codex_comment "Codex Review: Didn't find any major issues.\n\n**Reviewed commit:
     comments_json >"$work/two-fields.json"
 codex_comment "Codex Review: Didn't find any major issues.\n\n**Reviewed commit:** \`deadbeefcafe\`\n" |
     comments_json >"$work/ref-name.json"
+# The body the bot has posted since October 2026: the same verdict behind a receipt marker line.
+receipt_marker='<!-- codex-review-receipt:v1 -->'
+codex_comment "$receipt_marker\n\n$verdict_body" | comments_json >"$work/receipt.json"
+codex_comment "$receipt_marker\n\n\`\`\`\n$verdict_body\`\`\`\n" | comments_json >"$work/receipt-fenced.json"
+codex_comment "Note.\n$receipt_marker\n\n$verdict_body" | comments_json >"$work/receipt-not-first.json"
+codex_comment "<!-- codex-review-receipt:v2 -->\n\n$verdict_body" | comments_json >"$work/receipt-other-marker.json"
+# The summary comment with its review-state record: the only evidence of a clean review on PR open.
+summary_head='<!-- codex-pull-request-review-summary -->'
+state_line() { # <sha> <status>
+    printf '<!-- codex-review-state:v1 {"code_review":{"commit_sha":"%s","has_any_findings":false,"has_unresolved_findings":false,"status":"%s"},"security_review":{"commit_sha":null,"has_any_findings":null,"has_unresolved_findings":null,"status":null}} -->' "$1" "$2"
+}
+summary_tail='\n\n<details>\n<summary><strong>Codex Review Summary</strong>: Completed</summary>\n</details>\n'
+codex_comment "$summary_head\n$(state_line "$reviewed" completed)$summary_tail" | comments_json >"$work/state.json"
+codex_comment "$summary_head\n$(state_line "$reviewed" in_progress)$summary_tail" | comments_json >"$work/state-running.json"
+codex_comment "$summary_head\n$(state_line "$abbrev" completed)$summary_tail" | comments_json >"$work/state-abbrev.json"
+codex_comment "Note.\n$summary_head\n$(state_line "$reviewed" completed)$summary_tail" | comments_json >"$work/state-not-first.json"
+codex_comment "$summary_head\n\n$(state_line "$reviewed" completed)$summary_tail" | comments_json >"$work/state-not-second.json"
+codex_comment "$summary_head\n<!-- codex-review-state:v1 {\"code_review\": -->$summary_tail" | comments_json >"$work/state-malformed.json"
+printf '%s\t%s\t%s\t%s\n' 66666666 'chatgpt-codex-connector-attacker' "$summary_head\n$(state_line "$reviewed" completed)$summary_tail" User |
+    comments_json >"$work/state-foreign.json"
 printf '[]\n' >"$work/none.json"
 
 resolves_both="$abbrev\t$reviewed\n$other_abbrev\t$other"
@@ -224,6 +244,95 @@ if accepts_verdict "$work/genuine.json" "$resolves_both" "$reviewed" "$reviewed"
     echo "  ok: a genuine verdict for this head is accepted"
 else
     fail "a genuine verdict for the current head was rejected"
+fi
+
+# The receipt fixture must be exactly the marker line, a blank line, then the genuine body.
+jq -e --arg marker "$receipt_marker" --slurpfile g "$work/genuine.json" '
+    .[0].body == ($marker + "\n\n" + $g[0][0].body)' "$work/receipt.json" >/dev/null ||
+    fail "the receipt verdict fixture is not the marker followed by the genuine body"
+
+if accepts_verdict "$work/receipt.json" "$resolves_both" "$reviewed" "$reviewed"; then
+    echo "  ok: a genuine verdict behind the receipt marker is accepted"
+else
+    fail "a genuine verdict behind the receipt marker was rejected"
+fi
+
+if accepts_verdict "$work/receipt.json" "$resolves_both" "$reviewed\n$ground" "$ground"; then
+    fail "a stale receipt verdict satisfied the gate for a ground look-alike head"
+else
+    echo "  ok: a receipt verdict naming a different commit is rejected for a ground look-alike head"
+fi
+
+if accepts_verdict "$work/receipt-fenced.json" "$resolves_both" "$reviewed" "$reviewed"; then
+    fail "a fenced verdict behind the receipt marker was accepted"
+else
+    echo "  ok: a verdict fenced behind the receipt marker is not a verdict"
+fi
+
+if accepts_verdict "$work/receipt-not-first.json" "$resolves_both" "$reviewed" "$reviewed"; then
+    fail "a receipt marker that does not open the comment was stripped"
+else
+    echo "  ok: the receipt marker is only stripped at the very start of the comment"
+fi
+
+if accepts_verdict "$work/receipt-other-marker.json" "$resolves_both" "$reviewed" "$reviewed"; then
+    fail "a marker other than codex-review-receipt:v1 was stripped"
+else
+    echo "  ok: only the codex-review-receipt:v1 marker is stripped"
+fi
+
+# The state fixture must be exactly the shape the bot posts: marker line, state line, then prose.
+jq -e --arg sha "$reviewed" '
+    .[0].body | test("^<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 \\{\"code_review\":\\{\"commit_sha\":\"" + $sha + "\"")' \
+    "$work/state.json" >/dev/null ||
+    fail "the review-state fixture is not the body the bot posts"
+
+if accepts_verdict "$work/state.json" "" "$reviewed" "$reviewed"; then
+    echo "  ok: a completed review-state record naming this head in full is accepted"
+else
+    fail "a completed review-state record for the current head was rejected"
+fi
+
+if accepts_verdict "$work/state.json" "" "$reviewed\n$ground" "$ground"; then
+    fail "a review-state record for another commit satisfied the gate for a look-alike head"
+else
+    echo "  ok: a review-state record for another commit is rejected, look-alike or not"
+fi
+
+if accepts_verdict "$work/state-running.json" "" "$reviewed" "$reviewed"; then
+    fail "a review-state record whose review has not completed was accepted"
+else
+    echo "  ok: a review still in progress is not a review"
+fi
+
+if accepts_verdict "$work/state-abbrev.json" "$abbrev\t$reviewed" "$reviewed" "$reviewed"; then
+    fail "a review-state record with an abbreviated sha was accepted"
+else
+    echo "  ok: the review-state record must name the head in full"
+fi
+
+if accepts_verdict "$work/state-not-first.json" "" "$reviewed" "$reviewed"; then
+    fail "a review-state record that does not open the comment was accepted"
+else
+    echo "  ok: the review-state record must open the comment"
+fi
+
+if accepts_verdict "$work/state-not-second.json" "" "$reviewed" "$reviewed"; then
+    fail "a review-state record not on the second line was accepted"
+else
+    echo "  ok: the state line must directly follow the summary marker"
+fi
+
+if accepts_verdict "$work/state-malformed.json" "" "$reviewed" "$reviewed"; then
+    fail "a malformed review-state record was accepted"
+else
+    echo "  ok: a malformed review-state record is refused"
+fi
+
+if accepts_verdict "$work/state-foreign.json" "" "$reviewed" "$reviewed"; then
+    fail "a review-state record posted by a look-alike account was accepted"
+else
+    echo "  ok: a review-state record from a non-Codex account is rejected"
 fi
 
 # The grind: head is the ground commit, while the verdict's abbreviation resolves to the reviewed one.

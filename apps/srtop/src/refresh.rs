@@ -790,9 +790,14 @@ impl ProcessView {
     /// deleted and reinserted under its own item ID inside one transaction
     /// ([`plan_moves`]) — never replaced by a new row, so a client's native
     /// selection, which is anchored to item IDs, stays on the same process
-    /// (§6.2, §8). The rows are the ones already published; nothing is sampled,
-    /// and the published set does not change, only its order. A request for the
-    /// order already published commits nothing at all.
+    /// (§6.2, §8). Nothing is sampled: the rows are the server's collection,
+    /// filtered again. Normally the published set does not change, only its
+    /// order; when the filters' result has changed since the last publication
+    /// (an account name resolved, or the published-row ceiling keeps a
+    /// different leading window in the new order), the rows that joined or
+    /// left are inserted or deleted in the same plan, with the filter and
+    /// search statuses that describe them (PX-012 review round, F1). A request
+    /// for the order already published commits nothing at all.
     ///
     /// The buttons' labels are planned ahead of the rows, like the status on a
     /// refresh, and the view's record of the active order advances when the
@@ -814,8 +819,6 @@ impl ProcessView {
         }
         self.unfiltered_rows
             .sort_by(|left, right| sort::compare(order, left, right));
-        let target = self.visible(&self.unfiltered_rows).rows;
-        let (batch, max_ops, max_bytes) = self.planning_limits(session);
         let mut plan = Vec::new();
         if let Some(previous) = self.sort.filter(|previous| previous.field != order.field) {
             plan.push(Planned::new(Effect::SortLabel {
@@ -829,24 +832,14 @@ impl ProcessView {
             label: sort::sort_button_label(order.field, Some(order.direction)),
             activates: Some(order),
         }));
-        let moved = plan_moves(&self.rows, &target, batch, max_ops, max_bytes);
-        debug_assert_eq!(
-            moved.rows.iter().map(|row| row.item_id).collect::<Vec<_>>(),
-            target.iter().map(|row| row.item_id).collect::<Vec<_>>()
-        );
-        plan.extend(moved.plan);
-        // The search's positions follow the new order (PX-011); its target is
-        // the same item ID wherever it moved.
-        plan.extend(self.search_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
-        let mut result = Refreshed::default();
-        count(&plan, &mut result);
-        let (transactions, outcome) =
-            commit(session, &plan, max_ops, max_bytes, &mut self.published());
-        result.transactions = transactions;
-        refresh_sort_values(&mut self.rows, &target);
-        self.ids.retain(&self.unfiltered_rows);
-        self.search.observe(&self.rows);
-        outcome.map(|()| result)
+        // A sort re-applies every filter and publishes through the full path
+        // (PX-012 review round, F1): moves for the rows that stay, insertions
+        // and deletions for any whose membership changed since the last
+        // publication — an account name resolved in between, or a different
+        // leading window under the published-row ceiling — and the filters'
+        // statuses and the search re-counted against exactly those rows, in
+        // the same plan. Every row keeps its item ID.
+        self.republish(session, plan)
     }
 
     /// The visible columns, in published order (PX-068).

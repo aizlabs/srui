@@ -16,6 +16,7 @@
 //!   settlement clear it in the same commit.
 //! * A delayed or hung account-name lookup never stalls publication.
 
+use srui_process_explorer::catalogue::ProcessField;
 use srui_process_explorer::owner::{
     AccountLookup, Accounts, OwnerChoice, MAX_OWNER_INPUT_BYTES, MAX_OWNER_STATUS_BYTES,
     MAX_PID_SET, MAX_PID_SET_INPUT_BYTES,
@@ -451,8 +452,36 @@ impl Drop for Release {
     }
 }
 
+/// The most a test whose resolver hangs may take before it fails as a stall
+/// instead of hanging the suite (PX-012 review round, W2).
+const WATCHDOG: Duration = Duration::from_secs(60);
+
+/// Runs `body` on its own thread and fails if it has not returned within
+/// `limit`: an unbounded stall is a failure, never a hung test. A panic in
+/// `body` is the test's panic.
+fn within(limit: Duration, body: impl FnOnce() + Send + 'static) {
+    let (done, finished) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        body();
+        let _ = done.send(());
+    });
+    match finished.recv_timeout(limit) {
+        Ok(()) => worker.join().expect("the body returned"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            std::panic::resume_unwind(worker.join().expect_err("the body panicked"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("the test stalled for {limit:?}: something waited for the name lookup")
+        }
+    }
+}
+
 #[test]
 fn a_delayed_name_lookup_never_stalls_publication() {
+    within(WATCHDOG, delayed_name_lookup);
+}
+
+fn delayed_name_lookup() {
     let gate = Arc::new(Gated::default());
     let _release = Release(Arc::clone(&gate));
     let accounts =
@@ -545,6 +574,107 @@ fn a_delayed_name_lookup_never_stalls_publication() {
             .unwrap(),
     );
     assert_eq!(pids(&session), [100, 101]);
+}
+
+/// PX-012 review round, F1: an account name that resolves after a name filter
+/// was applied and before the next refresh changes the filter's result. A sort
+/// then publishes that membership through the full path — the rows that now
+/// match are inserted under their own item IDs, with the user-filter and
+/// search statuses describing exactly the rows the table holds — and nothing
+/// trips the moves-only invariant in a debug build.
+#[test]
+fn a_sort_after_a_name_resolves_publishes_the_new_membership_with_its_statuses() {
+    within(WATCHDOG, || {
+        let gate = Arc::new(Gated::default());
+        let _release = Release(Arc::clone(&gate));
+        let accounts =
+            Accounts::with_lookup(Observed::Known(ME), gate.clone() as Arc<dyn AccountLookup>);
+        let session = Session::mint();
+        let mut source = Fixture::new(accounts);
+        let (mut view, _) = start_from_source(&session, &mut source).unwrap();
+        let original = rows(&session);
+        view.set_search(&session, "worker").unwrap();
+        // The name cannot be resolved yet: the filter keeps nothing.
+        view.set_owner_input(&session, "alice").unwrap();
+        assert_eq!(pids(&session), Vec::<u64>::new());
+        assert!(status(&session, &view).contains("not resolved yet"));
+        // The lookup completes between publications.
+        gate.release();
+        assert!(view.owner_filter().names().wait_idle(SETTLE));
+        view.click_sort(&session, ProcessField::Pid).unwrap();
+        let shown = rows(&session);
+        let mut shown_pids: Vec<u64> = shown.iter().map(|(_, pid)| *pid).collect();
+        shown_pids.sort_unstable();
+        assert_eq!(shown_pids, [100, 101], "the rows alice owns are inserted");
+        for row in &shown {
+            assert!(original.contains(row), "{row:?} kept its item ID");
+        }
+        assert_eq!(
+            view.row_count(),
+            shown.len(),
+            "the view records what committed"
+        );
+        assert!(
+            status(&session, &view).starts_with("User: name \"alice\", UID 1000 · 2 of 6"),
+            "{}",
+            view.owner_status()
+        );
+        let search = text(&session, SEARCH_STATUS);
+        assert!(search.contains("in 2 shown rows"), "{search}");
+        assert_eq!(search, view.search_status());
+    });
+}
+
+/// PX-012 review round, F2: a PID-set or user field longer than its bound is
+/// never cut into a different PID or UID. 510 spaces and `4102` is not PID 41,
+/// and 60 spaces and `10001` is not UID 1000; each keeps nothing and says why,
+/// and the field keeps only whole entries.
+#[test]
+fn a_field_past_its_bound_is_never_read_as_a_shorter_pid_or_uid() {
+    let session = Session::mint();
+    let mut source = Fixture::new(fixture_accounts());
+    source
+        .records
+        .push(record(41, "bystander", Observed::Known(OPS_A)));
+    let (mut view, _) = start_from_source(&session, &mut source).unwrap();
+    settle_names(&view);
+    let original = rows(&session);
+    // At the bound the PID is read whole.
+    let at = format!("{}4102", " ".repeat(MAX_PID_SET_INPUT_BYTES - 4));
+    view.set_pid_set(&session, &at).unwrap();
+    assert_eq!(
+        view.owner_filter().pid_set().pids(),
+        &BTreeSet::from([4102])
+    );
+    // Past it, the cut entry is dropped: PID 41 is never shown.
+    let past = format!("{}4102", " ".repeat(MAX_PID_SET_INPUT_BYTES - 2));
+    view.set_pid_set(&session, &past).unwrap();
+    assert_eq!(pids(&session), Vec::<u64>::new(), "not PID 41");
+    assert!(view.owner_filter().pid_set().pids().is_empty());
+    assert_eq!(
+        value(&session, PID_SET_INPUT),
+        " ".repeat(MAX_PID_SET_INPUT_BYTES - 2)
+    );
+    assert!(
+        status(&session, &view).contains("text past 512 bytes ignored"),
+        "{}",
+        view.owner_status()
+    );
+    view.set_pid_set(&session, "").unwrap();
+    assert_eq!(rows(&session), original);
+    // The user field: at the bound a UID is read whole, past it nothing.
+    let uid_at = format!("{}1001", " ".repeat(MAX_OWNER_INPUT_BYTES - 4));
+    view.set_owner_input(&session, &uid_at).unwrap();
+    assert_eq!(pids(&session), [102, 41]);
+    let uid_past = format!("{}10001", " ".repeat(MAX_OWNER_INPUT_BYTES - 4));
+    view.set_owner_input(&session, &uid_past).unwrap();
+    assert_eq!(view.owner_filter().choice(), &OwnerChoice::TooLong);
+    assert_eq!(pids(&session), Vec::<u64>::new(), "not UID 1000");
+    assert!(status(&session, &view).starts_with("User: the user field is longer than 64 bytes"));
+    assert_eq!(
+        value(&session, OWNER_INPUT),
+        " ".repeat(MAX_OWNER_INPUT_BYTES - 4)
+    );
 }
 
 #[test]

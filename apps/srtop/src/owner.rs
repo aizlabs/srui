@@ -127,6 +127,10 @@ impl AccountLookup for FixedAccountLookup {
     }
 }
 
+/// The monotonic clock the name cache measures timeouts and answer ages on
+/// (PX-012). `Instant::now` unless a test injects another.
+pub type AccountClock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
 /// Whose processes "my processes" means, and how owner UIDs are named, for one
 /// source's records (PX-012).
 #[derive(Clone)]
@@ -138,6 +142,8 @@ pub struct Accounts {
     /// How long one lookup may stay unanswered before it is published as
     /// timed out.
     pub timeout: Duration,
+    /// The clock timeouts and answer ages are measured on.
+    pub clock: AccountClock,
 }
 
 impl std::fmt::Debug for Accounts {
@@ -158,6 +164,7 @@ impl Accounts {
             current: Observed::Missing(MissingReason::Unavailable),
             lookup: None,
             timeout: LOOKUP_TIMEOUT,
+            clock: Arc::new(Instant::now),
         }
     }
 
@@ -182,6 +189,7 @@ impl Accounts {
             current,
             lookup: Some(lookup),
             timeout: LOOKUP_TIMEOUT,
+            clock: Arc::new(Instant::now),
         }
     }
 
@@ -189,6 +197,13 @@ impl Accounts {
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// The same accounts with timeouts and answer ages measured on `clock`.
+    #[must_use]
+    pub fn with_clock(mut self, clock: AccountClock) -> Self {
+        self.clock = clock;
         self
     }
 }
@@ -261,6 +276,7 @@ pub struct AccountNames {
     shared: Cell,
     requests: Option<SyncSender<u32>>,
     timeout: Duration,
+    now: AccountClock,
 }
 
 impl std::fmt::Debug for AccountNames {
@@ -286,7 +302,7 @@ fn answer_of(answer: Result<Option<Vec<u8>>, MissingReason>) -> AccountName {
     }
 }
 
-fn work(lookup: Arc<dyn AccountLookup>, requests: Receiver<u32>, shared: Cell) {
+fn work(lookup: Arc<dyn AccountLookup>, requests: Receiver<u32>, shared: Cell, now: AccountClock) {
     while let Ok(uid) = requests.recv() {
         let answer = answer_of(lookup.account_name(uid));
         let (state, changed) = &*shared;
@@ -296,7 +312,7 @@ fn work(lookup: Arc<dyn AccountLookup>, requests: Receiver<u32>, shared: Cell) {
         if let Some(entry) = state.entries.get_mut(&uid) {
             entry.slot = Slot::Answered {
                 name: answer,
-                at: Instant::now(),
+                at: now(),
                 refreshing: false,
             };
         }
@@ -315,19 +331,22 @@ impl AccountNames {
                 shared,
                 requests: None,
                 timeout: accounts.timeout,
+                now: Arc::clone(&accounts.clock),
             };
         };
         let (sender, receiver) = mpsc::sync_channel(MAX_QUEUED_LOOKUPS);
         let worker = Arc::clone(&shared);
+        let clock = Arc::clone(&accounts.clock);
         let started = std::thread::Builder::new()
             .name("srtop-accounts".into())
-            .spawn(move || work(lookup, receiver, worker));
+            .spawn(move || work(lookup, receiver, worker, clock));
         Self {
             shared,
             // A worker that could not start leaves a closed queue, and every
             // lookup then fails as unavailable instead of waiting.
             requests: started.ok().map(|_| sender),
             timeout: accounts.timeout,
+            now: Arc::clone(&accounts.clock),
         }
     }
 
@@ -337,9 +356,10 @@ impl AccountNames {
         let Some(requests) = &self.requests else {
             return AccountName::NotProvided;
         };
+        let now = (self.now)();
         let failed = || Slot::Answered {
             name: AccountName::Failed(MissingReason::Unavailable),
-            at: Instant::now(),
+            at: now,
             refreshing: false,
         };
         let mut guard = lock(&self.shared.0);
@@ -357,7 +377,7 @@ impl AccountNames {
             let resend = match &entry.slot {
                 Slot::Waiting { queued, .. } => !queued,
                 Slot::Answered { at, refreshing, .. } => {
-                    !refreshing && at.elapsed() >= ACCOUNT_NAME_TTL
+                    !refreshing && now.saturating_duration_since(*at) >= ACCOUNT_NAME_TTL
                 }
             };
             if resend {
@@ -374,7 +394,9 @@ impl AccountNames {
                 }
             }
             return match &entry.slot {
-                Slot::Waiting { since, .. } if since.elapsed() >= self.timeout => {
+                Slot::Waiting { since, .. }
+                    if now.saturating_duration_since(*since) >= self.timeout =>
+                {
                     AccountName::TimedOut
                 }
                 Slot::Waiting { .. } => AccountName::Pending,
@@ -388,12 +410,12 @@ impl AccountNames {
             Ok(()) => {
                 *in_flight += 1;
                 Slot::Waiting {
-                    since: Instant::now(),
+                    since: now,
                     queued: true,
                 }
             }
             Err(TrySendError::Full(_)) => Slot::Waiting {
-                since: Instant::now(),
+                since: now,
                 queued: false,
             },
             Err(TrySendError::Disconnected(_)) => failed(),
@@ -477,6 +499,9 @@ pub enum OwnerChoice {
     Name(String),
     /// Digits that are no UID (beyond `u32`): keeps nothing, and says so.
     NotAUid(String),
+    /// Text longer than [`MAX_OWNER_INPUT_BYTES`]: no UID or name is read from
+    /// a cut field. Keeps nothing, and says so.
+    TooLong,
 }
 
 /// `text` cut to at most `limit` bytes on a character boundary.
@@ -489,6 +514,36 @@ fn cut(text: &str, limit: usize) -> &str {
         end -= 1;
     }
     &text[..end]
+}
+
+/// The longest prefix of `text` within `limit` bytes that ends on an entry
+/// boundary, and whether anything was cut (PX-012 review round, F2).
+///
+/// Cutting a field's text and then parsing it would turn a cut entry into a
+/// different, valid one: 510 spaces and `4102` cut at 512 bytes reads `41`. So
+/// text within the bound is kept whole, and text past it is cut on a
+/// character boundary and then back to the last `separator`, dropping the
+/// entry the bound cut through. Callers treat a cut field as refused or
+/// incomplete and say so; they never read the cut text as what was typed.
+pub(crate) fn whole_entries(
+    text: &str,
+    limit: usize,
+    separator: impl Fn(char) -> bool,
+) -> (&str, bool) {
+    if text.len() <= limit {
+        return (text, false);
+    }
+    let kept = cut(text, limit);
+    let rest = &text[kept.len()..];
+    let through_an_entry =
+        !kept.ends_with(&separator) && rest.chars().next().is_some_and(|next| !separator(next));
+    if !through_an_entry {
+        return (kept, true);
+    }
+    let end = kept.rfind(&separator).map_or(0, |index| {
+        index + kept[index..].chars().next().map_or(0, char::len_utf8)
+    });
+    (&kept[..end], true)
 }
 
 /// `text` with every control or unsafe character made inert, as a display
@@ -509,9 +564,14 @@ fn inert(text: &str) -> String {
 
 impl OwnerChoice {
     /// The choice the user field's `text` makes: empty is every visible user,
-    /// digits are a UID, anything else is an account name.
+    /// digits are a UID, anything else is an account name, and text longer
+    /// than [`MAX_OWNER_INPUT_BYTES`] is refused whole rather than cut into
+    /// another UID or name.
     pub fn parse(text: &str) -> Self {
-        let text = inert(cut(text, MAX_OWNER_INPUT_BYTES));
+        if text.len() > MAX_OWNER_INPUT_BYTES {
+            return Self::TooLong;
+        }
+        let text = inert(text);
         let text = text.trim();
         if text.is_empty() {
             Self::AllVisible
@@ -539,15 +599,23 @@ pub struct PidSet {
     first_invalid: Option<String>,
     /// Valid, distinct PIDs beyond [`MAX_PID_SET`].
     omitted: usize,
+    /// Whether the field was longer than [`MAX_PID_SET_INPUT_BYTES`]: the
+    /// rest, and any entry the bound cut through, were dropped.
+    overlong: bool,
 }
 
 impl PidSet {
     /// The set `text` names: entries separated by commas or white space, each
-    /// a PID as Go to PID reads one ([`crate::search::parse_pid`]).
+    /// a PID as Go to PID reads one ([`crate::search::parse_pid`]). Text past
+    /// [`MAX_PID_SET_INPUT_BYTES`] is dropped together with any entry the
+    /// bound cuts through, so a cut PID is never read as a shorter one.
     pub fn parse(text: &str) -> Self {
-        let text = cut(text, MAX_PID_SET_INPUT_BYTES).to_string();
+        let (text, overlong) = whole_entries(text, MAX_PID_SET_INPUT_BYTES, |character: char| {
+            character == ',' || character.is_whitespace()
+        });
         let mut set = Self {
-            text,
+            text: text.to_string(),
+            overlong,
             ..Self::default()
         };
         for entry in set
@@ -579,10 +647,16 @@ impl PidSet {
         &self.text
     }
 
-    /// Whether the field holds any entry. A field of entries none of which is a
-    /// PID is active and keeps nothing: a mistyped set never shows everything.
+    /// Whether the field holds any entry, or was cut. A field of entries none
+    /// of which is a PID, like one cut down to none, is active and keeps
+    /// nothing: a mistyped or overlong set never shows everything.
     pub fn is_active(&self) -> bool {
-        self.entries > 0
+        self.entries > 0 || self.overlong
+    }
+
+    /// Whether the field was longer than [`MAX_PID_SET_INPUT_BYTES`].
+    pub fn is_overlong(&self) -> bool {
+        self.overlong
     }
 
     /// The valid PIDs, at most [`MAX_PID_SET`].
@@ -754,10 +828,18 @@ impl OwnerFilter {
         self.input.clear();
     }
 
-    /// The user field's new text; returns the text the server keeps.
+    /// The user field's new text; returns the text the server keeps. Text
+    /// past [`MAX_OWNER_INPUT_BYTES`] is refused ([`OwnerChoice::TooLong`]);
+    /// the field keeps it only up to the last whole entry, so a later edit of
+    /// what the field shows never reads a cut UID.
     pub fn set_input(&mut self, text: &str) -> &str {
-        self.input = cut(text, MAX_OWNER_INPUT_BYTES).to_string();
-        self.choice = OwnerChoice::parse(&self.input);
+        let (kept, overlong) = whole_entries(text, MAX_OWNER_INPUT_BYTES, char::is_whitespace);
+        self.input = kept.to_string();
+        self.choice = if overlong {
+            OwnerChoice::TooLong
+        } else {
+            OwnerChoice::parse(&self.input)
+        };
         &self.input
     }
 
@@ -796,6 +878,13 @@ impl OwnerFilter {
                     "\"{}\" is not a UID (at most {})",
                     crate::bounded(text, MAX_ENTRY_ECHO_BYTES),
                     u32::MAX
+                ),
+            ),
+            OwnerChoice::TooLong => (
+                OwnerMatch::Uids(BTreeSet::new()),
+                format!(
+                    "the user field is longer than {MAX_OWNER_INPUT_BYTES} bytes, so it names \
+                     no UID or account; shorten it"
                 ),
             ),
             OwnerChoice::Name(name) => self.by_name(name, collection),
@@ -902,6 +991,12 @@ impl OwnerFilter {
                     plural(self.pids.invalid, "a PID", "PIDs"),
                 ));
             }
+            if self.pids.overlong {
+                status.push_str(&format!(
+                    " · text past {MAX_PID_SET_INPUT_BYTES} bytes ignored, with any entry the \
+                     bound cut through"
+                ));
+            }
             if self.pids.omitted > 0 {
                 status.push_str(&format!(
                     " · bounded to {MAX_PID_SET} PIDs, {} more ignored",
@@ -995,11 +1090,11 @@ mod tests {
             OwnerChoice::parse("a\u{1b}[2Jb"),
             OwnerChoice::Name(format!("a{REPLACEMENT}[2Jb"))
         );
-        let long = "x".repeat(MAX_OWNER_INPUT_BYTES * 2);
-        let OwnerChoice::Name(name) = OwnerChoice::parse(&long) else {
-            panic!("a long name is a name")
-        };
-        assert_eq!(name.len(), MAX_OWNER_INPUT_BYTES);
+        // At the bound a name is read whole; past it nothing is read.
+        let at = "x".repeat(MAX_OWNER_INPUT_BYTES);
+        assert_eq!(OwnerChoice::parse(&at), OwnerChoice::Name(at.clone()));
+        let past = "x".repeat(MAX_OWNER_INPUT_BYTES + 1);
+        assert_eq!(OwnerChoice::parse(&past), OwnerChoice::TooLong);
     }
 
     #[test]
@@ -1020,6 +1115,48 @@ mod tests {
         assert!(bounded.text().len() <= MAX_PID_SET_INPUT_BYTES);
         let wide = "\u{20000}".repeat(MAX_PID_SET_INPUT_BYTES);
         assert!(PidSet::parse(&wide).text().len() <= MAX_PID_SET_INPUT_BYTES);
+    }
+
+    /// PX-012 review round, F2: the bound never cuts a PID into a shorter one.
+    #[test]
+    fn a_pid_set_past_its_bound_drops_the_entry_the_bound_cuts_through() {
+        let spaces = |count: usize| " ".repeat(count);
+        // At the bound: read whole.
+        let at = PidSet::parse(&format!("{}4102", spaces(MAX_PID_SET_INPUT_BYTES - 4)));
+        assert_eq!(at.pids(), &BTreeSet::from([4102]));
+        assert!(!at.is_overlong());
+        // The reported case: 510 spaces and 4102 is not PID 41.
+        let past = PidSet::parse(&format!("{}4102", spaces(510)));
+        assert!(past.pids().is_empty(), "{:?}", past.pids());
+        assert!(
+            past.is_overlong() && past.is_active(),
+            "keeps nothing, never everything"
+        );
+        assert_eq!(past.text(), spaces(510));
+        // A separator right at the bound: the entries before it are whole.
+        let edge = PidSet::parse(&format!("{}4102 7", spaces(MAX_PID_SET_INPUT_BYTES - 4)));
+        assert_eq!(edge.pids(), &BTreeSet::from([4102]));
+        assert!(edge.is_overlong());
+        // Commas separate too, and earlier whole entries survive the cut.
+        let commas = PidSet::parse(&format!("4101,{},99999", ",".repeat(503)));
+        assert_eq!(commas.pids(), &BTreeSet::from([4101]));
+        // A multi-byte character at the cut stays on a character boundary.
+        let wide = PidSet::parse(&format!("{}é4102", spaces(MAX_PID_SET_INPUT_BYTES - 1)));
+        assert!(wide.pids().is_empty() && wide.text().len() <= MAX_PID_SET_INPUT_BYTES);
+    }
+
+    #[test]
+    fn the_user_field_past_its_bound_names_no_uid() {
+        let mut filter = OwnerFilter::new(&Accounts::not_provided());
+        let at = format!("{}1001", " ".repeat(MAX_OWNER_INPUT_BYTES - 4));
+        filter.set_input(&at);
+        assert_eq!(filter.choice(), &OwnerChoice::Uid(1001));
+        let past = format!("{}10001", " ".repeat(MAX_OWNER_INPUT_BYTES - 4));
+        assert_eq!(
+            filter.set_input(&past),
+            " ".repeat(MAX_OWNER_INPUT_BYTES - 4)
+        );
+        assert_eq!(filter.choice(), &OwnerChoice::TooLong, "not UID 1000");
     }
 
     #[test]
@@ -1043,6 +1180,115 @@ mod tests {
             panic!("a long name is a name")
         };
         assert!(long.len() <= MAX_ACCOUNT_NAME_BYTES + '…'.len_utf8());
+    }
+
+    /// A database that records every question and answers `name-<uid>-<n>`,
+    /// `n` counting the questions about that UID so far.
+    #[derive(Default)]
+    struct Counting {
+        asked: Mutex<Vec<u32>>,
+    }
+
+    impl Counting {
+        fn times(&self, uid: u32) -> usize {
+            self.asked
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|asked| **asked == uid)
+                .count()
+        }
+    }
+
+    impl AccountLookup for Counting {
+        fn account_name(&self, uid: u32) -> Result<Option<Vec<u8>>, MissingReason> {
+            let mut asked = self.asked.lock().unwrap();
+            asked.push(uid);
+            let n = asked.iter().filter(|asked| **asked == uid).count();
+            Ok(Some(format!("name-{uid}-{n}").into_bytes()))
+        }
+    }
+
+    fn holds(names: &AccountNames, uid: u32) -> bool {
+        lock(&names.shared.0).entries.contains_key(&uid)
+    }
+
+    const SETTLE: Duration = Duration::from_secs(10);
+
+    /// PX-012 review round, W1: a full cache evicts the least recently used
+    /// answer, not the most recent one, and an evicted UID is asked again.
+    #[test]
+    fn a_full_cache_evicts_the_least_recently_used_answer() {
+        let lookup = Arc::new(Counting::default());
+        let names = AccountNames::new(&Accounts::with_lookup(
+            Observed::Known(0),
+            Arc::clone(&lookup) as Arc<dyn AccountLookup>,
+        ));
+        for uid in 0..MAX_CACHED_ACCOUNTS as u32 {
+            let _ = names.name(uid);
+            if uid % 32 == 31 {
+                assert!(names.wait_idle(SETTLE));
+            }
+        }
+        assert!(names.wait_idle(SETTLE));
+        assert_eq!(names.cached(), MAX_CACHED_ACCOUNTS);
+        // UID 0 is used again, so UID 1 is now the least recently used.
+        assert_eq!(names.name(0), AccountName::Named("name-0-1".into()));
+        let _ = names.name(5000);
+        assert!(names.wait_idle(SETTLE));
+        assert_eq!(names.cached(), MAX_CACHED_ACCOUNTS);
+        assert!(holds(&names, 0), "the most recently used answer is kept");
+        assert!(
+            !holds(&names, 1),
+            "the least recently used answer is evicted"
+        );
+        assert!(holds(&names, 2) && holds(&names, 5000));
+        // An evicted UID is a new question.
+        assert_eq!(names.name(1), AccountName::Pending);
+        assert!(names.wait_idle(SETTLE));
+        assert_eq!(lookup.times(1), 2);
+        assert_eq!(names.name(1), AccountName::Named("name-1-2".into()));
+    }
+
+    /// PX-012 review round, W1: an answer is used, without a new question,
+    /// until it is [`ACCOUNT_NAME_TTL`] old; then the cache asks again once,
+    /// keeps publishing the old answer meanwhile, and uses the new one.
+    #[test]
+    fn an_answer_is_asked_again_once_it_is_ten_minutes_old() {
+        let start = Instant::now();
+        let elapsed = Arc::new(Mutex::new(Duration::ZERO));
+        let clock: AccountClock = {
+            let elapsed = Arc::clone(&elapsed);
+            Arc::new(move || start + *elapsed.lock().unwrap())
+        };
+        let advance = |by: Duration| *elapsed.lock().unwrap() += by;
+        let lookup = Arc::new(Counting::default());
+        let names = AccountNames::new(
+            &Accounts::with_lookup(
+                Observed::Known(7),
+                Arc::clone(&lookup) as Arc<dyn AccountLookup>,
+            )
+            .with_clock(clock),
+        );
+        assert_eq!(names.name(7), AccountName::Pending);
+        assert!(names.wait_idle(SETTLE));
+        assert_eq!(names.name(7), AccountName::Named("name-7-1".into()));
+        advance(ACCOUNT_NAME_TTL - Duration::from_secs(1));
+        assert_eq!(names.name(7), AccountName::Named("name-7-1".into()));
+        assert!(names.wait_idle(SETTLE));
+        assert_eq!(lookup.times(7), 1, "a fresh answer is not asked again");
+        advance(Duration::from_secs(1));
+        assert_eq!(
+            names.name(7),
+            AccountName::Named("name-7-1".into()),
+            "the old answer is published while it is asked again"
+        );
+        let _ = names.name(7);
+        assert!(names.wait_idle(SETTLE));
+        assert_eq!(lookup.times(7), 2, "asked again exactly once");
+        assert_eq!(names.name(7), AccountName::Named("name-7-2".into()));
+        assert!(names.wait_idle(SETTLE));
+        assert_eq!(lookup.times(7), 2, "the new answer is fresh");
     }
 
     /// The cache never holds more than its bound, and the worker's queue never

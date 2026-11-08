@@ -27,7 +27,7 @@
     },
     {
       "feature_id": "SRUI-PX012-002",
-      "feature": "User filter: All visible users (default; every process the daemon's OS account can enumerate, not a promise to bypass host permissions), Only my processes (the daemon's effective UID as the source states it), a numeric UID typed into the user field (selectable whether or not an account names it; digits beyond u32 refused), or an account name matched exactly against the resolved names of the collection's owners, keeping every UID that shares the name; an unreadable owner is hidden by any specific filter and counted; a source that states no accounts is explained, never guessed",
+      "feature": "User filter: All visible users (default; every process the daemon's OS account can enumerate, not a promise to bypass host permissions), Only my processes (the daemon's effective UID as the source states it), a numeric UID typed into the user field (selectable whether or not an account names it; digits beyond u32 refused, and a field longer than 64 bytes refused whole rather than cut into another UID or name), or an account name matched exactly against the resolved names of the collection's owners, keeping every UID that shares the name; an unreadable owner is hidden by any specific filter and counted; a source that states no accounts is explained, never guessed",
       "scope": "PX-012/owner (src/owner.rs) OwnerChoice, OwnerFilter::scope, OwnerFilter::by_name, OwnerFilter::view, Accounts; refresh (src/refresh.rs) ProcessView::choose_owner, set_owner_input; ProcessSource::accounts",
       "source_refs": [
         "D1",
@@ -41,7 +41,7 @@
     },
     {
       "feature_id": "SRUI-PX012-003",
-      "feature": "Account-name resolution is bounded, cached and never blocks sampling or publication: getpwuid_r(3) (srui_unix_security::account_name) runs only on one worker thread; the cache answers at once (named, no account, pending, timed out, failed, not provided), holds at most 1024 UIDs with least-recently-used eviction, queues at most 64 lookups, publishes a lookup unanswered after 2 s as timed out, records a late answer, re-asks after 10 minutes, and sanitizes and bounds each name to 64 bytes; a deliberately delayed resolver leaves every edit and refresh immediate",
+      "feature": "Account-name resolution is bounded, cached and never blocks sampling or publication: getpwuid_r(3) (srui_unix_security::account_name) runs only on one worker thread; the cache answers at once (named, no account, pending, timed out, failed, not provided), holds at most 1024 UIDs with least-recently-used eviction, queues at most 64 lookups, publishes a lookup unanswered after 2 s as timed out, records a late answer, re-asks after 10 minutes (measured on an injectable monotonic clock), and sanitizes and bounds each name to 64 bytes; a deliberately delayed resolver leaves every edit and refresh immediate",
       "scope": "PX-012/owner (src/owner.rs) AccountNames, AccountLookup, SystemAccountLookup, FixedAccountLookup; server-rust/unix-security (src/lib.rs) account_name",
       "source_refs": [
         "D1",
@@ -55,7 +55,7 @@
     },
     {
       "feature_id": "SRUI-PX012-004",
-      "feature": "Optional PID-set filter: PIDs separated by commas or white space, at most 64 distinct PIDs from at most 512 bytes of text, duplicates collapsed, further PIDs counted and ignored, entries that are not PIDs named and a set of only such entries keeping nothing; PIDs no visible process has are listed on the status; a PID set selects by number on every scan, identity stays the row's ItemId",
+      "feature": "Optional PID-set filter: PIDs separated by commas or white space, at most 64 distinct PIDs from at most 512 bytes of text (text past the bound dropped with any entry it cuts through, never read as a shorter PID; such a set keeps only its whole PIDs and says so), duplicates collapsed, further PIDs counted and ignored, entries that are not PIDs named and a set of only such entries keeping nothing; PIDs no visible process has are listed on the status; a PID set selects by number on every scan, identity stays the row's ItemId",
       "scope": "PX-012/owner (src/owner.rs) PidSet; refresh (src/refresh.rs) ProcessView::set_pid_set",
       "source_refs": [
         "D1",
@@ -69,7 +69,7 @@
     },
     {
       "feature_id": "SRUI-PX012-005",
-      "feature": "The user filter, PID set and text filter combine by conjunction before the published-row ceiling; the user-filter status counts what all of them keep and an empty result states what each active filter keeps alone; the text filter's counts say when they are counted after the other two; search still counts over the whole collection and reports hidden matches as not shown; a filter that hides the promoted search match lets PX-011-G01 settlement clear it in the same commit that removes the row; changing any filter never creates a process identity and clearing them restores every row under its original ItemId",
+      "feature": "The user filter, PID set and text filter combine by conjunction before the published-row ceiling; the user-filter status counts what all of them keep and an empty result states what each active filter keeps alone; the text filter's counts say when they are counted after the other two; a sort publishes through the same full path, so membership changed by a name resolved since the last publication is inserted or deleted with matching statuses; search still counts over the whole collection and reports hidden matches as not shown; a filter that hides the promoted search match lets PX-011-G01 settlement clear it in the same commit that removes the row; changing any filter never creates a process identity and clearing them restores every row under its original ItemId",
       "scope": "PX-012/owner (src/owner.rs) Scope; refresh (src/refresh.rs) ProcessView::visible, republish, filter_status_for, project_visible_rows; tests/owner_test.rs; native ProcessExplorerShellTests.userFilterAndPIDSetFilterTheNativeTableAndKeepItemIDs",
       "source_refs": [
         "D1",

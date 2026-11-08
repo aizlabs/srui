@@ -5,7 +5,7 @@ Edition 1.2 · 12 September 2026. Use the authoritative SRUI v0.6 design and the
 ## PX-017 — Add follow mode and stable viewport behavior
 
 **Phase:** B · **Scope size:** M · **Status:** planned · **Gate:** none
-**Dependencies:** PX-016
+**Dependencies:** PX-016, PX-017-G01
 **Read:** D1 §§6.2–6.3, 8, 22.7; D2 T28
 
 ### Standing execution contract
@@ -54,3 +54,7 @@ Apply the standing completion contract. Record evidence in `docs/process-explore
 ### Reference lookup
 
 Read [BASELINE.md](../BASELINE.md) and [SOURCES.md](../SOURCES.md). Verify version-specific OS/API details at implementation time and record exact references in the completion note.
+
+### Prerequisite adoption
+
+The follow rework adopts PX-017-G01 (server-hinted keep-in-view): after turn-on, follow names the followed item through the standard `keep_visible` property instead of re-promoting it through `value`, so a sample never overwrites the user's newer local selection.

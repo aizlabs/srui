@@ -35,10 +35,16 @@ repo=${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}
 # with the clean-verdict sentence. Captured from that field rather than searched for anywhere in the
 # body, so a sha quoted in prose is not a verdict; and the body test excludes the bot's own "Codex
 # Review Summary" comment, which tabulates an abbreviated sha too.
+#
+# Since October 2026 the bot opens that comment with a `<!-- codex-review-receipt:v1 -->` marker line
+# (first seen on PR #88, posted 2026-10-24). Exactly that marker, and only at the very start, is
+# stripped before the test; the sentence must still open what remains, so a quoted or fenced verdict
+# behind the marker is still refused.
 abbrevs=$(gh api "repos/$repo/issues/$pr/comments" --paginate \
     --jq "[ .[]
             | select(.user.id == $CODEX_BOT_ID)
             | (.body // \"\")
+            | sub(\"^<!-- codex-review-receipt:v1 -->\\\\s*\"; \"\")
             | select(startswith(\"Codex Review: Didn't find any major issues.\"))
             | capture(\"Reviewed commit:\\\\*\\\\*\\\\s*\`(?<sha>[0-9a-fA-F]{7,40})\`\").sha
           ] | .[]" 2>/dev/null | tr 'A-F' 'a-f' | sort -u)

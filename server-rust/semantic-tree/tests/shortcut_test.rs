@@ -317,6 +317,91 @@ fn surfaces_scope_uniqueness_and_moves_are_checked_against_the_destination() {
     store.move_node(column, Some(SURFACE), None).unwrap();
 }
 
+/// PX-016-G01 round 2: the holder sits inside a nested Surface and the duplicate lands on an
+/// outer node (SET, BATCH and CREATE), or in a sibling nested Surface. The search must descend
+/// into every nested Surface of the window-owning tree.
+#[test]
+fn a_holder_inside_a_nested_surface_refuses_outer_and_sibling_duplicates() {
+    let mut store = surface_store();
+    let column = NodeId::new(2);
+    let outer = NodeId::new(3);
+    let left = NodeId::new(4);
+    let holder = NodeId::new(5);
+    let right = NodeId::new(6);
+    store
+        .create_node(column, TypeRef::COLUMN, Some(SURFACE), None, [])
+        .unwrap();
+    store
+        .create_node(outer, TypeRef::BUTTON, Some(column), None, [])
+        .unwrap();
+    store
+        .create_node(left, TypeRef::SURFACE, Some(SURFACE), None, [])
+        .unwrap();
+    store
+        .create_node(
+            holder,
+            TypeRef::BUTTON,
+            Some(left),
+            None,
+            [shortcut("primary+r")],
+        )
+        .unwrap();
+    store
+        .create_node(right, TypeRef::SURFACE, Some(SURFACE), None, [])
+        .unwrap();
+
+    let duplicate = |result: Result<_, StoreError>, node: NodeId| {
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::DuplicateShortcut { node_id, existing, .. })
+                    if node_id == node && existing == holder
+            ),
+            "{result:?}"
+        );
+    };
+    let (p, v) = shortcut("primary+r");
+    duplicate(store.set_property(outer, p, v.clone()).map(|_| ()), outer);
+    duplicate(store.batch_property_set(outer, [(p, v.clone())]), outer);
+    duplicate(
+        store.create_node(
+            NodeId::new(7),
+            TypeRef::BUTTON,
+            Some(column),
+            None,
+            [(p, v.clone())],
+        ),
+        NodeId::new(7),
+    );
+    duplicate(
+        store.create_node(
+            NodeId::new(8),
+            TypeRef::TOGGLE,
+            Some(right),
+            None,
+            [(p, v.clone())],
+        ),
+        NodeId::new(8),
+    );
+    // Moving an outer subtree carrying the key into the sibling nested Surface stays refused.
+    store
+        .create_node(NodeId::new(9), TypeRef::SURFACE, None, None, [])
+        .unwrap();
+    store
+        .create_node(
+            NodeId::new(10),
+            TypeRef::BUTTON,
+            Some(NodeId::new(9)),
+            None,
+            [(p, v.clone())],
+        )
+        .expect("another root Surface is another scope");
+    let moved = store.move_node(NodeId::new(10), Some(right), None);
+    duplicate(moved, NodeId::new(10));
+    assert!(store.get_node(outer).unwrap().get_property(p).is_none());
+    assert!(!store.contains_node(NodeId::new(7)) && !store.contains_node(NodeId::new(8)));
+}
+
 #[derive(serde::Deserialize)]
 struct GrammarTable {
     cases: Vec<GrammarCase>,
@@ -340,7 +425,11 @@ fn the_shared_grammar_table_matches_exactly() {
         .join("../../protocol/conformance-vectors/shortcut_grammar_cases.json");
     let table: GrammarTable =
         serde_json::from_str(&std::fs::read_to_string(path).expect("table")).expect("json");
-    assert!(table.cases.len() >= 50);
+    assert_eq!(
+        table.cases.len(),
+        53,
+        "update both languages' exact row count"
+    );
     for case in &table.cases {
         let result = Shortcut::parse(&case.input);
         match (&result, case.outcome.as_str()) {

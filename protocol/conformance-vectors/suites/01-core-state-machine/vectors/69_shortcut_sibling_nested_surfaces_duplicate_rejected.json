@@ -1,0 +1,98 @@
+{
+  "name": "shortcut_sibling_nested_surfaces_duplicate_rejected",
+  "description": "Two sibling nested Surfaces of one window share its scope: a key held in the first is refused when created in the second, after a distinct key there succeeded (§7.4, §12.1; PX-016-G01 round 2).",
+  "spec_sections": [
+    "§4",
+    "§7.4",
+    "§7.6",
+    "§7.7",
+    "§12.1",
+    "§22.5",
+    "§26"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Shortcuts"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 10,
+          "node_type": "Surface",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "label": "Left panel"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 11,
+          "node_type": "Button",
+          "parent_id": 10,
+          "child_index": null,
+          "properties": {
+            "label": "Left refresh",
+            "shortcut": "primary+r"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 20,
+          "node_type": "Surface",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "label": "Right panel"
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "CREATE_NODE",
+        "node_id": 21,
+        "node_type": "Button",
+        "parent_id": 20,
+        "child_index": null,
+        "properties": {
+          "label": "Right next",
+          "shortcut": "primary+n"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 22,
+        "node_type": "Button",
+        "parent_id": 20,
+        "child_index": null,
+        "properties": {
+          "label": "Right refresh",
+          "shortcut": "primary+r"
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "duplicate_shortcut",
+    "failed_op_index": 1,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

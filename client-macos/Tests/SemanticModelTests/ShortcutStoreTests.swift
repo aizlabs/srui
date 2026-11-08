@@ -103,7 +103,7 @@ final class ShortcutStoreTests: XCTestCase {
             JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
         )
         let cases = try XCTUnwrap(table["cases"] as? [[String: Any]])
-        XCTAssertGreaterThanOrEqual(cases.count, 50)
+        XCTAssertEqual(cases.count, 53, "update both languages' exact row count")
         for row in cases {
             let input = try XCTUnwrap(row["input"] as? String)
             let outcome = try XCTUnwrap(row["outcome"] as? String)
@@ -265,6 +265,38 @@ final class ShortcutStoreTests: XCTestCase {
                        "duplicate_shortcut")
         try store.clearProperty(nodeID: 2, property: .shortcut)
         XCTAssertNoThrow(try store.moveNode(nodeID: 11, newParentID: 1, newChildIndex: nil))
+    }
+
+    /// PX-016-G01 round 2: the holder sits inside a nested Surface and the duplicate lands on an
+    /// outer node (SET, BATCH and CREATE), or in a sibling nested Surface; same cases as the Rust
+    /// `a_holder_inside_a_nested_surface_refuses_outer_and_sibling_duplicates`.
+    func testAHolderInsideANestedSurfaceRefusesOuterAndSiblingDuplicates() throws {
+        var store = try surfaceStore()
+        try store.createNode(id: 2, nodeType: .column, parentID: 1)
+        try store.createNode(id: 3, nodeType: .button, parentID: 2)
+        try store.createNode(id: 4, nodeType: .surface, parentID: 1)
+        try store.createNode(id: 5, nodeType: .button, parentID: 4, properties: [(.shortcut, .string("primary+r"))])
+        try store.createNode(id: 6, nodeType: .surface, parentID: 1)
+        let r: Value = .string("primary+r")
+        func expectDuplicate(_ node: NodeId, _ body: () throws -> Void) {
+            XCTAssertThrowsError(try body()) {
+                XCTAssertEqual($0 as? StoreError,
+                               .duplicateShortcut(nodeID: node, existing: 5, shortcut: "primary+r"))
+            }
+        }
+        expectDuplicate(3) { try store.setProperty(nodeID: 3, property: .shortcut, value: r) }
+        expectDuplicate(3) { try store.batchPropertySet(nodeID: 3, properties: [(.shortcut, r)]) }
+        expectDuplicate(7) {
+            try store.createNode(id: 7, nodeType: .button, parentID: 2, properties: [(.shortcut, r)])
+        }
+        expectDuplicate(8) {
+            try store.createNode(id: 8, nodeType: .toggle, parentID: 6, properties: [(.shortcut, r)])
+        }
+        try store.createNode(id: 9, nodeType: .surface)
+        try store.createNode(id: 10, nodeType: .button, parentID: 9, properties: [(.shortcut, r)])
+        expectDuplicate(10) { try store.moveNode(nodeID: 10, newParentID: 6, newChildIndex: nil) }
+        XCTAssertNil(store.getNode(3)?.getProperty(.shortcut))
+        XCTAssertFalse(store.containsNode(7) || store.containsNode(8))
     }
 
     func testARefusedShortcutDiscardsTheWholeTransaction() throws {

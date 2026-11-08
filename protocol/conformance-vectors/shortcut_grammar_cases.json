@@ -284,6 +284,22 @@
       "outcome": "unknown_token",
       "token": "\u212a",
       "message": "unknown shortcut token \"\\u{212a}\""
+    },
+    {
+      "input": "primary+\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9",
+      "outcome": "too_long",
+      "message": "a shortcut is at most 32 bytes, got 34"
+    },
+    {
+      "input": "primary+shift+alt+page_down+xxx\u00e9",
+      "outcome": "too_long",
+      "message": "a shortcut is at most 32 bytes, got 33"
+    },
+    {
+      "input": "primary+shift+alt+page_down+xx\u00e9",
+      "outcome": "unknown_token",
+      "token": "page_down",
+      "message": "unknown shortcut token \"page_down\""
     }
   ]
 }

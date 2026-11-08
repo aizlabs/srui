@@ -218,6 +218,9 @@ STATE_MACHINE_VECTORS_ADDED_AFTER_SPLIT = (
     "66_shortcut_swap_through_clear_success.json",
     # PX-016-G01 round 1: a nested Surface shares the window-owning Surface's scope.
     "67_shortcut_duplicate_across_nested_surface_rejected.json",
+    # PX-016-G01 round 2: a nested holder refuses an outer duplicate; sibling nested Surfaces.
+    "68_shortcut_outer_duplicate_of_nested_holder_rejected.json",
+    "69_shortcut_sibling_nested_surfaces_duplicate_rejected.json",
 )
 
 

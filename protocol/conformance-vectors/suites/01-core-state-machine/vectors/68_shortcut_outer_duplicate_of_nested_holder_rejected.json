@@ -1,0 +1,96 @@
+{
+  "name": "shortcut_outer_duplicate_of_nested_holder_rejected",
+  "description": "The holder is inside a nested Surface and the duplicate is set on a node of the outer, window-owning Surface: the search descends into the nested Surface and refuses it, discarding the preceding label change (§7.4, §12.1; PX-016-G01 round 2).",
+  "spec_sections": [
+    "§4",
+    "§7.4",
+    "§7.6",
+    "§7.7",
+    "§12.1",
+    "§22.5",
+    "§26"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Shortcuts"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Column",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {}
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 3,
+          "node_type": "Button",
+          "parent_id": 2,
+          "child_index": null,
+          "properties": {
+            "label": "Refresh"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 4,
+          "node_type": "Surface",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "label": "Nested panel"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 5,
+          "node_type": "Button",
+          "parent_id": 4,
+          "child_index": null,
+          "properties": {
+            "label": "Inner refresh",
+            "shortcut": "primary+r"
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "SET_PROPERTY",
+        "node_id": 3,
+        "property": "label",
+        "value": "Reload"
+      },
+      {
+        "type": "SET_PROPERTY",
+        "node_id": 3,
+        "property": "shortcut",
+        "value": "primary+r"
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "duplicate_shortcut",
+    "failed_op_index": 1,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

@@ -1,6 +1,7 @@
 //! Typed, injectable one-shot process snapshots and process-instance identity
 //! (design §§6.3, 8, 12, 22; PX-002 records, PX-003 identity and completeness,
-//! PX-004 retention, PX-007 system-wide figures).
+//! PX-004 retention, PX-007 system-wide figures, PX-012 owners and the
+//! accounts a source states).
 //! This module reads no process state: adapters live in their own modules and the
 //! fake adapter below uses constants only, with no OS enumeration or clock read.
 //!
@@ -453,7 +454,18 @@ pub struct ProcessRecord {
     /// instance ([`crate::metric::CPU_USAGE`]); per field like `resident`, and
     /// never a [`Completeness`] degradation.
     pub cpu: CpuUsage,
+    /// The UID that owns this process instance (PX-012): on Linux the
+    /// effective UID of `/proc/<pid>/status`, read through the same pinned
+    /// record directory as `stat`, so a recycled PID never lends its owner to
+    /// the instance `stat` identified. The UID is the owner; an account name is
+    /// only ever a display of it ([`crate::owner`]). An owner the scan could
+    /// not read is [`Observed::Missing`] — never UID 0, never "root" — and is
+    /// per field, like `resident`: never a [`Completeness`] degradation.
+    pub owner: Observed<u32>,
 }
+
+/// The owner of a record whose source does not collect owners (PX-012).
+pub const OWNER_NOT_COLLECTED: Observed<u32> = Observed::Missing(MissingReason::Unavailable);
 
 impl ProcessRecord {
     /// Attaches sanitized command text to this record's display name.
@@ -834,6 +846,15 @@ pub trait ProcessSource {
     fn status_text(&self) -> &str;
 
     fn snapshot(&mut self) -> ProcessSnapshot;
+
+    /// Whose processes "my processes" means for this source's records, and how
+    /// their owner UIDs are named (PX-012). A source that does not say states
+    /// neither: no current account and no names, which the owner filter
+    /// explains rather than guesses at. Only a source that reads this host's
+    /// own processes may name this host's daemon account and user database.
+    fn accounts(&self) -> crate::owner::Accounts {
+        crate::owner::Accounts::not_provided()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -841,6 +862,15 @@ pub struct FakeProcessSource;
 
 impl FakeProcessSource {
     pub const SOURCE: &'static str = "fake-processes-v1";
+    /// The fixture's own account, which "my processes" means (PX-012): the
+    /// owner of PID 4101.
+    pub const CURRENT_UID: u32 = 1000;
+    /// The owner of PID 4102 (PX-012). The third record's owner is denied.
+    pub const OTHER_UID: u32 = 1001;
+    /// The fixture's account names (PX-012): constants, answered by the
+    /// bounded name cache's worker like any other lookup.
+    pub const ACCOUNT_NAMES: [(u32, &'static str); 2] =
+        [(Self::CURRENT_UID, "alice"), (Self::OTHER_UID, "bob")];
 
     fn key(token: &str, pid: Observed<u32>) -> ProcessKey {
         ProcessKey {
@@ -884,6 +914,10 @@ impl ProcessSource for FakeProcessSource {
         FAKE_STATUS_TEXT
     }
 
+    fn accounts(&self) -> crate::owner::Accounts {
+        crate::owner::Accounts::fixed(Self::CURRENT_UID, &Self::ACCOUNT_NAMES)
+    }
+
     fn snapshot(&mut self) -> ProcessSnapshot {
         ProcessSnapshot {
             source: SourceId(Self::SOURCE.into()),
@@ -892,6 +926,7 @@ impl ProcessSource for FakeProcessSource {
                 // A value whose fraction is truncated rather than rounded, and a
                 // multithreaded process using two and a half logical CPUs.
                 ProcessRecord {
+                    owner: Observed::Known(Self::CURRENT_UID),
                     key: Self::key("worker-a", Observed::Known(4101)),
                     display_name: DisplayName::from("worker").with_command(b"worker --role=worker"),
                     resident: Observed::Known(1_234_567),
@@ -903,6 +938,7 @@ impl ProcessSource for FakeProcessSource {
                 },
                 // Known zeros, which must survive as zeros.
                 ProcessRecord {
+                    owner: Observed::Known(Self::OTHER_UID),
                     key: Self::key("worker-b", Observed::Known(4102)),
                     display_name: DisplayName::from("worker").with_command(b"worker --role=worker"),
                     resident: Observed::Known(0),
@@ -915,6 +951,7 @@ impl ProcessSource for FakeProcessSource {
                 // Every field unread or not yet measurable, for different
                 // reasons: the states are per field, not per record.
                 ProcessRecord {
+                    owner: Observed::Missing(MissingReason::Denied),
                     key: Self::key("helper", Observed::Missing(MissingReason::Unavailable)),
                     display_name: DisplayName::from("helper").with_command(b"helper --daemon"),
                     resident: Observed::Missing(MissingReason::Denied),
@@ -967,6 +1004,7 @@ impl ProcessSource for RepeatedNamesSource {
                     (name.clone(), name)
                 };
                 ProcessRecord {
+                    owner: OWNER_NOT_COLLECTED,
                     key: ProcessKey {
                         source: SourceId(Self::SOURCE.into()),
                         ..FakeProcessSource::key(&format!("repeated-{row}"), Observed::Known(pid))
@@ -1095,6 +1133,7 @@ impl ScriptedFakeSource {
         cpu: CpuUsage,
     ) -> ProcessRecord {
         ProcessRecord {
+            owner: OWNER_NOT_COLLECTED,
             key: Self::key(token, pid),
             display_name: name.into(),
             resident,
@@ -1310,6 +1349,7 @@ impl SyntheticProcessInstance {
             }
         };
         ProcessRecord {
+            owner: OWNER_NOT_COLLECTED,
             key,
             display_name,
             resident,

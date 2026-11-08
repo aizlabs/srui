@@ -37,6 +37,9 @@ pub(crate) struct Row {
     pub(crate) value: Value,
     pub(crate) sort: SortValues,
     pub(crate) display_name: DisplayName,
+    /// The owner UID the scan read (PX-012): server-side filter input only,
+    /// never published as identity.
+    pub(crate) owner: Observed<u32>,
 }
 
 impl Row {
@@ -225,6 +228,7 @@ impl SessionItemIds {
                     cells,
                     sort,
                     display_name: record.display_name.clone(),
+                    owner: record.owner.clone(),
                 })
             })
             .collect()

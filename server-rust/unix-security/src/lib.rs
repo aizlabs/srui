@@ -4,7 +4,9 @@
 //! runtime directory and socket to be owned by the effective UID with no group/other access, and
 //! require the kernel-reported peer UID to match. Mapping the SSH-authenticated account onto that
 //! effective UID is an OpenSSH/service-manager responsibility (§25); this crate only enforces the
-//! local boundary once that mapping has happened.
+//! local boundary once that mapping has happened. It also answers one read-only account question,
+//! the name the user database gives a UID (`account_name`, `getpwuid_r(3)`), for apps that
+//! display process owners (srtop, PX-012).
 
 use std::ffi::{CString, OsString};
 use std::io;
@@ -548,6 +550,68 @@ pub fn validate_peer<T: AsRawFd + ?Sized>(stream: &T, expected_uid: u32) -> io::
     require_same_uid(expected_uid, peer_effective_uid(stream)?)
 }
 
+/// The first buffer [`account_name`] gives `getpwuid_r(3)` for one entry.
+const ACCOUNT_RECORD_INITIAL_BYTES: usize = 1024;
+
+/// The largest buffer [`account_name`] gives `getpwuid_r(3)` for one entry. An entry that needs
+/// more is refused with `ERANGE` rather than read with an unbounded allocation.
+pub const MAX_ACCOUNT_RECORD_BYTES: usize = 64 * 1024;
+
+/// The account name the system user database gives `uid`, as raw bytes, or `None` when the
+/// database has no entry for it (`getpwuid_r(3)`).
+///
+/// This **blocks** for as long as the database takes to answer, and through NSS that can be a
+/// network directory (LDAP, SSSD) with its own timeouts. A caller on a latency-sensitive path
+/// must call it from a worker of its own and never wait on that worker unboundedly (srtop,
+/// PX-012). The bytes are the database's, unsanitized: a caller that displays them sanitizes
+/// them first.
+pub fn account_name(uid: u32) -> io::Result<Option<Vec<u8>>> {
+    let mut size = ACCOUNT_RECORD_INITIAL_BYTES;
+    loop {
+        let mut buffer = vec![0 as libc::c_char; size];
+        let mut entry = MaybeUninit::<libc::passwd>::zeroed();
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `entry` is a writable passwd, `buffer` is writable for exactly `buffer.len()`
+        // bytes, and `found` is a writable pointer; all three outlive the call, and
+        // getpwuid_r(3) only stores into them.
+        let status = unsafe {
+            libc::getpwuid_r(
+                uid as libc::uid_t,
+                entry.as_mut_ptr(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut found,
+            )
+        };
+        if status == libc::ERANGE && size < MAX_ACCOUNT_RECORD_BYTES {
+            size = (size * 4).min(MAX_ACCOUNT_RECORD_BYTES);
+            continue;
+        }
+        // POSIX lets an implementation report "no such entry" with one of these as well as
+        // with a null result.
+        if matches!(status, libc::ENOENT | libc::ESRCH) {
+            return Ok(None);
+        }
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status));
+        }
+        if found.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: a zero status with a non-null result means `found` points at `entry`, which
+        // getpwuid_r(3) filled, and whose `pw_name`, when not null, points at a NUL-terminated
+        // string inside `buffer`, which is still alive here.
+        let name = unsafe {
+            let name = (*found).pw_name;
+            if name.is_null() {
+                return Ok(None);
+            }
+            std::ffi::CStr::from_ptr(name).to_bytes().to_vec()
+        };
+        return Ok(Some(name));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,6 +637,20 @@ mod tests {
             std::process::id(),
             NEXT_PATH.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn account_names_come_from_the_user_database_and_a_missing_entry_is_none() {
+        // UID 0 is named on every Unix this builds on.
+        assert_eq!(
+            account_name(0).expect("the user database answers for uid 0"),
+            Some(b"root".to_vec())
+        );
+        // A UID no ordinary database assigns has no entry, which is not an error.
+        assert_eq!(
+            account_name(3_999_999_937).expect("an absent entry is not an error"),
+            None
+        );
     }
 
     #[test]

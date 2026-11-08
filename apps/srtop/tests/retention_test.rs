@@ -66,6 +66,7 @@ fn key(pid: u32) -> ProcessKey {
 
 fn record(pid: u32) -> ProcessRecord {
     ProcessRecord {
+        owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
         key: key(pid),
         display_name: format!("worker-{pid}").as_str().into(),
         // One page of a 4 KiB-page host, so a retained row's metric is a value

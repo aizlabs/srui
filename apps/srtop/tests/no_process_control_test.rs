@@ -32,7 +32,8 @@
 //!   sort-button node constants as its first argument and `ACTIVATE` as its
 //!   second (PX-009's standard semantic controls), or, in the same exact shape,
 //!   a column chooser button (PX-068), a search button with `ACTIVATE` or the
-//!   filter, search or PID field with `TEXT_EDIT` (PX-010, PX-011); `on_result`, `on_text_edit`
+//!   filter, search or PID field with `TEXT_EDIT` (PX-010, PX-011), or a user-filter
+//!   button with `ACTIVATE` or the user or PID-set field with `TEXT_EDIT` (PX-012); `on_result`, `on_text_edit`
 //!   and a model range provider unconditionally; `include`, called or
 //!   renamed; or a macro definition (`macro_rules!`), whose expansion can
 //!   assemble tokens this audit never sees together. Attributes come from an
@@ -634,8 +635,9 @@ fn scan(level: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
                     // `x.on(..)` and `Session::on(&session, ..)`: a client event
                     // handler. The sort controls' four ACTIVATE registrations
                     // (PX-009), the column chooser's (PX-068), the search
-                    // buttons' (PX-011), and the filter, search and PID
-                    // fields' TEXT_EDIT registrations (PX-010, PX-011) are
+                    // buttons' (PX-011), the user-filter buttons' (PX-012),
+                    // and the filter, search, PID, user and PID-set fields'
+                    // TEXT_EDIT registrations (PX-010, PX-011, PX-012) are
                     // the allowances: the first argument must be one of
                     // those button constants with `ACTIVATE`, or one of
                     // those input constants with `TEXT_EDIT`, so a handler on any
@@ -763,9 +765,20 @@ const COLUMN_CHOOSER_CONSTANTS: &[&str] = &[
 /// process.
 const SEARCH_BUTTON_CONSTANTS: &[&str] = &["SEARCH_PREVIOUS", "SEARCH_NEXT", "PID_GO"];
 
+/// The user filter's buttons (PX-012), whose `ACTIVATE` handlers choose which
+/// owners' rows are shown, and touch no process.
+const OWNER_BUTTON_CONSTANTS: &[&str] = &["OWNER_MINE", "OWNER_ALL"];
+
 /// The text inputs whose `TEXT_EDIT` handlers are allowed: the filter input
-/// (PX-010) and the search and PID fields (PX-011).
-const TEXT_INPUT_CONSTANTS: &[&str] = &["FILTER_INPUT", "SEARCH_INPUT", "PID_INPUT"];
+/// (PX-010), the search and PID fields (PX-011), and the user and PID-set
+/// fields (PX-012).
+const TEXT_INPUT_CONSTANTS: &[&str] = &[
+    "FILTER_INPUT",
+    "SEARCH_INPUT",
+    "PID_INPUT",
+    "OWNER_INPUT",
+    "PID_SET_INPUT",
+];
 
 /// Whether an `on(..)` argument list is one of the sort buttons' `ACTIVATE`
 /// registrations: the first argument exactly a sort-button node constant, the
@@ -801,6 +814,7 @@ fn is_sort_button_activation(tokens: &[Tok]) -> bool {
         Some(name) if SORT_BUTTON_CONSTANTS.contains(&name)
             || COLUMN_CHOOSER_CONSTANTS.contains(&name)
             || SEARCH_BUTTON_CONSTANTS.contains(&name)
+            || OWNER_BUTTON_CONSTANTS.contains(&name)
     ) && event.as_deref() == Some("ACTIVATE")
 }
 
@@ -1512,6 +1526,32 @@ fn the_source_audit_reports_every_known_bypass() {
             "session.on(search_buttons[i], ACTIVATE, |_, _| {});",
             "handler",
         ),
+        // PX-012: the user-filter controls are allowed only in their exact shape.
+        (
+            "a user-filter button under another event",
+            "session.on(OWNER_MINE, TEXT_EDIT, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the all-users button under a selection event",
+            "session.on(OWNER_ALL, SELECTION_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the user field under ACTIVATE",
+            "session.on(OWNER_INPUT, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the PID-set field under ACTIVATE",
+            "session.on(PID_SET_INPUT, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a computed user-filter target",
+            "session.on(owner_controls[i], TEXT_EDIT, |_, _| {});",
+            "handler",
+        ),
         ("on_result", "session.on_result(TABLE, ACTIVATE, |_, _| Ok(()));", "ident"),
         ("model range provider", "impl ModelRangeProvider for Rows {}", "ident"),
         // outbound connections
@@ -1566,6 +1606,11 @@ fn the_source_audit_reports_every_known_bypass() {
         "session.on(SEARCH_NEXT, ACTIVATE, move |session, _| { refresh::search_stepped(&next, session, search::SearchStep::Next); });",
         "session.on(PID_INPUT, TEXT_EDIT, move |session, event| { refresh::pid_edited(&pid, session, event); });",
         "session.on(PID_GO, ACTIVATE, move |session, _| { refresh::pid_requested(&go, session); });",
+        // the user filter's registrations, as PX-012 installs them
+        "session.on(OWNER_MINE, ACTIVATE, move |session, _| { refresh::owner_chosen(&mine, session, owner::OwnerChoice::Current); });",
+        "session.on(OWNER_ALL, ACTIVATE, move |session, _| { refresh::owner_chosen(&all, session, owner::OwnerChoice::AllVisible); });",
+        "session.on(OWNER_INPUT, TEXT_EDIT, move |session, event| { refresh::owner_edited(&user, session, event); });",
+        "session.on(PID_SET_INPUT, TEXT_EDIT, move |session, event| { refresh::pid_set_edited(&pids, session, event); });",
         "let kind = std::fs::symlink_metadata(&path)?;",
         "use std::fs::File;",
         "use std::os::unix::fs::MetadataExt;",

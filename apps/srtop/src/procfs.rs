@@ -36,6 +36,10 @@
 //! [`ProcFsSource::with_root`] — is read through the same handle with no such
 //! guarantee (see `RecordAccess`).
 //!
+//! The owner (PX-012) is read third, through the same handle: the effective
+//! UID on `status`'s `Uid:` line ([`parse_status_uid`]). An owner that cannot
+//! be read is unread, never UID 0, and the record is still published.
+//!
 //! The system-wide figures (PX-007) are read beside the records, from the
 //! scanned root's own `stat`, `meminfo`, `uptime` and `loadavg`, so a fixture
 //! tree states its own and is deterministic on any host. Each file is read, and
@@ -45,6 +49,7 @@
 //! two consecutive successful reads. The sample time is taken on an injected
 //! [`WallClock`], so a fixture's sample time, which the freshness line
 //! publishes, is a fact of the test rather than of the moment it ran.
+use crate::owner::Accounts;
 use crate::source::{
     record_issue, BootId, CappedRecords, Completeness, CpuInterval, CpuUsage, CreationToken,
     DisplayName, EnumerationIssue, Figure, FigureGap, HostId, IssueScope, LoadAverages,
@@ -500,6 +505,11 @@ pub struct ProcFsSource {
     system_baseline: Option<SystemCpuCounters>,
     /// The clock that stamps each sample's time (PX-007).
     wall_clock: Arc<dyn WallClock>,
+    /// Whose processes "my processes" means and how owner UIDs are named
+    /// (PX-012): this host's daemon account and user database for the live
+    /// source, and nothing for any other tree, whose UIDs this host's database
+    /// may not name.
+    accounts: Accounts,
 }
 
 impl ProcFsSource {
@@ -510,6 +520,7 @@ impl ProcFsSource {
             PathBuf::from(DEFAULT_PROC_ROOT),
             LIVE_STATUS_TEXT.to_string(),
         )
+        .with_accounts(Accounts::system())
     }
 
     /// Reads a `/proc`-shaped tree. The root is part of the source identity, so
@@ -551,6 +562,7 @@ impl ProcFsSource {
                 cpu_namespace: None,
                 system_baseline: None,
                 wall_clock: Arc::new(SystemWallClock),
+                accounts: Accounts::not_provided(),
             };
         };
         let status = format!(
@@ -575,7 +587,16 @@ impl ProcFsSource {
             cpu_namespace: None,
             system_baseline: None,
             wall_clock: Arc::new(SystemWallClock),
+            accounts: Accounts::not_provided(),
         }
+    }
+
+    /// States whose processes "my processes" means for this tree's records,
+    /// and how their owner UIDs are named (PX-012).
+    #[must_use]
+    pub fn with_accounts(mut self, accounts: Accounts) -> Self {
+        self.accounts = accounts;
+        self
     }
 
     /// Measures CPU intervals on `clock` instead of the system's monotonic
@@ -800,6 +821,10 @@ impl ProcFsSource {
 impl ProcessSource for ProcFsSource {
     fn status_text(&self) -> &str {
         &self.status
+    }
+
+    fn accounts(&self) -> Accounts {
+        self.accounts.clone()
     }
 
     fn snapshot(&mut self) -> ProcessSnapshot {
@@ -1061,6 +1086,31 @@ impl ProcessSource for ProcFsSource {
                                 None => Observed::Missing(MissingReason::Unavailable),
                             },
                         };
+                        // The owner is read third, from the same directory
+                        // again (PX-012): the effective UID on `status`'s
+                        // `Uid:` line. Through the pinned handle a recycled PID
+                        // cannot lend its owner to the instance `stat`
+                        // identified. The directory's own owner is not used:
+                        // the kernel reports a non-dumpable process's directory
+                        // as root's, which would attribute it to UID 0.
+                        let owner = match directory.read("status") {
+                            // Ended between its reads, exactly like a `statm`
+                            // that is gone with its process.
+                            Err(error)
+                                if ended(&error)
+                                    && directory.confirms_exit(pid, stat.start_ticks) =>
+                            {
+                                vanished += 1;
+                                continue;
+                            }
+                            // Refused or unreadable: the owner is unread, never
+                            // UID 0, and the record is still published.
+                            Err(error) => Observed::Missing(reason_for(&error)),
+                            Ok(bytes) => match parse_status_uid(&bytes) {
+                                Some(uid) => Observed::Known(uid),
+                                None => Observed::Missing(MissingReason::Unavailable),
+                            },
+                        };
                         // The instance is the PID *and* its creation token: a
                         // reused PID is a different key, so it warms up instead
                         // of inheriting the counters of the process it replaced.
@@ -1080,6 +1130,7 @@ impl ProcessSource for ProcFsSource {
                             None => CpuUsage::Missing(MissingReason::Unavailable),
                         };
                         records.push(ProcessRecord {
+                            owner,
                             key: ProcessKey {
                                 source: self.source.clone(),
                                 host: host.clone(),
@@ -1444,6 +1495,36 @@ fn parse_statm_resident(bytes: &[u8]) -> Option<u64> {
         return None;
     }
     Some(counts[STATM_RESIDENT])
+}
+
+/// The effective UID on a `/proc/<pid>/status` `Uid:` line (PX-012; K1,
+/// proc_pid_status(5)): the line is `Uid:` followed by the real, effective,
+/// saved set and filesystem UIDs, separated by tabs. Exactly one such line,
+/// with exactly four plain counts each within `u32`, is accepted; anything else
+/// is an unread owner, never UID 0.
+pub fn parse_status_uid(bytes: &[u8]) -> Option<u32> {
+    let mut found = None;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let Some(rest) = line.strip_prefix(b"Uid:") else {
+            continue;
+        };
+        if found.is_some() {
+            return None;
+        }
+        let fields: Vec<&[u8]> = rest
+            .split(|byte| *byte == b'\t' || *byte == b' ')
+            .filter(|field| !field.is_empty())
+            .collect();
+        let [_, effective, _, _] = fields.as_slice() else {
+            return None;
+        };
+        let mut uids = fields.iter().map(|field| parse_count(field));
+        if uids.any(|uid| uid.is_none_or(|uid| uid > u64::from(u32::MAX))) {
+            return None;
+        }
+        found = Some(u32::try_from(parse_count(effective)?).ok()?);
+    }
+    found
 }
 
 /// A plain unsigned decimal: digits only, at least one, fitting a `u64`.
@@ -2078,6 +2159,13 @@ mod tests {
                 );
                 std::fs::write(directory.join("stat"), stat).unwrap();
                 std::fs::write(directory.join("statm"), "10 3 1 1 0 1 0\n").unwrap();
+                // Real UID 1000 + pid, effective UID 2000 + pid (PX-012).
+                let (real, effective) = (1000 + pid, 2000 + pid);
+                std::fs::write(
+                    directory.join("status"),
+                    format!("Name:\tworker\nUid:\t{real}\t{effective}\t{effective}\t{effective}\nGid:\t1\t1\t1\t1\n"),
+                )
+                .unwrap();
             }
             Self(root)
         }
@@ -2185,6 +2273,72 @@ mod tests {
         );
         assert_eq!(snapshot.vanished, 1);
         assert_eq!(snapshot.completeness, Completeness::Complete);
+    }
+
+    /// PX-012: the owner is the effective UID of the record's `status`, read
+    /// through the same directory as its `stat`. A `status` that is gone while
+    /// the record's `stat` still reads is an unread owner; one that is gone
+    /// with its `stat` is an exit; a refused one is a denied owner. None of them
+    /// is ever UID 0.
+    #[test]
+    fn an_unread_owner_is_missing_or_an_exit_and_never_uid_zero() {
+        let tree = Tree::new(&[10, 20, 30, 40]);
+        let mut stat_reads_of_30 = 0;
+        let snapshot = tree.scan(
+            move |record, operation| match (record_pid(record), operation) {
+                (Some(10), "status") => Some(io::Error::from(io::ErrorKind::PermissionDenied)),
+                (Some(20), "status") => Some(reaped()),
+                (Some(30), "status") => Some(gone()),
+                (Some(30), "stat") => {
+                    stat_reads_of_30 += 1;
+                    (stat_reads_of_30 > 1).then(reaped)
+                }
+                _ => None,
+            },
+        );
+        assert_eq!(published(&snapshot), vec![10, 20, 40]);
+        let owners: Vec<Observed<u32>> = snapshot
+            .records
+            .iter()
+            .map(|record| record.owner.clone())
+            .collect();
+        assert_eq!(
+            owners,
+            vec![
+                Observed::Missing(MissingReason::Denied),
+                Observed::Missing(MissingReason::Unavailable),
+                Observed::Known(2040),
+            ]
+        );
+        assert_eq!(snapshot.vanished, 1);
+        assert_eq!(snapshot.completeness, Completeness::Complete);
+    }
+
+    #[test]
+    fn the_owner_is_the_effective_uid_of_exactly_one_uid_line() {
+        let line = |text: &str| parse_status_uid(text.as_bytes());
+        assert_eq!(
+            line("Name:\tx\nUid:\t1000\t1001\t1002\t1003\nGid:\t5\t5\t5\t5\n"),
+            Some(1001)
+        );
+        assert_eq!(line("Uid:\t0\t0\t0\t0\n"), Some(0));
+        assert_eq!(
+            line("Uid:\t4294967295\t4294967294\t1\t1\n"),
+            Some(4_294_967_294)
+        );
+        // No line, a short or long line, a sign, a value past u32, two lines.
+        for refused in [
+            "Name:\tx\n",
+            "Uid:\t1000\n",
+            "Uid:\t1\t2\t3\n",
+            "Uid:\t1\t2\t3\t4\t5\n",
+            "Uid:\t1\t-2\t3\t4\n",
+            "Uid:\t1\t4294967296\t3\t4\n",
+            "Uid:\t1\t2\t3\t4\nUid:\t1\t2\t3\t4\n",
+            "Uid:\t1\t2x\t3\t4\n",
+        ] {
+            assert_eq!(line(refused), None, "{refused:?}");
+        }
     }
 
     /// Review round 1, W1: through a pinned directory an exit is confirmed only

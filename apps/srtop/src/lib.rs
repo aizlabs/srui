@@ -11,6 +11,7 @@ pub mod catalogue;
 pub mod filter;
 pub mod metric;
 pub mod on_demand;
+pub mod owner;
 pub mod procfs;
 mod projection;
 pub mod refresh;
@@ -97,6 +98,25 @@ pub const PID_DESCRIPTION: &str =
     "Digits only. Go to PID selects and scrolls to the shown row the latest scan confirmed with this PID; a row kept from an earlier scan, a hidden row or a missing PID is explained on the search status instead.";
 pub const PID_GO_LABEL: &str = "Go to PID";
 pub const SEARCH_NODE_COUNT: usize = 7;
+/// The user filter and PID set (PX-012): a Row holding two buttons, two text
+/// fields and one status line, between the filter row and the search row.
+pub const OWNER_ROW: NodeId = NodeId::new(49);
+pub const OWNER_MINE: NodeId = NodeId::new(50);
+pub const OWNER_ALL: NodeId = NodeId::new(51);
+pub const OWNER_INPUT: NodeId = NodeId::new(52);
+pub const PID_SET_INPUT: NodeId = NodeId::new(53);
+pub const OWNER_STATUS: NodeId = NodeId::new(54);
+pub const OWNER_MINE_LABEL: &str = "Only my processes";
+pub const OWNER_ALL_LABEL: &str = "All visible users";
+pub const OWNER_LABEL: &str = "User";
+pub const OWNER_PLACEHOLDER: &str = "UID or account name";
+pub const OWNER_DESCRIPTION: &str =
+    "Shows only processes owned by this UID, or by every UID whose account name is exactly this; empty shows every user visible to this daemon's account. A row is shown only when the user filter, the PID set and the text filter all keep it.";
+pub const PID_SET_LABEL: &str = "PID set";
+pub const PID_SET_PLACEHOLDER: &str = "PIDs, separated by commas or spaces";
+pub const PID_SET_DESCRIPTION: &str =
+    "Shows only processes with one of these PIDs, at most 64; empty shows every PID. A PID no visible process has is named on the user filter status.";
+pub const OWNER_NODE_COUNT: usize = 6;
 
 /// What one column chooser button does (PX-068). Each is resolved against the
 /// layout the server holds when the click is applied, never against anything
@@ -180,15 +200,17 @@ pub const STATUS_TEXT: &str = "Read-only · Process collection not started";
 /// Every node of the shell: the five above, the fourteen of the system summary
 /// (PX-007), which sits between the status line and the filter controls, the three
 /// of the filter bar (PX-010), the sort row with its four buttons (PX-009),
-/// the column chooser's row with its buttons (PX-068) and the seven search
-/// controls (PX-011). Rows are model items, never nodes.
+/// the column chooser's row with its buttons (PX-068), the seven search
+/// controls (PX-011) and the six user-filter controls (PX-012). Rows are model
+/// items, never nodes.
 pub const SHELL_NODE_COUNT: usize = 5
     + summary::NODE_COUNT
     + FILTER_NODE_COUNT
     + 1
     + SORT_BUTTONS.len()
     + COLUMN_CHOOSER_NODE_COUNT
-    + SEARCH_NODE_COUNT;
+    + SEARCH_NODE_COUNT
+    + OWNER_NODE_COUNT;
 
 /// The sort button that orders `field`.
 pub fn sort_button_of(field: catalogue::ProcessField) -> NodeId {
@@ -317,6 +339,31 @@ pub fn install_search_handlers(session: &Session, view: &refresh::SharedView) {
     });
 }
 
+/// Installs the user filter's handlers (§7.6, §22.6, PX-012): the "Only my
+/// processes" and "All visible users" buttons' `ACTIVATE`, and the user and
+/// PID-set fields' `TEXT_EDIT`. Each is applied before the event is
+/// acknowledged. A click names only which button it was; the choice is the
+/// button's, fixed here. No process is touched: the filters only choose which
+/// published rows are shown.
+pub fn install_owner_handlers(session: &Session, view: &refresh::SharedView) {
+    let mine = std::sync::Arc::clone(view);
+    session.on(OWNER_MINE, ACTIVATE, move |session, _| {
+        refresh::owner_chosen(&mine, session, owner::OwnerChoice::Current);
+    });
+    let all = std::sync::Arc::clone(view);
+    session.on(OWNER_ALL, ACTIVATE, move |session, _| {
+        refresh::owner_chosen(&all, session, owner::OwnerChoice::AllVisible);
+    });
+    let user = std::sync::Arc::clone(view);
+    session.on(OWNER_INPUT, TEXT_EDIT, move |session, event| {
+        refresh::owner_edited(&user, session, event);
+    });
+    let pids = std::sync::Arc::clone(view);
+    session.on(PID_SET_INPUT, TEXT_EDIT, move |session, event| {
+        refresh::pid_set_edited(&pids, session, event);
+    });
+}
+
 /// One click on `field`'s sort button.
 fn sort_clicked(
     view: &std::sync::Mutex<refresh::ProcessView>,
@@ -336,7 +383,14 @@ fn sort_clicked(
 /// are disabled: there is no collection for them to order.
 pub fn initialize(session: &Session) -> Result<(), SessionError> {
     let summary = summary::properties(&summary::summarize(&summary::State::NotStarted));
-    initialize_rows(session, vec![], STATUS_TEXT, &summary, false)
+    initialize_rows(
+        session,
+        vec![],
+        STATUS_TEXT,
+        &summary,
+        &owner::OwnerView::uncollected(),
+        false,
+    )
 }
 
 /// Samples the injected source once and publishes its model rows atomically with the shell,
@@ -524,6 +578,7 @@ pub(crate) fn initialize_rows(
     items: Vec<srui_semantic_tree::ModelItem>,
     status: &str,
     summary: &summary::Properties,
+    owner: &owner::OwnerView,
     sort_enabled: bool,
 ) -> Result<(), SessionError> {
     // §26 bounds the items in a single model mutation batch, and a live host can
@@ -600,6 +655,57 @@ pub(crate) fn initialize_rows(
         Text::builder(FILTER_STATUS)
             .parent(FILTER_ROW)
             .text(initial_filter_status)
+            .role(if sort_enabled {
+                TextRole::Status
+            } else {
+                TextRole::Caption
+            })
+            .create(ui)?;
+        // The user filter and PID set: standard Buttons, TextInputs and a
+        // status Text in a Row, between the filter controls and the search
+        // controls (PX-012). Every visible user is shown until one is chosen,
+        // so "All visible users" starts disabled.
+        Row::builder(OWNER_ROW)
+            .parent(COLUMN)
+            .spacing_role(SpacingRole::Normal)
+            .create(ui)?;
+        for (button, label, enabled) in [
+            (OWNER_MINE, OWNER_MINE_LABEL, sort_enabled && owner.mine),
+            (OWNER_ALL, OWNER_ALL_LABEL, sort_enabled && owner.all),
+        ] {
+            Button::builder(button)
+                .parent(OWNER_ROW)
+                .label(label)
+                .create(ui)?;
+            ui.set(button, ENABLED, enabled)?;
+        }
+        for (input, label, placeholder, description) in [
+            (
+                OWNER_INPUT,
+                OWNER_LABEL,
+                OWNER_PLACEHOLDER,
+                OWNER_DESCRIPTION,
+            ),
+            (
+                PID_SET_INPUT,
+                PID_SET_LABEL,
+                PID_SET_PLACEHOLDER,
+                PID_SET_DESCRIPTION,
+            ),
+        ] {
+            TextInput::builder(input)
+                .parent(OWNER_ROW)
+                .label(label)
+                .placeholder(placeholder)
+                .value("")
+                .role(InputRole::Plain)
+                .accessible_description(description)
+                .create(ui)?;
+            ui.set(input, ENABLED, sort_enabled)?;
+        }
+        Text::builder(OWNER_STATUS)
+            .parent(OWNER_ROW)
+            .text(owner.status.as_str())
             .role(if sort_enabled {
                 TextRole::Status
             } else {
@@ -848,10 +954,10 @@ mod tests {
             // The five shell nodes, the fourteen of the system summary
             // (PX-007), the three of the filter bar (PX-010), the sort row
             // with its four buttons (PX-009), the column chooser's row with
-            // its thirteen buttons (PX-068) and the seven search controls
-            // (PX-011).
-            assert_eq!(store.node_count(), 48);
-            assert_eq!(SHELL_NODE_COUNT, 48);
+            // its thirteen buttons (PX-068), the seven search controls
+            // (PX-011) and the six user-filter controls (PX-012).
+            assert_eq!(store.node_count(), 54);
+            assert_eq!(SHELL_NODE_COUNT, 54);
             assert_eq!(store.root_ids(), &[SURFACE]);
             assert_eq!(store.children_of(SURFACE), Some([COLUMN].as_slice()));
             assert_eq!(
@@ -862,6 +968,7 @@ mod tests {
                         STATUS,
                         summary::SUMMARY,
                         FILTER_ROW,
+                        OWNER_ROW,
                         SEARCH_ROW,
                         SORT_ROW,
                         COLUMN_CHOOSER_ROW,
@@ -873,6 +980,19 @@ mod tests {
             assert_eq!(
                 store.children_of(FILTER_ROW),
                 Some([FILTER_INPUT, FILTER_STATUS].as_slice())
+            );
+            assert_eq!(
+                store.children_of(OWNER_ROW),
+                Some(
+                    [
+                        OWNER_MINE,
+                        OWNER_ALL,
+                        OWNER_INPUT,
+                        PID_SET_INPUT,
+                        OWNER_STATUS
+                    ]
+                    .as_slice()
+                )
             );
             assert_eq!(
                 store.children_of(SEARCH_ROW),
@@ -945,6 +1065,12 @@ mod tests {
                 (PID_INPUT, TypeRef::TEXT_INPUT),
                 (PID_GO, TypeRef::BUTTON),
                 (SEARCH_STATUS, TypeRef::TEXT),
+                (OWNER_ROW, TypeRef::ROW),
+                (OWNER_MINE, TypeRef::BUTTON),
+                (OWNER_ALL, TypeRef::BUTTON),
+                (OWNER_INPUT, TypeRef::TEXT_INPUT),
+                (PID_SET_INPUT, TypeRef::TEXT_INPUT),
+                (OWNER_STATUS, TypeRef::TEXT),
             ];
             let summary_nodes = summary::LAYOUT.map(|(id, node_type, _)| (id, node_type));
             let chooser = COLUMN_CHOOSER_BUTTONS.map(|(id, _)| (id, TypeRef::BUTTON));
@@ -954,6 +1080,18 @@ mod tests {
                 assert!(!node.has_property(ACTIONS));
                 assert!(!node.has_property(ACTION_KEY));
             }
+            // The user-filter controls of a shell that samples nothing are
+            // disabled, and say why (PX-012).
+            for node in [OWNER_MINE, OWNER_ALL, OWNER_INPUT, PID_SET_INPUT] {
+                assert_eq!(
+                    store.get_node(node).unwrap().get_property(ENABLED),
+                    Some(&Value::Bool(false))
+                );
+            }
+            assert_eq!(
+                store.get_node(OWNER_STATUS).unwrap().get_property(TEXT),
+                Some(&Value::String(owner::UNCOLLECTED_STATUS.into()))
+            );
             // The filter controls of a shell that samples nothing are disabled:
             let filter_input = store.get_node(FILTER_INPUT).unwrap();
             assert_eq!(
@@ -1134,6 +1272,7 @@ mod tests {
                         STATUS,
                         summary::SUMMARY,
                         FILTER_ROW,
+                        OWNER_ROW,
                         SEARCH_ROW,
                         SORT_ROW,
                         COLUMN_CHOOSER_ROW,

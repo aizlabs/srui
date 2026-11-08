@@ -10,7 +10,10 @@
 //! see [`plan_moves`]. Since PX-011 every publication that changes the rows
 //! also re-counts the active search ([`crate::search`]) against the rows the
 //! client is about to hold, in the same plan, so the search status never
-//! describes a different collection than the one published with it.
+//! describes a different collection than the one published with it. Since
+//! PX-012 the rows shown are the ones the user filter, the PID set and the text
+//! filter all keep ([`crate::owner`]), and every publication that applies them
+//! also publishes the user filter's status in the same plan.
 //!
 //! Four rules shape this module:
 //!
@@ -90,6 +93,7 @@
 
 use crate::catalogue::{ColumnLayout, LayoutError, ProcessField};
 use crate::filter::{FilterGeneration, FilterQuery, PendingFilter};
+use crate::owner::{OwnerChoice, OwnerFilter, OwnerView, Scope};
 use crate::projection::{Row, SessionItemIds};
 use crate::search::{Search, SearchStep, SearchView};
 use crate::sort::{self, SortOrder};
@@ -97,8 +101,9 @@ use crate::source::{ProcessSnapshot, ProcessSource, Retention};
 use crate::summary::{self, CollectorError, Sample};
 use crate::{
     bounded, initialize_rows, published_status_from, sort_button_of, ColumnAction, ScanReport,
-    COLUMN_CHOOSER_BUTTONS, FILTER_INPUT, FILTER_STATUS, MAX_PUBLISHED_LABEL_BYTES, MODEL, PID_GO,
-    PID_INPUT, SEARCH_INPUT, SEARCH_NEXT, SEARCH_PREVIOUS, SEARCH_STATUS, STATUS, TABLE,
+    COLUMN_CHOOSER_BUTTONS, FILTER_INPUT, FILTER_STATUS, MAX_PUBLISHED_LABEL_BYTES, MODEL,
+    OWNER_ALL, OWNER_INPUT, OWNER_MINE, OWNER_STATUS, PID_GO, PID_INPUT, PID_SET_INPUT,
+    SEARCH_INPUT, SEARCH_NEXT, SEARCH_PREVIOUS, SEARCH_STATUS, STATUS, TABLE,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
 use srui_sdk::{ItemId, NodeId, Operation, Value, COLUMNS, ENABLED, LABEL, TEXT, VALUE};
@@ -237,6 +242,16 @@ pub const FILTER_RESERVE_BYTES: usize = 2048;
 /// the row budget. `the_shell_status_and_summary_fit_their_snapshot_allowances`
 /// measures it with every search value at its widest.
 pub const SEARCH_RESERVE_BYTES: usize = 4096;
+
+/// Bytes reserved for the user filter and PID set in a catch-up snapshot
+/// (PX-012): the row, the two buttons, the user and PID-set `TextInput`s with
+/// their labels, descriptions and values at [`crate::owner::MAX_OWNER_INPUT_BYTES`]
+/// and [`crate::owner::MAX_PID_SET_INPUT_BYTES`], and the status line at
+/// [`crate::owner::MAX_OWNER_STATUS_BYTES`]. Charged at this fixed reserve, so
+/// a long status can never shrink the row budget;
+/// `the_shell_status_and_summary_fit_their_snapshot_allowances` measures it
+/// with every value at its widest.
+pub const OWNER_RESERVE_BYTES: usize = 4096;
 
 /// Bytes the `CLEAR_PROPERTY` settlement adds when a commit removes the
 /// promoted row (PX-011-G01): a clear carries no value.
@@ -377,6 +392,26 @@ pub struct ProcessView {
     /// the last commit: set by an explicit search, cleared by settlement when
     /// its row leaves the model.
     promoted: Option<ItemId>,
+    /// The user filter, the PID set and the account-name cache (PX-012).
+    owner: OwnerFilter,
+    /// The user-filter controls as the client holds them (PX-012).
+    owner_published: OwnerView,
+}
+
+/// The rows every active filter keeps, and what the filters' controls say
+/// about them (PX-010, PX-012).
+struct Visible {
+    /// The kept rows, bounded to what one snapshot can carry.
+    rows: Vec<Row>,
+    /// How many rows every filter keeps, before that bound.
+    matched: usize,
+    /// How many kept rows the bound left out.
+    truncated: usize,
+    /// Whether any filter is active.
+    restricted: bool,
+    /// Whether the user filter or the PID set is active.
+    beyond_text: bool,
+    owner: OwnerView,
 }
 
 /// Why a column layout request was not published (PX-068).
@@ -427,6 +462,7 @@ impl ProcessView {
             columns: &mut self.columns,
             search: &mut self.search_published,
             promoted: &mut self.promoted,
+            owner: &mut self.owner_published,
         }
     }
 
@@ -460,6 +496,10 @@ impl ProcessView {
         // The shell starts in the default layout (PX-068).
         let columns = ColumnLayout::default();
         let unfiltered_rows = ids.project(&snapshot, &columns)?;
+        // The user filter starts at every visible user, and its cache starts
+        // naming the daemon's own account at once (PX-012).
+        let owner = OwnerFilter::new(&source.accounts());
+        let committed_filter = FilterQuery::default();
         // Both bounds are this store's as well as the protocol's: a session
         // minted with a lower cached-item limit publishes fewer rows, never rows
         // its own store would refuse.
@@ -493,15 +533,19 @@ impl ProcessView {
             source: &snapshot.source,
             filter_matches: None,
         }));
+        let owner_published = {
+            let scope = owner.scope(&unfiltered_rows, &committed_filter);
+            owner.view(&scope, &unfiltered_rows, rows.len(), unfiltered_rows.len())
+        };
         initialize_rows(
             session,
             rows.iter().map(Row::to_model_item).collect(),
             &status,
             &summary,
+            &owner_published,
             true,
         )?;
         ids.retain(&unfiltered_rows);
-        let committed_filter = FilterQuery::default();
         let committed_generation = FilterGeneration::INITIAL;
         let filter_status = committed_filter.format_committed_status(
             committed_generation,
@@ -529,6 +573,8 @@ impl ProcessView {
                 search_published: SearchView::initial(true),
                 unconfirmed: HashSet::new(),
                 promoted: None,
+                owner,
+                owner_published,
             },
             snapshot,
         ))
@@ -604,16 +650,14 @@ impl ProcessView {
         // published-row ceiling leaves once this scan's own rows are counted.
         let evicted =
             evict_unconfirmed_beyond(&mut unfiltered_target, &confirmed_ids, self.published_limit);
-        let (target, matched, filter_truncated) = project_visible_rows(
-            &unfiltered_target,
-            &self.committed_filter,
-            self.published_limit,
-        );
-        let filter_matches = if self.committed_filter.is_empty() {
-            None
-        } else {
-            Some(matched)
-        };
+        // Every filter is applied to the collection together (PX-012): the
+        // user filter, the PID set and the text filter.
+        let visible = self.visible(&unfiltered_target);
+        let (target, matched, filter_truncated) =
+            (visible.rows, visible.matched, visible.truncated);
+        let filter_matches = visible.restricted.then_some(matched);
+        let owner_view = visible.owner;
+        let beyond_text = visible.beyond_text;
         // The summary shows the last successful sample (PX-007): this scan, if
         // its process list was read and accepted, and otherwise the one before
         // it, marked with this scan's collector error.
@@ -654,12 +698,8 @@ impl ProcessView {
             },
         );
         debug_assert!(status.len() <= STATUS_RESERVE_BYTES);
-        let filter_status = self.committed_filter.format_committed_status(
-            self.committed_generation,
-            target.len(),
-            matched,
-            unfiltered_target.len(),
-        );
+        let filter_status =
+            self.filter_status_for(target.len(), matched, unfiltered_target.len(), beyond_text);
 
         let (batch, max_ops, max_bytes) = self.planning_limits(session);
 
@@ -672,6 +712,7 @@ impl ProcessView {
         if filter_status != self.filter_status {
             plan.push(Planned::new(Effect::FilterStatus(filter_status)));
         }
+        plan.extend(self.owner_effects(owner_view));
         // Then the summary, whose lines are scalar properties: only the ones a
         // client would see change are planned (PX-007).
         plan.extend(summary_effects(&self.summary, &summary));
@@ -773,11 +814,7 @@ impl ProcessView {
         }
         self.unfiltered_rows
             .sort_by(|left, right| sort::compare(order, left, right));
-        let (target, _, _) = project_visible_rows(
-            &self.unfiltered_rows,
-            &self.committed_filter,
-            self.published_limit,
-        );
+        let target = self.visible(&self.unfiltered_rows).rows;
         let (batch, max_ops, max_bytes) = self.planning_limits(session);
         let mut plan = Vec::new();
         if let Some(previous) = self.sort.filter(|previous| previous.field != order.field) {
@@ -1107,53 +1144,123 @@ impl ProcessView {
         self.committed_generation = generation;
         self.committed_filter = query;
 
-        let (target, matched, _) = project_visible_rows(
-            &self.unfiltered_rows,
-            &self.committed_filter,
-            self.published_limit,
-        );
-
-        let filter_matches = if self.committed_filter.is_empty() {
-            None
-        } else {
-            Some(matched)
-        };
-        let summary = self.summarize_with_matches(filter_matches);
-
-        let new_filter_status = self.committed_filter.format_committed_status(
-            self.committed_generation,
-            target.len(),
-            matched,
-            self.unfiltered_rows.len(),
-        );
-
-        let (batch, max_ops, max_bytes) = self.planning_limits(session);
         let mut plan = Vec::new();
-
-        let current_input_val = session.with_store(|store| {
-            store
-                .get_node(FILTER_INPUT)
-                .and_then(|n| n.get_property(VALUE))
-                .and_then(Value::as_string)
-                .unwrap_or("")
-                .to_string()
-        });
-        if current_input_val != self.committed_filter.raw() {
+        if input_value(session, FILTER_INPUT) != self.committed_filter.raw() {
             plan.push(Planned::new(Effect::FilterValue(
                 self.committed_filter.raw().to_string(),
             )));
         }
+        self.republish(session, plan)
+    }
 
-        if new_filter_status != self.filter_status {
-            plan.push(Planned::new(Effect::FilterStatus(new_filter_status)));
+    /// The rows every active filter keeps out of `unfiltered`, and the
+    /// user-filter controls for them (PX-010, PX-012).
+    fn visible(&self, unfiltered: &[Row]) -> Visible {
+        let scope = self.owner.scope(unfiltered, &self.committed_filter);
+        let (rows, matched, truncated) =
+            project_visible_rows(unfiltered, &scope, self.published_limit);
+        let owner = self.owner.view(&scope, unfiltered, rows.len(), matched);
+        Visible {
+            restricted: scope.is_restricted(),
+            beyond_text: scope.restricts_beyond_text(),
+            rows,
+            matched,
+            truncated,
+            owner,
         }
+    }
+
+    /// The text filter's status when `shown` of the `matched` rows every filter
+    /// keeps are published out of `total`. While the user filter or the PID
+    /// set is active, the text filter's own counts say they are counted after
+    /// them (PX-012).
+    fn filter_status_for(
+        &self,
+        shown: usize,
+        matched: usize,
+        total: usize,
+        beyond_text: bool,
+    ) -> String {
+        if !beyond_text {
+            return self.committed_filter.format_committed_status(
+                self.committed_generation,
+                shown,
+                matched,
+                total,
+            );
+        }
+        if self.committed_filter.is_empty() {
+            let head = if self.committed_generation.get() == 0 {
+                "Filter: none".to_string()
+            } else {
+                format!("Committed filter (gen {}): none", self.committed_generation)
+            };
+            format!("{head} · {shown} of {total} rows shown by the user filter and PID set")
+        } else {
+            format!(
+                "{} · counted after the user filter and PID set",
+                self.committed_filter.format_committed_status(
+                    self.committed_generation,
+                    shown,
+                    matched,
+                    total,
+                )
+            )
+        }
+    }
+
+    /// The user-filter controls' changes when they say `target` (PX-012).
+    fn owner_effects(&self, target: OwnerView) -> Vec<Planned> {
+        let published = &self.owner_published;
+        let mut plan = Vec::new();
+        if target.status != published.status {
+            plan.push(Planned::new(Effect::OwnerStatus(target.status)));
+        }
+        for (node, was, now) in [
+            (OWNER_MINE, published.mine, target.mine),
+            (OWNER_ALL, published.all, target.all),
+        ] {
+            if was != now {
+                plan.push(Planned::new(Effect::OwnerEnabled { node, enabled: now }));
+            }
+        }
+        plan
+    }
+
+    /// Re-applies every filter to the server-side collection and publishes the
+    /// result after `plan` (PX-010, PX-012): the filters' status lines, the
+    /// summary's match count, the rows that leave, return or move — each under
+    /// its own item ID, never a new one — and the search re-counted against
+    /// them, all in one plan. A row that leaves takes the table's promoted
+    /// selection with it, which the SDK's settlement clears in the same commit
+    /// (PX-011-G01).
+    fn republish(
+        &mut self,
+        session: &Session,
+        mut plan: Vec<Planned>,
+    ) -> Result<Refreshed, SessionError> {
+        let visible = self.visible(&self.unfiltered_rows);
+        let target = visible.rows;
+        let filter_matches = visible.restricted.then_some(visible.matched);
+        let summary = self.summarize_with_matches(filter_matches);
+        let filter_status = self.filter_status_for(
+            target.len(),
+            visible.matched,
+            self.unfiltered_rows.len(),
+            visible.beyond_text,
+        );
+        let (batch, max_ops, max_bytes) = self.planning_limits(session);
+        if filter_status != self.filter_status {
+            plan.push(Planned::new(Effect::FilterStatus(filter_status)));
+        }
+        plan.extend(self.owner_effects(visible.owner));
         plan.extend(summary_effects(&self.summary, &summary));
 
         let moved = plan_moves(&self.rows, &target, batch, max_ops, max_bytes);
         plan.extend(moved.plan);
         plan.extend(diff(&moved.rows, &target, batch, max_bytes));
-        // The search counts the newly filtered rows; a target the filter hid
-        // is reported as no longer shown, never replaced (PX-011).
+        // The search counts the newly filtered rows; a target a filter hid is
+        // reported as no longer shown, never replaced (PX-011).
         plan.extend(self.search_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
 
         let mut result = Refreshed::default();
@@ -1173,6 +1280,70 @@ impl ProcessView {
         self.ids.retain(&self.unfiltered_rows);
         self.search.observe(&self.rows);
         outcome.map(|()| result)
+    }
+
+    /// Makes `choice` the user filter (PX-012), as a button does: the user
+    /// field is emptied, and every filter is applied again. The rows keep
+    /// their item IDs whichever are shown.
+    pub fn choose_owner(
+        &mut self,
+        session: &Session,
+        choice: OwnerChoice,
+    ) -> Result<Refreshed, SessionError> {
+        self.owner.choose(choice);
+        let mut plan = Vec::new();
+        if !input_value(session, OWNER_INPUT).is_empty() {
+            plan.push(Planned::new(Effect::OwnerValue {
+                node: OWNER_INPUT,
+                value: String::new(),
+            }));
+        }
+        self.republish(session, plan)
+    }
+
+    /// The user field's new text (PX-012): empty is every visible user, digits
+    /// a UID, anything else an account name.
+    pub fn set_owner_input(
+        &mut self,
+        session: &Session,
+        text: &str,
+    ) -> Result<Refreshed, SessionError> {
+        let kept = self.owner.set_input(text).to_string();
+        let mut plan = Vec::new();
+        if input_value(session, OWNER_INPUT) != kept {
+            plan.push(Planned::new(Effect::OwnerValue {
+                node: OWNER_INPUT,
+                value: kept,
+            }));
+        }
+        self.republish(session, plan)
+    }
+
+    /// The PID-set field's new text (PX-012).
+    pub fn set_pid_set(
+        &mut self,
+        session: &Session,
+        text: &str,
+    ) -> Result<Refreshed, SessionError> {
+        let kept = self.owner.set_pid_set(text).to_string();
+        let mut plan = Vec::new();
+        if input_value(session, PID_SET_INPUT) != kept {
+            plan.push(Planned::new(Effect::OwnerValue {
+                node: PID_SET_INPUT,
+                value: kept,
+            }));
+        }
+        self.republish(session, plan)
+    }
+
+    /// The user filter, PID set and account-name cache (PX-012).
+    pub fn owner_filter(&self) -> &OwnerFilter {
+        &self.owner
+    }
+
+    /// The user-filter status this view last published (PX-012).
+    pub fn owner_status(&self) -> &str {
+        &self.owner_published.status
     }
 
     /// Stages and commits a filter query (PX-010).
@@ -1394,13 +1565,13 @@ fn input_value(session: &Session, node: NodeId) -> String {
 /// and the count of truncated matching rows beyond `limit`.
 fn project_visible_rows(
     unfiltered: &[Row],
-    filter: &FilterQuery,
+    scope: &Scope<'_>,
     limit: usize,
 ) -> (Vec<Row>, usize, usize) {
     let mut matching = Vec::new();
     let mut total_matches = 0;
     for row in unfiltered {
-        if filter.matches_row(row) {
+        if scope.keeps(row) {
             total_matches += 1;
             matching.push(row.clone());
         }
@@ -1454,6 +1625,37 @@ pub fn pid_edited(
     }
 }
 
+/// Dispatches one user-filter button click to the shared view (PX-012).
+pub fn owner_chosen(view: &std::sync::Mutex<ProcessView>, session: &Session, choice: OwnerChoice) {
+    if let Err(error) = lock_view(view).choose_owner(session, choice) {
+        eprintln!("srtop: user filter not published: {error}");
+    }
+}
+
+/// Dispatches a `TEXT_EDIT` event on the user field to the shared view (PX-012).
+pub fn owner_edited(
+    view: &std::sync::Mutex<ProcessView>,
+    session: &Session,
+    event: &srui_protocol::Event,
+) {
+    let text = edited_text(session, event, OWNER_INPUT);
+    if let Err(error) = lock_view(view).set_owner_input(session, &text) {
+        eprintln!("srtop: user filter not published: {error}");
+    }
+}
+
+/// Dispatches a `TEXT_EDIT` event on the PID-set field to the shared view (PX-012).
+pub fn pid_set_edited(
+    view: &std::sync::Mutex<ProcessView>,
+    session: &Session,
+    event: &srui_protocol::Event,
+) {
+    let text = edited_text(session, event, PID_SET_INPUT);
+    if let Err(error) = lock_view(view).set_pid_set(session, &text) {
+        eprintln!("srtop: PID set not published: {error}");
+    }
+}
+
 /// Dispatches one Next or Previous click to the shared view (PX-011).
 pub fn search_stepped(view: &std::sync::Mutex<ProcessView>, session: &Session, step: SearchStep) {
     if let Err(error) = lock_view(view).step_search(session, step) {
@@ -1498,6 +1700,9 @@ fn count(plan: &[Planned], result: &mut Refreshed) {
             | Effect::SearchEnabled { .. }
             | Effect::SearchValue { .. }
             | Effect::Promote(_) => result.controls += 1,
+            Effect::OwnerStatus(_) | Effect::OwnerEnabled { .. } | Effect::OwnerValue { .. } => {
+                result.controls += 1
+            }
             Effect::Columns(_) | Effect::ChooserLabel { .. } | Effect::ChooserEnabled { .. } => {
                 result.controls += 1
             }
@@ -1717,7 +1922,8 @@ fn rows_word(count: usize) -> &'static str {
 /// The status is charged [`STATUS_RESERVE_BYTES`] rather than its own length,
 /// the system summary [`SUMMARY_RESERVE_BYTES`] rather than its own (PX-007), and
 /// the command filter controls [`FILTER_RESERVE_BYTES`] rather than their own (PX-010), and
-/// the search controls [`SEARCH_RESERVE_BYTES`] rather than their own (PX-011), so
+/// the search controls [`SEARCH_RESERVE_BYTES`] rather than their own (PX-011),
+/// and the user filter [`OWNER_RESERVE_BYTES`] rather than its own (PX-012), so
 /// the rows that fit are a function of the rows alone. A status or summary that
 /// grew because a scan or a collector failed therefore cannot shrink the row
 /// budget and delete a row no scan said had ended.
@@ -1734,7 +1940,8 @@ fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
             + STATUS_RESERVE_BYTES
             + SUMMARY_RESERVE_BYTES
             + FILTER_RESERVE_BYTES
-            + SEARCH_RESERVE_BYTES,
+            + SEARCH_RESERVE_BYTES
+            + OWNER_RESERVE_BYTES,
     );
     let mut spent = 0usize;
     let mut kept = 0usize;
@@ -1920,6 +2127,18 @@ enum Effect {
     /// `UiTransaction::promote_selection`, which records a one-item
     /// `MODEL_RESET_RANGE` carrying the row and `SET_PROPERTY(value = ItemId)`.
     Promote(Box<Row>),
+    /// The user-filter status text set (PX-012).
+    OwnerStatus(String),
+    /// One user-filter button enabled or disabled (PX-012).
+    OwnerEnabled {
+        node: NodeId,
+        enabled: bool,
+    },
+    /// The user or PID-set field's value set to what the server keeps (PX-012).
+    OwnerValue {
+        node: NodeId,
+        value: String,
+    },
     Delete(Vec<ItemId>),
     Insert(u64, Vec<Row>),
     Update(Vec<Row>),
@@ -1940,6 +2159,8 @@ struct Published<'a> {
     search: &'a mut SearchView,
     /// The table's promoted selection as the store holds it (PX-011).
     promoted: &'a mut Option<ItemId>,
+    /// The user-filter controls as announced (PX-012).
+    owner: &'a mut OwnerView,
 }
 
 /// The planned operations that turn the `published` summary into `target`:
@@ -1993,6 +2214,15 @@ impl Planned {
             // What the promotion sets; `commit` records it through the SDK.
             Effect::Promote(row) => {
                 Operation::set_property(TABLE, VALUE, Value::ItemId(row.item_id))
+            }
+            Effect::OwnerStatus(text) => {
+                Operation::set_property(OWNER_STATUS, TEXT, Value::String(text.clone()))
+            }
+            Effect::OwnerEnabled { node, enabled } => {
+                Operation::set_property(*node, ENABLED, Value::Bool(*enabled))
+            }
+            Effect::OwnerValue { node, value } => {
+                Operation::set_property(*node, VALUE, Value::String(value.clone()))
             }
             Effect::Delete(ids) => Operation::model_delete_items(MODEL, ids.iter().copied()),
             Effect::Insert(index, rows) => {
@@ -2051,9 +2281,11 @@ impl Effect {
                         .sum::<usize>()
             }
             Self::ChooserLabel { label, .. } => VALUE_FRAMING_BYTES + label.len(),
-            Self::ChooserEnabled { .. } | Self::SearchEnabled { .. } => {
-                VALUE_FRAMING_BYTES + SCALAR_VALUE_BYTES
-            }
+            Self::ChooserEnabled { .. }
+            | Self::SearchEnabled { .. }
+            | Self::OwnerEnabled { .. } => VALUE_FRAMING_BYTES + SCALAR_VALUE_BYTES,
+            Self::OwnerStatus(text) => VALUE_FRAMING_BYTES + text.len(),
+            Self::OwnerValue { value, .. } => VALUE_FRAMING_BYTES + value.len(),
             Self::SearchStatus(text) => VALUE_FRAMING_BYTES + text.len(),
             Self::SearchValue { value, .. } => VALUE_FRAMING_BYTES + value.len(),
             // The `SET_PROPERTY` of the item ID, and a whole second operation:
@@ -2082,8 +2314,18 @@ impl Effect {
             columns,
             search,
             promoted,
+            owner,
         } = published;
         match self {
+            Self::OwnerStatus(text) => owner.status.clone_from(text),
+            Self::OwnerEnabled { node, enabled } => {
+                if *node == OWNER_MINE {
+                    owner.mine = *enabled;
+                } else if *node == OWNER_ALL {
+                    owner.all = *enabled;
+                }
+            }
+            Self::OwnerValue { .. } => {}
             Self::Promote(row) => **promoted = Some(row.item_id),
             Self::Status(text) => status.clone_from(text),
             Self::FilterStatus(text) => filter_status.clone_from(text),
@@ -2759,12 +3001,14 @@ mod tests {
                 // The cells are the widest missing words, so the order values
                 // are missing in both metric columns (PX-009).
                 let record = ProcessRecord {
+                    owner: crate::source::OWNER_NOT_COLLECTED,
                     key: key.clone(),
                     display_name: name.clone(),
                     resident: Observed::Missing(MissingReason::Unavailable),
                     cpu: crate::source::CpuUsage::Missing(MissingReason::Unavailable),
                 };
                 Row {
+                    owner: crate::source::OWNER_NOT_COLLECTED,
                     sort: crate::sort::SortValues::of_record(&key, &record),
                     display_name: name.clone(),
                     item_id: ItemId::new(1_000 + index),
@@ -3116,6 +3360,7 @@ mod tests {
             let mut snapshot = FakeProcessSource.snapshot();
             snapshot.records = (first..self.rows)
                 .map(|index| ProcessRecord {
+                    owner: crate::source::OWNER_NOT_COLLECTED,
                     key: ProcessKey {
                         pid: Observed::Known(index + 1),
                         creation: CreationToken::Opaque(format!("host-{index}")),
@@ -3211,7 +3456,8 @@ mod tests {
                 + STATUS_RESERVE_BYTES
                 + SUMMARY_RESERVE_BYTES
                 + FILTER_RESERVE_BYTES
-                + SEARCH_RESERVE_BYTES);
+                + SEARCH_RESERVE_BYTES
+                + OWNER_RESERVE_BYTES);
         let mut published = Vec::new();
         for system in [
             SystemSample::not_provided(),
@@ -3430,7 +3676,24 @@ mod tests {
     fn the_shell_status_and_summary_fit_their_snapshot_allowances() {
         let session = srui_sessiond::Session::mint();
         let status = "\u{20000}".repeat(STATUS_RESERVE_BYTES / 4);
-        crate::initialize_rows(&session, Vec::new(), &status, &widest_summary(), false).unwrap();
+        // PX-012: the user-filter status at its widest, ellipsis included.
+        let owner = OwnerView {
+            status: crate::bounded(
+                &"\u{20000}".repeat(crate::owner::MAX_OWNER_STATUS_BYTES / 4 + 1),
+                crate::owner::MAX_OWNER_STATUS_BYTES,
+            ),
+            mine: true,
+            all: true,
+        };
+        crate::initialize_rows(
+            &session,
+            Vec::new(),
+            &status,
+            &widest_summary(),
+            &owner,
+            false,
+        )
+        .unwrap();
         // PX-011: every search value at its widest — the status at its bound,
         // the query at the filter's cap and the PID field at its own.
         session
@@ -3449,6 +3712,17 @@ mod tests {
                     PID_INPUT,
                     VALUE,
                     "9".repeat(crate::search::MAX_PID_INPUT_BYTES),
+                )?;
+                // PX-012: the user and PID-set fields at their caps.
+                ui.set(
+                    OWNER_INPUT,
+                    VALUE,
+                    "\u{20000}".repeat(crate::owner::MAX_OWNER_INPUT_BYTES / 4),
+                )?;
+                ui.set(
+                    PID_SET_INPUT,
+                    VALUE,
+                    "9".repeat(crate::owner::MAX_PID_SET_INPUT_BYTES),
                 )?;
                 Ok(())
             })
@@ -3476,6 +3750,7 @@ mod tests {
                     + SUMMARY_RESERVE_BYTES
                     + FILTER_RESERVE_BYTES
                     + SEARCH_RESERVE_BYTES
+                    + OWNER_RESERVE_BYTES
                     + TRANSACTION_ENVELOPE_BYTES,
             "a snapshot with no row is {frame} bytes, above the allowances the row budget \
              leaves for it"
@@ -3487,6 +3762,7 @@ mod tests {
                 + SUMMARY_RESERVE_BYTES
                 + FILTER_RESERVE_BYTES
                 + SEARCH_RESERVE_BYTES
+                + OWNER_RESERVE_BYTES
         );
     }
 
@@ -3628,6 +3904,7 @@ mod tests {
             Planned::new(Effect::Insert(
                 3 + offset,
                 vec![Row {
+                    owner: crate::source::OWNER_NOT_COLLECTED,
                     key: template.key.clone(),
                     display_name: template.display_name.clone(),
                     item_id: ItemId::new(100 + offset),
@@ -3662,6 +3939,7 @@ mod tests {
         plan[2] = Planned::new(Effect::Insert(
             9,
             vec![Row {
+                owner: crate::source::OWNER_NOT_COLLECTED,
                 item_id: ItemId::new(100),
                 ..template.clone()
             }],

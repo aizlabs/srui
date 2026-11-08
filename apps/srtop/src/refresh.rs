@@ -2134,6 +2134,7 @@ impl Effect {
                         row.value = update.value.clone();
                         row.cells = update.cells.clone();
                         row.sort = update.sort.clone();
+                        row.display_name = update.display_name.clone();
                     }
                 }
             }
@@ -2324,6 +2325,13 @@ fn flush_insert(plan: &mut Vec<Planned>, start: u64, rows: &mut Vec<Row>, bytes:
 /// hidden cell that changed leaves the published value as it was, so it is
 /// brought up to `target` here too, and showing the column again publishes the
 /// latest sample rather than the one the column was hidden under (PX-068).
+///
+/// The display name and command text the filter and search match against are
+/// server-side too (PX-010, PX-011): a command-only change alters no cell and
+/// publishes nothing, and a rename's `MODEL_UPDATE` carries only cells. They
+/// are brought up to `target` here, so search counts, steps, selects and
+/// resolves PIDs against the same, current metadata as the collection it
+/// counts over.
 fn refresh_sort_values(rows: &mut [Row], target: &[Row]) {
     let current: HashMap<ItemId, &Row> = target.iter().map(|row| (row.item_id, row)).collect();
     for row in rows.iter_mut() {
@@ -2333,6 +2341,9 @@ fn refresh_sort_values(rows: &mut [Row], target: &[Row]) {
             }
             if row.cells != latest.cells {
                 row.cells = latest.cells.clone();
+            }
+            if row.display_name != latest.display_name {
+                row.display_name = latest.display_name.clone();
             }
         }
     }

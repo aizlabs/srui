@@ -788,3 +788,103 @@ fn the_search_controls_are_driven_by_standard_client_events() {
     );
     assert_eq!(rows(&session), before);
 }
+
+/// PR #91 review: a rename under the same process-instance key. Counting,
+/// stepping, selection and Go to PID all read the latest sample's name: the
+/// new name matches and is selected, the old one no longer matches.
+#[test]
+fn a_rename_under_the_same_key_is_searched_by_its_new_name_only() {
+    let session = Session::mint();
+    let mut source = Fixture::new(three_workers());
+    let (mut view, _) = start_from_source(&session, &mut source).unwrap();
+    let renamed = item_of(&session, 101);
+    // Name and command both change: the old name must match nothing of it.
+    source.records[2] = record(101, "worker-b", "builder", b"builder --job=b");
+    view.refresh(&session, &mut source).unwrap();
+    assert_eq!(item_of(&session, 101), renamed, "same key, same item");
+
+    view.set_search(&session, "builder").unwrap();
+    assert_eq!(
+        status(&session, &view),
+        "Search: \"builder\": 1 match in 5 shown rows · match 1 of 1 at row 3 of 5 · PID 101 · builder"
+    );
+    assert!(enabled(&session, SEARCH_NEXT) && enabled(&session, SEARCH_PREVIOUS));
+    assert_eq!(view.search().target(), Some(renamed));
+    assert_eq!(promoted(&session), Some(renamed));
+    view.step_search(&session, SearchStep::Next).unwrap();
+    assert_eq!(view.search().target(), Some(renamed));
+    assert_eq!(promoted(&session), Some(renamed));
+
+    // The old name matches only the two processes that still have it.
+    view.set_search(&session, "worker").unwrap();
+    assert!(status(&session, &view).starts_with("Search: \"worker\": 2 matches in 5 shown rows"));
+    let mut visited = Vec::new();
+    for _ in 0..4 {
+        view.step_search(&session, SearchStep::Next).unwrap();
+        visited.push(view.search().target().unwrap());
+        assert_eq!(promoted(&session), view.search().target());
+    }
+    let (first, last) = (item_of(&session, 100), item_of(&session, 102));
+    assert_eq!(visited, [last, first, last, first]);
+    assert!(!visited.contains(&renamed));
+
+    // Go to PID names it by its current name, and the filter agrees.
+    view.set_search(&session, "").unwrap();
+    view.jump_to_pid(&session, "101").unwrap();
+    assert_eq!(
+        status(&session, &view),
+        "Search: PID 101 found at row 3 of 5 · builder"
+    );
+    view.set_filter(&session, "builder").unwrap();
+    assert_eq!(rows(&session).len(), 1);
+}
+
+/// PR #91 review: a command-only change under the same key publishes no
+/// `MODEL_UPDATE` (no cell changes), and search still reads the new command.
+#[test]
+fn a_command_only_change_is_searched_by_its_new_command_only() {
+    let session = Session::mint();
+    let mut source = Fixture::new(three_workers());
+    let (mut view, _) = start_from_source(&session, &mut source).unwrap();
+    let changed = item_of(&session, 102);
+    source.records[3] = record(102, "worker-c", "worker", b"worker --job=deploy");
+    let revision = session.current_revision();
+    view.refresh(&session, &mut source).unwrap();
+    assert!(
+        operations_since(&session, revision)
+            .iter()
+            .all(|op| !matches!(op, Operation::ModelUpdate { .. })),
+        "the command is not a cell"
+    );
+    assert_eq!(item_of(&session, 102), changed);
+
+    view.set_search(&session, "job=deploy").unwrap();
+    assert_eq!(
+        status(&session, &view),
+        "Search: \"job=deploy\": 1 match in 5 shown rows · match 1 of 1 at row 4 of 5 · PID 102 · worker"
+    );
+    assert!(enabled(&session, SEARCH_NEXT));
+    assert_eq!(view.search().target(), Some(changed));
+    assert_eq!(promoted(&session), Some(changed));
+    view.step_search(&session, SearchStep::Previous).unwrap();
+    assert_eq!(view.search().target(), Some(changed));
+
+    // The old command no longer matches anything: no target, nothing enabled.
+    view.set_search(&session, "job=c").unwrap();
+    assert_eq!(
+        status(&session, &view),
+        "Search: no match for \"job=c\" in 5 shown rows; search hides no rows"
+    );
+    assert!(!enabled(&session, SEARCH_NEXT) && !enabled(&session, SEARCH_PREVIOUS));
+    assert_eq!(view.search().target(), None);
+    view.step_search(&session, SearchStep::Next).unwrap();
+    assert_eq!(view.search().target(), None);
+    assert_eq!(
+        promoted(&session),
+        Some(changed),
+        "selecting nothing keeps the promotion"
+    );
+    // The filter agrees with the search.
+    view.set_filter(&session, "job=deploy").unwrap();
+    assert_eq!(rows(&session).len(), 1);
+}

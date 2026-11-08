@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-014",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "The selected process's command line and executable context: the inspector's detail worker reads the current target's argv (cmdline), executable (exe) and working directory (cwd) lazily, bound to its ProcessKey and selection generation and confirmed by its start-time token before and after the read; the raw bytes are kept bounded and exact, display text is scrubbed separately and shown one argument per line in one standard read-only RichText; nothing is logged; no process action, no protocol, registry, SDK, renderer or client source change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX014-001",
+      "feature": "Lazy collection bound to identity: the command line, executable and working directory are read only by the inspector's one bounded detail worker, for the current target, in the same visit to the same pinned /proc/<pid> directory as its stat; the stat line is read again afterwards and must still carry the key's LinuxBootTicks start time, so a PID reused during the read makes the target ended and nothing read is returned; results are accepted only under the target's (ProcessKey, SelectionGeneration); nothing is collected by the scan",
+      "scope": "PX-014/procfs (src/procfs.rs) ProcFsDetails::read_details, read_command, memoryless, RecordDir::open_file, RecordDir::read_link, StatFields::flags; inspector (src/inspector.rs) ProcessDetails::command",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-014",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-014.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX014-002",
+      "feature": "Argv, not a shell command: the raw argument area is split at NULs and kept byte-exact (Arguments, Argument::raw) up to 256 arguments and 16 KiB, the rest counted up to 2 MiB and never kept; each argument is shown on its own line with its index and exact byte length; no joined, quoted or copy-as-shell form exists; a NUL-less (rewritten) area is flagged",
+      "scope": "PX-014/command (src/command.rs) Arguments::read, Parser, CommandContext::text, argument_line",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-014",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-014.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX014-003",
+      "feature": "Inert display text kept apart from identity: C0, DEL and C1 controls, listed format, separator and bidi characters, and non-UTF-8 bytes are shown as visible escapes and a backslash is doubled, so no argument can forge an escape; each argument shows at most 1024 display bytes, each path 1024, the whole view 8192; every cut states its raw byte counts ahead of the text it cut, and arguments not shown are counted; the scrubbed text is never written back into any key, row or filter",
+      "scope": "PX-014/command (src/command.rs) inert, is_hidden, escape, path_line, MAX_* bounds",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-014",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-014.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX014-004",
+      "feature": "Distinct states: argv read, empty (started with no arguments), none for a zombie (state Z/X/x) or a kernel thread (PF_KTHREAD in stat field 9), permission denied, unavailable; exe and cwd fail on their own (another account's process typically shows its argv and denies its paths); loading, not provided, not shown, ended and refused selections each have their own command-line text",
+      "scope": "PX-014/command (src/command.rs) ArgumentsRead, PathRead, Memoryless; inspector (src/inspector.rs) Inspector::view",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-014",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-014.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX014-005",
+      "feature": "No logging or persistence: raw arguments and paths are held only in the inspector's current details; Sensitive's Debug shows only a length, so a Debug of any detail read cannot print them; every production eprintln formats exactly an error; a child-process test runs the real handlers and worker over a secret-bearing argument (fake source on every platform, a live test-owned worker on Linux) and its captured stdout and stderr never contain the secret; the native test's server log does not either",
+      "scope": "PX-014/command (src/command.rs) Sensitive; tests/command_line_test.rs no_output_carries_a_secret_argument, no_production_log_line_formats_a_value; tests/procfs_test.rs live::live_inspection_of_a_secret_argument_logs_nothing",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-014",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-014.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX014-006",
+      "feature": "Native selectable text: one new shell node, INSPECTOR_COMMAND (60), a standard RichText with read_only true, plain text only (no link, action or resource), rendered by the unchanged generic client as a non-editable, selectable NSTextView with no automatic link or data detection; Copy writes the exact text through NSTextView's own selection writer; the node is charged a fixed 10240-byte COMMAND_RESERVE_BYTES against the catch-up snapshot, measured on the encoder at its widest; server paths are text and nothing resolves or opens them locally",
+      "scope": "PX-014/lib (src/lib.rs) INSPECTOR_COMMAND; refresh (src/refresh.rs) COMMAND_RESERVE_BYTES, inspector_effects; client-macos/Tests/SRUITests/ProcessExplorerShellTests.swift commandLineIsSelectableInertNativeTextAndNoSecretReachesTheServerLog",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-014",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-014.md"
+      ]
+    }
+  ]
+}

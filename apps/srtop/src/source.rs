@@ -866,8 +866,14 @@ pub trait ProcessSource {
 }
 
 /// A fixture detail that was read: `state`, `parent`, and a start
-/// `after_boot` seconds after a boot at [`FIXTURE_BOOT_TIME`] (PX-013).
-fn fixture_read(state: u8, parent: u32, after_boot: u64) -> crate::inspector::DetailRead {
+/// `after_boot` seconds after a boot at [`FIXTURE_BOOT_TIME`] (PX-013), and
+/// its `command` (PX-014).
+fn fixture_read(
+    state: u8,
+    parent: u32,
+    after_boot: u64,
+    command: crate::command::CommandContext,
+) -> crate::inspector::DetailRead {
     use crate::inspector::{DetailRead, ProcessDetails, ProcessState, StartTime};
     DetailRead::Read(ProcessDetails {
         state: ProcessState::from_code(state).map_or(
@@ -880,7 +886,38 @@ fn fixture_read(state: u8, parent: u32, after_boot: u64) -> crate::inspector::De
             100,
             Observed::Known(FIXTURE_BOOT_TIME),
         )),
+        command,
     })
+}
+
+/// A secret-bearing argument of the fake fixture's first worker (PX-014). It
+/// is shown in that process's command-line view, as any argument is, and must
+/// appear in no log, no standard output and no `Debug` rendering.
+pub const FIXTURE_SECRET_ARGUMENT: &str = "--password=hunter2-SECRET";
+
+/// The fake fixture's first worker's arguments (PX-014): quotes, a newline, an
+/// escape sequence, shell metacharacters, a bidirectional override and a
+/// secret, each of which must show as inert text.
+pub const FIXTURE_TRICKY_ARGV: [&[u8]; 8] = [
+    b"/usr/libexec/srtop-fixture/worker",
+    b"--role=worker",
+    b"--label=it's \"quoted\"",
+    b"line one\nline two",
+    b"\x1b[31mred\x1b[0m",
+    b"; rm -rf / # $(touch /tmp/px014) `id` | tee",
+    "\u{202e}gpj.exe".as_bytes(),
+    FIXTURE_SECRET_ARGUMENT.as_bytes(),
+];
+
+/// A plain fixture command: `argv`, with its executable and working
+/// directory stated as server paths.
+fn fixture_command(argv: &[&[u8]], executable: &[u8]) -> crate::command::CommandContext {
+    use crate::command::{CommandContext, PathRead};
+    CommandContext::fixture(
+        argv,
+        PathRead::server(executable),
+        PathRead::server(b"/srv/fixture"),
+    )
 }
 
 /// The fixtures' boot time, in seconds since the epoch (PX-013): some hours
@@ -949,13 +986,41 @@ impl ProcessSource for FakeProcessSource {
     }
 
     /// The fixture's details (PX-013): PID 4101 sleeps under PID 1, PID 4102
-    /// runs under PID 4101, and the helper's details are denied.
+    /// runs under PID 4101, and the helper's details are denied. PID 4101's
+    /// arguments are [`FIXTURE_TRICKY_ARGV`] and its paths are stated; PID
+    /// 4102, another account's process, shows its arguments and denies its
+    /// executable and working directory (PX-014).
     fn details(&self) -> Option<std::sync::Arc<dyn crate::inspector::DetailSource>> {
+        use crate::command::{CommandContext, PathRead};
         Some(std::sync::Arc::new(crate::inspector::FixtureDetails::new(
             Self::SOURCE,
             vec![
-                ("worker-a", fixture_read(b'S', 1, 4_000)),
-                ("worker-b", fixture_read(b'R', 4101, 9_000)),
+                (
+                    "worker-a",
+                    fixture_read(
+                        b'S',
+                        1,
+                        4_000,
+                        CommandContext::fixture(
+                            &FIXTURE_TRICKY_ARGV,
+                            PathRead::server(b"/usr/libexec/srtop-fixture/worker"),
+                            PathRead::server(b"/home/alice/work"),
+                        ),
+                    ),
+                ),
+                (
+                    "worker-b",
+                    fixture_read(
+                        b'R',
+                        4101,
+                        9_000,
+                        CommandContext::fixture(
+                            &[b"worker", b"--role=worker"],
+                            PathRead::Missing(MissingReason::Denied),
+                            PathRead::Missing(MissingReason::Denied),
+                        ),
+                    ),
+                ),
                 (
                     "helper",
                     crate::inspector::DetailRead::Unreadable(MissingReason::Denied),
@@ -1270,10 +1335,42 @@ impl ProcessSource for ScriptedFakeSource {
         Some(std::sync::Arc::new(crate::inspector::FixtureDetails::new(
             Self::SOURCE,
             vec![
-                ("worker-a", fixture_read(b'S', 1, 4_000)),
-                ("worker-b", fixture_read(b'S', 4101, 9_000)),
-                ("helper", fixture_read(b'S', 1, 2_000)),
-                ("builder", fixture_read(b'R', 4101, 9_500)),
+                (
+                    "worker-a",
+                    fixture_read(
+                        b'S',
+                        1,
+                        4_000,
+                        fixture_command(&[b"worker", b"--role=worker"], b"/usr/bin/worker"),
+                    ),
+                ),
+                (
+                    "worker-b",
+                    fixture_read(
+                        b'S',
+                        4101,
+                        9_000,
+                        fixture_command(&[b"worker", b"--role=worker"], b"/usr/bin/worker"),
+                    ),
+                ),
+                (
+                    "helper",
+                    fixture_read(
+                        b'S',
+                        1,
+                        2_000,
+                        fixture_command(&[b"helper", b"--daemon"], b"/usr/bin/helper"),
+                    ),
+                ),
+                (
+                    "builder",
+                    fixture_read(
+                        b'R',
+                        4101,
+                        9_500,
+                        fixture_command(&[b"builder"], b"/usr/bin/builder"),
+                    ),
+                ),
             ],
         )))
     }

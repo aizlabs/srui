@@ -48,6 +48,14 @@
 //! derived from that same token: the root's `stat` `btime` plus the token's
 //! clock ticks at the mount's own `AT_CLKTCK`.
 //!
+//! The same read returns the instance's command line, executable and working
+//! directory (PX-014): `cmdline` is read through the same handle by
+//! [`crate::command::Arguments::read`], bounded and kept byte-exact, and
+//! `exe` and `cwd` are read with `readlink` through it, never followed or
+//! opened. The instance's `stat` is read again afterwards and must still carry
+//! the key's start time, so what was read belongs to that instance and to no
+//! newcomer under its PID, whether the directory is pinned or read by name.
+//!
 //! The system-wide figures (PX-007) are read beside the records, from the
 //! scanned root's own `stat`, `meminfo`, `uptime` and `loadavg`, so a fixture
 //! tree states its own and is deterministic on any host. Each file is read, and
@@ -57,6 +65,7 @@
 //! two consecutive successful reads. The sample time is taken on an injected
 //! [`WallClock`], so a fixture's sample time, which the freshness line
 //! publishes, is a fact of the test rather than of the moment it ran.
+use crate::command::{ArgumentsRead, CommandContext, Memoryless, PathRead};
 use crate::inspector::{DetailRead, DetailSource, ProcessDetails, ProcessState, StartTime};
 use crate::owner::Accounts;
 use crate::source::{
@@ -71,6 +80,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -181,6 +191,11 @@ const BOOT_TIME_LINE_BYTES: u64 = 64;
 /// and second fields after `comm` (`proc_pid_stat(5)`; PX-013).
 const STATE_FIELD_AFTER_COMM: usize = 0;
 const PPID_FIELD_AFTER_COMM: usize = 1;
+/// `/proc/<pid>/stat` field 9 (`flags`, the kernel's `PF_*` word) is the
+/// seventh field after `comm` (`proc_pid_stat(5)`; PX-014).
+const FLAGS_FIELD_AFTER_COMM: usize = 6;
+/// `PF_KTHREAD`: the `flags` bit of a kernel thread (include/linux/sched.h).
+const PF_KTHREAD: u32 = 0x0020_0000;
 
 /// A monotonic clock, as elapsed time since an arbitrary fixed origin.
 ///
@@ -456,6 +471,23 @@ impl RecordDir {
         #[cfg(test)]
         fault::check(&self.record, file)?;
         read_bounded(&self.base.join(file))
+    }
+
+    /// Opens one of the record's files for a bounded reader of its own
+    /// (PX-014: `cmdline`, which [`crate::command::Arguments::read`] bounds).
+    fn open_file(&self, file: &str) -> io::Result<File> {
+        #[cfg(test)]
+        fault::check(&self.record, file)?;
+        File::open(self.base.join(file))
+    }
+
+    /// The target of one of the record's links (PX-014: `exe`, `cwd`), read
+    /// with `readlink` and never followed. The kernel's own `readlink` of
+    /// these links returns at most `PATH_MAX` bytes.
+    fn read_link(&self, file: &str) -> io::Result<PathBuf> {
+        #[cfg(test)]
+        fault::check(&self.record, file)?;
+        std::fs::read_link(self.base.join(file))
     }
 
     /// Whether the process instance `pid` started at `start_ticks` is really
@@ -1257,6 +1289,11 @@ impl ProcFsSource {
 /// is a newcomer under a reused PID, reported as the asked-for instance having
 /// ended, and none of its fields is shown. State (field 3) and parent (field 4)
 /// come from that same line, and the start time from the token itself.
+///
+/// The command line, executable and working directory (PX-014) are read next,
+/// through the same directory, and the `stat` line is read once more: unless
+/// it still carries the key's start time, the instance has ended (or its record
+/// can no longer be confirmed) and nothing that was read is returned.
 #[derive(Debug, Clone)]
 pub struct ProcFsDetails {
     root: PathBuf,
@@ -1291,6 +1328,21 @@ impl DetailSource for ProcFsDetails {
         if stat.start_ticks != *start_ticks {
             return DetailRead::Ended;
         }
+        let mut command = read_command(&directory, &stat);
+        // Read the record again: what was read is this instance's only if the
+        // record still is. A kernel procfs binds a pinned directory to its
+        // instance, so this confirms it is still alive; read by name, it also
+        // proves the PID named this instance throughout, because an instance
+        // that ended never comes back.
+        match directory.read("stat") {
+            Ok(bytes) => match parse_stat(*pid, &bytes) {
+                Some(again) if again.start_ticks == *start_ticks => {}
+                Some(_) => return DetailRead::Ended,
+                None => command = CommandContext::missing(MissingReason::Unavailable),
+            },
+            Err(error) if ended(&error) => return DetailRead::Ended,
+            Err(error) => command = CommandContext::missing(reason_for(&error)),
+        }
         let started = match read_auxv_entry(&self.root, parse_clock_ticks) {
             Observed::Known(rate) => Observed::Known(StartTime::from_ticks(
                 stat.start_ticks,
@@ -1303,7 +1355,57 @@ impl DetailSource for ProcFsDetails {
             state: stat.state,
             parent: stat.parent,
             started,
+            command,
         })
+    }
+}
+
+/// Why the instance `stat` describes has no user memory, if it has none: a
+/// zombie (state `Z`, or `X`/`x` while it is being reaped) or a kernel thread
+/// (`PF_KTHREAD` in `flags`). Such a record's `cmdline` is empty and its `exe`
+/// does not resolve, which is that, not an error (PX-014).
+fn memoryless(stat: &StatFields) -> Option<Memoryless> {
+    if let Observed::Known(state) = stat.state {
+        if matches!(state.code(), 'Z' | 'X' | 'x') {
+            return Some(Memoryless::Zombie);
+        }
+    }
+    match stat.flags {
+        Observed::Known(flags) if flags & PF_KTHREAD != 0 => Some(Memoryless::KernelThread),
+        _ => None,
+    }
+}
+
+/// The command line, executable and working directory of the record behind
+/// `directory`, whose `stat` is `stat` (PX-014). Each is read, and can fail,
+/// on its own: `cmdline` is world-readable, while `exe` and `cwd` need the
+/// ptrace read access the kernel checks (`proc_fd_access_allowed`,
+/// fs/proc/base.c), so another account's process normally shows its arguments
+/// and denies its paths.
+fn read_command(directory: &RecordDir, stat: &StatFields) -> CommandContext {
+    let memoryless = memoryless(stat);
+    let arguments = match directory
+        .open_file("cmdline")
+        .and_then(crate::command::Arguments::read)
+    {
+        Ok(arguments) if arguments.is_empty() => {
+            memoryless.map_or(ArgumentsRead::Empty, ArgumentsRead::None)
+        }
+        Ok(arguments) => ArgumentsRead::Read(arguments),
+        Err(error) => ArgumentsRead::Missing(reason_for(&error)),
+    };
+    let path = |file: &str| match directory.read_link(file) {
+        Ok(target) => PathRead::server(target.as_os_str().as_bytes()),
+        Err(error) if ended(&error) => memoryless.map_or(
+            PathRead::Missing(MissingReason::Unavailable),
+            PathRead::None,
+        ),
+        Err(error) => PathRead::Missing(reason_for(&error)),
+    };
+    CommandContext {
+        arguments,
+        executable: path("exe"),
+        working_directory: path("cwd"),
     }
 }
 
@@ -1585,6 +1687,9 @@ pub struct StatFields {
     /// Field 4: the parent PID, 0 for a task the kernel started (PX-013). A
     /// field that is not a plain count within `u32` is unread, never 0.
     pub parent: Observed<u32>,
+    /// Field 9: the kernel's `PF_*` flags (PX-014), read only to recognise a
+    /// kernel thread. A field that is not a plain count within `u32` is unread.
+    pub flags: Observed<u32>,
 }
 
 /// Parses `comm`, the creation token, the CPU counters, the state and the
@@ -1641,12 +1746,21 @@ pub fn parse_stat(pid: u32, bytes: &[u8]) -> Option<StatFields> {
             Observed::Missing(MissingReason::Unavailable),
             Observed::Known,
         );
+    let flags = fields
+        .get(FLAGS_FIELD_AFTER_COMM)
+        .and_then(|field| parse_count(field))
+        .and_then(|flags| u32::try_from(flags).ok())
+        .map_or(
+            Observed::Missing(MissingReason::Unavailable),
+            Observed::Known,
+        );
     Some(StatFields {
         display_name: DisplayName::sanitize(&bytes[open + 1..close]),
         start_ticks,
         cpu_ticks,
         state,
         parent,
+        flags,
     })
 }
 
@@ -2419,6 +2533,84 @@ mod tests {
         assert_eq!(snapshot.vanished, 2);
         assert_eq!(snapshot.completeness, Completeness::Complete);
         assert!(snapshot.completeness.issues().is_empty());
+    }
+
+    /// PX-014: what is read of a record's command line belongs to the key's
+    /// instance only if its `stat` still carries the key's start time after
+    /// the read. A newcomer that takes the PID while the arguments are read
+    /// makes the asked-for instance ended, and none of it is returned; a
+    /// second `stat` that cannot be read keeps the state and parent but none of
+    /// the command. Each link fails on its own: a denied `exe` and a vanished
+    /// `cwd` beside arguments that read.
+    #[test]
+    fn a_command_read_across_a_pid_reuse_is_ended_and_each_part_fails_on_its_own() {
+        let tree = Tree::new(&[10, 20, 30]);
+        for pid in [10, 20, 30] {
+            let directory = tree.0.join(pid.to_string());
+            std::fs::write(directory.join("cmdline"), b"worker\0--token=s3cret\0").unwrap();
+            std::os::unix::fs::symlink("/usr/bin/worker", directory.join("exe")).unwrap();
+            std::os::unix::fs::symlink("/srv", directory.join("cwd")).unwrap();
+        }
+        let mut source = ProcFsSource::with_root(&tree.0);
+        let snapshot = source.snapshot();
+        let key = |pid: u32| {
+            snapshot
+                .records
+                .iter()
+                .find(|record| record.key.pid == Observed::Known(pid))
+                .unwrap()
+                .key
+                .clone()
+        };
+        let details = source.details_reader();
+        let stat_of_10 = tree.0.join("10/stat");
+        let fillers: Vec<String> = (4..=21).map(|field| field.to_string()).collect();
+        let newcomer = format!("10 (newcomer) S {} 999 4096 0 0\n", fillers.join(" "));
+        let mut stat_reads_of_30 = 0;
+        let _faults = fault::install(move |record, operation| {
+            match (record_pid(record), operation) {
+                // A newcomer takes PID 10 while its arguments are read.
+                (Some(10), "cmdline") => {
+                    std::fs::write(&stat_of_10, &newcomer).unwrap();
+                    None
+                }
+                (Some(20), "exe") => Some(io::Error::from(io::ErrorKind::PermissionDenied)),
+                (Some(20), "cwd") => Some(gone()),
+                (Some(30), "stat") => {
+                    stat_reads_of_30 += 1;
+                    (stat_reads_of_30 > 1).then(|| io::Error::from(io::ErrorKind::PermissionDenied))
+                }
+                _ => None,
+            }
+        });
+        assert_eq!(details.read_details(&key(10)), DetailRead::Ended);
+        let DetailRead::Read(read) = details.read_details(&key(20)) else {
+            panic!("record 20 reads")
+        };
+        let ArgumentsRead::Read(arguments) = &read.command.arguments else {
+            panic!("record 20's arguments read")
+        };
+        let raw: Vec<&[u8]> = arguments.entries().iter().map(|a| a.raw()).collect();
+        assert_eq!(raw, [&b"worker"[..], b"--token=s3cret"]);
+        assert_eq!(
+            read.command.executable,
+            PathRead::Missing(MissingReason::Denied)
+        );
+        assert_eq!(
+            read.command.working_directory,
+            PathRead::Missing(MissingReason::Unavailable)
+        );
+        let DetailRead::Read(unconfirmed) = details.read_details(&key(30)) else {
+            panic!("record 30's first stat reads")
+        };
+        assert_eq!(
+            unconfirmed.state,
+            Observed::Known(ProcessState::from_code(b'S').unwrap())
+        );
+        assert_eq!(
+            unconfirmed.command,
+            CommandContext::missing(MissingReason::Denied)
+        );
     }
 
     /// Review round 1, W1: a `statm` that answers as if its process were gone is

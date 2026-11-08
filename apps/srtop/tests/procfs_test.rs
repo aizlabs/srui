@@ -6,6 +6,9 @@
 //! `/proc` cases are compiled for Linux, where they must run for real. This
 //! suite must run unprivileged, like the app itself: the denied-record case
 //! relies on mode 0 being unreadable.
+use srui_process_explorer::command::{
+    Argument, ArgumentsRead, CommandContext, Memoryless, PathRead, MAX_RETAINED_ARGUMENT_BYTES,
+};
 use srui_process_explorer::inspector::{
     DetailRead, DetailSource, ProcessDetails, ProcessState, StartTime,
 };
@@ -2769,6 +2772,8 @@ fn details_are_read_for_the_keys_own_instance_and_never_from_a_reused_pid() {
             state: Observed::Known(ProcessState::from_code(b'S').unwrap()),
             parent: Observed::Known(1),
             started: Observed::Known(StartTime::from_ticks(12_345, 100, boot.clone())),
+            // This tree states no `cmdline`, `exe` or `cwd` (PX-014).
+            command: CommandContext::missing(MissingReason::Unavailable),
         })
     );
     assert_eq!(
@@ -2777,6 +2782,12 @@ fn details_are_read_for_the_keys_own_instance_and_never_from_a_reused_pid() {
             state: Observed::Known(ProcessState::from_code(b'Z').unwrap()),
             parent: Observed::Known(0),
             started: Observed::Known(StartTime::from_ticks(7, 100, boot)),
+            // A zombie's links resolve to nothing, which is what a zombie is.
+            command: CommandContext {
+                arguments: ArgumentsRead::Missing(MissingReason::Unavailable),
+                executable: PathRead::None(Memoryless::Zombie),
+                working_directory: PathRead::None(Memoryless::Zombie),
+            },
         })
     );
     // The source's own reader, as the inspector is given it.
@@ -2895,6 +2906,246 @@ fn the_start_time_needs_the_mounts_tick_rate_and_states_an_unread_boot_time() {
     assert_eq!(started(), Observed::Missing(MissingReason::Unavailable));
 }
 
+/// A `stat` line with `state`, `parent` and `flags` (field 9) written
+/// verbatim, and `ticks` as field 22 (PX-014).
+fn stat_line_with_flags(
+    pid: u32,
+    comm: &[u8],
+    state: &str,
+    parent: &str,
+    flags: u32,
+    ticks: u64,
+) -> Vec<u8> {
+    let mut line = format!("{pid} (").into_bytes();
+    line.extend_from_slice(comm);
+    line.extend_from_slice(format!(") {state} {parent}").as_bytes());
+    for field in 5..=21 {
+        let value = if field == 9 {
+            flags.to_string()
+        } else {
+            field.to_string()
+        };
+        line.extend_from_slice(format!(" {value}").as_bytes());
+    }
+    line.extend_from_slice(format!(" {ticks} 4096 {STAT_RSS_DECOY} 0\n").as_bytes());
+    line
+}
+
+/// `PF_KTHREAD` (include/linux/sched.h).
+const PF_KTHREAD: u32 = 0x0020_0000;
+
+impl ProcFixture {
+    /// A record's `cmdline`, verbatim (PX-014).
+    fn cmdline(&self, pid: u32, area: &[u8]) -> &Self {
+        fs::write(self.0.join(pid.to_string()).join("cmdline"), area).unwrap();
+        self
+    }
+
+    /// A record's `exe` or `cwd` link to `target`, which need not exist
+    /// (PX-014).
+    fn link(&self, pid: u32, name: &str, target: &str) -> &Self {
+        std::os::unix::fs::symlink(target, self.0.join(pid.to_string()).join(name)).unwrap();
+        self
+    }
+}
+
+fn command_of(read: DetailRead) -> CommandContext {
+    match read {
+        DetailRead::Read(details) => details.command,
+        other => panic!("not read: {other:?}"),
+    }
+}
+
+fn raw_arguments(command: &CommandContext) -> Vec<Vec<u8>> {
+    match &command.arguments {
+        ArgumentsRead::Read(arguments) => arguments
+            .entries()
+            .iter()
+            .map(|argument| argument.raw().to_vec())
+            .collect(),
+        other => panic!("no arguments: {other:?}"),
+    }
+}
+
+/// PX-014: the command line is read with the inspector's details, from the
+/// key's own record, byte-exact: quotes, a newline, an escape sequence, shell
+/// metacharacters, bytes that are not UTF-8 and an empty argument are kept as
+/// they are and shown as inert text, one line per argument. A zombie, a kernel
+/// thread, a process started with no arguments and a denied `cmdline` are each
+/// their own state. An area past the single-file read bound is read, kept to
+/// its bound and counted, and a reused PID's arguments are never returned.
+#[test]
+fn the_command_line_is_read_byte_exact_for_the_keys_instance_and_every_empty_state_is_distinct() {
+    let tricky: [&[u8]; 8] = [
+        b"/usr/bin/worker",
+        b"it's \"quoted\"",
+        b"line one\nline two",
+        b"\x1b[31mred",
+        b"; rm -rf / #",
+        b"\xff\xfe",
+        b"",
+        b"--password=hunter2-SECRET",
+    ];
+    let mut area = Vec::new();
+    for argument in tricky {
+        area.extend_from_slice(argument);
+        area.push(0);
+    }
+    // 300 arguments of 300 bytes: 90,300 bytes, past the 64 KiB bound on
+    // every other file this source reads.
+    let mut huge = Vec::new();
+    for _ in 0..300 {
+        huge.extend_from_slice(&[b'a'; 300]);
+        huge.push(0);
+    }
+    assert!(huge.len() as u64 > MAX_FILE_BYTES);
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .clock_ticks(100)
+        .process(42, b"worker", 12_345)
+        .cmdline(42, &area)
+        .link(42, "exe", "/usr/bin/worker")
+        .link(42, "cwd", "/home/u/dir with space")
+        .raw(43, &stat_line_with_flags(43, b"gone", "Z", "1", 0, 7))
+        .cmdline(43, b"")
+        .raw(
+            2,
+            &stat_line_with_flags(2, b"kthreadd", "S", "0", PF_KTHREAD | 0x40, 3),
+        )
+        .cmdline(2, b"")
+        .process(44, b"bare", 900)
+        .cmdline(44, b"")
+        .link(44, "exe", "/usr/bin/bare")
+        .link(44, "cwd", "/")
+        .process(45, b"hidden", 901)
+        .cmdline(45, b"x\0")
+        .process(46, b"huge", 902)
+        .cmdline(46, &huge);
+    fs::set_permissions(
+        fixture.0.join("45/cmdline"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    let mut source = fixture.source();
+    let snapshot = source.snapshot();
+    let key_of = |pid: u32| {
+        snapshot
+            .records
+            .iter()
+            .find(|record| record.key.pid == Observed::Known(pid))
+            .unwrap_or_else(|| panic!("the fixture lists record {pid}"))
+            .key
+            .clone()
+    };
+    let details = source.details_reader();
+
+    let command = command_of(details.read_details(&key_of(42)));
+    assert_eq!(
+        raw_arguments(&command),
+        tricky
+            .iter()
+            .map(|argument| argument.to_vec())
+            .collect::<Vec<_>>(),
+        "every argument is kept exactly as the kernel reported it"
+    );
+    assert_eq!(command.executable, PathRead::server(b"/usr/bin/worker"));
+    assert_eq!(
+        command.working_directory,
+        PathRead::server(b"/home/u/dir with space")
+    );
+    assert_eq!(
+        command.text(),
+        [
+            "Command line (argv on the server, shown as text, never run): 8 arguments, 100 bytes",
+            "argv[0] · 15 bytes · /usr/bin/worker",
+            "argv[1] · 13 bytes · it's \"quoted\"",
+            "argv[2] · 17 bytes · line one\\nline two",
+            "argv[3] · 8 bytes · \\x1b[31mred",
+            "argv[4] · 12 bytes · ; rm -rf / #",
+            "argv[5] · 2 bytes · \\xff\\xfe",
+            "argv[6] · 0 bytes (empty)",
+            "argv[7] · 25 bytes · --password=hunter2-SECRET",
+            "Executable on the server: /usr/bin/worker",
+            "Working directory on the server: /home/u/dir with space",
+        ]
+        .join("\n")
+    );
+
+    let zombie = command_of(details.read_details(&key_of(43)));
+    assert_eq!(zombie.arguments, ArgumentsRead::None(Memoryless::Zombie));
+    assert_eq!(zombie.executable, PathRead::None(Memoryless::Zombie));
+    let kernel = command_of(details.read_details(&key_of(2)));
+    assert_eq!(
+        kernel.arguments,
+        ArgumentsRead::None(Memoryless::KernelThread)
+    );
+    assert_eq!(kernel.executable, PathRead::None(Memoryless::KernelThread));
+    assert!(kernel
+        .text()
+        .starts_with("Command line: none: a kernel thread has none\n"));
+    let bare = command_of(details.read_details(&key_of(44)));
+    assert_eq!(bare.arguments, ArgumentsRead::Empty);
+    assert_eq!(bare.executable, PathRead::server(b"/usr/bin/bare"));
+    assert!(bare
+        .text()
+        .starts_with("Command line: empty: the process was started with no arguments\n"));
+    let hidden = details.read_details(&key_of(45));
+    let DetailRead::Read(hidden) = hidden else {
+        panic!("a denied cmdline is one field, not the record: {hidden:?}")
+    };
+    assert_eq!(
+        hidden.state,
+        Observed::Known(ProcessState::from_code(b'S').unwrap())
+    );
+    assert_eq!(
+        hidden.command.arguments,
+        ArgumentsRead::Missing(MissingReason::Denied)
+    );
+    assert!(hidden
+        .command
+        .text()
+        .starts_with("Command line: permission denied\n"));
+
+    let huge_command = command_of(details.read_details(&key_of(46)));
+    let ArgumentsRead::Read(arguments) = &huge_command.arguments else {
+        panic!("the huge area is read")
+    };
+    assert_eq!(arguments.total_bytes(), huge.len() as u64);
+    assert!(arguments.counted_to_end() && arguments.terminated());
+    // Kept while fewer than 16 KiB were kept: the 55th argument starts at
+    // 16,200 bytes and is cut at the bound; the 245 after it are counted.
+    let kept = MAX_RETAINED_ARGUMENT_BYTES.div_ceil(300);
+    assert_eq!(arguments.entries().len(), kept);
+    assert_eq!(arguments.unretained(), (300 - kept) as u64);
+    assert!(arguments.entries()[..kept - 1]
+        .iter()
+        .all(Argument::is_whole));
+    assert!(!arguments.entries()[kept - 1].is_whole());
+    assert_eq!(arguments.entries()[kept - 1].length(), 300);
+    let text = huge_command.text();
+    assert!(text.len() <= srui_process_explorer::command::MAX_COMMAND_TEXT_BYTES);
+    assert!(text.starts_with(
+        "Command line (argv on the server, shown as text, never run): 300 arguments, 90300 bytes\nargv[0] · 300 bytes · aaa"
+    ));
+    let listed = text
+        .lines()
+        .filter(|line| line.starts_with("argv["))
+        .count();
+    assert!(
+        text.contains(&format!(
+            "\n… {} more arguments not shown ({} bytes)\n",
+            300 - listed,
+            (300 - listed) * 300
+        )),
+        "{text}"
+    );
+
+    // PID 42 reused by a newcomer: its arguments are never returned.
+    fixture.process(42, b"newcomer", 99_999);
+    assert_eq!(details.read_details(&key_of(42)), DetailRead::Ended);
+}
+
 #[cfg(target_os = "linux")]
 mod live {
     use super::*;
@@ -2967,15 +3218,36 @@ mod live {
         }
 
         fn spawn(activity: &str) -> Self {
+            Self::spawn_with(activity, &[])
+        }
+
+        /// A sleeping worker whose argument vector ends with `extra` (PX-014).
+        /// libtest takes each as one more exact-name filter, which matches no
+        /// test, or as a `--skip=` value, so the worker still runs only
+        /// [`test_owned_worker`].
+        fn with_arguments(extra: &[&str]) -> Self {
+            Self::spawn_with(WORKER_SLEEPS, extra)
+        }
+
+        /// The arguments every worker is started with, `extra` last.
+        fn argv(extra: &[&str]) -> Vec<String> {
             let program = std::env::current_exe().expect("a test binary knows its own path");
-            let mut child = Command::new(program)
-                .args([
-                    "--exact",
-                    WORKER_TEST,
-                    "--ignored",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
+            let mut argv = vec![
+                program.to_str().expect("a UTF-8 test path").to_string(),
+                "--exact".to_string(),
+                WORKER_TEST.to_string(),
+                "--ignored".to_string(),
+                "--nocapture".to_string(),
+                "--test-threads=1".to_string(),
+            ];
+            argv.extend(extra.iter().map(|argument| argument.to_string()));
+            argv
+        }
+
+        fn spawn_with(activity: &str, extra: &[&str]) -> Self {
+            let argv = Self::argv(extra);
+            let mut child = Command::new(&argv[0])
+                .args(&argv[1..])
                 .env(WORKER_ENV, format!("{}:{activity}", std::process::id()))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -4004,6 +4276,202 @@ mod live {
             "PX-013 live evidence: worker_pid={pid} parent={:?} state={:?} start_ticks={ticks} \
              clk_tck={rate} btime={btime} started={:?} after_exit=Ended",
             read.parent, read.state, read.started
+        );
+    }
+
+    /// The tricky arguments PX-014's live workers end with: quotes, a
+    /// newline, an escape sequence, shell metacharacters, a bidirectional
+    /// override and a secret (as a `--skip=` value libtest accepts).
+    const TRICKY: [&str; 6] = [
+        "it's \"quoted\"",
+        "line one\nline two",
+        "\u{1b}[31mred\u{1b}[0m",
+        "; rm -rf / # $(touch /tmp/px014-live) `id` | tee",
+        "\u{202e}gpj.exe",
+        "--skip=--password=hunter2-SECRET",
+    ];
+
+    /// PX-014: a test-owned worker started with tricky arguments has exactly
+    /// those arguments read back from its own record, in order and byte for
+    /// byte, beside its real executable and working directory; they are shown
+    /// as inert lines; and once the worker ends, its key reads as ended.
+    #[test]
+    fn a_test_owned_workers_tricky_argv_is_read_exactly_and_shown_inert() {
+        let worker = Worker::with_arguments(&TRICKY);
+        let pid = worker.pid();
+        let mut source = ProcFsSource::live();
+        let snapshot = source.snapshot();
+        let key = snapshot
+            .records
+            .iter()
+            .find(|record| record.key.pid == Observed::Known(pid))
+            .expect("the owned worker is listed")
+            .key
+            .clone();
+        let details = source.details().expect("the live source reads details");
+        let command = command_of(details.read_details(&key));
+        let expected: Vec<Vec<u8>> = Worker::argv(&TRICKY)
+            .into_iter()
+            .map(String::into_bytes)
+            .collect();
+        assert_eq!(raw_arguments(&command), expected, "argv is read exactly");
+        let ArgumentsRead::Read(arguments) = &command.arguments else {
+            unreachable!()
+        };
+        assert!(arguments.terminated() && arguments.counted_to_end());
+        let exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        assert_eq!(
+            command.executable,
+            PathRead::server(exe.as_os_str().as_encoded_bytes())
+        );
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            command.working_directory,
+            PathRead::server(cwd.as_os_str().as_encoded_bytes())
+        );
+        let text = command.text();
+        for shown in [
+            "· 13 bytes · it's \"quoted\"\n",
+            "· 17 bytes · line one\\nline two\n",
+            "· 12 bytes · \\x1b[31mred\\x1b[0m\n",
+            "· 48 bytes · ; rm -rf / # $(touch /tmp/px014-live) `id` | tee\n",
+            "· 10 bytes · \\u{202e}gpj.exe\n",
+            "· 32 bytes · --skip=--password=hunter2-SECRET\n",
+        ] {
+            assert!(text.contains(shown), "{shown:?} in the view");
+        }
+        assert!(
+            !text
+                .chars()
+                .any(|c| (c.is_control() && c != '\n')
+                    || srui_process_explorer::command::is_hidden(c))
+        );
+        assert_eq!(text.lines().count(), 1 + expected.len() + 2);
+        drop(worker);
+        assert_eq!(details.read_details(&key), DetailRead::Ended);
+        println!(
+            "PX-014 live evidence: worker_pid={pid} argc={} area_bytes={} exe_bytes={} cwd_bytes={} \
+             view_lines={} after_exit=Ended",
+            arguments.entries().len(),
+            arguments.total_bytes(),
+            exe.as_os_str().len(),
+            cwd.as_os_str().len(),
+            text.lines().count()
+        );
+    }
+
+    const LIVE_SECRET_BODY: &str = "live::live_secret_argument_body";
+    const LIVE_SECRET_ENV: &str = "SRTOP_PX014_LIVE_SECRET_BODY";
+    const LIVE_SECRET_DONE: &str = "PX-014 live secret-path body ran";
+
+    /// The real live paths over a test-owned worker with a secret argument:
+    /// a live procfs source, its own detail reader on the inspector's worker, a
+    /// `SELECTION_CHANGED` for the worker's row, refreshes that re-read it, and
+    /// the worker's exit. Ignored, and a no-op unless its parent test started
+    /// it; its assertions never print what they compare.
+    #[test]
+    #[ignore = "the body of live_inspection_of_a_secret_argument_logs_nothing"]
+    fn live_secret_argument_body() {
+        use srui_process_explorer::refresh::{lock_view, SharedView};
+        use srui_process_explorer::{install_inspector, INSPECTOR_COMMAND, TABLE};
+        use srui_sdk::{PropertyRef, TypeRef, TEXT};
+        let parent = std::env::var(LIVE_SECRET_ENV).unwrap_or_default();
+        if parent.parse::<u32>().ok() != Some(std::os::unix::process::parent_id()) {
+            return;
+        }
+        let worker = Worker::with_arguments(&TRICKY);
+        let session = Arc::new(Session::mint());
+        let mut source = ProcFsSource::live();
+        let (view, _) = start_from_source(&session, &mut source).unwrap();
+        let view: SharedView = Arc::new(Mutex::new(view));
+        let idle = install_inspector(&session, &view, source.details()).unwrap();
+        let (item, _) = row_for(&session, worker.pid()).expect("the worker's row is published");
+        let event = srui_semantic_tree::Event::new(
+            None,
+            1,
+            "live-secret-select".to_string(),
+            session.current_revision(),
+            TABLE,
+            TypeRef::EVENT_SELECTION_CHANGED,
+            vec![(PropertyRef::VALUE, Value::ItemId(item))],
+        )
+        .with_client_instance_id(b"live-secret".to_vec())
+        .to_wire();
+        session
+            .process_event(&event)
+            .expect("the selection is admitted");
+        assert!(idle.wait_idle(Duration::from_secs(10)));
+        let command = || {
+            session.with_store(|store| {
+                match store
+                    .get_node(INSPECTOR_COMMAND)
+                    .and_then(|n| n.get_property(TEXT))
+                {
+                    Some(Value::String(text)) => text.clone(),
+                    _ => String::new(),
+                }
+            })
+        };
+        assert!(
+            command().contains("hunter2-SECRET") && command().contains("line one\\nline two"),
+            "the worker's own view shows its arguments"
+        );
+        for _ in 0..2 {
+            lock_view(&view)
+                .refresh(&session, &mut source)
+                .expect("a refresh publishes");
+            assert!(idle.wait_idle(Duration::from_secs(10)));
+        }
+        drop(worker);
+        lock_view(&view)
+            .refresh(&session, &mut source)
+            .expect("a refresh publishes");
+        assert!(idle.wait_idle(Duration::from_secs(10)));
+        assert!(
+            !command().contains("hunter2-SECRET"),
+            "an ended target's arguments are no longer shown"
+        );
+        println!("{LIVE_SECRET_DONE}: view_bytes={}", command().len());
+    }
+
+    /// PX-014: logs do not contain secret-bearing arguments, on the live
+    /// paths. The body above runs in a child process with both output streams
+    /// captured; neither holds any part of the secret.
+    #[test]
+    fn live_inspection_of_a_secret_argument_logs_nothing() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                LIVE_SECRET_BODY,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(LIVE_SECRET_ENV, std::process::id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("the body runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stdout.contains("hunter2-SECRET") && !stderr.contains("hunter2-SECRET"),
+            "the secret reached the body's output"
+        );
+        assert!(
+            output.status.success(),
+            "the body failed: {stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains(LIVE_SECRET_DONE) && stdout.contains("1 passed"),
+            "{stdout}"
+        );
+        println!(
+            "PX-014 live log evidence: body exit={:?} stdout_bytes={} stderr_bytes={} secret_in_output=false",
+            output.status.code(),
+            output.stdout.len(),
+            output.stderr.len()
         );
     }
 

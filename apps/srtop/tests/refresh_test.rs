@@ -844,15 +844,20 @@ fn a_refresh_beyond_the_frame_bound_commits_as_frames_a_client_accepts() {
     let max_ops = session.with_store(|store| store.limits().max_transaction_operations);
     // Rows that all vanish in the refresh below, so the deletions this refresh
     // plans must still precede its insertions across a size-driven split.
+    // Their deletions are what carries the plan past one frame: the inserted
+    // rows alone fill the row budget, which every fixed shell reserve
+    // (PX-014's command line among them) keeps below a frame, so there must be
+    // more deletion bytes than all the reserves together.
+    let vanishing = 8_000;
     let (mut view, _) = start_from_source(
         &session,
         &mut Widest {
-            rows: 4_000,
+            rows: vanishing,
             first_pid: 900_000,
         },
     )
     .unwrap();
-    assert_eq!(published(&session).len(), 4_000);
+    assert_eq!(published(&session).len(), vanishing as usize);
 
     let revision = session.current_revision();
     // 34,000 rows of 512 name bytes each, in four operations. The published
@@ -867,7 +872,7 @@ fn a_refresh_beyond_the_frame_bound_commits_as_frames_a_client_accepts() {
     assert!(published_rows < rows as usize && published_rows > 20_000);
     assert_eq!(outcome.inserted, published_rows);
     assert_eq!(outcome.truncated, rows as usize - published_rows);
-    assert_eq!(outcome.deleted, 4_000);
+    assert_eq!(outcome.deleted, vanishing as usize);
     assert_shell_intact(&session);
 
     let operations = operations_since(&session, revision);

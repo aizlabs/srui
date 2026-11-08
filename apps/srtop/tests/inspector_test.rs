@@ -16,6 +16,7 @@
 //!   distinct, and the detail worker is bounded and ends with its view.
 
 use srui_process_explorer::catalogue::ProcessField;
+use srui_process_explorer::command::CommandContext;
 use srui_process_explorer::inspector::{
     DetailRead, DetailReadsIdle, DetailSource, ProcessDetails, ProcessState, StartTime,
     MAX_INSPECTOR_LINE_BYTES, NO_SELECTION_STATUS,
@@ -117,6 +118,7 @@ fn read(state: u8, parent: u32, after_boot_seconds: u64) -> DetailRead {
             100,
             Observed::Known(BOOT),
         )),
+        command: CommandContext::missing(MissingReason::Unavailable),
     })
 }
 

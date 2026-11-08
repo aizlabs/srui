@@ -236,6 +236,7 @@ fn assert_only_search_controls_changed(
                     srui_process_explorer::INSPECTOR_PROCESS,
                     srui_process_explorer::INSPECTOR_DETAILS,
                     srui_process_explorer::INSPECTOR_METRICS,
+                    srui_process_explorer::INSPECTOR_COMMAND,
                 ]
                 .contains(&id),
                 "search touched node {id:?}"

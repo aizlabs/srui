@@ -8,6 +8,7 @@
 //! and touch no process.
 
 pub mod catalogue;
+pub mod command;
 pub mod filter;
 pub mod inspector;
 pub mod metric;
@@ -127,9 +128,16 @@ pub const INSPECTOR_STATUS: NodeId = NodeId::new(56);
 pub const INSPECTOR_PROCESS: NodeId = NodeId::new(57);
 pub const INSPECTOR_DETAILS: NodeId = NodeId::new(58);
 pub const INSPECTOR_METRICS: NodeId = NodeId::new(59);
+/// The selected process's command line, executable and working directory
+/// (PX-014): one standard read-only `RichText`, selectable and copyable with
+/// the platform's own text behavior, under the four lines.
+pub const INSPECTOR_COMMAND: NodeId = NodeId::new(60);
 pub const INSPECTOR_DESCRIPTION: &str =
     "Describes the process selected in the table: the server resolves the selected row, reads its state, parent and start time, and shows its current CPU share and resident memory.";
-pub const INSPECTOR_NODE_COUNT: usize = 5;
+pub const INSPECTOR_COMMAND_LABEL: &str = "Command line and executable";
+pub const INSPECTOR_COMMAND_DESCRIPTION: &str =
+    "The selected process's arguments, one per line, then its executable and working directory, as the server reads them. Text only: nothing here is run, opened or resolved on this computer.";
+pub const INSPECTOR_NODE_COUNT: usize = 6;
 
 /// What one column chooser button does (PX-068). Each is resolved against the
 /// layout the server holds when the click is applied, never against anything
@@ -214,8 +222,8 @@ pub const STATUS_TEXT: &str = "Read-only · Process collection not started";
 /// (PX-007), which sits between the status line and the filter controls, the three
 /// of the filter bar (PX-010), the sort row with its four buttons (PX-009),
 /// the column chooser's row with its buttons (PX-068), the seven search
-/// controls (PX-011), the six user-filter controls (PX-012) and the five of
-/// the inspector (PX-013). Rows are model items, never nodes.
+/// controls (PX-011), the six user-filter controls (PX-012) and the six of
+/// the inspector (PX-013, PX-014). Rows are model items, never nodes.
 pub const SHELL_NODE_COUNT: usize = 5
     + summary::NODE_COUNT
     + FILTER_NODE_COUNT
@@ -871,6 +879,17 @@ pub(crate) fn initialize_rows(
                 })
                 .create(ui)?;
         }
+        // The command line (PX-014): the standard selectable text, read-only,
+        // which the generic client renders as a non-editable, selectable
+        // native text view (§22.4). Its text is plain: no annotation, link or
+        // action, so a server path is never a local file action (§26).
+        RichText::builder(INSPECTOR_COMMAND)
+            .parent(INSPECTOR)
+            .text(inspector.command.as_str())
+            .label(INSPECTOR_COMMAND_LABEL)
+            .accessible_description(INSPECTOR_COMMAND_DESCRIPTION)
+            .read_only(true)
+            .create(ui)?;
         Ok(())
     })?;
     Ok(())
@@ -1015,10 +1034,26 @@ mod tests {
             // (PX-007), the three of the filter bar (PX-010), the sort row
             // with its four buttons (PX-009), the column chooser's row with
             // its thirteen buttons (PX-068), the seven search controls
-            // (PX-011), the six user-filter controls (PX-012) and the five of
-            // the inspector (PX-013).
-            assert_eq!(store.node_count(), 59);
-            assert_eq!(SHELL_NODE_COUNT, 59);
+            // (PX-011), the six user-filter controls (PX-012) and the six of
+            // the inspector (PX-013, and its command line since PX-014).
+            assert_eq!(store.node_count(), 60);
+            assert_eq!(SHELL_NODE_COUNT, 60);
+            assert_eq!(
+                store.children_of(INSPECTOR),
+                Some(
+                    [
+                        INSPECTOR_STATUS,
+                        INSPECTOR_PROCESS,
+                        INSPECTOR_DETAILS,
+                        INSPECTOR_METRICS,
+                        INSPECTOR_COMMAND
+                    ]
+                    .as_slice()
+                )
+            );
+            let command = store.get_node(INSPECTOR_COMMAND).unwrap();
+            assert_eq!(command.node_type, TypeRef::RICHTEXT);
+            assert_eq!(command.get_property(READ_ONLY), Some(&Value::Bool(true)));
             assert_eq!(store.root_ids(), &[SURFACE]);
             assert_eq!(store.children_of(SURFACE), Some([COLUMN].as_slice()));
             assert_eq!(

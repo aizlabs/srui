@@ -2,11 +2,15 @@
 //! (design §§6–8, 12, 22, 29; PX-001/PX-002/PX-003/PX-004, PX-007 system
 //! summary, PX-009 server-authoritative sorting, PX-010 filtering, PX-068
 //! column chooser, PX-011 find-next/find-previous and jump to PID, PX-015
-//! sampling interval, Pause view/Resume view and manual refresh). No process
+//! sampling interval, Pause view/Resume view and manual refresh, PX-016
+//! keyboard shortcuts). No process
 //! is ever opened for control: the only client-input handlers are the sort
 //! buttons', the filter input's, the column chooser buttons', the search
 //! controls' and the sampling controls', which reorder, filter, re-lay out,
-//! locate, freeze or re-sample the published rows and touch no process.
+//! locate, freeze or re-sample the published rows and touch no process. A
+//! keyboard shortcut (design §§7.4, 7.6, 22.5; PX-016-G01's standard
+//! `shortcut` property) sends the same event its control's click sends, or
+//! only moves local focus; it adds no handler.
 
 pub mod catalogue;
 pub mod command;
@@ -152,6 +156,42 @@ pub const INTERVAL_INPUT: NodeId = NodeId::new(64);
 pub const INTERVAL_APPLY: NodeId = NodeId::new(65);
 pub const SAMPLING_STATUS: NodeId = NodeId::new(66);
 pub const SAMPLING_NODE_COUNT: usize = 6;
+
+/// The keyboard shortcuts (PX-016), in the shell's reading order: the
+/// standard `shortcut` property (31, PX-016-G01) on existing controls, in its
+/// platform-neutral grammar, where `primary` is Command on macOS.
+///
+/// - A button's shortcut is the click: the client sends the same `ACTIVATE`
+///   through the same target and action, so a disabled button's shortcut does
+///   nothing and event validation refuses a forged one (§7.4).
+/// - A text field's, the table's and the command line's shortcut only moves
+///   local focus and sends nothing (§22.5). Native table movement, paging,
+///   scrolling and text selection stay the client's own.
+/// - Every key carries `primary`, so no shortcut competes with typing or an
+///   input method, and none is in a client's reserved table (copy, paste,
+///   select all, undo, quit, close, hide, minimize).
+///
+/// The sort shortcuts follow the sort buttons, which keep their order when
+/// the column chooser moves a column: Command-1 is always PID. The two
+/// resets are the existing "All visible users" and "Restore default columns"
+/// buttons; a text filter resets by deleting its text, which its focus
+/// shortcut selects whole. No node, handler or event is added.
+pub const KEYBOARD_SHORTCUTS: [(NodeId, &str); 14] = [
+    (SAMPLING_PAUSE, "primary+alt+p"),
+    (SAMPLING_REFRESH, "primary+r"),
+    (FILTER_INPUT, "primary+alt+f"),
+    (OWNER_ALL, "primary+alt+u"),
+    (SEARCH_INPUT, "primary+f"),
+    (SEARCH_PREVIOUS, "primary+shift+g"),
+    (SEARCH_NEXT, "primary+g"),
+    (SORT_PID, "primary+1"),
+    (SORT_NAME, "primary+2"),
+    (SORT_RESIDENT, "primary+3"),
+    (SORT_CPU, "primary+4"),
+    (COLUMNS_RESTORE, "primary+alt+r"),
+    (TABLE, "primary+l"),
+    (INSPECTOR_COMMAND, "primary+i"),
+];
 
 /// What one column chooser button does (PX-068). Each is resolved against the
 /// layout the server holds when the click is applied, never against anything
@@ -986,6 +1026,11 @@ pub(crate) fn initialize_rows(
             .accessible_description(INSPECTOR_COMMAND_DESCRIPTION)
             .read_only(true)
             .create(ui)?;
+        // The keyboard shortcuts (PX-016), on controls created above, in the
+        // same commit, so no client ever sees the shell without them.
+        for (node, shortcut) in KEYBOARD_SHORTCUTS {
+            ui.set(node, PropertyRef::SHORTCUT, shortcut)?;
+        }
         Ok(())
     })?;
     Ok(())
@@ -1516,6 +1561,63 @@ mod tests {
             );
             assert_eq!(store.get_model(MODEL).unwrap().item_count, 0);
         });
+    }
+
+    /// PX-016: every shortcut is canonical in the standard grammar, carries
+    /// `primary` (so no letter competes with a text editor or an input
+    /// method), is unique in the window, and sits on a control whose node type
+    /// admits one. Exactly those controls carry one, in the uncollected shell
+    /// and in a collecting one, and a shortcut is the only property PX-016
+    /// adds to them.
+    #[test]
+    fn keyboard_shortcuts_are_canonical_unique_modified_and_on_admitted_controls() {
+        let mut values = std::collections::BTreeSet::new();
+        let mut nodes = std::collections::BTreeSet::new();
+        for (node, value) in KEYBOARD_SHORTCUTS {
+            let parsed = Shortcut::parse(value).unwrap_or_else(|error| panic!("{value}: {error}"));
+            assert_eq!(parsed.canonical(), value, "{value} is not canonical");
+            assert!(parsed.primary, "{value} must carry primary");
+            assert!(value.len() <= MAX_SHORTCUT_BYTES);
+            assert!(values.insert(value), "{value} is bound twice");
+            assert!(nodes.insert(node), "{node:?} has two shortcuts");
+        }
+        let uncollected = Session::mint();
+        initialize(&uncollected).unwrap();
+        let collecting = Session::mint();
+        start_from_source(&collecting, &mut source::FakeProcessSource).unwrap();
+        for session in [&uncollected, &collecting] {
+            session.with_store(|store| {
+                let mut seen = 0;
+                for id in 1..=u64::try_from(4 * SHELL_NODE_COUNT).unwrap() {
+                    let Some(node) = store.get_node(NodeId::new(id)) else {
+                        continue;
+                    };
+                    seen += 1;
+                    let expected = KEYBOARD_SHORTCUTS
+                        .iter()
+                        .find(|(bound, _)| *bound == node.id)
+                        .map(|(_, value)| Value::String((*value).into()));
+                    assert_eq!(
+                        node.get_property(PropertyRef::SHORTCUT),
+                        expected.as_ref(),
+                        "node {id}"
+                    );
+                    if expected.is_some() {
+                        let behavior = shortcut_behavior(node.node_type);
+                        assert!(behavior.is_some(), "node {id} does not admit a shortcut");
+                        // Buttons send their click's ACTIVATE; everything else
+                        // only takes focus. No Toggle is bound.
+                        assert_eq!(
+                            behavior == Some(ShortcutBehavior::Activate),
+                            node.node_type == TypeRef::BUTTON,
+                            "node {id}"
+                        );
+                    }
+                }
+                assert_eq!(seen, store.node_count());
+                assert_eq!(seen, SHELL_NODE_COUNT);
+            });
+        }
     }
 
     #[test]

@@ -169,6 +169,32 @@ A row under the system summary holds the sampling controls (PX-015): **Pause vie
 - **Bounds.** The status is at most 512 bytes and the interval field keeps at most 32; the six nodes are charged a fixed 2048-byte reserve (`SAMPLING_RESERVE_BYTES`) against the catch-up snapshot.
 - **No process-changing action exists.** When one is added, it must refuse every target while `ProcessView::frozen()` is `Some`: a paused view shows historical rows, not the host's current processes.
 
+## Keyboard
+
+The basic workflow runs without a mouse (PX-016). srtop publishes the standard `shortcut` property (PX-016-G01) on its existing controls. The generic client binds each one, and shows it in the control's tooltip and accessibility help, for example `Find processes (⌘F)`. In the grammar, `primary` is Command on macOS and Control elsewhere.
+
+| Shortcut (macOS) | Value | Control | What it does |
+| --- | --- | --- | --- |
+| ⌥⌘P | `primary+alt+p` | Pause view / Resume view | the button's click |
+| ⌘R | `primary+r` | Refresh now | the button's click; nothing while paused |
+| ⌥⌘F | `primary+alt+f` | Filter processes | focuses the filter field |
+| ⌥⌘U | `primary+alt+u` | All visible users | the button's click: resets the user filter |
+| ⌘F | `primary+f` | Find processes | focuses the search field |
+| ⇧⌘G | `primary+shift+g` | Previous match | the button's click |
+| ⌘G | `primary+g` | Next match | the button's click |
+| ⌘1 … ⌘4 | `primary+1` … `primary+4` | Sort by PID, Name, Resident, CPU | the button's click |
+| ⌥⌘R | `primary+alt+r` | Restore default columns | the button's click |
+| ⌘L | `primary+l` | Processes (the table) | focuses the table |
+| ⌘I | `primary+i` | Command line and executable | focuses the inspector's selectable command line |
+
+- **A button's shortcut is its click.** The client sends the same `ACTIVATE` through the same target and action. A disabled button's shortcut therefore does nothing: Refresh now while paused, Next match with no match, a reset with nothing to reset. Event validation refuses a forged event to a disabled control.
+- **A field's, the table's and the command line's shortcut only moves focus.** It sends nothing. Focus, table movement (arrows, Page Up/Down, Home/End), horizontal scrolling and text selection are the client's own. A selection made with the arrow keys is reported like a click, and the inspector follows it.
+- **Typing is never a shortcut.** Every shortcut carries Command, so a letter typed into a field is text. While an input method is composing, no shortcut fires at all.
+- **Reserved combinations stay the system's.** None of srtop's shortcuts is in the client's reserved table, which includes ⌘C, ⌘V, ⌘X, ⌘A, ⌘Z, ⌘Q, ⌘W, ⌘H and ⌘M. Copy, paste and select all keep working in every field and in the command line.
+- **Sort shortcuts follow the sort buttons, not the column positions.** The sort buttons keep their order when the column chooser moves a column, so ⌘1 always sorts by PID. Per-column shortcuts are offered because Tab reaches buttons only when macOS Keyboard navigation (Full Keyboard Access) is on, which it is not by default.
+- **Reset.** Focusing a field with its shortcut, or with Tab, selects its whole text, so ⌥⌘F then Delete clears the filter, and ⌘F then Delete clears the search. ⌥⌘U shows every user again, and ⌥⌘R restores the default columns.
+- **Without a mouse:** ⌘F, type a name, ⌘G until the match is the one, ⌘L and the arrow keys to move the selection, ⌘I to read and copy the command line, ⌥⌘F and type a filter, then ⌥⌘F and Delete to reset.
+
 ## Refresh
 
 Every collecting mode polls its source on a fixed schedule: `--refresh-interval-ms MS` configures it between 50 ms and 300 s, the default is one second, and the sampling controls can change it, pause it or take one sample at once (see above). The first snapshot creates the shell; every later tick publishes only the difference — inserts, deletes, the values of rows whose displayed cells changed, and the status text when it changed — so a row that did not change keeps its item identity and its native control. Deletions are emitted before insertions, so an insertion index is the row's final index, and a refresh larger than a §26 bound commits as consecutive atomic transactions rather than failing whole.

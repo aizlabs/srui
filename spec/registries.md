@@ -92,6 +92,13 @@ The canonical registry defines 30 standard properties in five categories:
 
 Each property entry includes `value_type` metadata validated by the registry tool.
 
+**Collection `value` — server-promoted selection (§6.3, §7.6, §8, §22.5).** On a `List`, `Table` or `Tree`, property 13 `value` is the selection the server has explicitly promoted from local presentation state to semantic state:
+
+- **Value:** an `ItemId` (`Value.item_id_value`) only, never a row index. No `value` means no promotion. Every replica refuses any other value type with `invalid_collection_selection`.
+- **Validity:** held only while `selection_mode` is `single` or `multiple`; setting `selection_mode` to `none`, or clearing it, while a promotion is held is refused. A replica does not check that the item is cached, because sparse caches may omit it. An authoritative session refuses a promotion naming an `ItemId` the collection's model does not hold (`item_not_found`), and clears in the same commit an earlier promotion whose item that commit removed.
+- **Rendering:** a committed operation on `value` selects the item's row, replacing local selection, and reveals it once; other commits never move the selection or scroll.
+- **Fallback (§4 inv. 13 optional semantics):** a client without support ignores the collection `value` and keeps local-only selection, as §6.3 and §22.5 describe; `SELECTION_CHANGED` is still sent for user selections.
+
 ### 4.3 Standard Enums (§7.5, §7.2, §7.4, §8)
 The canonical registry defines 12 standard enum types with monotonic type IDs ($1 \ldots 12$) and contiguous value IDs within each enum.
 On the wire, enum values are represented by `EnumValue(enum_id, value_id)` where `enum_id` references the `StandardEnum` type ID (e.g. `ActionRole = 2`) and `value_id` references the value within that enum (e.g. `destructive = 3`).

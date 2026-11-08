@@ -8,97 +8,109 @@
 //! promotion. The rules the store enforces on every replica live in `srui_semantic_tree::store`;
 //! this module adds the authoritative-only rules:
 //!
-//! - **Unknown item.** [`UiTransaction::promote_selection`] refuses an `ItemId` the authoritative
-//!   model does not hold with [`StoreError::ItemNotFound`]. There is no row-index fallback.
+//! - **Unknown item.** A promotion naming an `ItemId` the collection's authoritative model does
+//!   not hold is refused with [`StoreError::ItemNotFound`], whether it comes from
+//!   [`UiTransaction::promote_selection`] or from a raw `SET_PROPERTY`, `CREATE_NODE` or
+//!   `BATCH_PROPERTY_SET` of `value`. The whole transaction is discarded. There is no row-index
+//!   fallback.
 //! - **selection_mode none.** A collection whose `selection_mode` is `none` or absent refuses the
 //!   promotion with [`StoreError::InvalidCollectionSelection`].
 //! - **Target outside the replica's cached range.** The promotion carries the item itself in a
 //!   one-item `MODEL_RESET_RANGE`, the same authoritative commit that range fulfilment and
 //!   server-initiated hydration use (§8, §12.1), so a sparse replica can place the item before it
 //!   reveals it. Neighbouring rows then arrive through ordinary viewport range requests.
-//! - **Deletion.** A `MODEL_DELETE` that removes the promoted item, and is not followed in the same
-//!   transaction by re-inserting that `ItemId` (a move under sorting), clears the promotion in the
-//!   same commit: [`UiTransaction::settle_promoted_selections`] runs before every SDK and sessiond
-//!   commit.
+//! - **Removal.** When a transaction leaves an earlier promotion naming an item its collection's
+//!   model no longer holds — through `MODEL_DELETE`, `MODEL_RESET_RANGE` (including cache-cap
+//!   eviction), a positional `MODEL_UPDATE`, or a `model_ref` change or clear — the promotion is
+//!   cleared in the same commit. A move under sorting (delete and re-insert of the same `ItemId`
+//!   in one transaction) keeps it. Deleting the collection node removes its promotion with it.
+//!   [`UiTransaction::settle_promoted_selections`] runs on every SDK and sessiond commit path; a
+//!   pre-built wire commit (`commit_transaction`) cannot gain operations, so it is refused instead
+//!   (see [`dangling_promotions`]).
+
+use std::collections::HashSet;
 
 use crate::session::UiTransaction;
 use srui_semantic_tree::{
-    is_selectable_collection, ItemId, ModelId, NodeId, Operation, PropertyRef, SemanticStore,
+    is_selectable_collection, ItemId, NodeId, Operation, PropertyRef, SemanticStore,
     StandardSelectionMode, StoreError, Value,
 };
 
-/// One promotion observed in the staging store: collection node, its model, promoted item.
-type Promotion = (NodeId, ModelId, ItemId);
+/// Returns `true` when `op` can assign a promotion or remove a promoted item from its
+/// collection's model, so the transaction's promotions must be re-checked (§6.3, §8).
+pub fn affects_promotions(op: &Operation) -> bool {
+    let promotion_or_model =
+        |p: &PropertyRef| *p == PropertyRef::VALUE || *p == PropertyRef::MODEL_REF;
+    match op {
+        Operation::SetProperty { property, .. } | Operation::ClearProperty { property, .. } => {
+            promotion_or_model(property)
+        }
+        Operation::BatchPropertySet { properties, .. } => {
+            properties.iter().any(|(p, _)| promotion_or_model(p))
+        }
+        Operation::CreateNode { properties, .. } => {
+            properties.iter().any(|(p, _)| *p == PropertyRef::VALUE)
+        }
+        Operation::ModelDelete { .. }
+        | Operation::ModelResetRange { .. }
+        | Operation::ModelUpdate { .. } => true,
+        _ => false,
+    }
+}
 
-/// Tracks promoted selections that a `MODEL_DELETE` removed within one transaction.
+/// Promotions in `store` whose item the collection's model does not hold: the model is missing,
+/// `model_ref` is absent, or the `ItemId` is not in the authoritative model (§6.3, §8).
 ///
-/// The promotion index is built lazily on the first `MODEL_DELETE` and invalidated by any node
-/// mutation, so a transaction with no model deletions never scans the node graph.
+/// Meaningful for an authoritative store. A sparse replica may legitimately not cache the item.
+pub fn dangling_promotions(store: &SemanticStore) -> Vec<(NodeId, ItemId)> {
+    // lc-debt: O(nodes) scan per commit that touches a model or a promotion; a promotion index
+    // maintained by the store would make it O(promotions).
+    store
+        .iter_nodes()
+        .filter_map(|node| {
+            let item = node.promoted_selection()?;
+            let held = node
+                .model_ref()
+                .and_then(|model| store.get_model(model))
+                .is_some_and(|model| model.contains_item(item));
+            (!held).then_some((node.id, item))
+        })
+        .collect()
+}
+
+/// Tracks, within one transaction, whether promotions must be re-checked at commit and which
+/// collections this transaction itself assigned a promotion to.
 #[derive(Debug, Default)]
 pub(crate) struct PromotionTracker {
-    /// Promotions in the staging store, or `None` when they must be rescanned.
-    index: Option<Vec<Promotion>>,
-    /// Promotions whose item a delete in this transaction removed.
-    orphaned: Vec<Promotion>,
+    /// Some operation could have assigned a promotion or removed a promoted item.
+    dirty: bool,
+    /// Nodes whose `value` this transaction assigned; a dangling one is refused, not cleared.
+    assigned: HashSet<NodeId>,
 }
 
 impl PromotionTracker {
-    /// Forgets the promotion index after a node mutation.
-    pub(crate) fn invalidate(&mut self) {
-        self.index = None;
-    }
-
-    /// Observes `op` before it is applied to `staged`.
-    pub(crate) fn observe(&mut self, staged: &SemanticStore, op: &Operation) {
-        match op {
-            Operation::ModelDelete {
-                id,
-                index,
-                count,
-                item_ids,
-            } => {
-                // lc-debt: one O(nodes) scan per transaction that deletes model items; an index
-                // maintained by the store would make it O(promotions).
-                let promotions = self.index.get_or_insert_with(|| scan(staged));
-                let Some(model) = staged.get_model(*id) else {
-                    return;
-                };
-                let range = match (index, count) {
-                    (start, Some(n)) if *n > 0 => {
-                        let start = start.unwrap_or(0);
-                        Some(start..start.saturating_add(*n))
-                    }
-                    _ => None,
-                };
-                for &(node, model_id, item) in promotions.iter() {
-                    if model_id != *id {
-                        continue;
-                    }
-                    let by_id = item_ids.contains(&item);
-                    let by_range = range
-                        .as_ref()
-                        .zip(model.index_of(item))
-                        .is_some_and(|(range, at)| range.contains(&at));
-                    if by_id || by_range {
-                        self.orphaned.push((node, model_id, item));
-                    }
-                }
+    /// Observes one recorded operation.
+    pub(crate) fn observe(&mut self, op: &Operation) {
+        if !affects_promotions(op) {
+            return;
+        }
+        self.dirty = true;
+        let assigns = match op {
+            Operation::SetProperty { id, property, .. } if *property == PropertyRef::VALUE => {
+                Some(*id)
             }
-            Operation::CreateNode { .. }
-            | Operation::DeleteNode { .. }
-            | Operation::SetProperty { .. }
-            | Operation::ClearProperty { .. }
-            | Operation::BatchPropertySet { .. } => self.invalidate(),
-            _ => {}
+            Operation::CreateNode { id, properties, .. }
+            | Operation::BatchPropertySet { id, properties }
+                if properties.iter().any(|(p, _)| *p == PropertyRef::VALUE) =>
+            {
+                Some(*id)
+            }
+            _ => None,
+        };
+        if let Some(id) = assigns {
+            self.assigned.insert(id);
         }
     }
-}
-
-fn scan(store: &SemanticStore) -> Vec<Promotion> {
-    store
-        .iter_nodes()
-        .filter_map(|node| Some((node.id, node.model_ref()?, node.promoted_selection()?)))
-        .collect()
 }
 
 fn selection_error(node_id: NodeId, reason: &str) -> StoreError {
@@ -204,28 +216,33 @@ impl UiTransaction {
         self.staged.get_node(node.into())?.promoted_selection()
     }
 
-    /// Clears promotions whose item a `MODEL_DELETE` in this transaction removed (§6.3, §8).
+    /// Settles this transaction's promoted selections before it commits (§6.3, §8).
     ///
-    /// A promotion is kept when its item was re-inserted later in the same transaction, which is
-    /// how a move under sorting is expressed. Called by every SDK and sessiond commit path before
-    /// the staged store is committed; calling it again is a no-op.
+    /// Runs only when an operation could have assigned a promotion or removed a promoted item.
+    /// Every collection whose promotion names an item its authoritative model does not hold is
+    /// then either refused — when this transaction assigned that promotion, with
+    /// [`StoreError::ItemNotFound`], so the whole transaction is discarded — or cleared in this
+    /// same commit, when the promotion predates the transaction and this transaction removed its
+    /// item (delete, range reset, positional update, `model_ref` change). A move under sorting
+    /// keeps the promotion because the item is present again at commit. Called by every SDK and
+    /// sessiond commit path; calling it again is a no-op.
     pub fn settle_promoted_selections(&mut self) -> Result<(), StoreError> {
-        let orphaned = std::mem::take(&mut self.promotions.orphaned);
-        for (node_id, model_id, item) in orphaned {
-            let Some(node) = self.staged.get_node(node_id) else {
-                continue;
-            };
-            if node.promoted_selection() != Some(item) || node.model_ref() != Some(model_id) {
-                continue;
-            }
-            let still_present = self
-                .staged
-                .get_model(model_id)
-                .is_some_and(|model| model.contains_item(item));
-            if !still_present {
-                self.clear(node_id, PropertyRef::VALUE)?;
-            }
+        let tracker = std::mem::take(&mut self.promotions);
+        if !tracker.dirty {
+            return Ok(());
         }
+        let dangling = dangling_promotions(&self.staged);
+        if let Some(&(_, item)) = dangling
+            .iter()
+            .find(|(node, _)| tracker.assigned.contains(node))
+        {
+            return Err(StoreError::ItemNotFound(item));
+        }
+        for (node_id, _) in dangling {
+            self.clear(node_id, PropertyRef::VALUE)?;
+        }
+        // The clears above were recorded through `clear`, which only re-marks the tracker.
+        self.promotions = PromotionTracker::default();
         Ok(())
     }
 }

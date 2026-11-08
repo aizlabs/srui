@@ -295,7 +295,7 @@ properties:
     name: value
     category: content
     value_type: value
-    description: "Current value of an input or control (boolean, number, string, etc.)"
+    description: "Current value of an input or control (boolean, number, string, etc.). On a List, Table or Tree it is the server-promoted selection (§6.3): an ItemId only, never a row index, valid only while selection_mode is single or multiple; authoritative sessions refuse an ItemId the collection's model does not hold. Fallback: a client without support keeps local-only selection (§6.3, §22.5)."
 
   - id: 14
     name: placeholder

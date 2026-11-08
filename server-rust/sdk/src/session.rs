@@ -3,8 +3,8 @@
 //! # Architecture & Design Invariants
 //!
 //! - **§6.3 Promoted selection**: every commit calls [`UiTransaction::settle_promoted_selections`]
-//!   (see [`crate::selection`]) so a promotion whose item the transaction deleted is cleared in the
-//!   same commit.
+//!   (see [`crate::selection`]): a promotion naming an item its model does not hold is refused when
+//!   this transaction assigned it and cleared in the same commit otherwise.
 //!
 //! - **§29 Reference Server SDK Contract**: The application developer interacts with high-level
 //!   semantic transactions (`session.transaction(|ui| { ... })`) and event handlers (`session.on(node, EVENT, handler)`).
@@ -153,7 +153,7 @@ pub struct UiTransaction {
     operations: Vec<Operation>,
     op_count: usize,
     max_ops: usize,
-    /// Promoted collection selections whose item a `MODEL_DELETE` removed (§6.3, §8).
+    /// Whether this transaction's promoted selections must be settled at commit (§6.3, §8).
     pub(crate) promotions: PromotionTracker,
 }
 
@@ -296,7 +296,7 @@ impl UiTransaction {
     pub fn apply_op(&mut self, op: &Operation) -> Result<(), StoreError> {
         self.record_op()?;
         self.operations.push(op.clone());
-        self.promotions.observe(&self.staged, op);
+        self.promotions.observe(op);
         op.apply(&mut self.staged)
     }
 }
@@ -321,14 +321,9 @@ impl StoreMut for UiTransaction {
     ) -> Result<(), StoreError> {
         let props: Vec<(PropertyRef, Value)> = properties.into_iter().collect();
         self.record_op()?;
-        self.promotions.invalidate();
-        self.operations.push(Operation::create_node(
-            id,
-            node_type,
-            parent_id,
-            child_index,
-            props.clone(),
-        ));
+        let op = Operation::create_node(id, node_type, parent_id, child_index, props.clone());
+        self.promotions.observe(&op);
+        self.operations.push(op);
         self.staged
             .create_node(id, node_type, parent_id, child_index, props)
     }
@@ -340,9 +335,9 @@ impl StoreMut for UiTransaction {
         val: Value,
     ) -> Result<Option<Value>, StoreError> {
         self.record_op()?;
-        self.promotions.invalidate();
-        self.operations
-            .push(Operation::set_property(node, prop, val.clone()));
+        let op = Operation::set_property(node, prop, val.clone());
+        self.promotions.observe(&op);
+        self.operations.push(op);
         self.staged.set_property(node, prop, val)
     }
 
@@ -352,14 +347,14 @@ impl StoreMut for UiTransaction {
         prop: PropertyRef,
     ) -> Result<Option<Value>, StoreError> {
         self.record_op()?;
-        self.promotions.invalidate();
-        self.operations.push(Operation::clear_property(node, prop));
+        let op = Operation::clear_property(node, prop);
+        self.promotions.observe(&op);
+        self.operations.push(op);
         self.staged.clear_property(node, prop)
     }
 
     fn delete_node(&mut self, node: NodeId) -> Result<Vec<NodeId>, StoreError> {
         self.record_op()?;
-        self.promotions.invalidate();
         self.operations.push(Operation::delete_node(node));
         self.staged.delete_node(node)
     }

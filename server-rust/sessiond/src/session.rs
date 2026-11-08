@@ -9,7 +9,9 @@
 //! marker that keeps two distinct oversized identifiers distinct.
 //!
 //! Every commit settles server-promoted collection selections (§6.3, §8) before it is journaled:
-//! a promotion whose item the transaction deleted is cleared in that same commit.
+//! a promotion this transaction assigned to an item its model does not hold is refused, and an
+//! earlier promotion whose item the transaction removed is cleared in that same commit. A
+//! pre-built `commit_transaction` that would leave a dangling promotion is refused.
 //!
 //! Conforms strictly to [`async-no-lock-await`](rules/async-no-lock-await.md):
 //! internal locks are held only for fast in-memory operations and never across `.await` points.
@@ -925,8 +927,9 @@ impl Session {
         let max_ops = guard.store.limits().max_transaction_operations;
         let mut ui = UiTransaction::new(guard.store.clone_staging(), max_ops);
 
-        // A promoted selection whose item this transaction deleted is cleared in the same commit
-        // so resync never restores a dangling promotion (§6.3, §8).
+        // Promotions are settled before journaling: an unknown promoted item is refused and a
+        // removed one is cleared in this commit, so resync never restores a dangling promotion
+        // (§6.3, §8).
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             f(&mut ui, revisions).and_then(|value| ui.settle_promoted_selections().map(|()| value))
         }));
@@ -1010,6 +1013,21 @@ impl Session {
             // store cannot end up ahead of the journal and wedge every later commit on this
             // session with `NonContiguousRevision` (§12.1, §18.1, §20.2).
             let staged = guard.store.prepare_commit(&commit)?;
+            // A pre-built commit cannot gain the CLEAR_PROPERTY a UiTransaction would settle, so
+            // one that would leave a promotion naming an item its model does not hold is refused
+            // (§6.3, §8): resync never restores a dangling promotion.
+            if commit
+                .as_transaction()
+                .operations
+                .iter()
+                .any(srui_sdk::selection::affects_promotions)
+            {
+                if let Some(&(_, item)) =
+                    srui_sdk::selection::dangling_promotions(staged.store()).first()
+                {
+                    return Err(SessionError::Store(StoreError::ItemNotFound(item)));
+                }
+            }
             let permit = guard.journal.prepare(&commit)?;
             let tx_wire = permit.transaction().clone();
             let deletes_nodes = tx_wire
@@ -1651,5 +1669,77 @@ mod tests {
     fn test_outbound_hub_accessible() {
         let session = Session::new("test-outbound-hub");
         assert!(!session.outbound_hub().is_closed());
+    }
+
+    /// §6.3, §8: a pre-built commit cannot gain the clearing operation, so one that would leave
+    /// a dangling promotion (or promote an unknown item) is refused without advancing the store.
+    #[test]
+    fn commit_transaction_refuses_a_dangling_promotion() {
+        use srui_semantic_tree::{
+            EnumToken, ItemId, ModelId, ModelItem, Revision, Transaction as DomainTransaction,
+        };
+
+        let session = Session::new("promotion-guard");
+        let model = ModelId::new(7);
+        let table = NodeId::new(2);
+        session
+            .transaction(|ui| {
+                ui.create_node(NodeId::new(1), TypeRef::SURFACE, None, None, [])?;
+                ui.apply_op(&Operation::create_model(model, TypeRef::TABLE, 0))?;
+                ui.apply_op(&Operation::model_insert(
+                    model,
+                    0,
+                    (1..=5u64).map(|i| ModelItem::with_value(ItemId::new(i), Value::from(i))),
+                ))?;
+                ui.create_node(
+                    table,
+                    TypeRef::TABLE,
+                    Some(NodeId::new(1)),
+                    None,
+                    [
+                        (PropertyRef::MODEL_REF, Value::UnsignedInt(model.get())),
+                        (
+                            PropertyRef::SELECTION_MODE,
+                            Value::EnumToken(EnumToken::SELECTION_MODE_SINGLE),
+                        ),
+                    ],
+                )?;
+                ui.promote_selection(table, ItemId::new(3))
+            })
+            .expect("setup");
+        let revision = session.current_revision();
+
+        for ops in [
+            vec![Operation::model_reset_range(
+                model,
+                2,
+                [ModelItem::with_value(
+                    ItemId::new(50_000),
+                    Value::from(0u64),
+                )],
+                None,
+            )],
+            vec![Operation::set_property(
+                table,
+                PropertyRef::VALUE,
+                Value::ItemId(ItemId::new(999_999)),
+            )],
+        ] {
+            let wire: Transaction = (&DomainTransaction::new(Revision::new(revision), ops)).into();
+            let err = session
+                .commit_transaction(wire)
+                .expect_err("dangling promotion");
+            assert!(
+                matches!(err, SessionError::Store(StoreError::ItemNotFound(_))),
+                "{err:?}"
+            );
+            assert_eq!(session.current_revision(), revision);
+        }
+        session.with_store(|store| {
+            assert_eq!(
+                store.get_node(table).unwrap().promoted_selection(),
+                Some(ItemId::new(3))
+            );
+        });
     }
 }

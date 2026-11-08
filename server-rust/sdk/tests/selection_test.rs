@@ -254,3 +254,188 @@ fn a_later_promotion_replaces_the_previous_one_and_clear_withdraws_it() {
         .unwrap();
     assert_eq!(none, None);
 }
+
+// -----------------------------------------------------------------------------------------------
+// Round 1: every authoritative way to lose the promoted item, and raw promotions (§6.3, §8).
+// -----------------------------------------------------------------------------------------------
+
+fn row(id: u64) -> srui_semantic_tree::ModelItem {
+    srui_semantic_tree::ModelItem::with_value(ItemId::new(id), Value::String(format!("row {id}")))
+}
+
+fn promoted_41() -> Session {
+    let session = session(SelectionMode::Single);
+    session
+        .transaction(|ui| ui.promote_selection(TABLE, ItemId::new(41)))
+        .unwrap();
+    session
+}
+
+#[test]
+fn reset_range_replacing_the_item_clears_the_promotion() {
+    // The verifier's probe: ItemId 41 sits at index 40.
+    let session = promoted_41();
+    session
+        .transaction(|ui| {
+            ui.apply_op(&Operation::model_reset_range(
+                MODEL,
+                40,
+                [row(50_000)],
+                None,
+            ))
+        })
+        .unwrap();
+    assert_eq!(promoted(&session), None);
+    session.with_store(|store| assert!(srui_sdk::selection::dangling_promotions(store).is_empty()));
+
+    // A reset that keeps the item (re-sent at the same or a different index in the window)
+    // keeps the promotion.
+    let session = promoted_41();
+    session
+        .transaction(|ui| {
+            ui.apply_op(&Operation::model_reset_range(
+                MODEL,
+                40,
+                [row(50_001), row(41)],
+                None,
+            ))
+        })
+        .unwrap();
+    assert_eq!(promoted(&session), Some(ItemId::new(41)));
+}
+
+#[test]
+fn positional_update_displacing_the_item_clears_the_promotion() {
+    let session = promoted_41();
+    session
+        .transaction(|ui| ui.apply_op(&Operation::model_update(MODEL, Some(40), [row(60_000)])))
+        .unwrap();
+    assert_eq!(promoted(&session), None);
+}
+
+#[test]
+fn model_ref_change_or_clear_clears_a_promotion_the_new_model_lacks() {
+    let other = ModelId::new(8);
+    let with_item = ModelId::new(9);
+    for (target, keeps) in [(Some(other), false), (Some(with_item), true), (None, false)] {
+        let session = promoted_41();
+        session
+            .transaction(|ui| {
+                ui.apply_op(&Operation::create_model(other, TypeRef::TABLE, 0))?;
+                ui.apply_op(&Operation::model_insert(other, 0, [row(1)]))?;
+                ui.apply_op(&Operation::create_model(with_item, TypeRef::TABLE, 0))?;
+                ui.apply_op(&Operation::model_insert(with_item, 0, [row(41)]))?;
+                match target {
+                    Some(model) => ui
+                        .set(TABLE, MODEL_REF, Value::UnsignedInt(model.get()))
+                        .map(|_| ()),
+                    None => ui.clear(TABLE, MODEL_REF).map(|_| ()),
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            promoted(&session),
+            keeps.then_some(ItemId::new(41)),
+            "model_ref -> {target:?}"
+        );
+    }
+}
+
+#[test]
+fn deleting_the_collection_node_removes_its_promotion() {
+    let session = promoted_41();
+    session
+        .transaction(|ui| ui.delete(TABLE).map(|_| ()))
+        .unwrap();
+    session.with_store(|store| {
+        assert!(store.get_node(NodeId::new(TABLE)).is_none());
+        assert!(srui_sdk::selection::dangling_promotions(store).is_empty());
+    });
+}
+
+#[test]
+fn raw_set_of_an_unknown_item_is_refused_and_rolled_back() {
+    let session = session(SelectionMode::Single);
+    let revision = session.current_revision();
+    let err = session
+        .transaction(|ui| {
+            ui.set(TABLE, LABEL, "renamed")?;
+            ui.set(TABLE, VALUE, Value::ItemId(ItemId::new(999_999)))
+                .map(|_| ())
+        })
+        .expect_err("unknown item");
+    assert!(
+        matches!(err, SdkError::Store(StoreError::ItemNotFound(id)) if id == ItemId::new(999_999)),
+        "{err:?}"
+    );
+    assert_eq!(session.current_revision(), revision);
+    assert_eq!(promoted(&session), None);
+    session.with_store(|store| {
+        assert!(!store
+            .get_node(NodeId::new(TABLE))
+            .unwrap()
+            .has_property(LABEL));
+    });
+
+    // A raw promotion of a held item is accepted.
+    session
+        .transaction(|ui| {
+            ui.set(TABLE, VALUE, Value::ItemId(ItemId::new(7)))
+                .map(|_| ())
+        })
+        .unwrap();
+    assert_eq!(promoted(&session), Some(ItemId::new(7)));
+}
+
+#[test]
+fn raw_batch_and_create_node_of_an_unknown_item_are_refused() {
+    let session = session(SelectionMode::Single);
+    let err = session
+        .transaction(|ui| {
+            ui.apply_op(&Operation::batch_property_set(
+                NodeId::new(TABLE),
+                [(VALUE, Value::ItemId(ItemId::new(999_999)))],
+            ))
+        })
+        .expect_err("unknown item in batch");
+    assert!(
+        matches!(err, SdkError::Store(StoreError::ItemNotFound(_))),
+        "{err:?}"
+    );
+
+    let err = session
+        .transaction(|ui| {
+            ui.create_node(
+                4u64,
+                TypeRef::TABLE,
+                Some(NodeId::new(SURFACE)),
+                None,
+                [
+                    (MODEL_REF, Value::UnsignedInt(MODEL.get())),
+                    (
+                        SELECTION_MODE,
+                        Value::EnumToken(SelectionMode::Single.into()),
+                    ),
+                    (VALUE, Value::ItemId(ItemId::new(999_999))),
+                ],
+            )
+        })
+        .expect_err("unknown item in create_node");
+    assert!(
+        matches!(err, SdkError::Store(StoreError::ItemNotFound(_))),
+        "{err:?}"
+    );
+    session.with_store(|store| assert!(store.get_node(NodeId::new(4)).is_none()));
+}
+
+#[test]
+fn promoting_then_deleting_the_item_in_one_transaction_is_refused() {
+    let session = session(SelectionMode::Single);
+    let err = session
+        .transaction(|ui| {
+            ui.promote_selection(TABLE, ItemId::new(9))?;
+            ui.apply_op(&Operation::model_delete_items(MODEL, [ItemId::new(9)]))
+        })
+        .expect_err("a promotion assigned in this transaction must name a held item");
+    assert!(matches!(err, SdkError::Store(StoreError::ItemNotFound(_))));
+}

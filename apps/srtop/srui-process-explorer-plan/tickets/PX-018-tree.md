@@ -54,3 +54,7 @@ Apply the standing completion contract. Record evidence in `docs/process-explore
 ### Reference lookup
 
 Read [BASELINE.md](../BASELINE.md) and [SOURCES.md](../SOURCES.md). Verify version-specific OS/API details at implementation time and record exact references in the completion note.
+
+### Hand-off from PX-017
+
+Per PX-017, follow selected process is bound to the process table, so PX-018 must carry follow into the tree view (following the same item ID) or stop it explicitly with a visible reason when the user switches views.

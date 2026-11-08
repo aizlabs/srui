@@ -18,7 +18,7 @@
 use srui_process_explorer::catalogue::ProcessField;
 use srui_process_explorer::follow::{FOLLOW_LABEL, OFF_STATUS};
 use srui_process_explorer::refresh::{lock_view, ProcessView, SharedView};
-use srui_process_explorer::source::{FollowSource, ProcessSource};
+use srui_process_explorer::source::{FollowSource, ProcessSource, FOLLOW_STATUS_TEXT};
 use srui_process_explorer::{
     install_follow_handlers, install_inspector, start_from_source, FOLLOW_STATUS, FOLLOW_TOGGLE,
     INSPECTOR_STATUS, MODEL, SORT_CPU, SORT_PID, TABLE,
@@ -571,16 +571,115 @@ fn selecting_another_row_follows_it_and_a_replaced_selection_is_restored() {
     );
 }
 
-/// With follow off, an early selection is never promoted back: nothing is
-/// promoted on a selection at all.
+/// With follow off, a selection made before a real promotion (here a search
+/// match, PX-011) reached the client is never promoted back: nothing is
+/// promoted on a selection at all, however stale its `observed_revision`.
 #[test]
 fn non_follow_mode_never_promotes_on_a_selection() {
     let mut h = harness();
     let tracked = h.item_of(FollowSource::TRACKED_PID.into());
     h.select(tracked);
+    h.view().set_search(&h.session, "task-05").unwrap();
+    let task_05 = h.item_of(6006);
+    assert_eq!(h.promoted(), Some(task_05), "the search promoted its match");
+    let promoted_at = h.view().last_promotion();
+    assert!(
+        promoted_at > 0 && promoted_at == h.revision(),
+        "a real promotion"
+    );
+    assert_eq!(h.view().follow().following(), None);
+    // Clicked before the client applied that promotion: the promotion
+    // replaced it on the client, and with follow off it stays replaced.
+    let task_03 = h.item_of(6004);
     let before = h.revision();
-    h.select_at(0, h.item_of(6004));
+    h.select_at(promoted_at - 1, task_03);
     assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(h.promoted(), Some(task_05));
+    assert!(!h.checked());
+    assert_eq!(h.status(), OFF_STATUS);
+    // The same after follow was on and turned off again.
+    h.select(tracked);
+    h.toggle(true);
+    h.toggle(false);
+    let promoted_at = h.view().last_promotion();
+    assert_eq!(h.promoted(), Some(tracked), "turning follow on promoted it");
+    let before = h.revision();
+    h.select_at(promoted_at - 1, task_03);
+    assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(h.view().follow().following(), None);
+}
+
+/// Follow and Pause view (PX-015): a paused view publishes no sample, so
+/// nothing is promoted for one; a user sort while paused that moves the
+/// followed row reveals it once; and the first sample after Resume view
+/// promotes nothing unless the row's index changed since it was last shown.
+#[test]
+fn follow_promotes_nothing_while_paused_and_after_resume_unless_the_row_moved() {
+    let mut h = harness();
+    let tracked = h.follow_tracked();
+    // Step 1: `tracked` moves to row 56 and is revealed there.
+    let before = h.revision();
+    h.sample();
+    assert_eq!(h.row_of(tracked), Some(55));
+    assert_eq!(promotions_since(&h.session, before), vec![tracked]);
+
+    // Pause; a sample that reaches the paused view (step 3 would move the
+    // row to 41) is discarded and promotes nothing.
+    let before = h.revision();
+    h.view().pause_view(&h.session).unwrap();
+    assert!(h.view().frozen().is_some());
+    let paused = snapshot_at(3);
+    h.view()
+        .apply(&h.session, FOLLOW_STATUS_TEXT, &paused)
+        .unwrap();
+    assert_eq!(h.row_of(tracked), Some(55), "a paused view keeps its rows");
+    assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert!(h.checked());
+
+    // Resume; the first sample (step 2) keeps the row at 56: nothing is
+    // promoted, so a pan made meanwhile is kept.
+    h.view().resume_view(&h.session).unwrap();
+    let resumed = snapshot_at(2);
+    h.view()
+        .apply(&h.session, FOLLOW_STATUS_TEXT, &resumed)
+        .unwrap();
+    assert_eq!(h.row_of(tracked), Some(55));
+    assert_eq!(
+        promotions_since(&h.session, before),
+        Vec::<ItemId>::new(),
+        "pause and resume alone promote nothing"
+    );
+
+    // Pause again; a sort by PID while paused moves the row to 10: revealed
+    // once.
+    h.view().pause_view(&h.session).unwrap();
+    let before = h.revision();
+    h.sort(SORT_PID);
+    assert_eq!(h.row_of(tracked), Some(9));
+    assert_eq!(promotions_since(&h.session, before), vec![tracked]);
+    // Resume: the next sample keeps PID order, so the row stays at 10 and
+    // nothing is promoted; a later sample under CPU order moves it.
+    let before = h.revision();
+    h.view().resume_view(&h.session).unwrap();
+    h.view()
+        .apply(&h.session, FOLLOW_STATUS_TEXT, &snapshot_at(3))
+        .unwrap();
+    assert_eq!(h.row_of(tracked), Some(9));
+    assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    let before = h.revision();
+    h.sort(SORT_CPU);
+    assert_eq!(h.row_of(tracked), Some(FollowSource::RANKS[3]));
+    assert_eq!(promotions_since(&h.session, before), vec![tracked]);
+    assert_eq!(h.view().follow().following(), Some(tracked));
+}
+
+/// The fixture's snapshot for `step`, independent of the harness's source.
+fn snapshot_at(step: usize) -> srui_process_explorer::source::ProcessSnapshot {
+    let mut source = FollowSource::default();
+    for _ in 0..step {
+        source.snapshot();
+    }
+    source.snapshot()
 }
 
 /// The fixture moves only `tracked`, to the scripted rank, and reuses its PID

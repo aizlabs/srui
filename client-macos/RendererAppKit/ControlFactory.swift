@@ -63,6 +63,10 @@ public final class ControlFactory {
     /// Promoted and local selection per collection node, kept across remounts (§6.3, §22.5).
     var collectionSelectionMemory: [NodeId: CollectionSelectionMemory] = [:]
 
+    /// Key-equivalent hook every Surface window's content view consults first (PX-016-G01).
+    /// `LayoutRenderer` points it at its `ShortcutRouter`.
+    public var shortcutKeyEquivalentHandler: (@MainActor (NSEvent, NSWindow) -> Bool)?
+
     public init(
         textEditingSession: TextEditingSession = TextEditingSession(),
         terminalSession: TerminalSession = TerminalSession(),
@@ -139,9 +143,14 @@ public final class ControlFactory {
             // Keep window geometry independent from the semantic stack's intrinsic fitting size.
             // Otherwise content growth can resize the NSWindow and user resizing never reaches
             // flexible descendants such as Terminal.
-            let windowContentView = NSView(frame: initialFrame)
+            let windowContentView = SurfaceContentView(frame: initialFrame)
             windowContentView.autoresizingMask = [.width, .height]
+            windowContentView.keyEquivalentHandler = { [weak self] event, window in
+                self?.shortcutKeyEquivalentHandler?(event, window) ?? false
+            }
             window.contentView = windowContentView
+            // Tab order follows the semantic tree's geometry after every mount (§22.5).
+            window.autorecalculatesKeyViewLoop = true
             // Semantic minimum-size constraints may raise the window's fitting minimum, but they
             // must never collapse its maximum to that same value. Keep both resize axes open.
             window.contentMaxSize = NSSize(width: 10_000, height: 10_000)
@@ -391,6 +400,9 @@ public final class ControlFactory {
             if let button = handle.view as? NSButton {
                 button.title = label ?? defaultLabel(for: handle.nodeType)
             }
+            if handle.accessibilityMetadata.shortcut != nil {
+                refreshShortcutDiscoverability(of: handle)
+            }
             if let table = tableView(in: handle) {
                 let adapter = handle.modelAdapter as? TableCollectionAdapter
                 let hasExplicitColumns = adapter?.hasExplicitColumns ?? false
@@ -403,6 +415,9 @@ public final class ControlFactory {
             let description = value?.asString
             handle.accessibilityMetadata.description = description
             handle.view.setAccessibilityHelp(description)
+            if handle.accessibilityMetadata.shortcut != nil {
+                refreshShortcutDiscoverability(of: handle)
+            }
 
         case .valueDescription:
             let description = value?.asString
@@ -593,6 +608,9 @@ public final class ControlFactory {
 
         case .presentationHint, .actionKey:
             break
+
+        case .shortcut:
+            applyShortcut(value, to: handle)
 
         case .validationState:
             handle.textAdapter?.applyValidation(value)

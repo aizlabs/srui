@@ -16,6 +16,7 @@ These fixtures encode the formal behavioral invariants of the SRUI distributed s
 - **Safety Limits (§26)**: Enforcement of tree depth, node count, transaction operation count, string length, and collection model bounds.
 - **Collection Models (§8, §13)**: Large-scale virtualized data mutation (`CREATE_MODEL`, `MODEL_INSERT`, `MODEL_UPDATE`, `MODEL_RESET_RANGE`, `MODEL_DELETE`).
 - **Promoted Collection Selection (§6.3, §7.6, §8)**: A `List`/`Table`/`Tree` `value` holds a server-promoted selection only as an `ItemId`, and only while `selection_mode` is `single` or `multiple` (vectors 50–53). Item presence is not a store rule, because a sparse replica may not cache the item.
+- **Keyboard Shortcuts (§4 inv. 13, §7.4, §7.7, §22.5, §26)**: the standard `shortcut` property is accepted on admitted types only (`shortcut_not_admitted`), refused outside the closed canonical grammar — bare printable key, unknown token, duplicate or misordered modifier, over 32 bytes, non-string (`invalid_shortcut`) — and unique within one Surface, including across `MOVE_NODE` (`duplicate_shortcut`); exchanging two shortcuts clears one first (vectors 54–66).
 - **Semantic-Not-Paint (§4.7, §4.16, §4.17, §32.3)**: Standard Widget Profile contains only semantic intent and state, strictly forbidding display frame cadence, paint instructions, and mandatory absolute pixel geometry.
 
 ---

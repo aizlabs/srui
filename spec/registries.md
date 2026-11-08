@@ -83,12 +83,12 @@ Design-doc tier groupings for reference:
 > **Admission Rule for Standard Widgets (§7.2)**: A widget belongs in the Standard Profile only if its meaning and state machine are stable across multiple major desktop toolkit families (AppKit, WinUI, GTK, SWT), its behavior is specified without reference to a particular drawing API, and it supports accessibility mapping.
 
 ### 4.2 Common Properties (§7.4, §8)
-The canonical registry defines 30 standard properties in five categories:
+The canonical registry defines 31 standard properties in five categories:
 1. **Identity & Accessibility** (§7.4)
 2. **Common State** (§7.4)
 3. **Content** (§7.4)
 4. **Layout Intent** (§7.4)
-5. **Control-Specific & Semantic Metadata** (§8): `presentation_hint`, `action_key`, `columns`, `selection_mode`
+5. **Control-Specific & Semantic Metadata** (§7.7, §8): `presentation_hint`, `action_key`, `columns`, `selection_mode`, `shortcut`
 
 Each property entry includes `value_type` metadata validated by the registry tool.
 
@@ -100,6 +100,18 @@ Each property entry includes `value_type` metadata validated by the registry too
 - **Pre-built commits:** a commit submitted through sessiond `commit_transaction` cannot gain the clearing operation, so one whose result would leave a dangling promotion is refused with `item_not_found` rather than cleared.
 - **Rendering:** a committed operation setting `value` selects the item's row, replacing local selection, and reveals it once; other commits never move the selection or scroll. Withdrawing the promotion (clearing `value`) keeps any selection the user made after the promotion; only an untouched promoted row is deselected, without a `SELECTION_CHANGED`.
 - **Fallback (§4 inv. 13 optional semantics):** a client without support ignores the collection `value` and keeps local-only selection, as §6.3 and §22.5 describe; `SELECTION_CHANGED` is still sent for user selections.
+
+**`shortcut` — platform-neutral keyboard shortcut (property 31; §4 inv. 13, §7.4, §7.6, §7.7, §22.5, §22.8, §22.9, §26).** A shortcut is local input routing to an existing semantic outcome, never a new wire event:
+
+- **Value:** a string in the closed canonical grammar `[primary+][shift+][alt+]<key>`, at most 32 bytes (`MAX_SHORTCUT_BYTES`). `<key>` is one lowercase ASCII letter `a`–`z` or digit `0`–`9`, or one of `return`, `escape`, `tab`, `space`, `delete`, `up`, `down`, `left`, `right`, `home`, `end`, `page_up`, `page_down`, `f1`–`f12`. Modifiers appear at most once and in that order, so each combination has exactly one spelling. `primary` is Command on macOS and Control elsewhere.
+- **Bare keys:** every key except `f1`–`f12` requires `primary`, so a bare letter, digit or editing key never competes with a text editor, a collection or the key-view loop.
+- **Failure (§4 inv. 13):** a non-string, empty, over-length, unknown-token (including upper case), duplicate-modifier, misordered-modifier, modifier-only or bare-key value is refused with `invalid_shortcut` on every decode path (node records, `SET_PROPERTY`, `BATCH_PROPERTY_SET`; vectors `malformed_shortcut_*.bin`) and again at apply.
+- **Admission by node type:** `Button` — the client dispatches `ACTIVATE` through the same target/action path as a click; `Toggle` — it flips the value and sends the ordinary `VALUE_CHANGED`; `TextInput`, `TextArea`, `List`, `Table`, `Tree`, `RichText` — it moves local focus only and sends no event (§22.5). Any other node type is refused with `shortcut_not_admitted`.
+- **Uniqueness:** within one `Surface` (the nearest `Surface` ancestor-or-self, or the root when there is none; a nested `Surface` is its own scope) no two nodes hold the same shortcut. `CREATE_NODE`, `SET_PROPERTY`, `BATCH_PROPERTY_SET` and a `MOVE_NODE` that changes scope are refused with `duplicate_shortcut`. Checks run per operation on every replica, so exchanging two shortcuts clears one first.
+- **Client dispatch:** never while the first responder has marked text (IME), never for a disabled, hidden or collapsed node (or one under a hidden or collapsed ancestor), and never when the node's window is not key. The server still validates the resulting event like any other and refuses a forged event to a disabled node with `NodeDisabled`.
+- **Reserved combinations:** a shortcut in the platform's reserved table is never bound and yields a renderer diagnostic. macOS: Cmd-Q, Cmd-W, Cmd-H, Opt-Cmd-H, Cmd-M, Cmd-Tab, Cmd-`, Cmd-comma, Cmd-C, Cmd-V, Cmd-X, Cmd-A, Cmd-Z, Shift-Cmd-Z, Cmd-Space, Ctrl-Cmd-F, Cmd-? (entries the grammar cannot express, such as Cmd-comma, are listed for completeness).
+- **Discoverability (§22.8, §22.9):** the platform-formatted shortcut (macOS `⇧⌘R`) appears in the control's tooltip, its accessibility help and the semantic inspection snapshot.
+- **Fallback (§4 inv. 13 optional semantics):** a client without support ignores the property; the node stays reachable by pointer, Tab and accessibility, and the application's behavior is unchanged.
 
 ### 4.3 Standard Enums (§7.5, §7.2, §7.4, §8)
 The canonical registry defines 12 standard enum types with monotonic type IDs ($1 \ldots 12$) and contiguous value IDs within each enum.

@@ -382,6 +382,27 @@
       "hex": "0762050814108020",
       "byte_length": 8,
       "expected_error": "empty TerminalData frame is forbidden"
+    },
+    "malformed_shortcut_over_length": {
+      "file": "malformed_shortcut_over_length.bin",
+      "sha256": "0bb0f88e43fa063393d0f2cce62e47fa2ec723c6063be8b15b7dee8e9f4f7847",
+      "hex": "353233080710081a2d1a2b08021202101f1a2332217072696d6172792b73686966742b616c742b706167655f646f776e2b7878787878",
+      "byte_length": 54,
+      "expected_error": "wire transaction error: invalid shortcut: a shortcut is at most 32 bytes, got 33"
+    },
+    "malformed_shortcut_unknown_token": {
+      "file": "malformed_shortcut_unknown_token.bin",
+      "sha256": "81225fa55125ead231b046c7629cfc6d4f26813effd7cc5a3d0b325e64317d2a",
+      "hex": "193217080710081a111a0f08021202101f1a073205636d642b72",
+      "byte_length": 26,
+      "expected_error": "wire transaction error: invalid shortcut: unknown shortcut token \"cmd\""
+    },
+    "malformed_shortcut_duplicate_modifier": {
+      "file": "malformed_shortcut_duplicate_modifier.bin",
+      "sha256": "7acfb6b8702b92c42a52b9b561c30dd46a54b64b41bcff5fe4b342025e24c796",
+      "hex": "253223080710081a1d1a1b08021202101f1a1332117072696d6172792b7072696d6172792b72",
+      "byte_length": 38,
+      "expected_error": "wire transaction error: invalid shortcut: modifier \"primary\" appears more than once"
     }
   }
 }

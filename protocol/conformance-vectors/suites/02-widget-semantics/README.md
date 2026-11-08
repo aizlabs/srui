@@ -13,12 +13,15 @@ scripts/run-conformance --suite 2
 
 Code-driven suite: no shared fixtures. This suite asserts behaviour against the registry tables `build.rs` and `generate_swift_registry.py` already generate, rather than introducing a second copy of the registry.
 
+Shortcut admission (PX-016-G01): `shortcut_test` and `ShortcutStoreTests` accept the standard `shortcut` property on exactly Button, Toggle, TextInput, TextArea, List, Table, Tree and RichText and refuse it on every other registry node type (`shortcut_not_admitted`); `widgets_test` covers the SDK builder/set/clear on each admitted widget; suite 1 vectors 54–56 replay the same rules in both languages.
+
 ## Runners
 
 **Rust**
 
 ```bash
 cargo test --manifest-path server-rust/Cargo.toml -p srui-sdk --test widgets_test
+cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test shortcut_test
 ```
 
 **Swift**
@@ -27,6 +30,8 @@ cargo test --manifest-path server-rust/Cargo.toml -p srui-sdk --test widgets_tes
 swift test --package-path client-macos --filter WidgetSemanticsConformanceTests
 swift test --package-path client-macos --filter ControlFactoryTests
 swift test --package-path client-macos --filter ControlFactoryPropertyTests
+swift test --package-path client-macos --filter ShortcutStoreTests
+swift test --package-path client-macos --filter ShortcutRoutingTests
 ```
 
 ## Open gaps

@@ -1,0 +1,79 @@
+{
+  "name": "shortcut_bare_printable_key_rejected",
+  "description": "A printable key without primary is refused so a bare letter never competes with a text editor (§22.5, §22.6).",
+  "spec_sections": [
+    "§4",
+    "§7.4",
+    "§7.6",
+    "§7.7",
+    "§12.1",
+    "§22.5",
+    "§26"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Shortcuts"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Button",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "label": "Refresh",
+            "shortcut": "primary+r"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 3,
+          "node_type": "Button",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "label": "Pause",
+            "shortcut": "primary+p"
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "SET_PROPERTY",
+        "node_id": 2,
+        "property": "label",
+        "value": "Reload"
+      },
+      {
+        "type": "SET_PROPERTY",
+        "node_id": 2,
+        "property": "shortcut",
+        "value": "r"
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "invalid_shortcut",
+    "failed_op_index": 1,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

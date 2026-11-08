@@ -21,6 +21,8 @@ change: it requires per-editor `edit_seq`, composition/coalescing, resume, and a
 handling owned by `TextEditingSession`. Text editors remain inspectable and advertise their
 registry-owned `EVENT_TEXT_EDIT`; `setValue` is not an alias for text entry.
 
+Shortcuts (PX-016-G01): `SemanticInspectorTests` asserts each node snapshot carries its canonical `shortcut` and the platform-formatted `shortcutDisplay` (none for a reserved combination), and that a shortcut adds no advertised event type.
+
 ## Runners
 
 **Swift**

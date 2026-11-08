@@ -1,0 +1,56 @@
+{
+  "name": "shortcut_refused_on_surface_create_rejected",
+  "description": "CREATE_NODE of a Surface carrying a shortcut is refused: a Surface does not admit one (§7.4).",
+  "spec_sections": [
+    "§4",
+    "§7.4",
+    "§7.6",
+    "§7.7",
+    "§12.1",
+    "§22.5",
+    "§26"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 20,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Existing window"
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "CREATE_NODE",
+        "node_id": 1,
+        "node_type": "Surface",
+        "parent_id": null,
+        "child_index": null,
+        "properties": {
+          "label": "Shortcuts",
+          "shortcut": "primary+r"
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "shortcut_not_admitted",
+    "failed_op_index": 0,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

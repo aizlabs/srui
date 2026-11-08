@@ -442,6 +442,49 @@ fn main() {
         fs::write(out_dir.join(name), &bytes).expect("write snapshot-framing vector");
         println!("Wrote {name} ({} bytes)", bytes.len());
     }
+
+    // 21–23. Protobuf-valid transactions whose standard `shortcut` (property 31) is outside the
+    // closed canonical grammar (PX-016-G01; §4 inv. 13, §26). Every decode path refuses them
+    // before any store sees them.
+    for (name, shortcut) in malformed_shortcut_vectors() {
+        let message = SruiMessage {
+            msg: Some(srui_message::Msg::Transaction(Transaction {
+                base_revision: 7,
+                new_revision: 8,
+                priority: 0,
+                operations: vec![Operation {
+                    op: Some(operation::Op::SetProperty(SetPropertyOp {
+                        node_id: 2,
+                        property: Some(PropertyRef {
+                            namespace_id: STANDARD_NAMESPACE_ID,
+                            local_id: StandardProperty::PropertyShortcut as u32,
+                        }),
+                        value: Some(Value {
+                            value: Some(value::Value::StringValue(shortcut.to_string())),
+                        }),
+                    })),
+                }],
+            })),
+        };
+        let bytes = encode_framed(&message).expect("encode framed malformed shortcut vector");
+        fs::write(out_dir.join(name), &bytes).expect("write malformed shortcut vector");
+        println!("Wrote {name} ({} bytes)", bytes.len());
+    }
+}
+
+/// Malformed `shortcut` values: over-length (33 bytes), an unknown token, a duplicate modifier.
+fn malformed_shortcut_vectors() -> [(&'static str, &'static str); 3] {
+    [
+        (
+            "malformed_shortcut_over_length.bin",
+            "primary+shift+alt+page_down+xxxxx",
+        ),
+        ("malformed_shortcut_unknown_token.bin", "cmd+r"),
+        (
+            "malformed_shortcut_duplicate_modifier.bin",
+            "primary+primary+r",
+        ),
+    ]
 }
 
 /// Authored messages for the snapshot-framing golden vectors (PX-004-G01 extension; §26).

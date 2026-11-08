@@ -138,6 +138,11 @@ impl_bool_prop!(
     PropertyRef::SELECTED,
     "Selected state (§7.4)."
 );
+impl_shortcut_prop!(
+    Button,
+    ButtonBuilder,
+    "Keyboard shortcut; the client sends ACTIVATE exactly as a click does (§7.6, §7.7)."
+);
 impl_common_state_props!(Button, ButtonBuilder);
 impl_common_layout_props!(Button, ButtonBuilder);
 
@@ -335,6 +340,11 @@ impl_bool_prop!(
     op_clear_read_only_for,
     PropertyRef::READ_ONLY,
     "Whether the toggle is read-only (§7.4)."
+);
+impl_shortcut_prop!(
+    Toggle,
+    ToggleBuilder,
+    "Keyboard shortcut; the client sends VALUE_CHANGED exactly as a click does (§7.6, §7.7)."
 );
 impl_common_state_props!(Toggle, ToggleBuilder);
 impl_common_layout_props!(Toggle, ToggleBuilder);

@@ -66,6 +66,8 @@ impl TryFrom<srui_protocol::Operation> for Operation {
                     }
                     None => Value::Null,
                 };
+                crate::value::wire::validate_decoded_shortcut(property, &value)
+                    .map_err(|e| TxnError::WireError(e.to_string()))?;
                 Ok(Self::SetProperty {
                     id,
                     property,

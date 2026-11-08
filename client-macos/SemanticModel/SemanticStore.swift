@@ -9,6 +9,11 @@
 // enforces only the cache-independent rules shared with the Rust store — the value is an ItemId,
 // and it is held only while selection_mode is single or multiple.
 //
+// Standard property 31 `shortcut` (§4 inv. 13, §7.4, §7.7, §22.5, §26) is checked with the same
+// rules, order and error codes as the Rust store: the canonical grammar (`Shortcut.swift`), the
+// node type's admission, and uniqueness within one Surface (nearest Surface ancestor-or-self, or
+// the root), including MOVE_NODE into another Surface.
+//
 // Architectural Invariants (§4):
 // - Invariant 2: The client retains a non-authoritative replica of committed semantic UI state
 //   plus local presentation state. The replica exists only to render, interact, inspect, cache,
@@ -397,6 +402,12 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
     /// A List/Table/Tree promoted selection (`value`) is not an `ItemId`, or is held while the
     /// node's `selection_mode` is absent or `none` (§6.3, §7.4, §8).
     case invalidCollectionSelection(nodeID: NodeId, reason: String)
+    /// A `shortcut` value is not in the closed canonical grammar (§4 inv. 13, §26).
+    case invalidShortcut(nodeID: NodeId, reason: String)
+    /// A `shortcut` was set on a node type that does not admit one (§7.4).
+    case shortcutNotAdmitted(nodeID: NodeId, nodeType: TypeRef)
+    /// Another node in the same Surface already holds this `shortcut` (§7.4).
+    case duplicateShortcut(nodeID: NodeId, existing: NodeId, shortcut: String)
     /// Generic operation error when applying an operation.
     case operationError(String)
 
@@ -450,6 +461,12 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
             return "duplicate item ID \(itemID) in model \(modelID)"
         case .invalidCollectionSelection(let nodeID, let reason):
             return "invalid promoted selection on collection node \(nodeID): \(reason)"
+        case .invalidShortcut(let nodeID, let reason):
+            return "invalid shortcut on node \(nodeID): \(reason)"
+        case .shortcutNotAdmitted(let nodeID, let nodeType):
+            return "node \(nodeID) of type \(nodeType) does not admit a shortcut"
+        case .duplicateShortcut(let nodeID, let existing, let shortcut):
+            return "shortcut \"\(shortcut)\" on node \(nodeID) is already held by node \(existing) in the same Surface"
         case .operationError(let msg):
             return "operation application error: \(msg)"
         }
@@ -482,6 +499,9 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
         case .modelIndexOutOfBounds: return "model_index_out_of_bounds"
         case .duplicateItemId: return "duplicate_item_id"
         case .invalidCollectionSelection: return "invalid_collection_selection"
+        case .invalidShortcut: return "invalid_shortcut"
+        case .shortcutNotAdmitted: return "shortcut_not_admitted"
+        case .duplicateShortcut: return "duplicate_shortcut"
         case .operationError: return "operation_error"
         }
     }
@@ -924,7 +944,10 @@ public struct SemanticStore: Equatable, Sendable {
     ///
     /// Extension properties remain registry-defined and are validated by their negotiated handler.
     private func validatePropertyValueType(property: PropertyRef, value: Value) throws {
-        guard let expected = standardPropertyValueType(property), expected != .any else {
+        // `shortcut` has its own validator, which also requires a string, so it reports
+        // `invalid_shortcut` exactly as the Rust store does (§4 inv. 13).
+        guard property != .shortcut,
+              let expected = standardPropertyValueType(property), expected != .any else {
             return
         }
 
@@ -974,6 +997,73 @@ public struct SemanticStore: Equatable, Sendable {
                 nodeID: nodeID,
                 reason: "selection_mode is none or absent, so no selection can be promoted"
             )
+        }
+    }
+
+    /// The node that scopes shortcut uniqueness for `id`: its nearest Surface ancestor-or-self, or
+    /// its root when it has no Surface ancestor.
+    private func shortcutScope(_ id: NodeId) -> NodeId {
+        var current = id
+        while let node = nodes[current] {
+            if node.nodeType == .surface { return current }
+            guard let parent = node.parentID else { return current }
+            current = parent
+        }
+        return current
+    }
+
+    /// A node in `scope`, other than those in `exclude`, that already holds `shortcut`. The walk does
+    /// not descend into a nested Surface, which is its own scope.
+    ///
+    /// lc-debt: O(nodes in the Surface) per shortcut-setting operation; an index from
+    /// (scope, shortcut) to NodeId would make it O(1) at the cost of maintaining it on every
+    /// MOVE_NODE/DELETE_NODE.
+    private func findShortcutHolder(
+        scope: NodeId,
+        shortcut: String,
+        exclude: Set<NodeId>
+    ) -> NodeId? {
+        var stack = [scope]
+        while let id = stack.popLast() {
+            guard let node = nodes[id] else { continue }
+            if id != scope && node.nodeType == .surface { continue }
+            if !exclude.contains(id), node.properties[.shortcut]?.asString == shortcut {
+                return id
+            }
+            stack.append(contentsOf: node.orderedChildren)
+        }
+        return nil
+    }
+
+    private func checkShortcutUnique(nodeID: NodeId, scope: NodeId, value: Value) throws {
+        guard let shortcut = value.asString else { return }
+        if let existing = findShortcutHolder(scope: scope, shortcut: shortcut, exclude: [nodeID]) {
+            throw StoreError.duplicateShortcut(nodeID: nodeID, existing: existing, shortcut: shortcut)
+        }
+    }
+
+    /// Shortcut checks for a MOVE_NODE that would re-parent `id` under `newParentID`.
+    private func checkMoveKeepsShortcutsUnique(id: NodeId, newParentID: NodeId?) throws {
+        // A new root is its own scope; a moved Surface keeps its own scope.
+        guard let newParent = newParentID, nodes[id]?.nodeType != .surface else { return }
+        let destination = shortcutScope(newParent)
+        guard destination != shortcutScope(id) else { return }
+        var moved = Set<NodeId>()
+        var carried: [(NodeId, String)] = []
+        var stack = [id]
+        while let current = stack.popLast() {
+            guard let node = nodes[current] else { continue }
+            if current != id && node.nodeType == .surface { continue }
+            moved.insert(current)
+            if let shortcut = node.properties[.shortcut]?.asString {
+                carried.append((current, shortcut))
+            }
+            stack.append(contentsOf: node.orderedChildren)
+        }
+        for (holder, shortcut) in carried {
+            if let existing = findShortcutHolder(scope: destination, shortcut: shortcut, exclude: moved) {
+                throw StoreError.duplicateShortcut(nodeID: holder, existing: existing, shortcut: shortcut)
+            }
         }
     }
 
@@ -1053,6 +1143,13 @@ public struct SemanticStore: Equatable, Sendable {
             value: properties.last(where: { $0.0 == .value })?.1,
             selectionMode: properties.last(where: { $0.0 == .selectionMode })?.1
         )
+        for (prop, val) in properties where prop == .shortcut {
+            try validateShortcutValue(nodeID: id, nodeType: nodeType, value: val)
+        }
+        if let shortcut = properties.last(where: { $0.0 == .shortcut })?.1, let pid = parentID,
+           nodeType != .surface, nodes[pid] != nil {
+            try checkShortcutUnique(nodeID: id, scope: shortcutScope(pid), value: shortcut)
+        }
 
         // 5. Validate insertion index bounds
         if let pid = parentID {
@@ -1172,6 +1269,10 @@ public struct SemanticStore: Equatable, Sendable {
         guard let node = nodes[nodeID] else {
             throw StoreError.nodeNotFound(nodeID)
         }
+        if property == .shortcut {
+            try validateShortcutValue(nodeID: nodeID, nodeType: node.nodeType, value: value)
+            try checkShortcutUnique(nodeID: nodeID, scope: shortcutScope(nodeID), value: value)
+        }
         if property == .value {
             try validateCollectionSelection(
                 nodeID: nodeID,
@@ -1232,6 +1333,12 @@ public struct SemanticStore: Equatable, Sendable {
             selectionMode: properties.last(where: { $0.0 == .selectionMode })?.1
                 ?? node.properties[.selectionMode]
         )
+        for (prop, val) in properties where prop == .shortcut {
+            try validateShortcutValue(nodeID: nodeID, nodeType: node.nodeType, value: val)
+        }
+        if let shortcut = properties.last(where: { $0.0 == .shortcut })?.1 {
+            try checkShortcutUnique(nodeID: nodeID, scope: shortcutScope(nodeID), value: shortcut)
+        }
         for (prop, val) in properties {
             nodes[nodeID]?.properties[prop] = val
         }
@@ -1317,6 +1424,9 @@ public struct SemanticStore: Equatable, Sendable {
         if let idx = newChildIndex, idx < 0 || idx > currentDestLen {
             throw StoreError.childIndexOutOfBounds(index: idx, count: currentDestLen)
         }
+
+        // Shortcut uniqueness within the destination Surface (§7.4).
+        try checkMoveKeepsShortcutsUnique(id: nodeID, newParentID: newParentID)
 
         // 4. Remove from old location
         if let oldPID = oldParentID {

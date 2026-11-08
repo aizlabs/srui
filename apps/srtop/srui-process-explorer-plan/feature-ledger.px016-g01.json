@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-016-G01",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Generic platform-neutral semantic keyboard shortcuts (§4 inv. 13, §7.2, §7.4, §7.6, §7.7, §22.5, §22.6, §22.8, §22.9, §26, §32): one standard registry property, closed grammar enforced at decode and apply in Rust and Swift, node-type admission and Surface uniqueness, SDK builders, native AppKit key-equivalent dispatch with IME/disabled/hidden/key-window guards and a reserved table, discoverability, a standard Edit menu and key-view loop in the generic shell; no Process Explorer feature work and no application-specific client path",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX016G01-001",
+      "feature": "Standard registry property 31 `shortcut` (namespace 0, string, control_specific) added through protocol/registry.yaml and srui.proto with codegen: build.rs asserts 31 properties, srui.pb.swift and RegistryTables.swift regenerated with no residual diff, spec/registries.md documents grammar, admission, uniqueness, client guards, the macOS reserved table, discoverability and the fallback (a client without support ignores it)",
+      "scope": "PX-016-G01/protocol registry.yaml, srui.proto, generate_proto.sh outputs; server-rust/semantic-tree/build.rs; spec/registries.md",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-016-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-016-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX016G01-002",
+      "feature": "Closed canonical grammar [primary+][shift+][alt+]<key> (key: a-z, 0-9, return, escape, tab, space, delete, up, down, left, right, home, end, page_up, page_down, f1-f12), at most 32 bytes checked before parsing, every key except f1-f12 requires primary; non-string, empty, over-length, unknown token (including upper case), duplicate or misordered modifier, modifier-only and bare keys fail explicitly with identical reasons in Rust and Swift on every decode path (node records, SET_PROPERTY, BATCH_PROPERTY_SET, event arguments, model items, small records) and again at apply (invalid_shortcut); malformed wire vectors for over-length, unknown token and duplicate modifier",
+      "scope": "PX-016-G01/semantic-tree shortcut.rs, value/wire.rs validate_decoded_shortcut, transaction/wire.rs; client-macos SemanticModel/Shortcut.swift, Protocol/Decoder.swift checkDecodedShortcut, Protocol/WireConversions.swift; protocol/conformance-vectors malformed_shortcut_*.bin and expected.json",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-016-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-016-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX016G01-003",
+      "feature": "Both stores admit a shortcut on Button (ACTIVATE), Toggle (VALUE_CHANGED) and TextInput, TextArea, List, Table, Tree, RichText (focus only) and refuse it on every other node type (shortcut_not_admitted); no two nodes of one Surface (nearest Surface ancestor-or-self, or the root; a nested Surface is its own scope) hold the same shortcut across CREATE_NODE, SET_PROPERTY, BATCH_PROPERTY_SET and a scope-changing MOVE_NODE (duplicate_shortcut); refusals roll back the transaction; suite 1 vectors 54-66 replay identically in Rust and Swift",
+      "scope": "PX-016-G01/semantic-tree store/mod.rs and store/error.rs; client-macos SemanticModel/SemanticStore.swift; suites/01-core-state-machine/vectors 54-66; semantic-tree/tests/shortcut_test.rs; Tests/SemanticModelTests/ShortcutStoreTests.swift",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-016-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-016-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX016G01-004",
+      "feature": "SDK builder `.shortcut(...)`, getters, set_shortcut/clear_shortcut and op_set_shortcut/op_clear_shortcut on Button, Toggle, TextInput, TextArea, List, Table, Tree and RichText; accepts &str or a parsed Shortcut; refusals surface as StoreError, never silent drops",
+      "scope": "PX-016-G01/sdk widgets/macros.rs impl_shortcut_prop, buttons.rs, inputs.rs, collections.rs, text.rs, lib.rs re-exports; sdk/tests/widgets_test.rs",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-016-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-016-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX016G01-005",
+      "feature": "Generic AppKit renderer maps a shortcut to keyEquivalent, modifier mask and key code; a Surface window's content view routes key equivalents to the bound node: Button and Toggle through the control's own target/action exactly as a click (byte-identical semantic event), focus-only types through makeFirstResponder with no event; no dispatch while the first responder has marked text, for a disabled node or a hidden/collapsed node or ancestor, or when the window is not key; macOS reserved combinations are never bound and record a ShortcutDiagnostic; SET/CLEAR update the binding, tooltip and accessibility help in place (DirtyClassifier: accessibilityOnly)",
+      "scope": "PX-016-G01/client-macos RendererAppKit ShortcutRouting.swift, ControlFactory.swift, LayoutRenderer.swift, RenderHandle.swift, DirtyClassifier.swift; Tests/RendererAppKitTests/ShortcutRoutingTests.swift; Tests/SRUITests/ShortcutEventIdentityTests.swift",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-016-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-016-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX016G01-006",
+      "feature": "The platform-formatted shortcut is discoverable in the tooltip, accessibility help and the T35 semantic inspection snapshot (SemanticNodeSnapshot.shortcut and shortcutDisplay, none for a reserved combination); a shortcut adds no advertised event type",
+      "scope": "PX-016-G01/client-macos Accessibility/Accessibility.swift, RendererAppKit ShortcutRouting.swift refreshShortcutDiscoverability; Tests/AccessibilityTests/SemanticInspectorTests.swift",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-016-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-016-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX016G01-007",
+      "feature": "The generic client shell installs a standard Edit menu (Undo, Redo, Cut, Copy, Paste, Select All) targeted at the first responder, so Cmd-C in a TextInput copies through it and is never claimed by a Surface shortcut; every Surface window recalculates its key-view loop after mounts and remounts so Tab order survives a remount",
+      "scope": "PX-016-G01/client-macos ConnectionManager/ApplicationMenu.swift; RendererAppKit ControlFactory.swift (autorecalculatesKeyViewLoop) and LayoutRenderer.recalculateKeyViewLoops; Tests/SRUITests/ApplicationMenuTests.swift; ShortcutRoutingTests.tabOrderSurvivesARemount",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-016-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-016-G01.md"
+      ]
+    }
+  ]
+}

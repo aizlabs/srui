@@ -1,4 +1,4 @@
-use crate::ids::{ItemId, ModelId, NodeId};
+use crate::ids::{ItemId, ModelId, NodeId, TypeRef};
 use std::fmt;
 
 /// Errors returned by `SemanticStore` mutation operations.
@@ -56,6 +56,16 @@ pub enum StoreError {
     /// A List/Table/Tree promoted selection (`value`) is not an `ItemId`, or is held while the
     /// node's `selection_mode` is absent or `none` (§6.3, §7.4, §8).
     InvalidCollectionSelection { node_id: NodeId, reason: String },
+    /// A `shortcut` value is not in the closed canonical grammar (§4 inv. 13, §26).
+    InvalidShortcut { node_id: NodeId, reason: String },
+    /// A `shortcut` was set on a node type that does not admit one (§7.4).
+    ShortcutNotAdmitted { node_id: NodeId, node_type: TypeRef },
+    /// Another node in the same `Surface` already holds this `shortcut` (§7.4).
+    DuplicateShortcut {
+        node_id: NodeId,
+        existing: NodeId,
+        shortcut: String,
+    },
     /// Generic operation error when applying a wire operation.
     OperationError(String),
 }
@@ -162,6 +172,23 @@ impl fmt::Display for StoreError {
                 "invalid promoted selection on collection node {}: {}",
                 node_id, reason
             ),
+            Self::InvalidShortcut { node_id, reason } => {
+                write!(f, "invalid shortcut on node {}: {}", node_id, reason)
+            }
+            Self::ShortcutNotAdmitted { node_id, node_type } => write!(
+                f,
+                "node {} of type {} does not admit a shortcut",
+                node_id, node_type
+            ),
+            Self::DuplicateShortcut {
+                node_id,
+                existing,
+                shortcut,
+            } => write!(
+                f,
+                "shortcut {:?} on node {} is already held by node {} in the same Surface",
+                shortcut, node_id, existing
+            ),
             Self::OperationError(msg) => write!(f, "operation application error: {}", msg),
         }
     }
@@ -197,6 +224,9 @@ impl StoreError {
             Self::ModelIndexOutOfBounds { .. } => "model_index_out_of_bounds",
             Self::DuplicateItemId { .. } => "duplicate_item_id",
             Self::InvalidCollectionSelection { .. } => "invalid_collection_selection",
+            Self::InvalidShortcut { .. } => "invalid_shortcut",
+            Self::ShortcutNotAdmitted { .. } => "shortcut_not_admitted",
+            Self::DuplicateShortcut { .. } => "duplicate_shortcut",
             Self::OperationError(_) => "operation_error",
         }
     }

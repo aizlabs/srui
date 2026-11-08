@@ -18,7 +18,7 @@
       "status": "active",
       "vectors": {
         "dir": "suites/01-core-state-machine/vectors",
-        "count": 52
+        "count": 65
       },
       "rust": [
         [
@@ -64,6 +64,16 @@
           "srui-sdk",
           "--test",
           "widgets_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-semantic-tree",
+          "--test",
+          "shortcut_test"
         ]
       ],
       "swift": [
@@ -90,6 +100,22 @@
           "client-macos",
           "--filter",
           "ControlFactoryPropertyTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ShortcutStoreTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ShortcutRoutingTests"
         ]
       ],
       "gaps": [
@@ -224,6 +250,22 @@
           "client-macos",
           "--filter",
           "WidgetSemanticsConformanceTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ShortcutRoutingTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ShortcutEventIdentityTests"
         ]
       ],
       "gaps": [
@@ -264,6 +306,16 @@
           "srui-sessiond",
           "--test",
           "text_edit_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-semantic-tree",
+          "--test",
+          "shortcut_test"
         ]
       ],
       "swift": [
@@ -298,6 +350,22 @@
           "client-macos",
           "--filter",
           "NativeTextEditorAdapterTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ShortcutRoutingTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ApplicationMenuTests"
         ]
       ]
     },
@@ -536,6 +604,16 @@
           "srui-semantic-tree",
           "--test",
           "conformance_security_limits_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-semantic-tree",
+          "--test",
+          "shortcut_test"
         ]
       ],
       "swift": [
@@ -578,6 +656,14 @@
           "client-macos",
           "--filter",
           "SecurityLimitsConformanceTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ShortcutStoreTests"
         ]
       ]
     },
@@ -632,6 +718,14 @@
           "client-macos",
           "--filter",
           "NativeTextEditorAdapterTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ShortcutRoutingTests"
         ]
       ],
       "not_applicable": {
@@ -706,6 +800,14 @@
           "client-macos",
           "--filter",
           "ControlFactoryTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ShortcutRoutingTests"
         ]
       ],
       "not_applicable": {

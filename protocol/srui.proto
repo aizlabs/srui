@@ -86,6 +86,7 @@ enum StandardProperty {
   PROPERTY_ACTION_KEY = 28;
   PROPERTY_COLUMNS = 29;
   PROPERTY_SELECTION_MODE = 30;
+  PROPERTY_SHORTCUT = 31;
 }
 
 enum TextRole {

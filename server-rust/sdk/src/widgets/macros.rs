@@ -862,6 +862,35 @@ macro_rules! impl_common_layout_props {
     };
 }
 
+/// The standard `shortcut` property (31) on a widget whose node type admits one (§7.4, §7.7,
+/// §22.5): builder, getters, `set_shortcut`/`clear_shortcut` and their `op_*` forms.
+///
+/// The value is the canonical grammar of [`srui_semantic_tree::Shortcut`]; pass a `&str` such
+/// as `"primary+r"` or a parsed `Shortcut`. A value outside the grammar, a duplicate within the
+/// widget's `Surface`, or a node type that does not admit a shortcut is refused by the store
+/// when the operation is applied, never silently dropped (§4 inv. 13).
+macro_rules! impl_shortcut_prop {
+    ($widget:ident, $builder:ident, $doc:expr) => {
+        impl_string_prop!(
+            $widget,
+            $builder,
+            shortcut,
+            shortcut_of,
+            get_shortcut,
+            set_shortcut,
+            set_shortcut_for,
+            op_set_shortcut,
+            op_set_shortcut_for,
+            clear_shortcut,
+            clear_shortcut_for,
+            op_clear_shortcut,
+            op_clear_shortcut_for,
+            PropertyRef::SHORTCUT,
+            $doc
+        );
+    };
+}
+
 macro_rules! impl_common_state_props {
     ($widget:ident, $builder:ident) => {
         impl_enum_prop!(

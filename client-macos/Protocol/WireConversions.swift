@@ -125,6 +125,19 @@ extension EdgeInsets {
     }
 }
 
+// MARK: - Shortcut decode check (§4 inv. 13, §26)
+
+/// Refuses a standard `shortcut` value outside the closed canonical grammar on these wire
+/// conversions, as `ProtocolDecoder` and the Rust `validate_decoded_shortcut` do.
+func validateDecodedShortcut(_ property: PropertyRef, _ value: Value) throws {
+    guard property == .shortcut else { return }
+    do {
+        _ = try Shortcut(value: value)
+    } catch let error as ShortcutError {
+        throw ValueConversionError.invalidShortcut(error.description)
+    }
+}
+
 // MARK: - Property <-> SRUIProperty
 
 extension Property {
@@ -139,6 +152,7 @@ extension Property {
         } else {
             val = .null
         }
+        try validateDecodedShortcut(prop, val)
         self.init(property: prop, value: val)
     }
 
@@ -372,6 +386,7 @@ extension StoreOperation {
             let id = NodeId(set.nodeID)
             let propRef = PropertyRef(wire: set.property)
             let val = set.hasValue ? try Value(wire: set.value) : .null
+            try validateDecodedShortcut(propRef, val)
             self = .setProperty(id: id, property: propRef, value: val)
 
         case .clearProperty_p(let clear):

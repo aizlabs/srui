@@ -104,6 +104,11 @@ impl_string_prop!(
     PropertyRef::ACCESSIBLE_DESCRIPTION,
     "Secondary accessibility description (§7.4)."
 );
+impl_shortcut_prop!(
+    List,
+    ListBuilder,
+    "Keyboard shortcut moving local focus to the list; no event is sent (§22.5)."
+);
 impl_common_state_props!(List, ListBuilder);
 impl_common_layout_props!(List, ListBuilder);
 
@@ -207,6 +212,11 @@ impl_string_prop!(
     PropertyRef::ACCESSIBLE_DESCRIPTION,
     "Secondary accessibility description (§7.4)."
 );
+impl_shortcut_prop!(
+    Table,
+    TableBuilder,
+    "Keyboard shortcut moving local focus to the table; no event is sent (§22.5)."
+);
 impl_common_state_props!(Table, TableBuilder);
 impl_common_layout_props!(Table, TableBuilder);
 
@@ -292,6 +302,11 @@ impl_string_prop!(
     op_clear_accessible_description_for,
     PropertyRef::ACCESSIBLE_DESCRIPTION,
     "Secondary accessibility description (§7.4)."
+);
+impl_shortcut_prop!(
+    Tree,
+    TreeBuilder,
+    "Keyboard shortcut moving local focus to the tree; no event is sent (§22.5)."
 );
 impl_common_state_props!(Tree, TreeBuilder);
 impl_common_layout_props!(Tree, TreeBuilder);

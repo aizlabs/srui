@@ -13,6 +13,8 @@ scripts/run-conformance --suite 5
 
 Code-driven suite: no shared fixtures. This suite asserts behaviour against the registry tables `build.rs` and `generate_swift_registry.py` already generate, rather than introducing a second copy of the registry.
 
+Shortcuts (PX-016-G01): a shortcut is not an event. `conformance_semantic_input_test` and `ShortcutEventIdentityTests` show a Button shortcut produces the same `ACTIVATE` (byte-identical encoding) as a click and a Toggle shortcut the same `VALUE_CHANGED`; a forged event to a disabled node is still refused with `NodeDisabled`. `ShortcutRoutingTests` drives real `NSEvent`s: a disabled, hidden or collapsed node, or a non-key window, gets no event, and a focus shortcut (TextInput, TextArea, Table, RichText) emits none.
+
 ## Runners
 
 **Rust**
@@ -26,6 +28,8 @@ cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test c
 ```bash
 swift test --package-path client-macos --filter SemanticInputConformanceTests
 swift test --package-path client-macos --filter WidgetSemanticsConformanceTests
+swift test --package-path client-macos --filter ShortcutRoutingTests
+swift test --package-path client-macos --filter ShortcutEventIdentityTests
 ```
 
 ## Open gaps

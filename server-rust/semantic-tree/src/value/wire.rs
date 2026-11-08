@@ -9,6 +9,8 @@ pub enum ValueConversionError {
     MissingField(&'static str),
     InvalidResourceHashLength(usize),
     InvalidNestedStructure(String),
+    /// A standard `shortcut` property value outside the closed canonical grammar (§4 inv. 13, §26).
+    InvalidShortcut(String),
 }
 
 impl fmt::Display for ValueConversionError {
@@ -21,11 +23,31 @@ impl fmt::Display for ValueConversionError {
                 write!(f, "expected 32-byte resource hash, got {} bytes", len)
             }
             Self::InvalidNestedStructure(msg) => write!(f, "invalid nested structure: {}", msg),
+            Self::InvalidShortcut(msg) => write!(f, "invalid shortcut: {}", msg),
         }
     }
 }
 
 impl std::error::Error for ValueConversionError {}
+
+/// Decode-time check of the standard `shortcut` property (§4 inv. 13, §26).
+///
+/// Every wire path that pairs a property with a value (node records, SET_PROPERTY,
+/// BATCH_PROPERTY_SET, event arguments, small records) calls this, so a malformed shortcut never
+/// reaches a store. The store repeats the check, plus node-type admission and uniqueness, at apply.
+pub fn validate_decoded_shortcut(
+    property: PropertyRef,
+    value: &Value,
+) -> Result<(), ValueConversionError> {
+    if property != PropertyRef::SHORTCUT {
+        return Ok(());
+    }
+    let result = match value {
+        Value::String(text) => crate::shortcut::Shortcut::parse(text).map(|_| ()),
+        _ => Err(crate::shortcut::ShortcutError::NotAString),
+    };
+    result.map_err(|e| ValueConversionError::InvalidShortcut(e.to_string()))
+}
 
 // In-Memory -> Wire Proto (borrowed: avoids cloning the full domain Value tree)
 impl From<&Value> for srui_protocol::Value {
@@ -181,6 +203,7 @@ impl TryFrom<srui_protocol::Property> for Property {
             .map(Value::try_from)
             .transpose()?
             .unwrap_or(Value::Null);
+        validate_decoded_shortcut(property, &value)?;
 
         Ok(Self { property, value })
     }

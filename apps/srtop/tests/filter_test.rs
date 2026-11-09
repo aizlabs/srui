@@ -63,6 +63,7 @@ fn record(
         display_name = display_name.with_command(cmd_bytes);
     }
     ProcessRecord {
+        lineage: srui_process_explorer::source::Lineage::NOT_COLLECTED,
         owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
         key: key(pid, token),
         display_name,

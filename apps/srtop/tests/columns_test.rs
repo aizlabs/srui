@@ -121,6 +121,7 @@ fn cpu(percent: u64) -> CpuUsage {
 
 fn record(pid: u32, name: &str, resident: u64, cpu: CpuUsage) -> ProcessRecord {
     ProcessRecord {
+        lineage: srui_process_explorer::source::Lineage::NOT_COLLECTED,
         owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
         key: key(pid, name),
         display_name: name.into(),

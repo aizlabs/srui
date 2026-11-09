@@ -24,7 +24,14 @@
 //! re-plans follow ([`crate::follow`]) last, after every row operation: the
 //! table's `keep_visible` hint (PX-017-G01) names the followed process while
 //! follow is on and nothing otherwise, so the client reveals it wherever a
-//! commit moves it, and follow never touches the selection.
+//! commit moves it, and follow never touches the selection. Since PX-018 the
+//! rows can be shown as a process tree instead ([`crate::tree`]): the same
+//! rows under the same item IDs, arranged on the server into one hierarchical
+//! `Tree` model whose index space is the forest's preorder. Exactly one of the
+//! two collections holds rows; a view switch empties one and fills the other
+//! in one transaction, and every tree edit is one index-based transaction,
+//! because a hierarchical model is judged whole after its last operation and a
+//! sparse replica cannot place an identity delete (PX-018-G01).
 //!
 //! Four rules shape this module:
 //!
@@ -115,20 +122,24 @@ use crate::search::{Search, SearchStep, SearchView};
 use crate::sort::{self, SortOrder};
 use crate::source::{ProcessSnapshot, ProcessSource, Retention};
 use crate::summary::{self, CollectorError, Sample};
+use crate::tree::{self, ForestSummary, Generation, ScanGaps};
 use crate::{
     bounded, initialize_rows, published_status_from, sort_button_of, ColumnAction, ScanReport,
     COLUMN_CHOOSER_BUTTONS, FILTER_INPUT, FILTER_STATUS, FOLLOW_STATUS, FOLLOW_TOGGLE,
     INSPECTOR_COMMAND, INSPECTOR_DETAILS, INSPECTOR_METRICS, INSPECTOR_PROCESS, INSPECTOR_STATUS,
-    INTERVAL_INPUT, MAX_PUBLISHED_LABEL_BYTES, MODEL, OWNER_ALL, OWNER_INPUT, OWNER_MINE,
-    OWNER_STATUS, PID_GO, PID_INPUT, PID_SET_INPUT, SAMPLING_PAUSE, SAMPLING_REFRESH,
+    INTERVAL_INPUT, LIST_SHORTCUT, MAX_PUBLISHED_LABEL_BYTES, MODEL, OWNER_ALL, OWNER_INPUT,
+    OWNER_MINE, OWNER_STATUS, PID_GO, PID_INPUT, PID_SET_INPUT, SAMPLING_PAUSE, SAMPLING_REFRESH,
     SAMPLING_STATUS, SEARCH_INPUT, SEARCH_NEXT, SEARCH_PREVIOUS, SEARCH_STATUS, STATUS, TABLE,
+    TREE, TREE_MODEL, VIEW_STATUS, VIEW_TOGGLE,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
 use srui_sdk::{
-    ItemId, NodeId, Operation, Value, COLUMNS, ENABLED, KEEP_VISIBLE, LABEL, TEXT, VALUE,
+    ItemId, ModelId, NodeId, Operation, PropertyRef, Tree, Value, Visibility, COLUMNS, ENABLED,
+    KEEP_VISIBLE, LABEL, TEXT, VALUE,
 };
 use srui_semantic_tree::{
     DEFAULT_MAX_CACHED_ITEMS_PER_MODEL, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
+    DEFAULT_MAX_MODEL_TREE_DEPTH,
 };
 use srui_sessiond::{Session, SessionError};
 use std::collections::{HashMap, HashSet};
@@ -310,6 +321,58 @@ pub const SAMPLING_RESERVE_BYTES: usize = 2048;
 /// with the status at its widest.
 pub const FOLLOW_RESERVE_BYTES: usize = 2048;
 
+/// Bytes reserved for the view switch and the process tree in a catch-up
+/// snapshot (PX-018): the row, the "Show process tree" `Toggle` with its
+/// label, description, shortcut and value, the view status at
+/// [`MAX_VIEW_STATUS_BYTES`], the tree's `CREATE_MODEL`, and the `Tree` node
+/// with its label, headings, selection mode, visibility, shortcut, promoted
+/// selection and `keep_visible` hint. Charged at this fixed reserve in both
+/// views, so switching views never changes the row budget's overheads;
+/// `the_shell_status_and_summary_fit_their_snapshot_allowances` measures it.
+pub const VIEW_RESERVE_BYTES: usize = 4096;
+
+/// The longest view status, before the cut mark (PX-018).
+pub const MAX_VIEW_STATUS_BYTES: usize = 512;
+
+/// What a model item of the process tree carries beyond a table row's: the
+/// two standard item properties `tree_depth` and `descendant_count`, each a
+/// property record holding one unsigned integer (PX-018).
+const TREE_ITEM_PROPERTIES_BYTES: usize =
+    2 * (RECORD_PROPERTY_BYTES + VALUE_FRAMING_BYTES + SCALAR_VALUE_BYTES);
+
+/// The view status while the table is shown (PX-018).
+pub const TABLE_VIEW_STATUS: &str =
+    "View: process table · Show process tree arranges the same processes under their parents";
+/// The view status of a shell that collects nothing (PX-018).
+pub const UNCOLLECTED_VIEW_STATUS: &str = "View disabled: process collection not started";
+
+/// Which collection shows the processes (PX-018): the table, or the process
+/// tree. Exactly one is shown and holds rows; the other's model is empty, so a
+/// catch-up snapshot never carries the collection twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Table,
+    Tree,
+}
+
+impl ViewMode {
+    /// The collection node of this view.
+    pub fn node(self) -> NodeId {
+        match self {
+            Self::Table => TABLE,
+            Self::Tree => TREE,
+        }
+    }
+
+    /// The model the collection node references.
+    pub fn model(self) -> ModelId {
+        match self {
+            Self::Table => MODEL,
+            Self::Tree => TREE_MODEL,
+        }
+    }
+}
+
 /// Bytes one `CLEAR_PROPERTY` settlement adds when a commit removes the
 /// promoted row (PX-011-G01) or the hinted row (PX-017-G01): a clear carries
 /// no value.
@@ -363,7 +426,9 @@ fn value_wire_bytes(value: &Value) -> usize {
 /// An upper bound on the bytes one row occupies inside a `MODEL_INSERT` or
 /// `MODEL_UPDATE` operation.
 fn row_wire_bytes(row: &Row) -> usize {
-    MODEL_ITEM_FRAMING_BYTES + value_wire_bytes(&row.value)
+    MODEL_ITEM_FRAMING_BYTES
+        + value_wire_bytes(&row.value)
+        + row.tree.as_ref().map_or(0, |_| TREE_ITEM_PROPERTIES_BYTES)
 }
 
 /// What one refresh published.
@@ -472,6 +537,25 @@ pub struct ProcessView {
     sampling: Sampling,
     /// The sampling controls as the client holds them (PX-015).
     sampling_published: SamplingView,
+    /// Which collection shows the processes (PX-018), as the store holds it
+    /// after the last commit. `rows` are that collection's model, in its
+    /// index order: the table's rows in the active order, or the tree's
+    /// preorder.
+    mode: ViewMode,
+    /// What the latest scan could not see (PX-018), which explains an absent
+    /// parent. Replaced, never grown, by every sample.
+    gaps: ScanGaps,
+    /// The tree items the client last reported collapsed (PX-018), through
+    /// `EXPANSION_CHANGED`. Disclosure is the client's (§22.5): this is only
+    /// what the server was told, used to say when a followed or selected
+    /// process is hidden under a collapsed parent. Bounded by the published
+    /// rows and pruned to them on every publication; emptied with the tree.
+    collapsed: HashSet<ItemId>,
+    /// The §26 `max_model_tree_depth` the tree is arranged under (PX-018): the
+    /// store's own limit, at most the wire default every client enforces.
+    tree_levels: usize,
+    /// The view status as the client holds it (PX-018).
+    view_status: String,
 }
 
 /// The rows every active filter keeps, and what the filters' controls say
@@ -488,6 +572,8 @@ struct Visible {
     /// Whether the user filter or the PID set is active.
     beyond_text: bool,
     owner: OwnerView,
+    /// What the published forest holds, in the tree view (PX-018).
+    forest: Option<ForestSummary>,
 }
 
 /// Why a column layout request was not published (PX-068).
@@ -543,6 +629,8 @@ impl ProcessView {
             inspector: &mut self.inspector_published,
             sampling: &mut self.sampling_published,
             follow: &mut self.follow_published,
+            mode: &mut self.mode,
+            view_status: &mut self.view_status,
         }
     }
 
@@ -675,6 +763,16 @@ impl ProcessView {
                 inspector_published: InspectorView::initial(true),
                 sampling,
                 sampling_published,
+                mode: ViewMode::Table,
+                gaps: ScanGaps::of(&snapshot),
+                collapsed: HashSet::new(),
+                tree_levels: session.with_store(|store| {
+                    store
+                        .limits()
+                        .max_model_tree_depth
+                        .min(DEFAULT_MAX_MODEL_TREE_DEPTH)
+                }),
+                view_status: TABLE_VIEW_STATUS.to_string(),
             },
             snapshot,
         ))
@@ -695,6 +793,38 @@ impl ProcessView {
     /// The most rows this view will publish.
     pub fn published_limit(&self) -> usize {
         self.published_limit
+    }
+
+    /// Lowers the levels the process tree may hold (PX-018).
+    ///
+    /// Like the row ceiling, it can only be lowered: never above the store's
+    /// own `max_model_tree_depth` or the wire default every client enforces,
+    /// and never below one level. It exists so a test can drive the depth
+    /// limit without a chain of 256 processes.
+    #[must_use]
+    pub fn with_tree_levels(mut self, levels: usize) -> Self {
+        self.tree_levels = self.tree_levels.min(levels.max(1));
+        self
+    }
+
+    /// The levels the process tree may hold (PX-018).
+    pub fn tree_levels(&self) -> usize {
+        self.tree_levels
+    }
+
+    /// Which collection shows the processes (PX-018).
+    pub fn view_mode(&self) -> ViewMode {
+        self.mode
+    }
+
+    /// The view status this view last published (PX-018).
+    pub fn view_status(&self) -> &str {
+        &self.view_status
+    }
+
+    /// The tree items the client last reported collapsed (PX-018).
+    pub fn collapsed(&self) -> &HashSet<ItemId> {
+        &self.collapsed
     }
 
     /// Samples the source once and publishes the difference.
@@ -759,9 +889,26 @@ impl ProcessView {
         // published-row ceiling leaves once this scan's own rows are counted.
         let evicted =
             evict_unconfirmed_beyond(&mut unfiltered_target, &confirmed_ids, self.published_limit);
+        // The rows this scan did not confirm, which a PID jump never selects
+        // (PX-011) and the tree never takes a parent from (PX-018): bounded by
+        // the collection, and replaced on every refresh.
+        let unconfirmed: HashSet<ItemId> = unfiltered_target
+            .iter()
+            .map(|row| row.item_id)
+            .filter(|id| !confirmed_ids.contains(id))
+            .collect();
+        // What this scan could not see, which explains an absent parent in the
+        // tree (PX-018). A rejected snapshot saw nothing it can be trusted on.
+        let gaps = if rejected.is_some() {
+            ScanGaps::default()
+        } else {
+            ScanGaps::of(snapshot)
+        };
         // Every filter is applied to the collection together (PX-012): the
-        // user filter, the PID set and the text filter.
-        let visible = self.visible(&unfiltered_target);
+        // user filter, the PID set and the text filter. The tree is arranged
+        // from this generation (PX-018).
+        let visible = self.visible_in(self.mode, &unfiltered_target, &unconfirmed, &gaps);
+        let forest = visible.forest;
         let (target, matched, filter_truncated) =
             (visible.rows, visible.matched, visible.truncated);
         let filter_matches = visible.restricted.then_some(matched);
@@ -779,13 +926,6 @@ impl ProcessView {
         if confirmed_empty && retention.is_global() {
             return self.publish_status_only(session, source_status, snapshot, rejected, summary);
         }
-        // The rows this scan did not confirm, which a PID jump never selects
-        // (PX-011): bounded by the collection, and replaced on every refresh.
-        let unconfirmed: HashSet<ItemId> = unfiltered_target
-            .iter()
-            .map(|row| row.item_id)
-            .filter(|id| !confirmed_ids.contains(id))
-            .collect();
         // A client receives the status and the rows in the same catch-up
         // snapshot, so the status is charged against the frame before the rows
         // are — at its fixed reserve, never at this tick's length, so no clause a
@@ -827,10 +967,10 @@ impl ProcessView {
         // client would see change are planned (PX-007).
         plan.extend(summary_effects(&self.summary, &summary));
         // Then the rows that changed place, each moved under its own item ID
-        // (PX-009), and only then what really appeared, ended or changed.
-        let moved = plan_moves(&self.rows, &target, batch, max_ops, max_bytes);
-        plan.extend(moved.plan);
-        plan.extend(diff(&moved.rows, &target, batch, max_bytes));
+        // (PX-009), and only then what really appeared, ended or changed; in
+        // the tree, one index-range unit (PX-018).
+        plan.extend(self.plan_rows(&target, batch, max_ops, max_bytes));
+        plan.extend(self.view_effects(self.mode, forest.as_ref()));
         // Last, the search re-counted against the rows this plan publishes, so
         // it commits with the final rows rather than ahead of them (PX-011),
         // and the inspector, whose metrics and state follow them (PX-013).
@@ -839,14 +979,9 @@ impl ProcessView {
         // Follow last of all (PX-017): it stops when this plan hides or ends
         // the followed process, and a hint it sets names the row's final
         // place, after every row operation of this plan.
-        plan.extend(follow_effects(
-            &mut self.follow,
-            &self.follow_published,
-            &target,
-            &unfiltered_target,
-            self.keep_visible,
-            self.promoted,
-        ));
+        self.follow.track(&target, &unfiltered_target);
+        let follow = self.follow_after(self.mode, &target, false, &plan);
+        plan.extend(follow);
 
         let mut result = Refreshed {
             retained,
@@ -866,6 +1001,7 @@ impl ProcessView {
             self.unfiltered_rows = unfiltered_target;
             self.ids.retain(&self.unfiltered_rows);
             self.unconfirmed = unconfirmed;
+            self.gaps = gaps;
             self.search.observe(&self.rows);
             self.inspector.reread(&self.rows, &confirmed_ids);
             return Ok(result);
@@ -882,6 +1018,8 @@ impl ProcessView {
         self.unfiltered_rows = unfiltered_target;
         self.ids.retain(&self.unfiltered_rows);
         self.unconfirmed = unconfirmed;
+        self.gaps = gaps;
+        self.prune_collapsed();
         self.search.observe(&self.rows);
         // The selected process's state is read again for this sample, if the
         // scan confirmed its row (PX-013).
@@ -1036,7 +1174,12 @@ impl ProcessView {
         }
         let target: Vec<Row> = self.rows.iter().map(|row| row.laid_out(&layout)).collect();
         let (batch, max_ops, max_bytes) = self.planning_limits(session);
-        let mut plan = vec![Planned::new(Effect::Columns(layout.clone()))];
+        // Both collections' headings follow the one layout, whichever is
+        // shown, so switching views never re-lays out a column (PX-018).
+        let mut plan = vec![
+            Planned::new(Effect::Columns(layout.clone())),
+            Planned::new(Effect::TreeColumns(layout.clone())),
+        ];
         for (node, action) in COLUMN_CHOOSER_BUTTONS {
             let label = action.label(&layout);
             if label != action.label(&self.columns) {
@@ -1047,7 +1190,7 @@ impl ProcessView {
                 plan.push(Planned::new(Effect::ChooserEnabled { node, enabled }));
             }
         }
-        plan.extend(diff(&self.rows, &target, batch, max_bytes));
+        plan.extend(self.plan_rows(&target, batch, max_ops, max_bytes));
         let bytes: usize = plan.iter().map(|planned| planned.bytes).sum();
         if plan.len() <= max_ops && bytes <= max_bytes {
             let last = plan.len() - 1;
@@ -1057,9 +1200,11 @@ impl ProcessView {
         }
         let mut result = Refreshed::default();
         count(&plan, &mut result);
-        debug_assert_eq!(
-            (result.inserted, result.deleted, result.moved),
-            (0, 0, 0),
+        // In the table; the tree may replace its preorder whole when its
+        // in-place updates exceed a bound (PX-018).
+        debug_assert!(
+            self.mode == ViewMode::Tree
+                || (result.inserted, result.deleted, result.moved) == (0, 0, 0),
             "a layout change only updates rows in place"
         );
         let (transactions, outcome) =
@@ -1283,11 +1428,60 @@ impl ProcessView {
     }
 
     /// The rows every active filter keeps out of `unfiltered`, and the
-    /// user-filter controls for them (PX-010, PX-012).
-    fn visible(&self, unfiltered: &[Row]) -> Visible {
+    /// user-filter controls for them (PX-010, PX-012), as `mode` shows
+    /// them (PX-018): the table's leading rows in the active order, or the
+    /// tree's leading preorder.
+    ///
+    /// The row ceiling applies to a forest exactly as to a table: the rows
+    /// kept are the leading ones in the order the collection is published in
+    /// — here the forest's preorder, each level in the active order — up to
+    /// the same frame budget and row limit, each tree row charged its parent
+    /// cell and item properties too. A prefix of a preorder is itself a
+    /// forest, and every kept row's ancestors precede it, so the ceiling
+    /// never orphans a shown process: a subtree it cuts is shown with the
+    /// descendants that fit, and the filter status counts the rest.
+    fn visible_in(
+        &self,
+        mode: ViewMode,
+        unfiltered: &[Row],
+        unconfirmed: &HashSet<ItemId>,
+        gaps: &ScanGaps,
+    ) -> Visible {
         let scope = self.owner.scope(unfiltered, &self.committed_filter);
-        let (rows, matched, truncated) =
-            project_visible_rows(unfiltered, &scope, self.published_limit);
+        let (rows, matched, truncated, forest) = match mode {
+            ViewMode::Table => {
+                let (rows, matched, truncated) =
+                    project_visible_rows(unfiltered, &scope, self.published_limit);
+                (rows, matched, truncated, None)
+            }
+            ViewMode::Tree => {
+                let kept: Vec<Row> = unfiltered
+                    .iter()
+                    .filter(|row| scope.keeps(row))
+                    .cloned()
+                    .collect();
+                let matched = kept.len();
+                let generation = Generation {
+                    unfiltered,
+                    unconfirmed,
+                    gaps,
+                };
+                let mut rows = tree::arrange(kept, &generation, &self.columns, self.tree_levels);
+                let truncated = bound_to_publishable_collection(&mut rows, self.published_limit);
+                // The arrangement never exceeds the depth limit, so the SDK
+                // refuses nothing here; a refusal would be this app's defect,
+                // and it publishes the rows flat rather than a refused shape.
+                if let Err(error) = tree::stamp(&mut rows, self.tree_levels) {
+                    debug_assert!(false, "the arranged forest was refused: {error}");
+                    eprintln!("srtop: process tree refused: {error}");
+                    for row in &mut rows {
+                        *row = row.flat(&self.columns);
+                    }
+                }
+                let forest = ForestSummary::of(&rows);
+                (rows, matched, truncated, Some(forest))
+            }
+        };
         let owner = self.owner.view(&scope, unfiltered, rows.len(), matched);
         Visible {
             restricted: scope.is_restricted(),
@@ -1296,6 +1490,7 @@ impl ProcessView {
             matched,
             truncated,
             owner,
+            forest,
         }
     }
 
@@ -1366,9 +1561,25 @@ impl ProcessView {
     fn republish(
         &mut self,
         session: &Session,
-        mut plan: Vec<Planned>,
+        plan: Vec<Planned>,
     ) -> Result<Refreshed, SessionError> {
-        let visible = self.visible(&self.unfiltered_rows);
+        self.republish_in(session, plan, None)
+    }
+
+    /// [`Self::republish`], into the view `switch` names when it names one
+    /// (PX-018): the shown collection's model is emptied, the other's filled
+    /// with the same rows under the same item IDs, and the two swap
+    /// visibility, all in one transaction, so no client revision shows both
+    /// collections or neither.
+    fn republish_in(
+        &mut self,
+        session: &Session,
+        mut plan: Vec<Planned>,
+        switch: Option<ViewMode>,
+    ) -> Result<Refreshed, SessionError> {
+        let mode = switch.unwrap_or(self.mode);
+        let visible = self.visible_in(mode, &self.unfiltered_rows, &self.unconfirmed, &self.gaps);
+        let forest = visible.forest;
         let target = visible.rows;
         let filter_matches = visible.restricted.then_some(visible.matched);
         // A paused view re-projects its frozen rows, and its freshness line
@@ -1387,25 +1598,62 @@ impl ProcessView {
         plan.extend(self.owner_effects(visible.owner));
         plan.extend(summary_effects(&self.summary, &summary));
 
-        let moved = plan_moves(&self.rows, &target, batch, max_ops, max_bytes);
-        plan.extend(moved.plan);
-        plan.extend(diff(&moved.rows, &target, batch, max_bytes));
+        let switched = match switch {
+            Some(to) => {
+                plan.extend(self.plan_switch(to, &target, batch, max_bytes));
+                true
+            }
+            None => {
+                plan.extend(self.plan_rows(&target, batch, max_ops, max_bytes));
+                false
+            }
+        };
+        plan.extend(self.view_effects(mode, forest.as_ref()));
         // The search counts the newly filtered rows; a target a filter hid is
         // reported as no longer shown, never replaced (PX-011). So is the
         // inspector's (PX-013).
         plan.extend(self.search_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
         plan.extend(self.inspector_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
+        if switched {
+            // The selection survives the switch by item ID (PX-018): the
+            // other view never held it, so the server promotes the process
+            // the inspector describes — the user's own last selection — in the
+            // same commit that shows the view. While follow is on, only the
+            // followed process may be promoted (PX-017).
+            let selected = self
+                .inspector
+                .selected_row()
+                .and_then(|selected| target.iter().find(|row| row.item_id == selected.item_id))
+                .filter(|row| {
+                    self.follow
+                        .following()
+                        .is_none_or(|followed| followed == row.item_id)
+                })
+                .cloned();
+            if let Some(row) = selected {
+                plan.push(Planned::new(Effect::Promote(mode.node(), Box::new(row))));
+            }
+        }
         // Follow last (PX-017): a filter that hides the followed process
         // stops follow; a sort or a filter that moves it needs nothing, as the
-        // client reveals the hinted item wherever it moves.
-        plan.extend(follow_effects(
-            &mut self.follow,
-            &self.follow_published,
-            &target,
-            &self.unfiltered_rows,
-            self.keep_visible,
-            self.promoted,
-        ));
+        // client reveals the hinted item wherever it moves. A switch carries
+        // it into the shown view: the new collection holds no hint yet
+        // (PX-018).
+        self.follow.track(&target, &self.unfiltered_rows);
+        let follow = self.follow_after(mode, &target, switched, &plan);
+        plan.extend(follow);
+        if switched {
+            // The whole switch is one transaction when it fits one, so the
+            // shown view, its selection and its hint arrive together.
+            let ops: usize = plan.iter().map(Planned::operations).sum();
+            let bytes: usize = plan.iter().map(|planned| planned.bytes).sum();
+            if ops <= max_ops && bytes <= max_bytes {
+                let last = plan.len() - 1;
+                for planned in &mut plan[..last] {
+                    planned.joins_next = true;
+                }
+            }
+        }
 
         let mut result = Refreshed::default();
         count(&plan, &mut result);
@@ -1422,6 +1670,12 @@ impl ProcessView {
         result.transactions = transactions;
         refresh_sort_values(&mut self.rows, &target);
         self.ids.retain(&self.unfiltered_rows);
+        if switched {
+            // The client's disclosure state belonged to the tree it no longer
+            // holds: every item starts expanded in a newly filled tree.
+            self.collapsed.clear();
+        }
+        self.prune_collapsed();
         self.search.observe(&self.rows);
         outcome.map(|()| result)
     }
@@ -1622,7 +1876,13 @@ impl ProcessView {
     fn promotion(&self, selected: Option<ItemId>) -> Option<Planned> {
         let item = selected?;
         let row = self.rows.iter().find(|row| row.item_id == item)?;
-        Some(Planned::new(Effect::Promote(Box::new(row.clone()))))
+        // On the shown collection (PX-018): in the tree, the client expands
+        // exactly the collapsed parents above the match to reveal it, and
+        // reports each with `EXPANSION_CHANGED` (PX-018-G01).
+        Some(Planned::new(Effect::Promote(
+            self.mode.node(),
+            Box::new(row.clone()),
+        )))
     }
 
     /// The item the table's promoted selection names, as the store holds it
@@ -1676,7 +1936,7 @@ impl ProcessView {
         // A promotion is a selection too: the inspector follows it, under a
         // new generation, exactly as it follows a click (PX-013).
         let promoted = plan.iter().find_map(|planned| match &planned.effect {
-            Effect::Promote(row) => Some(row.as_ref().clone()),
+            Effect::Promote(_, row) => Some(row.as_ref().clone()),
             _ => None,
         });
         if let Some(row) = promoted {
@@ -1763,6 +2023,23 @@ impl ProcessView {
         session: &Session,
         item: Option<ItemId>,
     ) -> Result<Refreshed, SessionError> {
+        self.select_item_in(session, self.mode.node(), item)
+    }
+
+    /// [`Self::select_item`], reported by the collection `node` (PX-018). Only
+    /// the shown collection's selection is the user's: a report from the
+    /// hidden one — sent before a switch reached that client — names rows it
+    /// no longer holds, and is ignored rather than taken for an empty
+    /// selection, so it neither clears the inspector nor stops follow.
+    pub fn select_item_in(
+        &mut self,
+        session: &Session,
+        node: NodeId,
+        item: Option<ItemId>,
+    ) -> Result<Refreshed, SessionError> {
+        if node != self.mode.node() {
+            return Ok(Refreshed::default());
+        }
         let row = item.and_then(|item| self.rows.iter().find(|row| row.item_id == item).cloned());
         match &row {
             Some(row) => self.inspector.select(row),
@@ -1811,7 +2088,7 @@ impl ProcessView {
             None => {}
         }
         let mut plan = self.follow_table_effects(&[]);
-        let target = self.follow.view(&self.rows);
+        let target = self.follow_view_in(self.mode, &self.rows);
         plan.push(Planned::new(Effect::FollowValue(target.checked)));
         if target.status != self.follow_published.status {
             plan.push(Planned::new(Effect::FollowStatus(target.status)));
@@ -1821,22 +2098,263 @@ impl ProcessView {
 
     /// The follow controls' changes over the rows already published (PX-017).
     fn follow_view_effects(&self) -> Vec<Planned> {
-        follow_view_effects(&self.follow.view(&self.rows), &self.follow_published)
+        follow_view_effects(
+            &self.follow_view_in(self.mode, &self.rows),
+            &self.follow_published,
+        )
     }
 
-    /// Follow's hold on the table once `plan`, which changes no row, commits
-    /// (PX-017): see [`follow_table_effects`]. A search promotion in `plan`
-    /// is the promoted `value` after it.
+    /// Follow's hold on the shown collection once `plan`, which changes no
+    /// row, commits (PX-017): see [`follow_table_effects`]. A search
+    /// promotion in `plan` is the promoted `value` after it.
     fn follow_table_effects(&self, plan: &[Planned]) -> Vec<Planned> {
-        let promoted = plan
+        let promoted = promotion_in(plan).or(self.promoted);
+        follow_table_effects(
+            self.mode.node(),
+            self.follow.followed(),
+            self.keep_visible,
+            promoted,
+        )
+    }
+
+    /// Follow's plan once `plan` commits and the client holds `rows` in
+    /// `mode` (PX-017, PX-018): its hold on that view's collection and the
+    /// follow controls' changes. `fresh` is a collection this plan just filled
+    /// by a view switch, which holds no hint and no promotion of its own yet:
+    /// follow carries over by hinting the same item ID there.
+    fn follow_after(
+        &self,
+        mode: ViewMode,
+        rows: &[Row],
+        fresh: bool,
+        plan: &[Planned],
+    ) -> Vec<Planned> {
+        let (hinted, held) = if fresh {
+            (None, None)
+        } else {
+            (self.keep_visible, self.promoted)
+        };
+        let promoted = promotion_in(plan).or(held);
+        let mut follow =
+            follow_table_effects(mode.node(), self.follow.followed(), hinted, promoted);
+        follow.extend(follow_view_effects(
+            &self.follow_view_in(mode, rows),
+            &self.follow_published,
+        ));
+        follow
+    }
+
+    /// The follow controls for a client that holds `rows` in `mode`: in the
+    /// tree, the status also says when the followed process is hidden under a
+    /// parent the client reported collapsed, because `keep_visible` never
+    /// expands one and a local expand never scrolls (PX-017-G01, PX-018).
+    fn follow_view_in(&self, mode: ViewMode, rows: &[Row]) -> FollowView {
+        match mode {
+            ViewMode::Table => self.follow.view(rows),
+            ViewMode::Tree => {
+                let hidden = self
+                    .follow
+                    .following()
+                    .and_then(|item| self.hidden_under(rows, item));
+                self.follow.view_tree(rows, hidden)
+            }
+        }
+    }
+
+    /// The outermost tree row the client reported collapsed whose subtree in
+    /// `rows` holds `item`, if any (PX-018).
+    fn hidden_under<'a>(&self, rows: &'a [Row], item: ItemId) -> Option<&'a Row> {
+        if self.collapsed.is_empty() {
+            return None;
+        }
+        let at = rows.iter().position(|row| row.item_id == item)?;
+        rows[..at]
             .iter()
-            .rev()
-            .find_map(|planned| match &planned.effect {
-                Effect::Promote(row) => Some(row.item_id),
-                _ => None,
+            .enumerate()
+            .find(|(index, row)| {
+                self.collapsed.contains(&row.item_id)
+                    && row
+                        .tree
+                        .as_ref()
+                        .is_some_and(|place| at as u64 <= *index as u64 + place.descendants)
             })
-            .or(self.promoted);
-        follow_table_effects(self.follow.followed(), self.keep_visible, promoted)
+            .map(|(_, row)| row)
+    }
+
+    /// Forgets every collapsed item the published tree no longer holds, or
+    /// that has no descendants left to hide, exactly as the client drops one
+    /// whose item leaves its cache (PX-018-G01).
+    fn prune_collapsed(&mut self) {
+        if self.mode != ViewMode::Tree {
+            self.collapsed.clear();
+            return;
+        }
+        if self.collapsed.is_empty() {
+            return;
+        }
+        let parents: HashSet<ItemId> = self
+            .rows
+            .iter()
+            .filter(|row| row.tree.as_ref().is_some_and(|place| place.descendants > 0))
+            .map(|row| row.item_id)
+            .collect();
+        self.collapsed.retain(|item| parents.contains(item));
+    }
+
+    /// The row operations that turn the published rows into `target` in the
+    /// shown view: moves and a diff in the table (PX-009), one index-range
+    /// unit in the tree (PX-018).
+    fn plan_rows(
+        &self,
+        target: &[Row],
+        batch: usize,
+        max_ops: usize,
+        max_bytes: usize,
+    ) -> Vec<Planned> {
+        match self.mode {
+            ViewMode::Table => {
+                let moved = plan_moves(&self.rows, target, batch, max_ops, max_bytes);
+                let mut plan = moved.plan;
+                plan.extend(diff(&moved.rows, target, batch, max_bytes));
+                plan
+            }
+            ViewMode::Tree => plan_tree(&self.rows, target, batch, max_ops, max_bytes),
+        }
+    }
+
+    /// The joined unit that switches the shown view to `to` holding `target`
+    /// (PX-018): the shown collection's model emptied by one index range, the
+    /// other's filled with `target` under the same item IDs, the two
+    /// collections' visibility swapped, the list-focus shortcut moved with
+    /// them, and the switch's own value. The emptied model takes its
+    /// collection's promoted selection and hint with it, which the SDK's
+    /// settlement clears in the same commit.
+    fn plan_switch(
+        &self,
+        to: ViewMode,
+        target: &[Row],
+        batch: usize,
+        max_bytes: usize,
+    ) -> Vec<Planned> {
+        let from = self.mode;
+        let mut plan = Vec::new();
+        if !self.rows.is_empty() {
+            plan.push(Planned::new(Effect::DeleteRange {
+                model: from.model(),
+                index: 0,
+                count: self.rows.len() as u64,
+            }));
+        }
+        push_inserts(&mut plan, to, 0, target, batch, max_bytes);
+        plan.push(Planned::new(Effect::Shortcut {
+            node: from.node(),
+            set: false,
+        }));
+        plan.push(Planned::new(Effect::Visibility {
+            node: from.node(),
+            shown: false,
+        }));
+        plan.push(Planned::new(Effect::Visibility {
+            node: to.node(),
+            shown: true,
+        }));
+        plan.push(Planned::new(Effect::Shortcut {
+            node: to.node(),
+            set: true,
+        }));
+        plan.push(Planned::new(Effect::ViewMode(to)));
+        let last = plan.len() - 1;
+        for planned in &mut plan[..last] {
+            planned.joins_next = true;
+        }
+        plan
+    }
+
+    /// The view status's change for `mode` showing `forest` (PX-018).
+    fn view_effects(&self, mode: ViewMode, forest: Option<&ForestSummary>) -> Vec<Planned> {
+        let status = view_status(mode, forest);
+        if status == self.view_status {
+            Vec::new()
+        } else {
+            vec![Planned::new(Effect::ViewStatus(status))]
+        }
+    }
+
+    /// Applies one view switch request (PX-018): `Some(true)` shows the
+    /// process tree, `Some(false)` the table, `None` (a request without a
+    /// boolean) changes nothing. The same rows are published under the same
+    /// item IDs, the selection is carried over by item ID, and follow is
+    /// carried into the shown view by hinting the same item there. The
+    /// switch's value is always published: the client's checkbox already
+    /// shows what was asked, so a request that changes nothing puts it back
+    /// (§6.3). A paused view switches too, over its frozen rows.
+    pub fn set_view(
+        &mut self,
+        session: &Session,
+        on: Option<bool>,
+    ) -> Result<Refreshed, SessionError> {
+        let to = match on {
+            Some(true) => ViewMode::Tree,
+            Some(false) => ViewMode::Table,
+            None => self.mode,
+        };
+        if to == self.mode {
+            let plan = vec![Planned::new(Effect::ViewMode(to))];
+            return self.publish_controls(session, plan);
+        }
+        self.republish_in(session, Vec::new(), Some(to))
+    }
+
+    /// Applies one `EXPANSION_CHANGED` report from the tree (PX-018): the
+    /// client has already expanded or collapsed `item` locally, and the
+    /// server only records what it was told. Nothing about the rows is
+    /// published: disclosure is the client's (§22.5).
+    ///
+    /// A collapse that hides the inspector's process has also deselected its
+    /// row on that client, without a `SELECTION_CHANGED` (an `NSOutlineView`
+    /// cannot select a row it does not show), so the inspector is cleared to
+    /// match instead of describing a selection the client no longer shows.
+    /// Follow is not a selection and stays on its process; its status says it
+    /// is hidden under the collapsed parent until that is expanded again.
+    /// A report from the hidden collection, about an item the tree does not
+    /// hold, or one that changes nothing, publishes nothing.
+    pub fn expansion_changed(
+        &mut self,
+        session: &Session,
+        node: NodeId,
+        item: ItemId,
+        expanded: bool,
+    ) -> Result<Refreshed, SessionError> {
+        if node != TREE || self.mode != ViewMode::Tree {
+            return Ok(Refreshed::default());
+        }
+        let Some(row) = self.rows.iter().find(|row| row.item_id == item) else {
+            return Ok(Refreshed::default());
+        };
+        if !row.tree.as_ref().is_some_and(|place| place.descendants > 0) {
+            return Ok(Refreshed::default());
+        }
+        let changed = if expanded {
+            self.collapsed.remove(&item)
+        } else {
+            self.collapsed.insert(item)
+        };
+        if !changed {
+            return Ok(Refreshed::default());
+        }
+        if !expanded {
+            let hidden = self
+                .inspector
+                .selected()
+                .and_then(|selected| self.hidden_under(&self.rows, selected))
+                .is_some();
+            if hidden {
+                self.inspector.clear();
+            }
+        }
+        let mut plan = self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
+        plan.extend(self.follow_view_effects());
+        self.publish_controls(session, plan)
     }
 
     /// Publishes one detail result (PX-013), if it answers the inspector's
@@ -2061,11 +2579,51 @@ pub fn selection_changed(
     session: &Session,
     event: &srui_protocol::Event,
 ) {
-    let item = srui_semantic_tree::Event::try_from(event.clone())
-        .ok()
-        .and_then(|event| event.item_id_arg());
-    if let Err(error) = lock_view(view).select_item(session, item) {
+    let Ok(event) = srui_semantic_tree::Event::try_from(event.clone()) else {
+        return;
+    };
+    let item = event.item_id_arg();
+    // The table's and the tree's selections both reach here (PX-018); only
+    // the shown collection's is the user's.
+    if let Err(error) = lock_view(view).select_item_in(session, event.node_id, item) {
         eprintln!("srtop: inspector not published: {error}");
+    }
+}
+
+/// Dispatches one `VALUE_CHANGED` on the view switch to the shared view
+/// (PX-018). Only the event's boolean argument is read.
+pub fn view_toggled(
+    view: &std::sync::Mutex<ProcessView>,
+    session: &Session,
+    event: &srui_protocol::Event,
+) {
+    let on = srui_semantic_tree::Event::try_from(event.clone())
+        .ok()
+        .and_then(|event| event.bool_arg());
+    if let Err(error) = lock_view(view).set_view(session, on) {
+        eprintln!("srtop: view not published: {error}");
+    }
+}
+
+/// Dispatches one `EXPANSION_CHANGED` on the tree to the shared view
+/// (PX-018). Only a well-formed report is read: its one `ItemId` and its
+/// boolean; anything else names nothing.
+pub fn expansion_reported(
+    view: &std::sync::Mutex<ProcessView>,
+    session: &Session,
+    event: &srui_protocol::Event,
+) {
+    let Some(change) = srui_semantic_tree::Event::try_from(event.clone())
+        .ok()
+        .as_ref()
+        .and_then(srui_sdk::ExpansionChange::from_event)
+    else {
+        return;
+    };
+    let published =
+        lock_view(view).expansion_changed(session, change.node, change.item, change.expanded);
+    if let Err(error) = published {
+        eprintln!("srtop: disclosure not published: {error}");
     }
 }
 
@@ -2084,29 +2642,55 @@ pub fn follow_toggled(
     }
 }
 
-/// Follow's plan for a client that will hold `rows` out of the server-side
-/// collection `unfiltered` (PX-017), while the table holds the hint `hinted`
-/// and the promotion `promoted`: follow's hold on the table
-/// ([`follow_table_effects`]) and the follow controls' changes. Follow stops,
-/// and never moves to another row, when its process is not among `rows`. A
-/// followed row that only moved needs nothing: the client reveals the hinted
-/// item wherever a commit moves it (PX-017-G01), so no sample ever promotes.
-fn follow_effects(
-    follow: &mut Follow,
-    published: &FollowView,
-    rows: &[Row],
-    unfiltered: &[Row],
-    hinted: Option<ItemId>,
-    promoted: Option<ItemId>,
-) -> Vec<Planned> {
-    follow.track(rows, unfiltered);
-    let mut plan = follow_table_effects(follow.followed(), hinted, promoted);
-    plan.extend(follow_view_effects(&follow.view(rows), published));
-    plan
+/// The item the last promotion in `plan` names, if it promotes one.
+fn promotion_in(plan: &[Planned]) -> Option<ItemId> {
+    plan.iter().rev().find_map(|planned| match &planned.effect {
+        Effect::Promote(_, row) => Some(row.item_id),
+        _ => None,
+    })
 }
 
-/// Follow's hold on the table (PX-017), from what it holds now: `hinted`, its
-/// `keep_visible` hint, and `promoted`, its promoted `value`.
+/// The view status for `mode` showing `forest` (PX-018): counts and fixed
+/// wording only, so no process can write into it.
+fn view_status(mode: ViewMode, forest: Option<&ForestSummary>) -> String {
+    let (ViewMode::Tree, Some(forest)) = (mode, forest) else {
+        return TABLE_VIEW_STATUS.to_string();
+    };
+    let mut clauses = vec![format!(
+        "View: process tree · {} {} under {} {}",
+        forest.rows,
+        if forest.rows == 1 {
+            "process"
+        } else {
+            "processes"
+        },
+        forest.roots,
+        if forest.roots == 1 { "root" } else { "roots" },
+    )];
+    if forest.orphans > 0 {
+        let mut why = Vec::new();
+        for (count, text) in [
+            (forest.absent, "parent not in this scan or unread"),
+            (forest.reused, "parent PID reused"),
+            (forest.hidden, "parent hidden by the filters"),
+            (forest.malformed, "cycle or depth limit"),
+        ] {
+            if count > 0 {
+                why.push(format!("{count} {text}"));
+            }
+        }
+        clauses.push(format!(
+            "{} without a shown parent ({}); the Parent column says why",
+            forest.orphans,
+            why.join(", ")
+        ));
+    }
+    clauses.push("expand and collapse are local; sorting orders each parent's children".into());
+    bounded(&clauses.join(" · "), MAX_VIEW_STATUS_BYTES)
+}
+
+/// Follow's hold on the collection `node` (PX-017), from what it holds now:
+/// `hinted`, its `keep_visible` hint, and `promoted`, its promoted `value`.
 ///
 /// - While follow is on, the hint names `followed`: set when it names
 ///   anything else (a turn-on, a retarget, or the repair of a set that did
@@ -2119,6 +2703,7 @@ fn follow_effects(
 ///
 /// Nothing here ever promotes.
 fn follow_table_effects(
+    node: NodeId,
     followed: Option<&Row>,
     hinted: Option<ItemId>,
     promoted: Option<ItemId>,
@@ -2127,15 +2712,18 @@ fn follow_table_effects(
     match followed {
         Some(row) => {
             if hinted != Some(row.item_id) {
-                plan.push(Planned::new(Effect::KeepVisible(Box::new(row.clone()))));
+                plan.push(Planned::new(Effect::KeepVisible(
+                    node,
+                    Box::new(row.clone()),
+                )));
             }
             if promoted.is_some_and(|item| item != row.item_id) {
-                plan.push(Planned::new(Effect::Withdraw));
+                plan.push(Planned::new(Effect::Withdraw(node)));
             }
         }
         None => {
             if hinted.is_some() {
-                plan.push(Planned::new(Effect::ClearKeepVisible));
+                plan.push(Planned::new(Effect::ClearKeepVisible(node)));
             }
         }
     }
@@ -2369,11 +2957,19 @@ fn count(plan: &[Planned], result: &mut Refreshed) {
             Effect::SearchStatus(_)
             | Effect::SearchEnabled { .. }
             | Effect::SearchValue { .. }
-            | Effect::Promote(_)
+            | Effect::Promote(..)
             | Effect::InspectorText { .. } => result.controls += 1,
-            Effect::KeepVisible(_) | Effect::ClearKeepVisible | Effect::Withdraw => {
+            Effect::KeepVisible(..) | Effect::ClearKeepVisible(_) | Effect::Withdraw(_) => {
                 result.controls += 1
             }
+            Effect::TreeColumns(_)
+            | Effect::Visibility { .. }
+            | Effect::Shortcut { .. }
+            | Effect::ViewMode(_)
+            | Effect::ViewStatus(_) => result.controls += 1,
+            Effect::DeleteRange { count, .. } => result.deleted += *count as usize,
+            Effect::TreeInsert(_, rows) => result.inserted += rows.len(),
+            Effect::TreeUpdate(_, rows) => result.updated += rows.len(),
             Effect::OwnerStatus(_) | Effect::OwnerEnabled { .. } | Effect::OwnerValue { .. } => {
                 result.controls += 1
             }
@@ -2463,16 +3059,16 @@ fn commit(
                 match &planned.effect {
                     // Through the SDK, which sends the item with the promotion
                     // and refuses an item the model does not hold (PX-011-G01).
-                    Effect::Promote(row) => ui.promote_selection(TABLE, row.item_id)?,
+                    Effect::Promote(node, row) => ui.promote_selection(*node, row.item_id)?,
                     // Likewise for the hint (PX-017-G01).
-                    Effect::KeepVisible(row) => ui.set_keep_visible(TABLE, row.item_id)?,
+                    Effect::KeepVisible(node, row) => ui.set_keep_visible(*node, row.item_id)?,
                     // A clear that settlement already made earlier in this
                     // plan records nothing.
-                    Effect::ClearKeepVisible => {
-                        ui.clear_keep_visible(TABLE)?;
+                    Effect::ClearKeepVisible(node) => {
+                        ui.clear_keep_visible(*node)?;
                     }
-                    Effect::Withdraw => {
-                        ui.clear_promoted_selection(TABLE)?;
+                    Effect::Withdraw(node) => {
+                        ui.clear_promoted_selection(*node)?;
                     }
                     _ => ui.apply_op(&planned.op)?,
                 }
@@ -2483,9 +3079,10 @@ fn commit(
                 record_committed(chunk, published);
                 // Settlement may have cleared the promotion or the hint in this
                 // commit, when its row left the model: the store is the record
-                // (PX-011, PX-017).
+                // (PX-011, PX-017). They are the shown collection's (PX-018).
+                let shown = published.mode.node();
                 let (promoted, keep_visible) = session.with_store(|store| {
-                    store.get_node(TABLE).map_or((None, None), |node| {
+                    store.get_node(shown).map_or((None, None), |node| {
                         (node.promoted_selection(), node.keep_visible())
                     })
                 });
@@ -2642,7 +3239,8 @@ fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
             + INSPECTOR_RESERVE_BYTES
             + COMMAND_RESERVE_BYTES
             + SAMPLING_RESERVE_BYTES
-            + FOLLOW_RESERVE_BYTES,
+            + FOLLOW_RESERVE_BYTES
+            + VIEW_RESERVE_BYTES,
     );
     let mut spent = 0usize;
     let mut kept = 0usize;
@@ -2653,9 +3251,14 @@ fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
         // Reserve every catalogued cell, including hidden columns. Otherwise
         // hiding a wide field admits extra rows that cannot fit when restored,
         // and the following refresh evicts them despite an unchanged source.
+        // A tree row also carries its parent cell and its two item
+        // properties (PX-018).
         let mut cost = MODEL_ITEM_FRAMING_BYTES
             + VALUE_FRAMING_BYTES
-            + row.cells.iter().map(value_wire_bytes).sum::<usize>();
+            + row.cells.iter().map(value_wire_bytes).sum::<usize>()
+            + row.tree.as_ref().map_or(0, |place| {
+                value_wire_bytes(&place.parent_cell()) + TREE_ITEM_PROPERTIES_BYTES
+            });
         if kept.is_multiple_of(DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION) {
             // This row opens another operation of the exported snapshot.
             cost += SNAPSHOT_RANGE_BYTES;
@@ -2823,21 +3426,52 @@ enum Effect {
         node: NodeId,
         value: String,
     },
-    /// The table's semantic selection promoted to this row's item ID
+    /// The collection's semantic selection promoted to this row's item ID
     /// (PX-011, PX-011-G01): committed through
     /// `UiTransaction::promote_selection`, which records a one-item
     /// `MODEL_RESET_RANGE` carrying the row and `SET_PROPERTY(value = ItemId)`.
-    Promote(Box<Row>),
-    /// The table's `keep_visible` hint set to this row's item ID (PX-017,
+    /// The node is the table or the tree, whichever is shown (PX-018).
+    Promote(NodeId, Box<Row>),
+    /// The collection's `keep_visible` hint set to this row's item ID (PX-017,
     /// PX-017-G01): committed through `UiTransaction::set_keep_visible`, which
     /// records a one-item `MODEL_RESET_RANGE` carrying the row and
     /// `SET_PROPERTY(keep_visible = ItemId)`. It never touches the selection.
-    KeepVisible(Box<Row>),
-    /// The table's `keep_visible` hint cleared (PX-017).
-    ClearKeepVisible,
-    /// The table's promoted selection withdrawn (PX-017, PX-011-G01): a
+    KeepVisible(NodeId, Box<Row>),
+    /// The collection's `keep_visible` hint cleared (PX-017).
+    ClearKeepVisible(NodeId),
+    /// The collection's promoted selection withdrawn (PX-017, PX-011-G01): a
     /// `CLEAR_PROPERTY(value)`, which keeps a client's later local selection.
-    Withdraw,
+    Withdraw(NodeId),
+    /// The tree's headings set to a layout's, with the parent column last
+    /// (PX-018). The layout itself is recorded by [`Effect::Columns`].
+    TreeColumns(ColumnLayout),
+    /// A collection shown or collapsed out of the layout (PX-018).
+    Visibility {
+        node: NodeId,
+        shown: bool,
+    },
+    /// The list-focus shortcut set on, or cleared from, a collection (PX-018):
+    /// it moves with the shown one, so it is never bound twice.
+    Shortcut {
+        node: NodeId,
+        set: bool,
+    },
+    /// The view switch's value set, and the view it shows recorded (PX-018).
+    ViewMode(ViewMode),
+    /// The view status text set (PX-018).
+    ViewStatus(String),
+    /// One index range of a model deleted (PX-018): the tree's edits, which
+    /// a sparse replica can apply without caching the deleted items, and the
+    /// emptying of the collection a view switch hides.
+    DeleteRange {
+        model: ModelId,
+        index: u64,
+        count: u64,
+    },
+    /// Tree rows inserted at a preorder index (PX-018).
+    TreeInsert(u64, Vec<Row>),
+    /// Tree rows replaced in place from a preorder index (PX-018).
+    TreeUpdate(u64, Vec<Row>),
     /// The user-filter status text set (PX-012).
     OwnerStatus(String),
     /// One user-filter button enabled or disabled (PX-012).
@@ -2897,6 +3531,10 @@ struct Published<'a> {
     sampling: &'a mut SamplingView,
     /// The follow controls as announced (PX-017).
     follow: &'a mut FollowView,
+    /// The view the switch announced (PX-018).
+    mode: &'a mut ViewMode,
+    /// The view status as announced (PX-018).
+    view_status: &'a mut String,
 }
 
 /// The planned operations that turn the `published` summary into `target`:
@@ -2948,16 +3586,52 @@ impl Planned {
                 Operation::set_property(*node, VALUE, Value::String(value.clone()))
             }
             // What the promotion sets; `commit` records it through the SDK.
-            Effect::Promote(row) => {
-                Operation::set_property(TABLE, VALUE, Value::ItemId(row.item_id))
+            Effect::Promote(node, row) => {
+                Operation::set_property(*node, VALUE, Value::ItemId(row.item_id))
             }
             // What the hint sets and the clears clear; `commit` records them
             // through the SDK.
-            Effect::KeepVisible(row) => {
-                Operation::set_property(TABLE, KEEP_VISIBLE, Value::ItemId(row.item_id))
+            Effect::KeepVisible(node, row) => {
+                Operation::set_property(*node, KEEP_VISIBLE, Value::ItemId(row.item_id))
             }
-            Effect::ClearKeepVisible => Operation::clear_property(TABLE, KEEP_VISIBLE),
-            Effect::Withdraw => Operation::clear_property(TABLE, VALUE),
+            Effect::ClearKeepVisible(node) => Operation::clear_property(*node, KEEP_VISIBLE),
+            Effect::Withdraw(node) => Operation::clear_property(*node, VALUE),
+            Effect::TreeColumns(layout) => {
+                Operation::set_property(TREE, COLUMNS, Value::List(tree_headings(layout)))
+            }
+            Effect::Visibility { node, shown } => Tree::op_set_visibility_for(
+                *node,
+                if *shown {
+                    Visibility::Visible
+                } else {
+                    Visibility::Collapsed
+                },
+            ),
+            Effect::Shortcut { node, set: true } => {
+                Operation::set_property(*node, PropertyRef::SHORTCUT, LIST_SHORTCUT)
+            }
+            Effect::Shortcut { node, set: false } => {
+                Operation::clear_property(*node, PropertyRef::SHORTCUT)
+            }
+            Effect::ViewMode(mode) => {
+                Operation::set_property(VIEW_TOGGLE, VALUE, *mode == ViewMode::Tree)
+            }
+            Effect::ViewStatus(text) => {
+                Operation::set_property(VIEW_STATUS, TEXT, Value::String(text.clone()))
+            }
+            Effect::DeleteRange {
+                model,
+                index,
+                count,
+            } => Operation::model_delete_range(*model, *index, *count),
+            Effect::TreeInsert(index, rows) => {
+                Operation::model_insert(TREE_MODEL, *index, rows.iter().map(Row::to_model_item))
+            }
+            Effect::TreeUpdate(index, rows) => Operation::model_update(
+                TREE_MODEL,
+                Some(*index),
+                rows.iter().map(Row::to_model_item),
+            ),
             Effect::OwnerStatus(text) => {
                 Operation::set_property(OWNER_STATUS, TEXT, Value::String(text.clone()))
             }
@@ -3010,7 +3684,7 @@ impl Planned {
     /// `keep_visible` hint (its item's one-item `MODEL_RESET_RANGE` and the
     /// `SET_PROPERTY`), one otherwise.
     fn operations(&self) -> usize {
-        if matches!(self.effect, Effect::Promote(_) | Effect::KeepVisible(_)) {
+        if matches!(self.effect, Effect::Promote(..) | Effect::KeepVisible(..)) {
             2
         } else {
             1
@@ -3063,7 +3737,7 @@ impl Effect {
             Self::SearchValue { value, .. } => VALUE_FRAMING_BYTES + value.len(),
             // The `SET_PROPERTY` of the item ID, and a whole second operation:
             // the one-item `MODEL_RESET_RANGE` carrying the row.
-            Self::Promote(row) | Self::KeepVisible(row) => {
+            Self::Promote(_, row) | Self::KeepVisible(_, row) => {
                 VALUE_FRAMING_BYTES
                     + SCALAR_VALUE_BYTES
                     + OPERATION_FRAMING_BYTES
@@ -3071,7 +3745,22 @@ impl Effect {
                     + row_wire_bytes(row)
             }
             // A clear carries no value.
-            Self::ClearKeepVisible | Self::Withdraw => 0,
+            Self::ClearKeepVisible(_) | Self::Withdraw(_) => 0,
+            Self::TreeColumns(layout) => {
+                VALUE_FRAMING_BYTES
+                    + tree_headings(layout)
+                        .iter()
+                        .map(value_wire_bytes)
+                        .sum::<usize>()
+            }
+            Self::Visibility { .. } | Self::ViewMode(_) => VALUE_FRAMING_BYTES + SCALAR_VALUE_BYTES,
+            Self::Shortcut { .. } => VALUE_FRAMING_BYTES + LIST_SHORTCUT.len(),
+            Self::ViewStatus(text) => VALUE_FRAMING_BYTES + text.len(),
+            // An index range is the header's two integers.
+            Self::DeleteRange { .. } => 0,
+            Self::TreeInsert(_, rows) | Self::TreeUpdate(_, rows) => {
+                rows.iter().map(row_wire_bytes).sum()
+            }
             Self::Delete(ids) => ids.len() * ITEM_ID_BYTES,
             Self::Insert(_, rows) | Self::Update(rows) => rows.iter().map(row_wire_bytes).sum(),
         }
@@ -3094,8 +3783,28 @@ impl Effect {
             inspector,
             sampling,
             follow,
+            mode,
+            view_status,
         } = published;
         match self {
+            Self::ViewMode(shown) => **mode = *shown,
+            Self::ViewStatus(text) => view_status.clone_from(text),
+            Self::TreeColumns(_) | Self::Visibility { .. } | Self::Shortcut { .. } => {}
+            Self::DeleteRange { index, count, .. } => {
+                let start = (*index as usize).min(rows.len());
+                let end = start.saturating_add(*count as usize).min(rows.len());
+                rows.drain(start..end);
+            }
+            Self::TreeInsert(index, inserted) => {
+                let at = (*index as usize).min(rows.len());
+                rows.splice(at..at, inserted.iter().cloned());
+            }
+            Self::TreeUpdate(index, updated) => {
+                let start = (*index as usize).min(rows.len());
+                for (slot, row) in rows[start..].iter_mut().zip(updated) {
+                    *slot = row.clone();
+                }
+            }
             Self::InspectorText { node, text } => {
                 let line = if *node == INSPECTOR_STATUS {
                     &mut inspector.status
@@ -3124,10 +3833,10 @@ impl Effect {
             Self::SamplingEnabled(enabled) => sampling.refresh_enabled = *enabled,
             Self::FollowValue(checked) => follow.checked = *checked,
             Self::FollowStatus(text) => follow.status.clone_from(text),
-            Self::Promote(row) => **promoted = Some(row.item_id),
-            Self::KeepVisible(row) => **keep_visible = Some(row.item_id),
-            Self::ClearKeepVisible => **keep_visible = None,
-            Self::Withdraw => **promoted = None,
+            Self::Promote(_, row) => **promoted = Some(row.item_id),
+            Self::KeepVisible(_, row) => **keep_visible = Some(row.item_id),
+            Self::ClearKeepVisible(_) => **keep_visible = None,
+            Self::Withdraw(_) => **promoted = None,
             Self::Status(text) => status.clone_from(text),
             Self::FilterStatus(text) => filter_status.clone_from(text),
             Self::FilterValue(_)
@@ -3344,6 +4053,189 @@ fn diff(published: &[Row], target: &[Row], batch: usize, max_bytes: usize) -> Ve
     }
     if !updates.is_empty() {
         plan.push(Planned::new(Effect::Update(updates)));
+    }
+    plan
+}
+
+/// The tree's headings for `layout` (PX-018): the table's, in the same order
+/// — the first is the outline column — and the parent column last.
+pub fn tree_headings(layout: &ColumnLayout) -> Vec<Value> {
+    let mut headings = column_headings(layout);
+    headings.push(Value::String(tree::PARENT_HEADING.into()));
+    headings
+}
+
+/// Rows inserted into `mode`'s model from `start`, in operations of at most
+/// `batch` items and `max_bytes` (PX-018).
+fn push_inserts(
+    plan: &mut Vec<Planned>,
+    mode: ViewMode,
+    start: usize,
+    rows: &[Row],
+    batch: usize,
+    max_bytes: usize,
+) {
+    let budget = max_bytes
+        .saturating_sub(OPERATION_FRAMING_BYTES + OPERATION_HEADER_BYTES)
+        .max(1);
+    let mut at = start;
+    let mut run: Vec<Row> = Vec::new();
+    let mut run_bytes = 0usize;
+    let flush = |plan: &mut Vec<Planned>, at: &mut usize, run: &mut Vec<Row>| {
+        if run.is_empty() {
+            return;
+        }
+        let rows = std::mem::take(run);
+        let count = rows.len();
+        plan.push(Planned::new(match mode {
+            ViewMode::Table => Effect::Insert(*at as u64, rows),
+            ViewMode::Tree => Effect::TreeInsert(*at as u64, rows),
+        }));
+        *at += count;
+    };
+    for row in rows {
+        let cost = row_wire_bytes(row);
+        if !run.is_empty() && (run.len() == batch || run_bytes + cost > budget) {
+            flush(plan, &mut at, &mut run);
+            run_bytes = 0;
+        }
+        run.push(row.clone());
+        run_bytes += cost;
+    }
+    flush(plan, &mut at, &mut run);
+}
+
+/// In-place replacements of the tree rows at `indices` (ascending) by
+/// `target`'s, one operation per consecutive run of at most `batch` items
+/// and `max_bytes` (PX-018).
+fn push_tree_updates(
+    plan: &mut Vec<Planned>,
+    indices: impl IntoIterator<Item = usize>,
+    target: &[Row],
+    batch: usize,
+    max_bytes: usize,
+) {
+    let budget = max_bytes
+        .saturating_sub(OPERATION_FRAMING_BYTES + OPERATION_HEADER_BYTES)
+        .max(1);
+    let mut run_start = 0usize;
+    let mut run: Vec<Row> = Vec::new();
+    let mut run_bytes = 0usize;
+    for index in indices {
+        let row = &target[index];
+        let cost = row_wire_bytes(row);
+        let contiguous = run_start + run.len() == index;
+        if !run.is_empty() && (!contiguous || run.len() == batch || run_bytes + cost > budget) {
+            plan.push(Planned::new(Effect::TreeUpdate(
+                run_start as u64,
+                std::mem::take(&mut run),
+            )));
+            run_bytes = 0;
+        }
+        if run.is_empty() {
+            run_start = index;
+        }
+        run.push(row.clone());
+        run_bytes += cost;
+    }
+    if !run.is_empty() {
+        plan.push(Planned::new(Effect::TreeUpdate(run_start as u64, run)));
+    }
+}
+
+/// The operations that turn the published preorder `published` into `target`
+/// on the tree's model (PX-018), as one unit [`commit`] never splits.
+///
+/// A hierarchical model is edited by index, never by item identity: a sparse
+/// replica cannot shift the indices it caches for an identity delete of an
+/// item it does not cache (PX-018-G01). And the store judges the shape once,
+/// after a transaction's last operation on the model, so an edit and the
+/// ancestors' `descendant_count` updates it implies must commit together: a
+/// tree edit is therefore one joined unit, which the row ceiling sizes to fit
+/// one transaction (a full replacement is no larger than a catch-up snapshot).
+///
+/// The rows `published` and `target` share as a leading run and a trailing
+/// run stay in place, updated where their cells or place changed; the middle
+/// between them is deleted as one range and reinserted from `target`, under
+/// the same item IDs where the rows are the same processes. Every row keeps
+/// its item identity, so a client's selection and collapsed set, both
+/// anchored to item IDs, survive the transaction (PX-018-G01). When even that
+/// does not fit `max_ops` and `max_bytes`, the whole preorder is replaced.
+///
+/// lc-debt: a reorder in the middle of a large tree resends every row between
+/// the first and the last that moved; an upgrade path is a subtree-move planner
+/// that deletes and reinserts only the moved subtrees, in index ranges.
+fn plan_tree(
+    published: &[Row],
+    target: &[Row],
+    batch: usize,
+    max_ops: usize,
+    max_bytes: usize,
+) -> Vec<Planned> {
+    let prefix = published
+        .iter()
+        .zip(target)
+        .take_while(|(old, new)| old.item_id == new.item_id)
+        .count();
+    let suffix = published[prefix..]
+        .iter()
+        .rev()
+        .zip(target[prefix..].iter().rev())
+        .take_while(|(old, new)| old.item_id == new.item_id)
+        .count();
+    let old_middle = published.len() - prefix - suffix;
+    let new_middle = target.len() - prefix - suffix;
+    let changed = |old: &Row, new: &Row| old.value != new.value || old.tree != new.tree;
+    let mut plan = Vec::new();
+    if old_middle > 0 {
+        plan.push(Planned::new(Effect::DeleteRange {
+            model: TREE_MODEL,
+            index: prefix as u64,
+            count: old_middle as u64,
+        }));
+    }
+    push_inserts(
+        &mut plan,
+        ViewMode::Tree,
+        prefix,
+        &target[prefix..prefix + new_middle],
+        batch,
+        max_bytes,
+    );
+    let kept_before = (0..prefix).filter(|&index| changed(&published[index], &target[index]));
+    let kept_after = (0..suffix)
+        .map(|offset| {
+            (
+                published.len() - suffix + offset,
+                target.len() - suffix + offset,
+            )
+        })
+        .filter(|&(old, new)| changed(&published[old], &target[new]))
+        .map(|(_, new)| new);
+    push_tree_updates(
+        &mut plan,
+        kept_before.chain(kept_after),
+        target,
+        batch,
+        max_bytes,
+    );
+    let ops: usize = plan.iter().map(Planned::operations).sum();
+    let bytes: usize = plan.iter().map(|planned| planned.bytes).sum();
+    if ops > max_ops || bytes > max_bytes {
+        plan.clear();
+        if !published.is_empty() {
+            plan.push(Planned::new(Effect::DeleteRange {
+                model: TREE_MODEL,
+                index: 0,
+                count: published.len() as u64,
+            }));
+        }
+        push_inserts(&mut plan, ViewMode::Tree, 0, target, batch, max_bytes);
+    }
+    if let Some(last) = plan.len().checked_sub(1) {
+        for planned in &mut plan[..last] {
+            planned.joins_next = true;
+        }
     }
     plan
 }
@@ -3843,6 +4735,7 @@ mod tests {
                 // The cells are the widest missing words, so the order values
                 // are missing in both metric columns (PX-009).
                 let record = ProcessRecord {
+                    lineage: crate::source::Lineage::NOT_COLLECTED,
                     owner: crate::source::OWNER_NOT_COLLECTED,
                     key: key.clone(),
                     display_name: name.clone(),
@@ -3851,6 +4744,8 @@ mod tests {
                 };
                 Row {
                     owner: crate::source::OWNER_NOT_COLLECTED,
+                    lineage: crate::source::Lineage::NOT_COLLECTED,
+                    tree: None,
                     sort: crate::sort::SortValues::of_record(&key, &record),
                     display_name: name.clone(),
                     item_id: ItemId::new(1_000 + index),
@@ -4202,6 +5097,7 @@ mod tests {
             let mut snapshot = FakeProcessSource.snapshot();
             snapshot.records = (first..self.rows)
                 .map(|index| ProcessRecord {
+                    lineage: crate::source::Lineage::NOT_COLLECTED,
                     owner: crate::source::OWNER_NOT_COLLECTED,
                     key: ProcessKey {
                         pid: Observed::Known(index + 1),
@@ -4303,7 +5199,8 @@ mod tests {
                 + INSPECTOR_RESERVE_BYTES
                 + COMMAND_RESERVE_BYTES
                 + SAMPLING_RESERVE_BYTES
-                + FOLLOW_RESERVE_BYTES);
+                + FOLLOW_RESERVE_BYTES
+                + VIEW_RESERVE_BYTES);
         let mut published = Vec::new();
         for system in [
             SystemSample::not_provided(),
@@ -4620,6 +5517,17 @@ mod tests {
                     ),
                 )?;
                 ui.set(crate::FOLLOW_TOGGLE, VALUE, true)?;
+                // PX-018: the view status at its widest, cut mark included,
+                // with the tree shown.
+                ui.set(
+                    VIEW_STATUS,
+                    TEXT,
+                    crate::bounded(
+                        &"\u{20000}".repeat(MAX_VIEW_STATUS_BYTES / 4 + 1),
+                        MAX_VIEW_STATUS_BYTES,
+                    ),
+                )?;
+                ui.set(VIEW_TOGGLE, VALUE, true)?;
                 // PX-016: the filter field at its cap, so the filter group
                 // below is measured with its value at its widest.
                 ui.set(
@@ -4690,6 +5598,31 @@ mod tests {
             crate::FOLLOW_TOGGLE,
             crate::FOLLOW_STATUS,
         ]) + hint;
+        // PX-018: the view group, the tree with its headings, its model, and
+        // its promoted selection and hint at their widest item IDs, which the
+        // view reserve covers.
+        let tree_extras = srui_protocol::framed_payload_len(&srui_protocol::SruiMessage {
+            msg: Some(srui_protocol::srui_message::Msg::Transaction(
+                srui_protocol::Transaction {
+                    base_revision: 0,
+                    new_revision: 0,
+                    priority: 0,
+                    operations: vec![
+                        Operation::create_model(TREE_MODEL, srui_sdk::TypeRef::TREE, u64::MAX)
+                            .to_wire(),
+                        Operation::set_property(TREE, VALUE, Value::ItemId(ItemId::new(u64::MAX)))
+                            .to_wire(),
+                        Operation::set_property(
+                            TREE,
+                            KEEP_VISIBLE,
+                            Value::ItemId(ItemId::new(u64::MAX)),
+                        )
+                        .to_wire(),
+                    ],
+                },
+            )),
+        });
+        let view = encoded(&[crate::VIEW_ROW, VIEW_TOGGLE, VIEW_STATUS, TREE]) + tree_extras;
         let sampling = encoded(&[
             crate::SAMPLING_ROW,
             SAMPLING_PAUSE,
@@ -4799,6 +5732,14 @@ mod tests {
             "the reserve must be measured against follow controls that really are wide: {follow}"
         );
         assert!(
+            view <= VIEW_RESERVE_BYTES,
+            "the widest view switch and tree encode to {view} bytes, above their {VIEW_RESERVE_BYTES} byte reserve"
+        );
+        assert!(
+            view > VIEW_RESERVE_BYTES / 4,
+            "the reserve must be measured against a view group that really is wide: {view}"
+        );
+        assert!(
             command <= COMMAND_RESERVE_BYTES,
             "the widest command line encodes to {command} bytes, above its {COMMAND_RESERVE_BYTES} byte reserve"
         );
@@ -4842,6 +5783,7 @@ mod tests {
                     + COMMAND_RESERVE_BYTES
                     + SAMPLING_RESERVE_BYTES
                     + FOLLOW_RESERVE_BYTES
+                    + VIEW_RESERVE_BYTES
                     + TRANSACTION_ENVELOPE_BYTES,
             "a snapshot with no row is {frame} bytes, above the allowances the row budget \
              leaves for it"
@@ -4858,6 +5800,10 @@ mod tests {
                 + COMMAND_RESERVE_BYTES
                 + SAMPLING_RESERVE_BYTES
                 + FOLLOW_RESERVE_BYTES
+                + VIEW_RESERVE_BYTES
+        );
+        println!(
+            "PX-018 view switch and tree at their widest: encoded={view} reserve={VIEW_RESERVE_BYTES}"
         );
         println!(
             "PX-013 inspector at its widest: encoded={inspector} reserve={INSPECTOR_RESERVE_BYTES}"
@@ -4976,7 +5922,7 @@ mod tests {
         assert_eq!(ops, max_ops - 1);
         assert_eq!(bytes, MAX_TRANSACTION_PAYLOAD_BYTES - PROMOTION_CLEAR_BYTES);
 
-        let promote = Planned::new(Effect::Promote(Box::new(view.rows[0].clone())));
+        let promote = Planned::new(Effect::Promote(TABLE, Box::new(view.rows[0].clone())));
         assert_eq!(promote.operations(), 2);
         let planned = promote.bytes;
         let revision = session.current_revision();
@@ -5018,6 +5964,8 @@ mod tests {
                 3 + offset,
                 vec![Row {
                     owner: crate::source::OWNER_NOT_COLLECTED,
+                    lineage: crate::source::Lineage::NOT_COLLECTED,
+                    tree: None,
                     key: template.key.clone(),
                     display_name: template.display_name.clone(),
                     item_id: ItemId::new(100 + offset),
@@ -5053,6 +6001,8 @@ mod tests {
             9,
             vec![Row {
                 owner: crate::source::OWNER_NOT_COLLECTED,
+                lineage: crate::source::Lineage::NOT_COLLECTED,
+                tree: None,
                 item_id: ItemId::new(100),
                 ..template.clone()
             }],
@@ -5166,6 +6116,7 @@ mod tests {
             let template = snapshot.records[0].clone();
             snapshot.records = (1..=self.0)
                 .map(|pid| ProcessRecord {
+                    lineage: crate::source::Lineage::NOT_COLLECTED,
                     key: ProcessKey {
                         pid: Observed::Known(pid),
                         creation: CreationToken::Opaque(format!("numbered-{pid}")),

@@ -37,7 +37,9 @@
 //!   exactly `TABLE` with `SELECTION_CHANGED`, the inspector's one selection input
 //!   (PX-013), or a sampling button with `ACTIVATE` or the interval field with
 //!   `TEXT_EDIT` (PX-015), or exactly `FOLLOW_TOGGLE` with `VALUE_CHANGED`
-//!   (PX-017); `on_result`, `on_text_edit`
+//!   (PX-017), or exactly `VIEW_TOGGLE` with `VALUE_CHANGED`, `TREE` with
+//!   `SELECTION_CHANGED` or `TREE` with `EXPANSION_CHANGED` (PX-018);
+//!   `on_result`, `on_text_edit`, `on_expansion_changed`
 //!   and a model range provider unconditionally; `include`, called or
 //!   renamed; or a macro definition (`macro_rules!`), whose expansion can
 //!   assemble tokens this audit never sees together. Attributes come from an
@@ -159,6 +161,9 @@ const FORBIDDEN_IDENTS: &[(&str, &str)] = &[
         "installs a client event handler",
     ),
     ("on_text_edit", "installs a client text-edit policy"),
+    // PX-018: the tree's disclosure reports reach srtop only through the one
+    // exact `on(TREE, EXPANSION_CHANGED, ..)` allowance.
+    ("on_expansion_changed", "installs a client event handler"),
     ("register_handler", "installs a client event handler"),
     ("ModelRangeProvider", "answers client range requests"),
     ("ModelRangeRequestInbox", "answers client range requests"),
@@ -656,6 +661,7 @@ fn scan(level: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
                                     || is_filter_input_text_edit(tokens)
                                     || is_table_selection(tokens)
                                     || is_follow_toggle(tokens)
+                                    || is_view_or_tree_input(tokens)
                             }
                             _ => false,
                         };
@@ -920,6 +926,47 @@ fn is_follow_toggle(tokens: &[Tok]) -> bool {
     };
     bare(arguments.first()).as_deref() == Some(FOLLOW_TOGGLE_CHANGE.0)
         && bare(arguments.get(1)).as_deref() == Some(FOLLOW_TOGGLE_CHANGE.1)
+}
+
+/// The view switch and the process tree (PX-018): the switch's
+/// `VALUE_CHANGED`, which republishes the same rows in the other collection,
+/// and the tree's `SELECTION_CHANGED` and `EXPANSION_CHANGED`, which resolve
+/// one published item ID for the inspector and record what the client
+/// already expanded or collapsed. None signals, opens for control or
+/// reconfigures a process.
+const VIEW_AND_TREE_INPUTS: &[(&str, &str)] = &[
+    ("VIEW_TOGGLE", "VALUE_CHANGED"),
+    ("TREE", "SELECTION_CHANGED"),
+    ("TREE", "EXPANSION_CHANGED"),
+];
+
+/// Whether an `on(..)` argument list is exactly one of
+/// [`VIEW_AND_TREE_INPUTS`]: both arguments bare constants, in that pair.
+/// Any other node, event type, path or computed argument is not the
+/// allowance.
+fn is_view_or_tree_input(tokens: &[Tok]) -> bool {
+    let mut arguments: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    for token in tokens {
+        match token {
+            Tok::Punct(',', _) => arguments.push(std::mem::take(&mut current)),
+            Tok::Ident(name, _, _) => current.push(name.clone()),
+            _ => current.push('\u{0}'.to_string()),
+        }
+    }
+    arguments.push(current);
+    let bare = |argument: Option<&Vec<String>>| -> Option<String> {
+        match argument?.as_slice() {
+            [only] if !only.is_empty() => Some(only.clone()),
+            _ => None,
+        }
+    };
+    let (Some(node), Some(event)) = (bare(arguments.first()), bare(arguments.get(1))) else {
+        return false;
+    };
+    VIEW_AND_TREE_INPUTS
+        .iter()
+        .any(|(allowed_node, allowed_event)| node == *allowed_node && event == *allowed_event)
 }
 
 /// Every violation in the production tokens of one source file.
@@ -1707,6 +1754,54 @@ fn the_source_audit_reports_every_known_bypass() {
             "the table selection by path with a receiver",
             "Session::on(&session, TABLE, SELECTION_CHANGED, |_, _| {});",
             "handler",
+        ),
+        // PX-018: the view switch's VALUE_CHANGED and the tree's
+        // SELECTION_CHANGED and EXPANSION_CHANGED are allowed only in their
+        // exact shapes.
+        (
+            "the view switch under ACTIVATE",
+            "session.on(VIEW_TOGGLE, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the view status as a toggle",
+            "session.on(VIEW_STATUS, VALUE_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the tree under a text edit",
+            "session.on(TREE, TEXT_EDIT, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the tree under a value change",
+            "session.on(TREE, VALUE_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the tree's model as a tree",
+            "session.on(TREE_MODEL, EXPANSION_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a path-qualified tree",
+            "session.on(crate::TREE, EXPANSION_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a computed tree target",
+            "session.on(trees[i], SELECTION_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a computed view switch event",
+            "session.on(VIEW_TOGGLE, events[i], |_, _| {});",
+            "handler",
+        ),
+        (
+            "the SDK's disclosure handler",
+            "tree.on_expansion_changed(&session, |_, _| {});",
+            "ident",
         ),
         (
             "a table selection through on_result",

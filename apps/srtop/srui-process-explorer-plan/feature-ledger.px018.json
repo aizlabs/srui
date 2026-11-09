@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-018",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Parent/child process tree navigation: the same process instances under the same item IDs projected into one hierarchical model-backed Tree (PX-018-G01) built server-side with the SDK TreeModel, parents resolved only from the current sampled generation with start-time ordering, explicit roots with stated reasons, deterministic cycle breaking and the max_model_tree_depth cap; local disclosure; sibling sorting; an explicit table/tree switch that carries the selection and follow (keep_visible, PX-017-G01) over; no protocol, registry, SDK, renderer or client source change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX018-001",
+      "feature": "An explicit view switch: a standard checkbox Toggle Show process tree (node 71, shortcut Command-T) and a view status Text (node 72) in a Row (node 70) between the follow controls and the collections, disabled with an explanation in the uncollected shell; its one handler is the toggle's VALUE_CHANGED, an exact audit pair, whose boolean chooses the table or the tree and which always publishes the value the server holds; the Tree (node 73) over its own model (2) is created with the table's headings and a Parent column and collapsed out of the layout; one switch is one transaction that empties the hidden collection's model by one index range, fills the other, swaps visibility and moves the list-focus shortcut",
+      "scope": "PX-018/lib (src/lib.rs) VIEW_ROW, VIEW_TOGGLE, VIEW_STATUS, TREE, TREE_MODEL, LIST_SHORTCUT, KEYBOARD_SHORTCUTS, initialize_rows, install_view_handlers; refresh (src/refresh.rs) ViewMode, set_view, republish_in, plan_switch, view_toggled, VIEW_RESERVE_BYTES; tests/tree_test.rs the_tree_projects_the_same_identities_with_parents_from_the_same_generation, a_request_without_a_boolean_or_for_the_shown_view_changes_nothing_but_the_switch, a_fresh_client_attaching_in_the_tree_view_gets_one_collection_and_its_hint; tests/no_process_control_test.rs is_view_or_tree_input; src/lib.rs keyboard_shortcuts_are_canonical_unique_modified_and_on_admitted_controls",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX018-002",
+      "feature": "Parent resolution from the current sampled generation: each record carries its parent PID and start time from the same /proc/<pid>/stat read as its identity (fields 4 and 22); a child is attached only to the one confirmed record of that generation holding its parent PID that started no later and is shown; anything else is an explicit root whose Parent cell says why (kernel, parent unread, not in this scan, unreadable, beyond the record limit, not seen in an incomplete scan, kept from an earlier scan, ambiguous, start time unread, started later as a reused PID, hidden by the filters)",
+      "scope": "PX-018/source (src/source.rs) Lineage, ProcessRecord::lineage, TreeSource; procfs (src/procfs.rs) ProcFsSource lineage from StatFields; tree (src/tree.rs) RootReason, Link, ScanGaps, Generation, resolve; tests/tree_test.rs a_reused_pid_is_never_a_parent_but_a_parent_started_at_the_same_tick_is, missing_parents_are_explicit_roots_that_say_why, a_row_kept_from_an_earlier_scan_is_neither_placed_nor_a_parent, reparenting_after_a_parent_exits_attaches_the_children_to_init_by_index_ranges; tests/procfs_test.rs the_tree_takes_each_parent_from_the_same_stat_read_and_never_a_reused_pid, live::a_test_owned_child_is_shown_under_its_parent_then_under_its_new_parent_once_orphaned",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX018-003",
+      "feature": "Malformed lineage: cycles are broken deterministically at the member that orders first by process identity, whatever the sort, and a chain deeper than the store's max_model_tree_depth (at most the wire default 256 levels) is cut where the next level would not fit, the cut child starting a new root after the subtree it was cut from, both stated in the Parent cell",
+      "scope": "PX-018/tree (src/tree.rs) break_cycles, arrange, tests::randomized_forests_hold_every_rule_under_every_depth_limit, tests::a_cycle_is_cut_at_its_first_identity_and_its_members_stay_together; refresh (src/refresh.rs) ProcessView::with_tree_levels; tests/tree_test.rs malformed_cycles_are_broken_deterministically_whatever_the_sort, deep_chains_fit_the_depth_limit_and_a_deeper_one_starts_a_new_root",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX018-004",
+      "feature": "One hierarchical model, built server-side: the forest is stamped with tree_depth and descendant_count by the SDK TreeModel, no semantic node is created per row, the same item IDs as the table; every tree edit is index-based (range delete, insert, indexed update) and one joined transaction that a replica accepts revision by revision; the row ceiling keeps the leading preorder prefix under the same frame budget and row limit, charging each tree row its Parent cell and item properties, and never orphans a shown process; a 10,000-process tree tick stays inside PX-010-G01's budget",
+      "scope": "PX-018/tree (src/tree.rs) stamp, ForestSummary, tests::every_prefix_of_an_arrangement_is_a_forest_the_sdk_stamps; projection (src/projection.rs) Row::tree, Row::to_model_item; refresh (src/refresh.rs) visible_in, plan_tree, push_inserts, push_tree_updates, bound_to_publishable_collection, Effect::DeleteRange, Effect::TreeInsert, Effect::TreeUpdate; tests/tree_test.rs the_row_ceiling_keeps_a_preorder_prefix_and_never_orphans_a_shown_process, ten_thousand_processes_arrange_and_refresh_inside_the_scale_budget, the_server_holds_every_published_tree_row_so_a_range_request_needs_nothing_sent; src/refresh.rs the_shell_status_and_summary_fit_their_snapshot_allowances",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX018-005",
+      "feature": "Sibling sorting: the roots and every parent's children follow the active sort, and sorting never flattens the hierarchy or changes an item ID; a local collapse survives a reorder",
+      "scope": "PX-018/tree (src/tree.rs) arrange; tests/tree_test.rs sorting_orders_each_parents_children_and_never_flattens_the_hierarchy; client-macos/Tests/SRUITests/ProcessExplorerShellTests.swift theProcessTreeKeepsTheSelectionAndFollowAndDisclosesLocally",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX018-006",
+      "feature": "Selection carries over between the table and the tree by item ID in both directions (the server promotes the inspector's process in the shown collection in the switch commit); a selection reported by the hidden collection is ignored; local disclosure is reported through EXPANSION_CHANGED and only recorded, and a collapse that hides the inspector's process clears the inspector to match the client, which deselected the hidden row without a SELECTION_CHANGED",
+      "scope": "PX-018/refresh (src/refresh.rs) select_item_in, expansion_changed, expansion_reported, prune_collapsed, hidden_under; inspector (src/inspector.rs) Inspector::clear; tests/tree_test.rs the_selection_and_follow_carry_over_between_the_table_and_the_tree, a_collapse_that_hides_the_selection_clears_the_inspector_and_follow_says_where_it_is; client-macos/Tests/SRUITests/ProcessExplorerShellTests.swift theProcessTreeKeepsTheSelectionAndFollowAndDisclosesLocally",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX018-007",
+      "feature": "Follow carries over: the switch moves the keep_visible hint to the shown collection under the same item ID and withdraws nothing it should keep; a selection in the tree retargets follow as in the table; while the followed process is hidden under a parent the client reported collapsed the follow status says so, because keep_visible never expands and a local expand never scrolls",
+      "scope": "PX-018/refresh (src/refresh.rs) follow_after, follow_view_in, follow_table_effects; follow (src/follow.rs) Follow::view_tree; tests/tree_test.rs the_selection_and_follow_carry_over_between_the_table_and_the_tree, a_collapse_that_hides_the_selection_clears_the_inspector_and_follow_says_where_it_is, a_fresh_client_attaching_in_the_tree_view_gets_one_collection_and_its_hint; client-macos/Tests/SRUITests/ProcessExplorerShellTests.swift theProcessTreeKeepsTheSelectionAndFollowAndDisclosesLocally",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX018-008",
+      "feature": "Search, filters, pause, the inspector and the column chooser keep working in the tree: a search promotes its match on the tree, a filter that hides a parent makes its shown children roots that say so, a paused view switches over its frozen rows and publishes no sample, and a layout change updates both collections' headings",
+      "scope": "PX-018/refresh (src/refresh.rs) promotion, publish_layout, Effect::TreeColumns, tree_headings; tests/tree_test.rs search_promotes_its_match_in_the_tree_and_the_filters_make_hidden_parents_roots, a_paused_view_switches_over_its_frozen_rows_and_publishes_no_sample",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018.md"
+      ]
+    }
+  ]
+}

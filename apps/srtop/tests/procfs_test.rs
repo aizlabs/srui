@@ -2734,6 +2734,90 @@ fn the_state_and_parent_are_stat_fields_3_and_4_and_an_unusable_one_is_unread() 
     }
 }
 
+/// PX-018: the scan publishes each record's parent PID and start time from
+/// the same `stat` line it reads the record's identity from, and the process
+/// tree attaches a child only to the one record of that generation holding
+/// its parent PID that started no later: a parent PID now held by a newer
+/// process is a reused PID and the child is a root that says so, and a parent
+/// whose record could not be read is never guessed.
+#[test]
+fn the_tree_takes_each_parent_from_the_same_stat_read_and_never_a_reused_pid() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .host()
+        .raw(1, &stat_line_with_state(1, b"init", "S", "0", 1))
+        .raw(100, &stat_line_with_state(100, b"parent", "S", "1", 100))
+        .raw(200, &stat_line_with_state(200, b"child", "S", "100", 200))
+        .raw(300, &stat_line_with_state(300, b"older", "S", "400", 300))
+        .raw(400, &stat_line_with_state(400, b"newer", "S", "1", 350))
+        .denied(500)
+        .raw(
+            501,
+            &stat_line_with_state(501, b"orphaned", "S", "500", 600),
+        );
+    let mut source = fixture.source();
+    let snapshot = source.snapshot();
+    let lineage = |pid: u32| {
+        snapshot
+            .records
+            .iter()
+            .find(|record| record.key.pid == Observed::Known(pid))
+            .map(|record| record.lineage.clone())
+            .unwrap()
+    };
+    assert_eq!(
+        lineage(200),
+        srui_process_explorer::source::Lineage::new(100, 200)
+    );
+    assert_eq!(
+        lineage(1),
+        srui_process_explorer::source::Lineage::new(0, 1)
+    );
+    let session = srui_sessiond::Session::mint();
+    let mut source = fixture.source();
+    let (mut view, _) = srui_process_explorer::start_from_source(&session, &mut source).unwrap();
+    view.set_view(&session, Some(true)).unwrap();
+    let rows: Vec<(u64, u64, String)> = session.with_store(|store| {
+        let model = store.get_model(srui_process_explorer::TREE_MODEL).unwrap();
+        (0..model.item_count)
+            .map(|index| {
+                let item = model.get_item_by_index(index).unwrap();
+                let srui_sdk::Value::List(cells) = &item.value else {
+                    panic!("a list of cells")
+                };
+                let srui_sdk::Value::UnsignedInt(pid) = cells[0] else {
+                    panic!("a known PID")
+                };
+                let Some(srui_sdk::Value::UnsignedInt(depth)) =
+                    item.get_property(srui_sdk::PropertyRef::TREE_DEPTH)
+                else {
+                    panic!("a depth")
+                };
+                let Some(srui_sdk::Value::String(parent)) = cells.last() else {
+                    panic!("a parent cell")
+                };
+                (pid, *depth, parent.clone())
+            })
+            .collect()
+    });
+    assert_eq!(
+        rows,
+        vec![
+            (1, 0, "none: started by the kernel".to_string()),
+            (100, 1, "1".to_string()),
+            (200, 2, "100".to_string()),
+            (400, 1, "1".to_string()),
+            (
+                300,
+                0,
+                "root: parent 400 started later (PID reused)".to_string()
+            ),
+            (501, 0, "root: parent 500 unreadable".to_string()),
+        ]
+    );
+}
+
 /// PX-013: the inspector reads one instance on demand, from its own record's
 /// `stat`: state and parent from that line, and the start time from the key's
 /// own creation token at the mount's tick rate after its `btime`. A line whose
@@ -3169,6 +3253,17 @@ mod live {
     const WORKER_SLEEPS: &str = "sleep";
     /// A worker that keeps one CPU busy once it is ready.
     const WORKER_BURNS: &str = "burn";
+    /// A worker that starts one sleeping child worker of its own, reports the
+    /// child's PID, and only then reports ready (PX-018).
+    const WORKER_PARENTS: &str = "parent";
+    /// The child a [`WORKER_PARENTS`] worker starts (PX-018). It outlives its
+    /// parent, so the kernel reparents it, and ends once the test process
+    /// that owns the family ([`WORKER_TEST_PID_ENV`]) is gone.
+    const WORKER_CHILD: &str = "child";
+    /// The PID of the test process that owns a family of workers (PX-018).
+    const WORKER_TEST_PID_ENV: &str = "SRTOP_LIVE_TEST_PID";
+    /// What a parent worker prints, followed by its child's PID (PX-018).
+    const WORKER_CHILD_READY: &str = "srtop live worker child: pid=";
     /// The libtest name of [`test_owned_worker`], the one test a worker runs.
     const WORKER_TEST: &str = "live::test_owned_worker";
     /// The name a worker gives itself, which a scan reads back from
@@ -3245,6 +3340,26 @@ mod live {
         }
 
         fn spawn_with(activity: &str, extra: &[&str]) -> Self {
+            Self::spawn_reporting(activity, extra).0
+        }
+
+        /// A parent worker and the PID of the child worker it started
+        /// (PX-018).
+        fn family() -> (Self, u32) {
+            let (worker, output) = Self::spawn_reporting(WORKER_PARENTS, &[]);
+            let child = output
+                .iter()
+                .find_map(|line| {
+                    line.find(WORKER_CHILD_READY)
+                        .and_then(|at| line[at + WORKER_CHILD_READY.len()..].trim().parse().ok())
+                })
+                .unwrap_or_else(|| panic!("the parent worker reported no child: {output:?}"));
+            (worker, child)
+        }
+
+        /// [`Self::spawn_with`], and every line the worker printed before it
+        /// reported ready.
+        fn spawn_reporting(activity: &str, extra: &[&str]) -> (Self, Vec<String>) {
             let argv = Self::argv(extra);
             let mut child = Command::new(&argv[0])
                 .args(&argv[1..])
@@ -3275,7 +3390,7 @@ mod live {
             let mut output = Vec::new();
             let cause = loop {
                 match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(line) if line.ends_with(&ready) => return worker,
+                    Ok(line) if line.ends_with(&ready) => return (worker, output),
                     Ok(line) => output.push(line),
                     Err(cause) => break cause,
                 }
@@ -3346,10 +3461,51 @@ mod live {
         }
         // Settled before the setup, so an unknown request fails before ready.
         let burns = match activity {
-            WORKER_SLEEPS => false,
+            WORKER_SLEEPS | WORKER_PARENTS | WORKER_CHILD => false,
             WORKER_BURNS => true,
             other => panic!("unknown worker activity {other:?}"),
         };
+        // A child outlives its parent on purpose (PX-018): it ends once the
+        // test process that owns the family is gone, not when it is orphaned.
+        let owner = match activity {
+            WORKER_CHILD => std::env::var(WORKER_TEST_PID_ENV)
+                .ok()
+                .and_then(|pid| pid.parse::<u32>().ok()),
+            _ => None,
+        };
+        let alive = || match owner {
+            Some(test) => std::path::Path::new(&format!("/proc/{test}")).exists(),
+            None => spawned_by_test(),
+        };
+        // A parent starts its child, which is this same binary again, before
+        // it reports ready, and says which PID the child has (PX-018).
+        let _child = (activity == WORKER_PARENTS).then(|| {
+            let argv = Worker::argv(&[]);
+            let mut child = Command::new(&argv[0])
+                .args(&argv[1..])
+                .env(WORKER_ENV, format!("{}:{WORKER_CHILD}", std::process::id()))
+                .env(
+                    WORKER_TEST_PID_ENV,
+                    std::os::unix::process::parent_id().to_string(),
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("a parent worker starts its child");
+            let ready = format!("{WORKER_READY}{}", child.id());
+            let stdout = child.stdout.take().expect("stdout is piped");
+            let mut lines = BufReader::new(stdout).lines();
+            loop {
+                match lines.next() {
+                    Some(Ok(line)) if line.ends_with(&ready) => break,
+                    Some(Ok(_)) => continue,
+                    _ => panic!("the child worker never reported ready"),
+                }
+            }
+            println!("{WORKER_CHILD_READY}{}", child.id());
+            child
+        });
         // Renames the thread-group leader, whichever thread writes it: the name
         // `/proc/<pid>/stat` reports for the process.
         std::fs::write("/proc/self/comm", WORKER_NAME).expect("a process may rename itself");
@@ -3360,7 +3516,7 @@ mod live {
         stdout.flush().expect("the test reads this");
         drop(stdout);
         let started = Instant::now();
-        while started.elapsed() < WORKER_LIFETIME && spawned_by_test() {
+        while started.elapsed() < WORKER_LIFETIME && alive() {
             if burns {
                 // Only this thread runs: libtest's main thread is blocked waiting
                 // for it, so the process uses one CPU and no more.
@@ -4669,6 +4825,176 @@ mod live {
     }
 
     /// The published row of `pid`, if the collection currently holds one.
+    /// (PID, depth, descendants, parent cell) of every published tree row, in
+    /// preorder (PX-018).
+    fn tree_rows(session: &Session) -> Vec<(u32, u64, u64, String)> {
+        session.with_store(|store| {
+            let model = store.get_model(srui_process_explorer::TREE_MODEL).unwrap();
+            (0..model.item_count)
+                .map(|index| {
+                    let item = model.get_item_by_index(index).unwrap();
+                    let Value::List(cells) = &item.value else {
+                        panic!("a tree row is a list of cells")
+                    };
+                    let pid = match cells[0] {
+                        Value::UnsignedInt(pid) => pid as u32,
+                        _ => 0,
+                    };
+                    let number = |property| match item.get_property(property) {
+                        Some(Value::UnsignedInt(value)) => *value,
+                        _ => panic!("a tree row carries {property:?}"),
+                    };
+                    let parent = match cells.last() {
+                        Some(Value::String(parent)) => parent.clone(),
+                        other => panic!("a parent cell: {other:?}"),
+                    };
+                    (
+                        pid,
+                        number(srui_sdk::PropertyRef::TREE_DEPTH),
+                        number(srui_sdk::PropertyRef::DESCENDANT_COUNT),
+                        parent,
+                    )
+                })
+                .collect()
+        })
+    }
+
+    /// The parent PID `/proc/<pid>/stat` names right now.
+    fn kernel_parent(pid: u32) -> Option<u32> {
+        let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+        parse_stat(pid, &stat).and_then(|fields| match fields.parent {
+            Observed::Known(parent) => Some(parent),
+            Observed::Missing(_) => None,
+        })
+    }
+
+    /// Every tree link holds against the very scan it was published from: an
+    /// attached row's record names that parent, and the one record of that
+    /// PID started no later; a root that says its parent PID was reused names a
+    /// parent that started later (PX-018).
+    fn assert_links_hold(
+        rows: &[(u32, u64, u64, String)],
+        snapshot: &srui_process_explorer::source::ProcessSnapshot,
+    ) -> (usize, usize) {
+        let record = |pid: u32| {
+            snapshot
+                .records
+                .iter()
+                .filter(|record| record.key.pid == Observed::Known(pid))
+                .collect::<Vec<_>>()
+        };
+        let started = |pid: u32| match &record(pid)[0].lineage.started {
+            Observed::Known(ticks) => *ticks,
+            Observed::Missing(_) => panic!("a live record states its start"),
+        };
+        let (mut attached, mut reused) = (0, 0);
+        for (pid, _, _, parent) in rows {
+            if let Ok(parent) = parent.parse::<u32>() {
+                let child = record(*pid);
+                assert_eq!(child.len(), 1);
+                assert_eq!(
+                    child[0].lineage.parent,
+                    Observed::Known(parent),
+                    "PID {pid}"
+                );
+                assert_eq!(record(parent).len(), 1, "one record holds PID {parent}");
+                assert!(started(parent) <= started(*pid), "{parent} started first");
+                attached += 1;
+            } else if let Some(rest) = parent.strip_prefix("root: parent ") {
+                if let Some(number) = rest.strip_suffix(" started later (PID reused)") {
+                    let parent: u32 = number.parse().unwrap();
+                    assert!(started(parent) > started(*pid), "PID {parent} is newer");
+                    reused += 1;
+                }
+            }
+        }
+        (attached, reused)
+    }
+
+    /// PX-018: a test-owned parent worker and the child worker it started.
+    /// The live tree shows the child under its parent, from the same scan's
+    /// parent PID and start times. Once the parent is killed and reaped, the
+    /// kernel reparents the child to init or a subreaper, and the next sample
+    /// shows it under that process, never under the PID it had. A new worker
+    /// that may reuse the dead parent's PID is never the child's parent, and
+    /// every link of the whole host's tree holds against the scan it came from.
+    #[test]
+    fn a_test_owned_child_is_shown_under_its_parent_then_under_its_new_parent_once_orphaned() {
+        let (parent, child) = Worker::family();
+        let parent_pid = parent.pid();
+        assert_eq!(kernel_parent(child), Some(parent_pid));
+        assert_eq!(kernel_parent(parent_pid), Some(std::process::id()));
+        let session = Session::mint();
+        let mut source = ProcFsSource::live();
+        let (mut view, _) = start_from_source(&session, &mut source).unwrap();
+        view.set_view(&session, Some(true)).unwrap();
+        let rows = tree_rows(&session);
+        let at = |pid: u32| rows.iter().position(|row| row.0 == pid);
+        let parent_at = at(parent_pid).expect("the parent worker is shown");
+        let child_at = at(child).expect("the child worker is shown");
+        assert_eq!(rows[child_at].3, parent_pid.to_string());
+        assert_eq!(
+            child_at,
+            parent_at + 1,
+            "the child is the parent's only descendant"
+        );
+        assert_eq!(rows[child_at].1, rows[parent_at].1 + 1);
+        assert_eq!(rows[parent_at].2, 1);
+        assert_eq!(rows[parent_at].3, std::process::id().to_string());
+
+        // The parent ends; the kernel reparents its child at once.
+        drop(parent);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let adopted = loop {
+            match kernel_parent(child) {
+                Some(adopter) if adopter != parent_pid => break adopter,
+                _ if Instant::now() > deadline => panic!("PID {child} was never reparented"),
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        // A new worker, which may be handed the dead parent's PID.
+        let successor = Worker::start();
+        let snapshot = source.snapshot();
+        view.apply(&session, LIVE_STATUS_TEXT, &snapshot).unwrap();
+        let rows = tree_rows(&session);
+        let child_at = rows
+            .iter()
+            .position(|row| row.0 == child)
+            .expect("the orphaned child is still shown");
+        assert_eq!(
+            rows[child_at].3,
+            adopted.to_string(),
+            "under its new parent"
+        );
+        assert_ne!(rows[child_at].3, parent_pid.to_string());
+        if let Some(adopter_at) = rows.iter().position(|row| row.0 == adopted) {
+            assert_eq!(rows[child_at].1, rows[adopter_at].1 + 1);
+            assert!(adopter_at < child_at, "under the adopter's subtree");
+        }
+        assert!(
+            rows.iter()
+                .all(|row| row.0 != parent_pid || row.0 == successor.pid()),
+            "the dead parent is not shown"
+        );
+        let (attached, reused) = assert_links_hold(&rows, &snapshot);
+        assert!(attached > 0);
+        // The child ends with this test; it is not this test's child to reap.
+        let _ = Command::new("kill")
+            .arg(child.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        println!(
+            "PX-018 live evidence: parent={parent_pid} child={child} adopted_by={adopted} \
+             successor={} (reused the parent PID: {}) rows={} attached={attached} \
+             reused_parent_roots={reused}",
+            successor.pid(),
+            successor.pid() == parent_pid,
+            rows.len()
+        );
+    }
+
     fn row_for(session: &Session, pid: u32) -> Option<(ItemId, Value)> {
         session.with_store(|store| {
             store

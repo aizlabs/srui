@@ -116,6 +116,8 @@ fn the_summary_is_published_as_text_and_progress_and_nothing_else() {
                     TypeRef::RICHTEXT,
                     // The follow checkbox (PX-017).
                     TypeRef::TOGGLE,
+                    // The process tree (PX-018).
+                    TypeRef::TREE,
                 ]
                 .contains(&node.node_type),
                 "node {id} is a {:?}",

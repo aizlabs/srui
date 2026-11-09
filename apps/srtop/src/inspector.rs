@@ -596,6 +596,15 @@ impl Inspector {
         self.selection = Selection::Refused(item);
     }
 
+    /// Describes nothing again, under a new generation (PX-018): the client
+    /// no longer shows a selection, because collapsing a parent in the tree
+    /// hid the selected row. Nothing is read, and a read still loading is
+    /// dropped when it returns.
+    pub(crate) fn clear(&mut self) {
+        self.generation = self.generation.next();
+        self.selection = Selection::None;
+    }
+
     /// The view is paused (PX-015): a read still loading is deferred, and
     /// its result is dropped when it returns.
     pub(crate) fn pause(&mut self) {

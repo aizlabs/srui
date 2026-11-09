@@ -56,6 +56,11 @@
 //! the key's start time, so what was read belongs to that instance and to no
 //! newcomer under its PID, whether the directory is pinned or read by name.
 //!
+//! Every published record also carries its parent PID and start time
+//! (PX-018), `stat` fields 4 and 22 of the very line that identified it, so
+//! the process tree resolves parents from one generation whose lineage no
+//! recycled PID can lend; an unusable parent field is unread, never 0.
+//!
 //! The system-wide figures (PX-007) are read beside the records, from the
 //! scanned root's own `stat`, `meminfo`, `uptime` and `loadavg`, so a fixture
 //! tree states its own and is deterministic on any host. Each file is read, and
@@ -70,7 +75,7 @@ use crate::inspector::{DetailRead, DetailSource, ProcessDetails, ProcessState, S
 use crate::owner::Accounts;
 use crate::source::{
     record_issue, BootId, CappedRecords, Completeness, CpuInterval, CpuUsage, CreationToken,
-    DisplayName, EnumerationIssue, Figure, FigureGap, HostId, IssueScope, LoadAverages,
+    DisplayName, EnumerationIssue, Figure, FigureGap, HostId, IssueScope, Lineage, LoadAverages,
     MemoryFigures, MissingReason, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
     ProcessSnapshot, ProcessSource, SkippedRecords, SnapshotTime, SourceId, SwapFigures, SystemCpu,
     SystemCpuInterval, SystemSample,
@@ -1190,6 +1195,14 @@ impl ProcessSource for ProcFsSource {
                             None => CpuUsage::Missing(MissingReason::Unavailable),
                         };
                         records.push(ProcessRecord {
+                            // The parent and the start time come from the
+                            // same `stat` read as the identity (PX-018), so
+                            // a recycled PID never lends its parent to the
+                            // instance this record names.
+                            lineage: Lineage {
+                                parent: stat.parent.clone(),
+                                started: Observed::Known(stat.start_ticks),
+                            },
                             owner,
                             key: ProcessKey {
                                 source: self.source.clone(),

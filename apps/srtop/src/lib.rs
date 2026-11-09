@@ -3,12 +3,14 @@
 //! summary, PX-009 server-authoritative sorting, PX-010 filtering, PX-068
 //! column chooser, PX-011 find-next/find-previous and jump to PID, PX-015
 //! sampling interval, Pause view/Resume view and manual refresh, PX-016
-//! keyboard shortcuts, PX-017 follow selected process). No process
+//! keyboard shortcuts, PX-017 follow selected process, PX-018 parent/child
+//! process tree). No process
 //! is ever opened for control: the only client-input handlers are the sort
 //! buttons', the filter input's, the column chooser buttons', the search
-//! controls', the sampling controls' and the follow toggle's, which reorder,
-//! filter, re-lay out, locate, freeze, re-sample or follow the published rows
-//! and touch no process. A
+//! controls', the sampling controls', the follow toggle's, the view switch's
+//! and the tree's selection and disclosure reports, which reorder,
+//! filter, re-lay out, locate, freeze, re-sample, follow or re-arrange the
+//! published rows and touch no process. A
 //! keyboard shortcut (design §§7.4, 7.6, 22.5; PX-016-G01's standard
 //! `shortcut` property) sends the same event its control's click sends, or
 //! only moves local focus; it adds no handler.
@@ -29,6 +31,7 @@ pub mod search;
 pub mod sort;
 pub mod source;
 pub mod summary;
+pub mod tree;
 
 use srui_sdk::*;
 use srui_sessiond::{Session, SessionError};
@@ -165,6 +168,27 @@ pub const FOLLOW_ROW: NodeId = NodeId::new(67);
 pub const FOLLOW_TOGGLE: NodeId = NodeId::new(68);
 pub const FOLLOW_STATUS: NodeId = NodeId::new(69);
 pub const FOLLOW_NODE_COUNT: usize = 3;
+/// The view switch (PX-018): a Row between the follow controls and the
+/// collections holding the "Show process tree" checkbox `Toggle` and the view
+/// status, which says which collection shows the processes and, in the tree,
+/// how many have no shown parent.
+pub const VIEW_ROW: NodeId = NodeId::new(70);
+pub const VIEW_TOGGLE: NodeId = NodeId::new(71);
+pub const VIEW_STATUS: NodeId = NodeId::new(72);
+/// The process tree (PX-018): a standard `Tree` over [`TREE_MODEL`], under
+/// the table and collapsed out of the layout while the table is shown. Its
+/// headings are the table's and a parent column, set when the shell is
+/// created, so the generic client mounts it with its columns.
+pub const TREE: NodeId = NodeId::new(73);
+pub const VIEW_NODE_COUNT: usize = 4;
+pub const VIEW_LABEL: &str = "Show process tree";
+pub const VIEW_DESCRIPTION: &str =
+    "When on, the same processes are shown as a tree under their parents instead of the table. The server resolves each parent from the latest scan and never guesses one: a process whose parent is not in the scan, unreadable, a newer process reusing its PID, hidden by the filters, or caught in a cycle is shown at the top, and its Parent column says why. Expanding and collapsing are local; sorting orders each parent's children. The selection and follow carry over.";
+/// The process tree's model (PX-018): empty while the table is shown.
+pub const TREE_MODEL: ModelId = ModelId::new(2);
+/// The shortcut that moves local focus to the shown collection (PX-016,
+/// PX-018): held by the table or the tree, whichever is shown, never both.
+pub const LIST_SHORTCUT: &str = "primary+l";
 
 /// The keyboard shortcuts (PX-016), in the shell's reading order: the
 /// standard `shortcut` property (31, PX-016-G01) on existing controls, in its
@@ -186,8 +210,11 @@ pub const FOLLOW_NODE_COUNT: usize = 3;
 /// the column chooser moves a column: Command-1 is always PID. The two
 /// resets are the existing "All visible users" and "Restore default columns"
 /// buttons; a text filter resets by deleting its text, which its focus
-/// shortcut selects whole. No node, handler or event is added.
-pub const KEYBOARD_SHORTCUTS: [(NodeId, &str); 15] = [
+/// shortcut selects whole. No node, handler or event is added. The view
+/// switch's (PX-018)
+/// is its click, like the follow toggle's; the list-focus shortcut moves to
+/// the tree while the tree is shown.
+pub const KEYBOARD_SHORTCUTS: [(NodeId, &str); 16] = [
     (SAMPLING_PAUSE, "primary+alt+p"),
     (SAMPLING_REFRESH, "primary+r"),
     (FILTER_INPUT, "primary+alt+f"),
@@ -201,7 +228,8 @@ pub const KEYBOARD_SHORTCUTS: [(NodeId, &str); 15] = [
     (SORT_CPU, "primary+4"),
     (COLUMNS_RESTORE, "primary+alt+r"),
     (FOLLOW_TOGGLE, "primary+shift+f"),
-    (TABLE, "primary+l"),
+    (VIEW_TOGGLE, "primary+t"),
+    (TABLE, LIST_SHORTCUT),
     (INSPECTOR_COMMAND, "primary+i"),
 ];
 
@@ -301,7 +329,8 @@ pub const SHELL_NODE_COUNT: usize = 5
     + SEARCH_NODE_COUNT
     + OWNER_NODE_COUNT
     + INSPECTOR_NODE_COUNT
-    + FOLLOW_NODE_COUNT;
+    + FOLLOW_NODE_COUNT
+    + VIEW_NODE_COUNT;
 
 /// The sort button that orders `field`.
 pub fn sort_button_of(field: catalogue::ProcessField) -> NodeId {
@@ -473,7 +502,31 @@ pub fn install_inspector(
     session.on(TABLE, SELECTION_CHANGED, move |session, event| {
         refresh::selection_changed(&selected, session, event);
     });
+    // The tree's selection is the same input (PX-018): only the shown
+    // collection's is read.
+    let selected = std::sync::Arc::clone(view);
+    session.on(TREE, SELECTION_CHANGED, move |session, event| {
+        refresh::selection_changed(&selected, session, event);
+    });
     idle
+}
+
+/// Installs the view switch's handler and the tree's disclosure reports
+/// (§7.6, §22.5, PX-018): the "Show process tree" toggle's `VALUE_CHANGED`,
+/// whose boolean chooses the collection that shows the processes, and the
+/// tree's `EXPANSION_CHANGED`, which only records what the client already
+/// expanded or collapsed locally. Neither reads a PID or touches a process:
+/// the switch republishes the same rows in the other collection, and a
+/// disclosure report names one published item ID.
+pub fn install_view_handlers(session: &Session, view: &refresh::SharedView) {
+    let switch = std::sync::Arc::clone(view);
+    session.on(VIEW_TOGGLE, VALUE_CHANGED, move |session, event| {
+        refresh::view_toggled(&switch, session, event);
+    });
+    let disclosure = std::sync::Arc::clone(view);
+    session.on(TREE, EXPANSION_CHANGED, move |session, event| {
+        refresh::expansion_reported(&disclosure, session, event);
+    });
 }
 
 /// Installs the sampling controls' handlers (§7.6, §22.6, PX-015): the Pause
@@ -760,6 +813,9 @@ pub(crate) fn initialize_rows(
         .clamp(1, srui_semantic_tree::DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION);
     session.transaction(|ui| {
         ui.apply_op(&Operation::create_model(MODEL, TypeRef::TABLE, 0))?;
+        // The process tree's model starts empty: the table shows the rows
+        // until the view switch moves them (PX-018).
+        ui.apply_op(&Operation::create_model(TREE_MODEL, TypeRef::TREE, 0))?;
         for (batch_index, chunk) in items.chunks(batch).enumerate() {
             ui.apply_op(&Operation::model_insert(
                 MODEL,
@@ -1023,6 +1079,32 @@ pub(crate) fn initialize_rows(
                 TextRole::Caption
             })
             .create(ui)?;
+        // The view switch (PX-018): a standard checkbox Toggle and a status
+        // Text in a Row above the collections. The table is shown first.
+        Row::builder(VIEW_ROW)
+            .parent(COLUMN)
+            .spacing_role(SpacingRole::Normal)
+            .create(ui)?;
+        Toggle::checkbox(VIEW_TOGGLE)
+            .parent(VIEW_ROW)
+            .label(VIEW_LABEL)
+            .value(false)
+            .accessible_description(VIEW_DESCRIPTION)
+            .create(ui)?;
+        ui.set(VIEW_TOGGLE, ENABLED, sort_enabled)?;
+        Text::builder(VIEW_STATUS)
+            .parent(VIEW_ROW)
+            .text(if sort_enabled {
+                refresh::TABLE_VIEW_STATUS
+            } else {
+                refresh::UNCOLLECTED_VIEW_STATUS
+            })
+            .role(if sort_enabled {
+                TextRole::Status
+            } else {
+                TextRole::Caption
+            })
+            .create(ui)?;
         Table::builder(TABLE)
             .parent(COLUMN)
             .model_ref(MODEL)
@@ -1044,6 +1126,20 @@ pub(crate) fn initialize_rows(
             .grow(1.0)
             .create(ui)?;
         ui.set(TABLE, READ_ONLY, true)?;
+        // The process tree (PX-018): the same rows as a forest, over its own
+        // model, collapsed out of the layout until the view switch shows it.
+        // Its headings are created with it, so a client mounts it with every
+        // column, the outline column first and the parent column last.
+        Tree::builder(TREE)
+            .parent(COLUMN)
+            .model_ref(TREE_MODEL)
+            .columns(refresh::tree_headings(&layout))
+            .selection_mode(SelectionMode::Single)
+            .label("Process tree")
+            .grow(1.0)
+            .visibility(Visibility::Collapsed)
+            .create(ui)?;
+        ui.set(TREE, READ_ONLY, true)?;
         // The inspector: standard status Texts in a Column under the table
         // (PX-013). It starts with nothing selected.
         let inspector = inspector::InspectorView::initial(sort_enabled);
@@ -1231,9 +1327,10 @@ mod tests {
             // (PX-011), the six user-filter controls (PX-012) and the six of
             // the inspector (PX-013, and its command line since PX-014) and
             // the six sampling controls (PX-015) and the three follow
-            // controls (PX-017).
-            assert_eq!(store.node_count(), 69);
-            assert_eq!(SHELL_NODE_COUNT, 69);
+            // controls (PX-017) and the view switch's row, toggle and
+            // status and the process tree (PX-018).
+            assert_eq!(store.node_count(), 73);
+            assert_eq!(SHELL_NODE_COUNT, 73);
             // A shell that samples nothing has nothing to follow, and says so
             // (PX-017).
             assert_eq!(
@@ -1313,7 +1410,9 @@ mod tests {
                         SORT_ROW,
                         COLUMN_CHOOSER_ROW,
                         FOLLOW_ROW,
+                        VIEW_ROW,
                         TABLE,
+                        TREE,
                         INSPECTOR
                     ]
                     .as_slice()
@@ -1629,7 +1728,9 @@ mod tests {
                         SORT_ROW,
                         COLUMN_CHOOSER_ROW,
                         FOLLOW_ROW,
+                        VIEW_ROW,
                         TABLE,
+                        TREE,
                         INSPECTOR
                     ]
                     .as_slice()
@@ -1691,7 +1792,7 @@ mod tests {
                         );
                         assert_eq!(
                             behavior == Some(ShortcutBehavior::Toggle),
-                            node.id == FOLLOW_TOGGLE,
+                            node.id == FOLLOW_TOGGLE || node.id == VIEW_TOGGLE,
                             "node {id}"
                         );
                     }

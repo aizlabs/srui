@@ -983,6 +983,9 @@ impl ProcessView {
         // it commits with the final rows rather than ahead of them (PX-011),
         // and the inspector, whose metrics and state follow them (PX-013).
         plan.extend(self.search_effects(&target, &unfiltered_target, &unconfirmed));
+        // A row this sample moved under a parent the client keeps collapsed is
+        // no longer selected there (PX-018).
+        self.reconcile_disclosure(&target, false);
         plan.extend(self.inspector_effects(&target, &unfiltered_target, &unconfirmed));
         // Follow last of all (PX-017): it stops when this plan hides or ends
         // the followed process, and a hint it sets names the row's final
@@ -1661,8 +1664,10 @@ impl ProcessView {
         plan.extend(self.view_effects(mode, forest.as_ref()));
         // The search counts the newly filtered rows; a target a filter hid is
         // reported as no longer shown, never replaced (PX-011). So is the
-        // inspector's (PX-013).
+        // inspector's (PX-013), and a row these rows put under a parent the
+        // client keeps collapsed is no longer selected there (PX-018).
         plan.extend(self.search_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
+        self.reconcile_disclosure(&target, switched);
         plan.extend(self.inspector_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
         if switched {
             // The selection survives the switch by item ID (PX-018): the
@@ -1720,11 +1725,6 @@ impl ProcessView {
         result.transactions = transactions;
         refresh_sort_values(&mut self.rows, &target);
         self.ids.retain(&self.unfiltered_rows);
-        if switched {
-            // The client's disclosure state belonged to the tree it no longer
-            // holds: every item starts expanded in a newly filled tree.
-            self.collapsed.clear();
-        }
         self.prune_collapsed();
         self.search.observe(&self.rows);
         outcome.map(|()| result)
@@ -2231,24 +2231,45 @@ impl ProcessView {
             .map(|(_, row)| row)
     }
 
-    /// Forgets every collapsed item the published tree no longer holds, or
-    /// that has no descendants left to hide, exactly as the client drops one
-    /// whose item leaves its cache (PX-018-G01).
+    /// Forgets every collapsed item the published tree no longer holds, with
+    /// exactly the client's rule (`OutlineCollectionAdapter.pruneCollapsedItems`
+    /// keeps every collapsed item its model still holds): an item that has no
+    /// children for a while stays collapsed, and hides the children it gains
+    /// again (PX-018-G01, PX-018). Outside the tree nothing is collapsed.
     fn prune_collapsed(&mut self) {
         if self.mode != ViewMode::Tree {
             self.collapsed.clear();
             return;
         }
-        if self.collapsed.is_empty() {
-            return;
+        prune_collapsed_to(&mut self.collapsed, &self.rows);
+    }
+
+    /// Brings the server's mirror of the client's disclosure and selection up
+    /// to `target`, the rows a plan is about to publish (PX-018).
+    ///
+    /// The client keeps a collapsed item while its model holds it, and every
+    /// item starts expanded in a tree a view switch (`fresh`) just filled. A
+    /// shown row that `target` places under a collapsed item has no row on
+    /// that client, so its native selection is gone: the outline restores a
+    /// selection only to a shown row, with selection events suppressed while
+    /// it applies the commit, so no `SELECTION_CHANGED` reports it. The
+    /// inspector is cleared to match, exactly as for a collapse
+    /// ([`Self::expansion_changed`]). Follow is not a selection: it stays on
+    /// its process, and its status says it is hidden under the collapsed
+    /// parent.
+    fn reconcile_disclosure(&mut self, target: &[Row], fresh: bool) {
+        if fresh {
+            self.collapsed.clear();
         }
-        let parents: HashSet<ItemId> = self
-            .rows
-            .iter()
-            .filter(|row| row.tree.as_ref().is_some_and(|place| place.descendants > 0))
-            .map(|row| row.item_id)
-            .collect();
-        self.collapsed.retain(|item| parents.contains(item));
+        prune_collapsed_to(&mut self.collapsed, target);
+        let hidden = self
+            .inspector
+            .selected()
+            .and_then(|selected| self.hidden_under(target, selected))
+            .is_some();
+        if hidden {
+            self.inspector.clear();
+        }
     }
 
     /// The row operations that turn the published rows into `target` in the
@@ -2690,6 +2711,15 @@ pub fn follow_toggled(
     if let Err(error) = lock_view(view).set_follow(session, on) {
         eprintln!("srtop: follow not published: {error}");
     }
+}
+
+/// Keeps only the collapsed items `rows` still hold (PX-018).
+fn prune_collapsed_to(collapsed: &mut HashSet<ItemId>, rows: &[Row]) {
+    if collapsed.is_empty() {
+        return;
+    }
+    let held: HashSet<ItemId> = rows.iter().map(|row| row.item_id).collect();
+    collapsed.retain(|item| held.contains(item));
 }
 
 /// The item the last promotion in `plan` names, if it promotes one.

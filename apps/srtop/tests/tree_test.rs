@@ -1326,3 +1326,174 @@ fn a_switch_to_the_tree_at_the_byte_ceiling_counts_the_rows_it_leaves_out() {
         }
     }
 }
+
+/// A fixed source whose records a test edits between samples, each with its
+/// own name, PID, parent and start tick.
+fn family(records: &[(u32, &str, u32, u64)]) -> Fixed {
+    Fixed::new(
+        records
+            .iter()
+            .map(|&(pid, name, parent, started)| {
+                record(pid, name, Lineage::new(parent, started), u64::from(pid))
+            })
+            .collect(),
+    )
+}
+
+/// Codex review round 1, finding 1: the client keeps a collapsed item while
+/// its model holds it, children or not (`OutlineCollectionAdapter
+/// .pruneCollapsedItems`), so a collapsed process that loses its last child
+/// and later gains one hides that child again. The server mirrors exactly
+/// that: it keeps the collapsed item through the leaf phase, so a followed
+/// process reparented under it later is reported hidden under it, and the
+/// inspector, whose row the client no longer shows, is cleared.
+#[test]
+fn a_collapsed_process_that_loses_its_last_child_stays_collapsed_for_the_next_one() {
+    let mut source = family(&[
+        (10, "alpha", 0, 10),
+        (11, "beta", 10, 11),
+        (20, "foxtrot", 0, 50),
+    ]);
+    let mut h = harness(&mut source);
+    h.show_tree(true);
+    let alpha = h.item_of(10);
+    let foxtrot = h.item_of(20);
+    h.select(TREE, foxtrot);
+    h.follow(true);
+    h.disclose(alpha, false);
+    assert!(h.view().collapsed().contains(&alpha));
+    // `beta` ends: `alpha` has no child left, and stays collapsed, as on the
+    // client.
+    source
+        .records
+        .retain(|record| record.key.pid != Observed::Known(11));
+    h.sample(&mut source);
+    assert_eq!(
+        h.tree()
+            .iter()
+            .find(|row| row.pid == 10)
+            .unwrap()
+            .descendants,
+        0
+    );
+    assert!(
+        h.view().collapsed().contains(&alpha),
+        "a collapsed leaf stays collapsed while the tree holds it"
+    );
+    // `foxtrot` is reparented under `alpha`, which the client still keeps
+    // collapsed: it is hidden there.
+    for record in &mut source.records {
+        if record.key.pid == Observed::Known(20) {
+            record.lineage = Lineage::new(10, 50);
+        }
+    }
+    h.sample(&mut source);
+    assert_eq!(
+        h.tree().iter().find(|row| row.pid == 20).unwrap().parent,
+        "10"
+    );
+    assert_eq!(
+        h.view().follow().following(),
+        Some(foxtrot),
+        "follow stays on"
+    );
+    let status = h.text(FOLLOW_STATUS);
+    assert!(
+        status.starts_with("Following PID 20 · foxtrot · hidden under collapsed PID 10 · alpha"),
+        "{status}"
+    );
+    assert_eq!(h.text(INSPECTOR_STATUS), NO_SELECTION_STATUS);
+    // Once `alpha` leaves the tree, it leaves the collapsed set too.
+    source
+        .records
+        .retain(|record| record.key.pid != Observed::Known(10));
+    h.sample(&mut source);
+    assert!(!h.view().collapsed().contains(&alpha));
+}
+
+/// Codex review round 1, finding 2: a refresh, or a republish, that places
+/// the selected process under a parent the client keeps collapsed hides its
+/// row there, and the client restores no selection to a hidden row and
+/// reports nothing (`OutlineCollectionAdapter.update` restores the selection
+/// with selection events suppressed). The inspector is cleared in that same
+/// plan instead of describing a process the client no longer shows selected.
+#[test]
+fn a_selected_process_moved_under_a_collapsed_parent_clears_the_inspector() {
+    // A sample: `xray` is reparented under the collapsed `alpha`.
+    let mut source = family(&[
+        (10, "alpha", 0, 10),
+        (11, "beta", 10, 11),
+        (30, "xray", 0, 60),
+    ]);
+    let mut h = harness(&mut source);
+    h.show_tree(true);
+    let alpha = h.item_of(10);
+    let xray = h.item_of(30);
+    h.select(TREE, xray);
+    h.disclose(alpha, false);
+    assert!(h.text(INSPECTOR_STATUS).contains("PID 30"));
+    for record in &mut source.records {
+        if record.key.pid == Observed::Known(30) {
+            record.lineage = Lineage::new(10, 60);
+        }
+    }
+    let before = h.revision();
+    h.sample(&mut source);
+    assert_eq!(
+        h.tree().iter().find(|row| row.pid == 30).unwrap().parent,
+        "10"
+    );
+    assert_eq!(h.text(INSPECTOR_STATUS), NO_SELECTION_STATUS);
+    assert_eq!(
+        h.session
+            .collect_replayed_transactions(before)
+            .unwrap()
+            .len(),
+        1,
+        "cleared in the sample's own commit"
+    );
+
+    // A republish: resetting a filter shows `mid` again, which puts the
+    // selected `xray` back under the collapsed `alpha`.
+    let mut source = family(&[
+        (10, "alpha", 0, 10),
+        (11, "beta", 10, 11),
+        (12, "mid", 10, 12),
+        (13, "xray", 12, 13),
+    ]);
+    let mut h = harness(&mut source);
+    h.show_tree(true);
+    h.view()
+        .set_filter(&h.session, "alpha | beta | xray")
+        .unwrap();
+    h.sync();
+    assert_eq!(
+        h.tree().iter().find(|row| row.pid == 13).unwrap().parent,
+        "root: parent 12 hidden by the filters"
+    );
+    let alpha = h.item_of(10);
+    let xray = h.item_of(13);
+    h.select(TREE, xray);
+    h.follow(true);
+    h.disclose(alpha, false);
+    assert!(
+        h.text(INSPECTOR_STATUS).contains("PID 13"),
+        "xray is a shown root"
+    );
+    h.view().set_filter(&h.session, "").unwrap();
+    h.sync();
+    assert_eq!(h.tree().iter().find(|row| row.pid == 13).unwrap().depth, 2);
+    assert_eq!(h.text(INSPECTOR_STATUS), NO_SELECTION_STATUS);
+    assert!(h
+        .text(FOLLOW_STATUS)
+        .starts_with("Following PID 13 · xray · hidden under collapsed PID 10 · alpha"));
+    // A switch starts a newly filled tree expanded: nothing is hidden there.
+    h.show_tree(false);
+    h.select(TABLE, xray);
+    h.show_tree(true);
+    assert!(h.view().collapsed().is_empty());
+    assert!(h.text(INSPECTOR_STATUS).contains("PID 13"));
+    assert!(h
+        .text(FOLLOW_STATUS)
+        .starts_with("Following PID 13 · xray · item 4 of 4 in the tree"));
+}

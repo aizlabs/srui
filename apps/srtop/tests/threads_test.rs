@@ -1053,12 +1053,13 @@ fn procfs_reads_threads_only_when_asked_and_names_what_it_could_not_read() {
         CpuUsage::WarmingUp,
         "the first sample of a thread"
     );
-    // Their earlier thread rows are kept, not deleted.
-    let retention = first.retention();
-    assert!(retention
-        .uncertain_pids()
-        .unwrap()
-        .is_superset(&BTreeSet::from([200, 300])));
+    // Their earlier thread rows are kept, not deleted; but the processes
+    // themselves were read, so no process row is kept on their account.
+    assert_eq!(
+        first.thread_retention(),
+        ThreadRetention::Named(BTreeSet::from([200, 300]))
+    );
+    assert_eq!(first.retention(), Retention::Skipped(BTreeSet::new()));
     // The next scan measures each thread on its own counters; TID 102 now
     // names a new thread, which warms up rather than inheriting its counter.
     tree.thread(100, 101, "worker-1", 110, 80)
@@ -1111,7 +1112,11 @@ fn the_thread_bound_names_the_processes_it_left_unread_at_and_past_the_bound() {
         assert_eq!(limit >= 6, short.is_empty(), "limit {limit}");
         // A capped process's thread rows are kept, never deleted.
         for pid in &short {
-            assert!(snapshot.retention().uncertain_pids().unwrap().contains(pid));
+            assert!(snapshot.thread_retention().covers(&Observed::Known(*pid)));
+            assert!(!snapshot.retention().keeps(&ProcessKey {
+                pid: Observed::Known(*pid),
+                ..snapshot.records[0].key.clone()
+            }));
         }
         // `bare` still has no `task` directory, and is never capped.
         assert_eq!(
@@ -1473,4 +1478,382 @@ fn a_thread_count_the_kernel_did_not_write_is_unread_never_zero() {
             "{bad}"
         );
     }
+}
+
+// ---- correction round 1 ----------------------------------------------------
+
+/// (PID cell, name) of every table row, in published order.
+fn named(h: &Harness) -> Vec<(String, String)> {
+    h.table()
+        .into_iter()
+        .map(|row| (row.pid, row.name))
+        .collect()
+}
+
+fn pairs(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+    rows.iter().map(|(pid, name)| (s(pid), s(name))).collect()
+}
+
+/// F1: PID 100 is reused by a new instance whose threads are denied. The scan
+/// read the new instance, so the old one ended: neither its process row nor
+/// its threads may stay beside the successor.
+#[test]
+fn a_reused_pid_whose_new_threads_are_unreadable_keeps_no_row_of_the_ended_instance() {
+    let tree = Tree::usual();
+    let mut source = ProcFsSource::with_root(&tree.0);
+    let mut h = harness(&mut source);
+    h.toggle(USER_THREADS_TOGGLE, true);
+    h.sample(&mut source);
+    let init_thread = h.item("1 (thread of 1)");
+    fs::remove_dir_all(tree.0.join("100")).unwrap();
+    tree.process(100, "server2", 0, 2, 900, 0).deny_threads(100);
+    h.sample(&mut source);
+    assert_eq!(
+        named(&h),
+        pairs(&[
+            ("1", "init"),
+            ("1 (thread of 1)", "init"),
+            ("2", "kthreadd"),
+            ("100", "server2"),
+            ("200", "bare"),
+            ("300", "locked"),
+        ])
+    );
+    assert_eq!(h.item("1 (thread of 1)"), init_thread);
+    // Every count agrees: five processes, no thread of a dead instance.
+    assert!(
+        h.text(PROCESSES_TEXT).contains(": 5 listed"),
+        "{}",
+        h.text(PROCESSES_TEXT)
+    );
+    assert!(
+        h.text(OWNER_STATUS).contains("showing all 5 processes"),
+        "{}",
+        h.text(OWNER_STATUS)
+    );
+    assert!(
+        h.text(THREADS_STATUS)
+            .starts_with("User threads: 1 thread row under 1 process")
+            && h.text(THREADS_STATUS)
+                .contains("threads of 3 processes unreadable (2 permission denied)"),
+        "{}",
+        h.text(THREADS_STATUS)
+    );
+}
+
+/// F1, through the thread bound: every process is capped, over several scans.
+/// A process that is the same instance keeps its earlier thread rows; the
+/// ended instance under a reused PID keeps nothing.
+#[test]
+fn a_reused_pid_past_the_thread_bound_keeps_no_row_of_the_ended_instance_over_scans() {
+    let tree = Tree::usual();
+    let mut full = ProcFsSource::with_root(&tree.0);
+    let mut h = harness(&mut full);
+    h.toggle(USER_THREADS_TOGGLE, true);
+    h.sample(&mut full);
+    let init_thread = h.item("1 (thread of 1)");
+    fs::remove_dir_all(tree.0.join("100")).unwrap();
+    tree.process(100, "server2", 0, 1, 900, 0)
+        .thread(100, 100, "server2", 900, 0);
+    let mut capped = ProcFsSource::with_root(&tree.0).with_thread_limit(0);
+    for scan in 0..3 {
+        h.sample(&mut capped);
+        assert_eq!(
+            named(&h),
+            pairs(&[
+                ("1", "init"),
+                ("1 (thread of 1)", "init"),
+                ("2", "kthreadd"),
+                ("100", "server2"),
+                ("200", "bare"),
+                ("300", "locked"),
+            ]),
+            "scan {scan}"
+        );
+        assert_eq!(h.item("1 (thread of 1)"), init_thread, "scan {scan}");
+        assert!(
+            h.text(OWNER_STATUS).contains("showing all 5 processes"),
+            "scan {scan}"
+        );
+    }
+    // Readable again: the new instance's own thread appears.
+    h.sample(&mut full);
+    assert!(
+        named(&h).contains(&(s("100 (thread of 100)"), s("server2"))),
+        "{:?}",
+        named(&h)
+    );
+}
+
+/// Two instances of PID 100 in one generation: a scan that cannot enumerate
+/// its uncertainty keeps every absent row, so the ended instance and its
+/// threads stay beside the new one. Each thread must stay with its own
+/// instance — in the table, in the tree and through the filters — and the
+/// status line counts processes only.
+struct TwoInstances {
+    step: usize,
+    collect: bool,
+}
+
+impl TwoInstances {
+    const SOURCE: &'static str = "two-instances-v1";
+
+    fn key(pid: u32, token: &str) -> ProcessKey {
+        ProcessKey {
+            source: SourceId(Self::SOURCE.into()),
+            host: Observed::Known(HostId("h".into())),
+            boot: Observed::Known(BootId("b".into())),
+            pid_namespace: Observed::Known(PidNamespaceId(1)),
+            pid: Observed::Known(pid),
+            creation: CreationToken::Opaque(token.into()),
+            thread: None,
+        }
+    }
+
+    fn process(pid: u32, token: &str, name: &str, parent: u32, started: u64) -> ProcessRecord {
+        ProcessRecord {
+            key: Self::key(pid, token),
+            display_name: DisplayName::from(name),
+            resident: Observed::Known(4096),
+            cpu: CpuUsage::WarmingUp,
+            owner: Observed::Known(1000),
+            lineage: Lineage::new(parent, started),
+            kind: Observed::Known(TaskKind::Process {
+                threads: Observed::Known(2),
+            }),
+        }
+    }
+
+    fn thread(process: &ProcessRecord, tid: u32, name: &str) -> ProcessRecord {
+        ProcessRecord {
+            key: ProcessKey {
+                thread: Some(ThreadIdentity {
+                    tid,
+                    creation: CreationToken::Opaque(format!("{name}-{tid}")),
+                }),
+                ..process.key.clone()
+            },
+            display_name: DisplayName::from(name),
+            resident: Observed::Missing(MissingReason::Unavailable),
+            cpu: CpuUsage::WarmingUp,
+            owner: Observed::Known(1000),
+            lineage: Lineage::new(100, 0),
+            kind: Observed::Known(TaskKind::Thread),
+        }
+    }
+}
+
+impl ProcessSource for TwoInstances {
+    fn status_text(&self) -> &str {
+        "Read-only · Two instances fixture"
+    }
+
+    fn snapshot(&mut self) -> ProcessSnapshot {
+        let step = self.step;
+        self.step += 1;
+        let init = Self::process(1, "init", "init", 0, 1);
+        let server = if step == 0 {
+            Self::process(100, "a", "server", 1, 100)
+        } else {
+            Self::process(100, "b", "server2", 1, 900)
+        };
+        let threads = if step == 0 {
+            vec![
+                Self::thread(&server, 100, "server"),
+                Self::thread(&server, 101, "worker-1"),
+            ]
+        } else {
+            vec![Self::thread(&server, 100, "server2")]
+        };
+        let mut read = ThreadRecords::with_limit(16);
+        read.records = threads;
+        let completeness = if step == 0 {
+            Completeness::Complete
+        } else {
+            // An entry that could not be examined: the scan cannot say which
+            // absences are uncertain, so it keeps every absent row.
+            let mut skipped = SkippedRecords::with_limit(16);
+            skipped.unnamed();
+            Completeness::from_scan(
+                skipped,
+                vec![EnumerationIssue {
+                    scope: IssueScope::Entry,
+                    reason: MissingReason::Denied,
+                    detail: "entry".into(),
+                }],
+            )
+        };
+        ProcessSnapshot {
+            source: SourceId(Self::SOURCE.into()),
+            sampled_at: SnapshotTime(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + step as u64),
+            ),
+            records: vec![init, server],
+            vanished: 0,
+            capped: CappedRecords::none(),
+            completeness,
+            system: FakeProcessSource::system(),
+            threads: if self.collect {
+                ThreadScan::Read(read)
+            } else {
+                ThreadScan::NotRequested
+            },
+        }
+    }
+
+    fn collect_threads(&mut self, on: bool) {
+        self.collect = on;
+    }
+}
+
+#[test]
+fn threads_stay_with_their_own_instance_when_two_instances_share_a_pid() {
+    let mut source = TwoInstances {
+        step: 0,
+        collect: false,
+    };
+    let mut h = harness(&mut source);
+    h.toggle(USER_THREADS_TOGGLE, true);
+    // Step 1 shows instance A's threads, as step 0 listed A.
+    source.step = 0;
+    h.sample(&mut source);
+    assert_eq!(
+        named(&h),
+        pairs(&[
+            ("1", "init"),
+            ("100", "server"),
+            ("100 (thread of 100)", "server"),
+            ("101 (thread of 100)", "worker-1"),
+        ])
+    );
+    let old = h.item("101 (thread of 100)");
+    // Step 1: instance B, in a scan that keeps every absent row.
+    h.sample(&mut source);
+    let table = named(&h);
+    assert_eq!(
+        table,
+        pairs(&[
+            ("1", "init"),
+            ("100", "server2"),
+            ("100 (thread of 100)", "server2"),
+            ("100", "server"),
+            ("100 (thread of 100)", "server"),
+            ("101 (thread of 100)", "worker-1"),
+        ]),
+        "each instance's threads follow it"
+    );
+    assert_eq!(h.table()[5].item, old);
+    // The status line counts the scan's process records, never a thread.
+    let status = h.text(srui_process_explorer::STATUS);
+    assert!(status.contains("· 2 processes listed"), "{status}");
+    // The tree attaches each thread to its own instance.
+    h.toggle(VIEW_TOGGLE, true);
+    let tree: Vec<(String, String, u64, String)> = h
+        .tree()
+        .into_iter()
+        .map(|row| (row.pid, row.name, row.depth.unwrap(), row.parent.unwrap()))
+        .collect();
+    assert_eq!(
+        tree,
+        vec![
+            (s("1"), s("init"), 0, s("none: started by the kernel")),
+            (s("100"), s("server2"), 1, s("1")),
+            (
+                s("100 (thread of 100)"),
+                s("server2"),
+                2,
+                s("thread of 100")
+            ),
+            (
+                s("100"),
+                s("server"),
+                0,
+                s("root: row kept from an earlier scan")
+            ),
+            (s("100 (thread of 100)"), s("server"), 1, s("thread of 100")),
+            (
+                s("101 (thread of 100)"),
+                s("worker-1"),
+                1,
+                s("thread of 100")
+            ),
+        ]
+    );
+    h.toggle(VIEW_TOGGLE, false);
+    // A filter that keeps only the new instance keeps only its threads.
+    h.view().set_filter(&h.session, "server2").unwrap();
+    h.sync();
+    assert_eq!(
+        named(&h),
+        pairs(&[("100", "server2"), ("100 (thread of 100)", "server2")])
+    );
+}
+
+/// A scan that read no threads drops every thread row, even of a process
+/// whose own record it could not read and whose row it therefore keeps.
+#[test]
+fn a_scan_that_read_no_threads_keeps_no_thread_row_even_of_a_kept_process() {
+    let tree = Tree::usual();
+    let mut source = ProcFsSource::with_root(&tree.0);
+    let mut h = harness(&mut source);
+    h.toggle(USER_THREADS_TOGGLE, true);
+    h.sample(&mut source);
+    let server = h.item("100");
+    h.toggle(USER_THREADS_TOGGLE, false);
+    fs::set_permissions(tree.0.join("100/stat"), fs::Permissions::from_mode(0o000)).unwrap();
+    h.sample(&mut source);
+    assert_eq!(h.item("100"), server, "the unread record's row is kept");
+    // Shown again before any sample: no stale thread row comes back.
+    h.toggle(USER_THREADS_TOGGLE, true);
+    assert!(
+        h.pids().iter().all(|pid| !pid.contains("thread")),
+        "{:?}",
+        h.pids()
+    );
+    fs::set_permissions(tree.0.join("100/stat"), fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+/// F3: Resume view republishes the threads status, which no longer says the
+/// view is paused.
+#[test]
+fn resuming_republishes_the_threads_status() {
+    let mut source = ThreadsSource::default();
+    let mut h = harness(&mut source);
+    h.toggle(USER_THREADS_TOGGLE, true);
+    assert_eq!(
+        h.text(THREADS_STATUS),
+        "User threads shown from the next sample · Kernel threads shown (2)"
+    );
+    h.view().pause_view(&h.session).unwrap();
+    h.sync();
+    assert_eq!(
+        h.text(THREADS_STATUS),
+        "User threads shown from the next sample · the view is paused: Resume view reads them \
+         · Kernel threads shown (2)"
+    );
+    h.view().resume_view(&h.session).unwrap();
+    h.sync();
+    assert_eq!(
+        h.text(THREADS_STATUS),
+        "User threads shown from the next sample · Kernel threads shown (2)"
+    );
+}
+
+/// F4: hiding user threads while following one says why follow stopped.
+#[test]
+fn follow_on_a_thread_says_user_threads_were_hidden() {
+    let mut source = ThreadsSource::default();
+    let mut h = harness(&mut source);
+    h.toggle(USER_THREADS_TOGGLE, true);
+    h.sample(&mut source);
+    h.select(TABLE, h.item(SERVER_THREADS[1]));
+    h.toggle(srui_process_explorer::FOLLOW_TOGGLE, true);
+    h.toggle(USER_THREADS_TOGGLE, false);
+    assert!(
+        h.text(FOLLOW_STATUS).starts_with(
+            "Follow stopped: TID 201 of PID 200 · worker-1 is no longer shown: user threads are hidden"
+        ),
+        "{}",
+        h.text(FOLLOW_STATUS)
+    );
 }

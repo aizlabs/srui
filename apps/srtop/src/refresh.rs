@@ -938,8 +938,28 @@ impl ProcessView {
         };
         let confirmed_ids: HashSet<ItemId> = confirmed.iter().map(|row| row.item_id).collect();
         let confirmed_empty = confirmed.is_empty();
+        // A thread row this scan did not confirm is kept only beside the
+        // process instance it belongs to, confirmed by this scan under the
+        // same whole key, and only when the scan says it could not read that
+        // process's threads (PX-019): never a process row, and never a thread
+        // of an earlier instance under a reused PID.
+        let thread_retention = if rejected.is_some() {
+            crate::source::ThreadRetention::None
+        } else {
+            snapshot.thread_retention()
+        };
+        let live_processes: HashSet<crate::source::ProcessKey> = confirmed
+            .iter()
+            .filter(|row| !row.key.is_thread())
+            .map(|row| row.key.clone())
+            .collect();
         let mut unfiltered_target =
-            retain_unconfirmed(&self.unfiltered_rows, confirmed, &retention);
+            retain_unconfirmed_by(&self.unfiltered_rows, confirmed, |row| {
+                retention.keeps(&row.key)
+                    || (row.key.is_thread()
+                        && thread_retention.covers(&row.key.pid)
+                        && live_processes.contains(&row.key.process_key()))
+            });
         // A scan that read no threads (PX-019) says nothing about any thread:
         // they were hidden when it was taken, or its source reads none. Its
         // earlier thread rows leave the collection rather than linger as rows
@@ -1067,7 +1087,8 @@ impl ProcessView {
         // Follow last of all (PX-017): it stops when this plan hides or ends
         // the followed process, and a hint it sets names the row's final
         // place, after every row operation of this plan.
-        self.follow.track(&target, &unfiltered_target);
+        self.follow
+            .track(&target, &unfiltered_target, self.threads.user);
         let follow = self.follow_after(self.mode, &target, false, &plan);
         plan.extend(follow);
 
@@ -1802,7 +1823,8 @@ impl ProcessView {
         // client reveals the hinted item wherever it moves. A switch carries
         // it into the shown view: the new collection holds no hint yet
         // (PX-018).
-        self.follow.track(&target, &self.unfiltered_rows);
+        self.follow
+            .track(&target, &self.unfiltered_rows, self.threads.user);
         let follow = self.follow_after(mode, &target, switched, &plan);
         plan.extend(follow);
         if switched {
@@ -2868,6 +2890,9 @@ impl ProcessView {
     /// for the current sampling state.
     fn publish_sampling(&mut self, session: &Session) -> Result<Refreshed, SessionError> {
         let mut plan = self.sampling_effects();
+        // The threads status says whether a hidden-until-sampled thread waits
+        // for Resume view (PX-019), so it changes with the pause too.
+        plan.extend(self.threads_effects(&self.unfiltered_rows));
         let summary = self.labelled(self.summary.clone());
         plan.extend(summary_effects(&self.summary, &summary));
         plan.extend(self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed));
@@ -3819,24 +3844,36 @@ fn evict_unconfirmed_beyond(
     evicted.len()
 }
 
+/// [`retain_unconfirmed_by`] under a record [`Retention`] alone.
+#[cfg(test)]
+fn retain_unconfirmed(published: &[Row], confirmed: Vec<Row>, retention: &Retention) -> Vec<Row> {
+    retain_unconfirmed_by(published, confirmed, |row| retention.keeps(&row.key))
+}
+
 /// Keeps rows the scan did not confirm and could not account for, in the
 /// position they already hold relative to the rows it did confirm.
 ///
-/// `retention` decides which unconfirmed rows those are: a scan that named the
+/// `keeps` decides which unconfirmed rows those are: a scan that named the
 /// records it skipped keeps only those, so an unrelated process that really
 /// ended is still deleted while one denied record is unreadable. Only a scan
-/// whose uncertainty cannot be enumerated at all keeps every absent row.
+/// whose uncertainty cannot be enumerated at all keeps every absent row. A
+/// thread row is also kept beside the process instance this scan confirmed
+/// when the scan could not read that process's threads (PX-019).
 ///
 /// A retained row is anchored to the confirmed row that followed it, so a
 /// scan that misses a record for one tick does not move that row to the end of
 /// the table and back again on the next.
-fn retain_unconfirmed(published: &[Row], confirmed: Vec<Row>, retention: &Retention) -> Vec<Row> {
+fn retain_unconfirmed_by(
+    published: &[Row],
+    confirmed: Vec<Row>,
+    keeps: impl Fn(&Row) -> bool,
+) -> Vec<Row> {
     let position: HashMap<ItemId, usize> = confirmed
         .iter()
         .enumerate()
         .map(|(index, row)| (row.item_id, index))
         .collect();
-    let uncertain = |row: &Row| !position.contains_key(&row.item_id) && retention.keeps(&row.key);
+    let uncertain = |row: &Row| !position.contains_key(&row.item_id) && keeps(row);
     if !published.iter().any(uncertain) {
         return confirmed;
     }
@@ -3848,7 +3885,7 @@ fn retain_unconfirmed(published: &[Row], confirmed: Vec<Row>, retention: &Retent
             Some(&index) => anchor = Some(index),
             // An absent row this scan accounted for really ended: it is left out
             // of the target, which deletes it.
-            None if !retention.keeps(&row.key) => {}
+            None if !keeps(row) => {}
             None => match anchor {
                 Some(index) => before.entry(index).or_default().push(row.clone()),
                 None => tail.push(row.clone()),

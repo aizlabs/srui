@@ -1017,11 +1017,11 @@ impl ProcessSnapshot {
     /// identity file the scan could not read degrades every record equally and
     /// hides none, so it skips nothing and scopes nothing.
     ///
-    /// Threads (PX-019) add the processes whose threads this scan could not
-    /// read or never reached: an earlier thread row of such a process is kept,
-    /// because nothing says that thread ended. Matching is by PID, as for a
-    /// record, so it errs towards keeping. A thread ledger that could not name
-    /// every such process keeps every absent row, like the record ledgers.
+    /// The thread ledgers (PX-019) take no part in this: a process whose
+    /// threads were not read was itself read, so its PID names the instance
+    /// this scan saw, and keeping absent rows by that PID would keep a dead
+    /// instance beside its successor. Which earlier thread rows such a scan
+    /// keeps is [`Self::thread_retention`], matched by process instance.
     pub fn retention(&self) -> Retention {
         if !self.capped.is_enumerable() {
             return Retention::Unenumerable;
@@ -1033,15 +1033,59 @@ impl ProcessSnapshot {
             }
             uncertain.extend(skipped.pids().iter().copied());
         }
-        if let ThreadScan::Read(threads) = &self.threads {
-            for ledger in [&threads.unreadable, &threads.capped] {
-                if !ledger.is_enumerable() {
-                    return Retention::Unenumerable;
-                }
-                uncertain.extend(ledger.pids().iter().copied());
-            }
-        }
         Retention::Skipped(uncertain)
+    }
+
+    /// Which processes' earlier thread rows this scan keeps (PX-019): those
+    /// whose threads it could not read or never reached, because nothing
+    /// says those threads ended.
+    ///
+    /// It names PIDs, so it is only ever applied together with the process
+    /// instance: an absent thread row is kept only when its process row is one
+    /// this scan confirmed, under the same whole key, and its PID is named
+    /// here. A process row is never kept by it, and neither is a thread of an
+    /// earlier instance under a reused PID. A ledger that could not name every
+    /// such process keeps the absent threads of every process this scan
+    /// confirmed, never more.
+    pub fn thread_retention(&self) -> ThreadRetention {
+        let ThreadScan::Read(threads) = &self.threads else {
+            return ThreadRetention::None;
+        };
+        let mut named = BTreeSet::new();
+        for ledger in [&threads.unreadable, &threads.capped] {
+            if !ledger.is_enumerable() {
+                return ThreadRetention::Every;
+            }
+            named.extend(ledger.pids().iter().copied());
+        }
+        ThreadRetention::Named(named)
+    }
+}
+
+/// Which absent thread rows one scan keeps (PX-019), always together with
+/// the process instance the scan confirmed; see
+/// [`ProcessSnapshot::thread_retention`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadRetention {
+    /// The scan read no threads: it keeps no thread row on their account.
+    None,
+    /// The threads of the processes with these PIDs were not read or not
+    /// reached.
+    Named(BTreeSet<u32>),
+    /// The scan could not name every process whose threads it missed.
+    Every,
+}
+
+impl ThreadRetention {
+    /// Whether the threads of the confirmed process instance with `pid` are
+    /// uncertain this scan.
+    pub fn covers(&self, pid: &Observed<u32>) -> bool {
+        match (self, pid) {
+            (Self::None, _) => false,
+            (Self::Every, _) => true,
+            (Self::Named(pids), Observed::Known(pid)) => pids.contains(pid),
+            (Self::Named(_), Observed::Missing(_)) => false,
+        }
     }
 }
 

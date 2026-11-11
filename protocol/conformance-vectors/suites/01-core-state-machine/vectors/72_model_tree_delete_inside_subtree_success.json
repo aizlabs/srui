@@ -1,0 +1,189 @@
+{
+  "name": "model_tree_delete_inside_subtree_success",
+  "description": "Removing the subtree B..C from inside A is a MODEL_DELETE of its index range plus a MODEL_UPDATE shrinking A's descendant_count, accepted as one transaction (§8, §12.1).",
+  "spec_sections": [
+    "§4",
+    "§8",
+    "§12.1",
+    "§22.5",
+    "§26"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Files"
+          }
+        },
+        {
+          "type": "CREATE_MODEL",
+          "model_id": 10,
+          "model_type": "Tree",
+          "item_count": 0
+        },
+        {
+          "type": "MODEL_INSERT",
+          "model_id": 10,
+          "index": 0,
+          "items": [
+            {
+              "item_id": 101,
+              "value": "A",
+              "properties": {
+                "tree_depth": 0,
+                "descendant_count": 3
+              }
+            },
+            {
+              "item_id": 102,
+              "value": "B",
+              "properties": {
+                "tree_depth": 1,
+                "descendant_count": 1
+              }
+            },
+            {
+              "item_id": 103,
+              "value": "C",
+              "properties": {
+                "tree_depth": 2,
+                "descendant_count": 0
+              }
+            },
+            {
+              "item_id": 104,
+              "value": "D",
+              "properties": {
+                "tree_depth": 1,
+                "descendant_count": 0
+              }
+            },
+            {
+              "item_id": 105,
+              "value": "E",
+              "properties": {
+                "tree_depth": 0,
+                "descendant_count": 1
+              }
+            },
+            {
+              "item_id": 106,
+              "value": "F",
+              "properties": {
+                "tree_depth": 1,
+                "descendant_count": 0
+              }
+            }
+          ]
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Tree",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "model_ref": 10
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "MODEL_DELETE",
+        "model_id": 10,
+        "index": 1,
+        "count": 2,
+        "item_ids": []
+      },
+      {
+        "type": "MODEL_UPDATE",
+        "model_id": 10,
+        "index": null,
+        "items": [
+          {
+            "item_id": 101,
+            "value": "A",
+            "properties": {
+              "tree_depth": 0,
+              "descendant_count": 1
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "success",
+    "committed_revision": 2,
+    "store_state": {
+      "node_count": 2,
+      "roots": [
+        1
+      ],
+      "nodes": {},
+      "model_count": 1,
+      "models": {
+        "10": {
+          "model_id": 10,
+          "model_type": "Tree",
+          "item_count": 4,
+          "cached_item_count": 4,
+          "cached_ranges": [
+            {
+              "start": 0,
+              "length": 4
+            }
+          ],
+          "items": {
+            "0": {
+              "item_id": 101,
+              "value": "A",
+              "properties": {
+                "tree_depth": 0,
+                "descendant_count": 1
+              }
+            },
+            "1": {
+              "item_id": 104,
+              "value": "D",
+              "properties": {
+                "tree_depth": 1,
+                "descendant_count": 0
+              }
+            },
+            "2": {
+              "item_id": 105,
+              "value": "E",
+              "properties": {
+                "tree_depth": 0,
+                "descendant_count": 1
+              }
+            },
+            "3": {
+              "item_id": 106,
+              "value": "F",
+              "properties": {
+                "tree_depth": 1,
+                "descendant_count": 0
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

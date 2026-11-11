@@ -17,6 +17,7 @@ These fixtures encode the formal behavioral invariants of the SRUI distributed s
 - **Collection Models (§8, §13)**: Large-scale virtualized data mutation (`CREATE_MODEL`, `MODEL_INSERT`, `MODEL_UPDATE`, `MODEL_RESET_RANGE`, `MODEL_DELETE`).
 - **Promoted Collection Selection (§6.3, §7.6, §8)**: A `List`/`Table`/`Tree` `value` holds a server-promoted selection only as an `ItemId`, and only while `selection_mode` is `single` or `multiple` (vectors 50–53). Item presence is not a store rule, because a sparse replica may not cache the item.
 - **Keyboard Shortcuts (§4 inv. 13, §7.4, §7.7, §22.5, §26)**: the standard `shortcut` property is accepted on admitted types only (`shortcut_not_admitted`), refused outside the closed canonical grammar — bare printable key, unknown token, duplicate or misordered modifier, over 32 bytes, non-string (`invalid_shortcut`) — and unique within one window-owning Surface tree — a nested Surface shares it — including across `MOVE_NODE` (`duplicate_shortcut`); exchanging two shortcuts clears one first (vectors 54–69; 67–69 cover nested and sibling nested Surfaces in both directions).
+- **Hierarchical Models (§4 inv. 13, §8, §12.1, §26)**: a `Tree` model's index space is the depth-first preorder of the forest, shaped by the item properties `tree_depth` and `descendant_count` and bounded by `max_model_tree_depth` (default 256 levels). The shape is judged after the last operation of the transaction that touches the model, so a subtree insert, delete or reset plus the ancestors' `descendant_count` update is accepted as one edit (vectors 70–75, including a sparse cache and depth 255 at the default limit), while depth over the limit, `descendant_count` past `item_count`, a depth jump over one, a child outside its parent's span, index 0 not a root, a negative depth and a stale ancestor are refused and rolled back (vectors 76–84; 81 reports the failure at the model's last operation, index 1). Round 1 of the independent verification added vectors 85–88: a deeper item directly after a cached leaf, a depth unreachable across an uncached gap, a flat model gaining shape through `MODEL_UPDATE`, and descendants below the deepest level. The check is exact: a cache is accepted iff some valid forest agrees with every cached item.
 - **Semantic-Not-Paint (§4.7, §4.16, §4.17, §32.3)**: Standard Widget Profile contains only semantic intent and state, strictly forbidding display frame cadence, paint instructions, and mandatory absolute pixel geometry.
 
 ---
@@ -156,6 +157,11 @@ Properties are encoded as JSON primitives or typed objects:
 | `model_index_out_of_bounds` | `StoreError::ModelIndexOutOfBounds` | §8, §13 |
 | `duplicate_item_id` | `StoreError::DuplicateItemId` | §8, §13 |
 | `invalid_collection_selection` | `StoreError::InvalidCollectionSelection` | §6.3, §7.6, §8 |
+| `max_model_tree_depth_exceeded` | `StoreError::MaxModelTreeDepthExceeded` | §8, §26 |
+| `invalid_model_tree_property` | `StoreError::InvalidModelTree` (`ModelTreeViolation::InvalidProperty`) | §4 inv. 13, §8 |
+| `model_tree_descendant_count_out_of_range` | `StoreError::InvalidModelTree` (`ModelTreeViolation::DescendantCountOutOfRange`) | §8, §26 |
+| `model_tree_depth_jump` | `StoreError::InvalidModelTree` (`ModelTreeViolation::DepthJump`) | §8 |
+| `model_tree_outside_parent_span` | `StoreError::InvalidModelTree` (`ModelTreeViolation::OutsideParentSpan`) | §8 |
 | `invalid_model_delete` | `StoreError::InvalidModelDelete` | §8, §13 |
 | `cycle_detected` | `StoreError::CycleDetected` | §13 |
 | `child_index_out_of_bounds` | `StoreError::ChildIndexOutOfBounds` | §13 |

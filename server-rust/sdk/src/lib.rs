@@ -6,12 +6,17 @@
 //! Admitted widgets (`Button`, `Toggle`, `TextInput`, `TextArea`, `List`, `Table`, `Tree`,
 //! `RichText`) expose the standard `shortcut` property through `shortcut`/`set_shortcut`/
 //! `clear_shortcut`, validated by the store against [`Shortcut`] (§4 inv. 13, §7.7, §22.5, §26).
+//! [`tree_model`] flattens a server-side forest into a hierarchical `Tree` model (preorder items
+//! with `tree_depth`/`descendant_count`, bounded by `max_model_tree_depth`, §8, §26); `Tree` reads
+//! `columns` and reports local disclosure through [`Tree::on_expansion_changed`] (§7.6, §22.5).
 
 pub mod selection;
 pub mod session;
+pub mod tree_model;
 pub mod widgets;
 
 pub use session::*;
+pub use tree_model::{TreeModel, TreeModelError, TreeNode};
 pub use widgets::*;
 
 // Re-export standard event types, identifiers, transactions, capabilities, and wire helpers (§6.1, §7.6, §7.7, §12.1, §15, §16)
@@ -19,8 +24,9 @@ pub use srui_semantic_tree::{
     decode_event, decode_message, decode_node_record, decode_operation, decode_transaction,
     decode_value, encode_event, encode_message, encode_node_record, encode_operation,
     encode_transaction, encode_value, CapabilitySet, ClientInstanceId, EditSeq, EnumToken, Event,
-    EventId, EventValidationError, NegotiationError, NodeRecord, Profile, ResourceHash, Revision,
-    ServerCapabilities, Transaction, TxnError, WireError,
+    EventId, EventValidationError, ModelItem, ModelTreeViolation, NegotiationError, NodeRecord,
+    Profile, ResourceHash, Revision, ServerCapabilities, StoreLimits, Transaction, TxnError,
+    WireError, DEFAULT_MAX_MODEL_TREE_DEPTH,
 };
 
 // Platform-neutral keyboard shortcuts (§7.7, §22.5)
@@ -99,6 +105,10 @@ pub const PREFERRED_SIZE: PropertyRef = PropertyRef::PREFERRED_SIZE;
 pub const SPACING_ROLE: PropertyRef = PropertyRef::SPACING_ROLE;
 /// Property reference for `padding_role` (§7.4).
 pub const PADDING_ROLE: PropertyRef = PropertyRef::PADDING_ROLE;
+/// Model item property `tree_depth`: depth in a hierarchical model's preorder, 0 for a root (§8).
+pub const TREE_DEPTH: PropertyRef = PropertyRef::TREE_DEPTH;
+/// Model item property `descendant_count`: subtree size excluding the item (§8).
+pub const DESCENDANT_COUNT: PropertyRef = PropertyRef::DESCENDANT_COUNT;
 
 // =============================================================================
 // Ergonomic Event Type Constants (§7.6, §29)

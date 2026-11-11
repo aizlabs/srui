@@ -381,12 +381,17 @@ impl Event {
         event
     }
 
-    /// Convenience constructor for expansion change events (`EXPANSION_CHANGED`, §7.6).
+    /// Convenience constructor for expansion change events (`EXPANSION_CHANGED`, §7.6, §22.5).
+    ///
+    /// Disclosure is local presentation state; the event only reports it. `value` carries the new
+    /// state (`true` expanded) and `items` names exactly the one [`ItemId`] whose disclosure
+    /// changed, never a row index. [`Self::expansion_change`] reads it back.
     pub fn expansion_changed(
         event_seq: u64,
         event_id: impl Into<EventId>,
         observed_revision: impl Into<Revision>,
         node_id: impl Into<NodeId>,
+        item_id: impl Into<ItemId>,
         expanded: bool,
     ) -> Self {
         Self::new(
@@ -396,8 +401,35 @@ impl Event {
             observed_revision,
             node_id,
             TypeRef::EVENT_EXPANSION_CHANGED,
-            [(PropertyRef::VALUE, Value::Bool(expanded))],
+            [
+                (PropertyRef::VALUE, Value::Bool(expanded)),
+                (
+                    PropertyRef::ITEMS,
+                    Value::List(vec![Value::ItemId(item_id.into())]),
+                ),
+            ],
         )
+    }
+
+    /// Reads an `EXPANSION_CHANGED` event's `(item, expanded)` pair (§7.6).
+    ///
+    /// Returns `None` for any other event type, or when `value` is not a boolean or `items` is
+    /// not a list of exactly one `ItemId`; a malformed report is never guessed at.
+    pub fn expansion_change(&self) -> Option<(ItemId, bool)> {
+        if self.event_type != TypeRef::EVENT_EXPANSION_CHANGED {
+            return None;
+        }
+        let expanded = match self.get_argument(PropertyRef::VALUE)? {
+            Value::Bool(expanded) => *expanded,
+            _ => return None,
+        };
+        match self.get_argument(PropertyRef::ITEMS)? {
+            Value::List(items) => match items.as_slice() {
+                [Value::ItemId(item)] => Some((*item, expanded)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Convenience constructor for viewport change events (`VIEWPORT_CHANGED`, §7.6).

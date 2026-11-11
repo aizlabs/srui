@@ -13,15 +13,21 @@
 //! the window-owning root `Surface` and everything under it, nested `Surface`s included, since
 //! the renderer mounts those inline in the same window — may hold the same shortcut. Checks run per operation, like every other store rule, so the Swift replica
 //! reaches the same verdict at the same operation index.
+//!
+//! A hierarchical model's shape (standard item properties 32 `tree_depth` and 33
+//! `descendant_count`, §8) is checked once per transaction, after the last operation that touches
+//! the model ([`SemanticStore::validate_model_tree`]), because a structural edit inside a subtree
+//! needs a `MODEL_INSERT`/`MODEL_DELETE` and the ancestors' `MODEL_UPDATE` together. The §26 limit
+//! `max_model_tree_depth` bounds it.
 
 pub mod error;
 pub mod limits;
 pub mod node;
 
-pub use error::StoreError;
+pub use error::{ModelTreeViolation, StoreError};
 pub use limits::{
     StoreLimits, DEFAULT_MAX_CACHED_ITEMS_PER_MODEL, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
-    DEFAULT_MAX_MODEL_COUNT, DEFAULT_MAX_TRANSACTION_OPERATIONS,
+    DEFAULT_MAX_MODEL_COUNT, DEFAULT_MAX_MODEL_TREE_DEPTH, DEFAULT_MAX_TRANSACTION_OPERATIONS,
 };
 pub use node::Node;
 
@@ -901,6 +907,18 @@ impl SemanticStore {
         self.models.get(&model_id)
     }
 
+    /// Checks a model's hierarchical shape against its cached items and `max_model_tree_depth`
+    /// (§8, §26); see [`Model::validate_tree_shape`]. A model that does not exist has no shape.
+    ///
+    /// Transaction appliers call this after the last operation of a transaction that touches the
+    /// model, so the whole edit is judged at once and the failure carries that operation's index.
+    pub fn validate_model_tree(&self, id: ModelId) -> Result<(), StoreError> {
+        match self.models.get(&id) {
+            Some(model) => model.validate_tree_shape(self.limits.max_model_tree_depth),
+            None => Ok(()),
+        }
+    }
+
     /// Creates a new collection model in the store (§13 CREATE_MODEL, §8).
     pub fn create_model(
         &mut self,
@@ -1072,8 +1090,13 @@ impl SemanticStore {
     /// [`SemanticStore::apply_wire_transaction`](crate::transaction::apply).
     /// This helper is intended primarily for low-level unit tests and bootstrap fixtures.
     pub fn apply_operation(&mut self, op: &srui_protocol::Operation) -> Result<(), StoreError> {
-        Operation::try_from(op.clone())
-            .map_err(|e| StoreError::OperationError(e.to_string()))?
-            .apply(self)
+        let op = Operation::try_from(op.clone())
+            .map_err(|e| StoreError::OperationError(e.to_string()))?;
+        op.apply(self)?;
+        // A lone operation is its own last touch of the model it edits (§8).
+        match op.model_id() {
+            Some(model) => self.validate_model_tree(model),
+            None => Ok(()),
+        }
     }
 }

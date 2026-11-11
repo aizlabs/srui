@@ -217,6 +217,8 @@ public nonisolated enum Srui_Protocol_StandardProperty: SwiftProtobuf.Enum, Swif
   case propertyColumns // = 29
   case propertySelectionMode // = 30
   case propertyShortcut // = 31
+  case propertyTreeDepth // = 32
+  case propertyDescendantCount // = 33
   case UNRECOGNIZED(Int)
 
   public init() {
@@ -257,6 +259,8 @@ public nonisolated enum Srui_Protocol_StandardProperty: SwiftProtobuf.Enum, Swif
     case 29: self = .propertyColumns
     case 30: self = .propertySelectionMode
     case 31: self = .propertyShortcut
+    case 32: self = .propertyTreeDepth
+    case 33: self = .propertyDescendantCount
     default: self = .UNRECOGNIZED(rawValue)
     }
   }
@@ -295,6 +299,8 @@ public nonisolated enum Srui_Protocol_StandardProperty: SwiftProtobuf.Enum, Swif
     case .propertyColumns: return 29
     case .propertySelectionMode: return 30
     case .propertyShortcut: return 31
+    case .propertyTreeDepth: return 32
+    case .propertyDescendantCount: return 33
     case .UNRECOGNIZED(let i): return i
     }
   }
@@ -333,6 +339,8 @@ public nonisolated enum Srui_Protocol_StandardProperty: SwiftProtobuf.Enum, Swif
     .propertyColumns,
     .propertySelectionMode,
     .propertyShortcut,
+    .propertyTreeDepth,
+    .propertyDescendantCount,
   ]
 
 }
@@ -2853,7 +2861,7 @@ nonisolated extension Srui_Protocol_StandardNodeType: SwiftProtobuf._ProtoNamePr
 }
 
 nonisolated extension Srui_Protocol_StandardProperty: SwiftProtobuf._ProtoNameProviding {
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0PROPERTY_UNSPECIFIED\0\u{1}PROPERTY_LABEL\0\u{1}PROPERTY_ACCESSIBLE_DESCRIPTION\0\u{1}PROPERTY_ROLE\0\u{1}PROPERTY_VALUE_DESCRIPTION\0\u{1}PROPERTY_ACTIONS\0\u{1}PROPERTY_VISIBILITY\0\u{1}PROPERTY_ENABLED\0\u{1}PROPERTY_READ_ONLY\0\u{1}PROPERTY_BUSY\0\u{1}PROPERTY_SELECTED\0\u{1}PROPERTY_VALIDATION_STATE\0\u{1}PROPERTY_TEXT\0\u{1}PROPERTY_VALUE\0\u{1}PROPERTY_PLACEHOLDER\0\u{1}PROPERTY_RESOURCE\0\u{1}PROPERTY_ITEMS\0\u{1}PROPERTY_MODEL_REF\0\u{1}PROPERTY_HORIZONTAL_ALIGNMENT\0\u{1}PROPERTY_VERTICAL_ALIGNMENT\0\u{1}PROPERTY_GROW\0\u{1}PROPERTY_SHRINK\0\u{1}PROPERTY_MINIMUM_SIZE\0\u{1}PROPERTY_MAXIMUM_SIZE\0\u{1}PROPERTY_PREFERRED_SIZE\0\u{1}PROPERTY_SPACING_ROLE\0\u{1}PROPERTY_PADDING_ROLE\0\u{1}PROPERTY_PRESENTATION_HINT\0\u{1}PROPERTY_ACTION_KEY\0\u{1}PROPERTY_COLUMNS\0\u{1}PROPERTY_SELECTION_MODE\0\u{1}PROPERTY_SHORTCUT\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0PROPERTY_UNSPECIFIED\0\u{1}PROPERTY_LABEL\0\u{1}PROPERTY_ACCESSIBLE_DESCRIPTION\0\u{1}PROPERTY_ROLE\0\u{1}PROPERTY_VALUE_DESCRIPTION\0\u{1}PROPERTY_ACTIONS\0\u{1}PROPERTY_VISIBILITY\0\u{1}PROPERTY_ENABLED\0\u{1}PROPERTY_READ_ONLY\0\u{1}PROPERTY_BUSY\0\u{1}PROPERTY_SELECTED\0\u{1}PROPERTY_VALIDATION_STATE\0\u{1}PROPERTY_TEXT\0\u{1}PROPERTY_VALUE\0\u{1}PROPERTY_PLACEHOLDER\0\u{1}PROPERTY_RESOURCE\0\u{1}PROPERTY_ITEMS\0\u{1}PROPERTY_MODEL_REF\0\u{1}PROPERTY_HORIZONTAL_ALIGNMENT\0\u{1}PROPERTY_VERTICAL_ALIGNMENT\0\u{1}PROPERTY_GROW\0\u{1}PROPERTY_SHRINK\0\u{1}PROPERTY_MINIMUM_SIZE\0\u{1}PROPERTY_MAXIMUM_SIZE\0\u{1}PROPERTY_PREFERRED_SIZE\0\u{1}PROPERTY_SPACING_ROLE\0\u{1}PROPERTY_PADDING_ROLE\0\u{1}PROPERTY_PRESENTATION_HINT\0\u{1}PROPERTY_ACTION_KEY\0\u{1}PROPERTY_COLUMNS\0\u{1}PROPERTY_SELECTION_MODE\0\u{1}PROPERTY_SHORTCUT\0\u{1}PROPERTY_TREE_DEPTH\0\u{1}PROPERTY_DESCENDANT_COUNT\0")
 }
 
 nonisolated extension Srui_Protocol_TextRole: SwiftProtobuf._ProtoNameProviding {

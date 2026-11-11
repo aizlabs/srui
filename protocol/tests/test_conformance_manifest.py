@@ -221,6 +221,28 @@ STATE_MACHINE_VECTORS_ADDED_AFTER_SPLIT = (
     # PX-016-G01 round 2: a nested holder refuses an outer duplicate; sibling nested Surfaces.
     "68_shortcut_outer_duplicate_of_nested_holder_rejected.json",
     "69_shortcut_sibling_nested_surfaces_duplicate_rejected.json",
+    # PX-018-G01: hierarchical models in preorder with tree_depth/descendant_count (§8, §26).
+    "70_model_tree_nested_preorder_success.json",
+    "71_model_tree_insert_inside_subtree_success.json",
+    "72_model_tree_delete_inside_subtree_success.json",
+    "73_model_tree_reset_inside_subtree_success.json",
+    "74_model_tree_sparse_cache_success.json",
+    "75_model_tree_depth_at_default_limit_success.json",
+    "76_model_tree_depth_over_limit_rejected.json",
+    "77_model_tree_depth_over_default_limit_rejected.json",
+    "78_model_tree_descendant_count_past_item_count_rejected.json",
+    "79_model_tree_depth_jump_rejected.json",
+    "80_model_tree_child_outside_parent_span_rejected.json",
+    "81_model_tree_stale_ancestor_after_insert_rejected.json",
+    "82_model_tree_index_zero_not_root_rejected.json",
+    "83_model_tree_negative_depth_rejected.json",
+    "84_model_tree_delete_without_ancestor_update_rejected.json",
+    # PX-018-G01 round 1: a deeper item after a cached leaf, sparse reachability, shape gained
+    # through MODEL_UPDATE, and descendants below the deepest level.
+    "85_model_tree_deeper_item_after_leaf_rejected.json",
+    "86_model_tree_unreachable_depth_across_gap_rejected.json",
+    "87_model_tree_shape_gained_through_update_rejected.json",
+    "88_model_tree_descendants_below_the_deepest_level_rejected.json",
 )
 
 

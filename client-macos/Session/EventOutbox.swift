@@ -735,6 +735,38 @@ public actor EventOutbox {
         }
     }
 
+    /// Constructs and sends an `EXPANSION_CHANGED` event (§7.6, §22.5) without creating a sequence
+    /// beyond the window. `value` is the new disclosure state; `items` names the one ItemId.
+    @discardableResult
+    public func sendExpansionChanged(
+        nodeId: NodeId,
+        observedRevision: Revision,
+        itemId: ItemId,
+        expanded: Bool,
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation suppliedIncarnation: EventOutboxSessionIncarnation? = nil,
+        via transport: any Transport
+    ) async throws -> Event {
+        let sessionIncarnation = try resolveSessionIncarnation(
+            suppliedIncarnation,
+            binding: binding
+        )
+        return try await allocateAndSend(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation,
+            via: transport
+        ) { eventSeq, eventId in
+            Event.expansionChanged(
+                eventSeq: eventSeq,
+                eventId: eventId,
+                observedRevision: observedRevision,
+                nodeId: nodeId,
+                itemId: itemId,
+                expanded: expanded
+            )
+        }
+    }
+
     /// Allocates and retains a TEXT_EDIT, reserving its FIFO transport slot before returning.
     /// The caller must authorize only after MainActor records the exact native assignment; explicit
     /// assignment failure may reject and rewind this newest identity before any later allocation.

@@ -838,10 +838,34 @@ Apply the standing completion contract. Record evidence in `docs/process-explore
 
 ---
 
+#### PX-018-G01 — Hierarchical model-backed Tree with local disclosure
+
+**Phase:** B · **Scope size:** L · **Status:** planned · **Gate:** R1-prerequisite
+**Dependencies:** PX-017
+**Read:** D1 §§4 inv. 13, 6.3, 7.6, 8, 12.1, 22.5, 22.7, 22.8, 26, 32; registry Tree (19)
+
+##### Build
+
+A Tree model's index space is the depth-first preorder of the whole forest. Two new standard item properties carry the shape: `tree_depth` (uint, 0 for a root) and `descendant_count` (uint, subtree size), added through registry.yaml, srui.proto, codegen and the build.rs count asserts, with committed Swift tables regenerated. No new wire messages: range requests, MODEL_INSERT/DELETE/UPDATE/RESET_RANGE, selection promotion and server-pushed ranges keep flat index semantics. Disclosure is local (§22.5): items start expanded; collapsing an item hides indices index+1 through index+descendant_count; the collapsed set is keyed by ItemId and only cached items can be collapsed; row-to-index mapping uses a sorted hidden-interval list so uncached gaps still show placeholders and fire asynchronous range requests for visible indices; indentation uses native outline levels from cached tree_depth, with no native control per item. Promotion reveal expands only the collapsed ancestors whose hidden intervals contain the promoted index. The client emits EXPANSION_CHANGED (§7.6) through a new semantic interaction without awaiting a reply, closing the Tree half of the suite-2 gap; the SDK gains Tree::on_expansion_changed. Tree reads `columns`, reusing the Table column and cell projection with the outline column first and a visible header. The SDK gains a TreeModel builder that converts a server-side forest into preorder items with depth and descendant counts and enforces the depth limit. A new §26 limit `max_model_tree_depth` (default 256) is enforced in Rust and Swift StoreLimits; apply-time checks are all-or-nothing and explicit: tree_depth within the limit, index+descendant_count < item_count, and where both neighbours are cached depth(i+1) <= depth(i)+1 and every child lies inside its parent's subtree span. A client without support renders the preorder flat with correct identity and selection, documented as the fallback. No application-specific client path.
+
+##### Out of scope
+
+No per-parent child index spaces or new range messages, server-driven expansion state, initially-collapsed items, drag and drop or reordering, Surface VIEWPORT_CHANGED, or Process Explorer feature work (PX-018 adopts this separately).
+
+##### Verification / acceptance criteria
+
+Rust and Swift tests plus conformance vectors: suite 9 negative vectors for depth over the limit, descendant_count past item_count, a depth jump over one, and a child outside its parent's span, rejected identically by Rust and Swift decode/apply; suites 1 and 12 positive vectors for a nested tree and for insert, delete and reset inside a subtree; suite 2 for the EXPANSION_CHANGED path with the manifest gap closed. Native AppKit tests: local collapse and expand send no range request and emit EXPANSION_CHANGED; a collapsed subtree with uncached ranges still loads visible rows asynchronously; promotion reveals through collapsed ancestors; a model update preserves the collapsed set by ItemId and drops entries whose items left the cache; a deep tree at and past the limit; Tree columns render with a header. SDK TreeModel tests for preorder, depth, descendant counts and limit enforcement.
+
+##### Handoff and completion
+
+Apply the standing completion contract. Record evidence in `docs/process-explorer/completions/PX-018-G01.md`, update the individual feature ledger, and commit only this bounded change after required checks pass. A gate remains open if a required behavior or native test is missing.
+
+---
+
 #### PX-018 — Add parent/child process tree navigation
 
 **Phase:** B · **Scope size:** M · **Status:** planned · **Gate:** none
-**Dependencies:** PX-017
+**Dependencies:** PX-017, PX-018-G01
 **Read:** D1 §§6.2, 8, 22.7; D2 T28
 
 ##### Build

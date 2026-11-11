@@ -14,6 +14,10 @@
 //   CREATE_MODEL, MODEL_INSERT, MODEL_DELETE, MODEL_UPDATE, and MODEL_RESET_RANGE.
 // - Stable Identity: Items are identified by stable ItemId values, supporting mutation
 //   by item identity independently of display index or scroll position.
+// - §8 Hierarchical models, §26 limits: a Tree model's index space is the depth-first preorder of
+//   the whole forest. The standard item properties `tree_depth` and `descendant_count` carry its
+//   shape; `validateTreeShape` checks the cached items against it and `maxModelTreeDepth` with the
+//   same rules, order and conformance codes as the Rust `Model::validate_tree_shape`.
 //
 
 import Foundation
@@ -98,6 +102,80 @@ public struct ModelItem: Equatable, Sendable, CustomStringConvertible {
     public var description: String {
         "ModelItem(id: \(itemID), value: \(value), properties: \(properties.count))"
     }
+
+    /// `true` when the item carries one of the hierarchical shape properties (§8).
+    var carriesTreeShape: Bool {
+        properties[.treeDepth] != nil || properties[.descendantCount] != nil
+    }
+
+    /// The item's `tree_depth` (0 for a root, and when absent), as declared by the server (§8).
+    /// A malformed value reads as 0 here; the store refuses it before it is committed.
+    public var treeDepth: UInt64 {
+        (try? treeShapeValue(.treeDepth).get()) ?? 0
+    }
+
+    /// The item's `descendant_count` (0 when absent): its subtree occupies the next
+    /// `descendantCount` indices of the preorder (§8).
+    public var descendantCount: UInt64 {
+        (try? treeShapeValue(.descendantCount).get()) ?? 0
+    }
+
+    /// Reads one hierarchical shape property; absent is 0, and only a non-negative integer is a
+    /// shape (§8).
+    func treeShapeValue(_ property: PropertyRef) -> Result<UInt64, ModelTreeViolation> {
+        switch properties[property] {
+        case nil:
+            return .success(0)
+        case .unsignedInt(let value)?:
+            return .success(value)
+        case .signedInt(let value)? where value >= 0:
+            return .success(UInt64(value))
+        default:
+            return .failure(.invalidProperty(property: lookupStandardPropertyName(property.localID) ?? "tree property"))
+        }
+    }
+}
+
+// MARK: - Hierarchical Model Shape (§8, §26)
+
+/// How a hierarchical model's cached items break the preorder shape that `tree_depth` and
+/// `descendant_count` declare (§8, §26). Mirrors the Rust `ModelTreeViolation`, code for code.
+public enum ModelTreeViolation: Error, Equatable, Sendable, CustomStringConvertible {
+    /// `tree_depth` or `descendant_count` is not a non-negative integer.
+    case invalidProperty(property: String)
+    /// `index + descendant_count` reaches or passes `item_count`.
+    case descendantCountOutOfRange(descendantCount: UInt64, itemCount: UInt64)
+    /// No valid preorder reaches the item's depth through the preceding indices: depth grows by
+    /// at most one level per index, index 0 is a root, and the position right after a cached
+    /// item's span is no deeper than that item. `deepestReachable` is the deepest depth allowed.
+    case depthJump(treeDepth: UInt64, deepestReachable: UInt64)
+    /// The item lies inside a cached item's span without being deeper than it, its own span runs
+    /// past that span, or it directly follows a span — including a leaf's empty span — while being
+    /// deeper than the span's owner.
+    case outsideParentSpan(parentIndex: UInt64)
+
+    /// Canonical conformance code (§32), identical to the Rust store's.
+    public var conformanceCode: String {
+        switch self {
+        case .invalidProperty: return "invalid_model_tree_property"
+        case .descendantCountOutOfRange: return "model_tree_descendant_count_out_of_range"
+        case .depthJump: return "model_tree_depth_jump"
+        case .outsideParentSpan: return "model_tree_outside_parent_span"
+        }
+    }
+
+    public var description: String {
+        switch self {
+        case .invalidProperty(let property):
+            return "\(property) is not a non-negative integer"
+        case .descendantCountOutOfRange(let descendantCount, let itemCount):
+            return "descendant_count \(descendantCount) runs past item_count \(itemCount)"
+        case .depthJump(let treeDepth, let deepestReachable):
+            return "tree_depth \(treeDepth) is deeper than the preceding items allow (at most \(deepestReachable))"
+        case .outsideParentSpan(let parentIndex):
+            return "item breaks the subtree span of the item at index \(parentIndex)"
+        }
+    }
 }
 
 // MARK: - Collection Model (§8, §13)
@@ -119,6 +197,10 @@ public struct Model: Equatable, Sendable, CustomStringConvertible {
     /// Reverse lookup mapping each cached item's stable `ItemId` to its index.
     public internal(set) var idToIndex: [ItemId: UInt64]
 
+    /// Set once any item carrying `tree_depth` or `descendant_count` has been written, and kept
+    /// for the model's lifetime: a model that never held one is a flat list of roots (§8).
+    public internal(set) var treeShaped: Bool
+
     /// Constructs a new empty collection model with specified item count (§8, §13).
     public init(id: ModelId, modelType: TypeRef, itemCount: UInt64) {
         self.id = id
@@ -126,6 +208,107 @@ public struct Model: Equatable, Sendable, CustomStringConvertible {
         self.itemCount = itemCount
         self.items = [:]
         self.idToIndex = [:]
+        self.treeShaped = false
+    }
+
+    private mutating func noteTreeShape(_ incoming: [ModelItem]) {
+        if !treeShaped && incoming.contains(where: { $0.carriesTreeShape }) {
+            treeShaped = true
+        }
+    }
+
+    /// Checks the cached items against the preorder shape their `tree_depth` and
+    /// `descendant_count` declare, and against `maxModelTreeDepth` (§8, §26).
+    ///
+    /// Exact for sparse caches, with the same rules, order and codes as the Rust
+    /// `Model::validate_tree_shape`: it accepts precisely the caches that some valid forest of
+    /// `itemCount` items agrees with on every cached item. Per item, in order:
+    /// 1. both properties are non-negative integers (absent is 0);
+    /// 2. `tree_depth < maxModelTreeDepth`, and an item with descendants leaves room for them;
+    /// 3. `index + descendant_count < itemCount`;
+    /// 4. the depth is reachable through the preceding indices, one level per index at most
+    ///    (index 0 is a root), honouring every earlier span's after-span bound;
+    /// 5. directly after a cached item's span (a leaf's span is empty) the item is no deeper than
+    ///    that item; inside the nearest enclosing cached span it is deeper than its owner and its
+    ///    own span ends inside.
+    ///
+    /// lc-debt: O(n log n) in cached items (sorted keys) per touched hierarchical model per
+    /// transaction; upgrade path is a check windowed around the touched index ranges.
+    public func validateTreeShape(maxModelTreeDepth: Int) throws {
+        guard treeShaped else { return }
+        func fail(_ index: UInt64, _ violation: ModelTreeViolation) -> StoreError {
+            .invalidModelTree(modelID: id, index: index, violation: violation)
+        }
+        let limit = max(maxModelTreeDepth, 0)
+        /// Deepest depth reachable at `target` walking one level per index from `reach` at `pos`
+        /// (`nil` is the position before index 0), capped below the limit.
+        func walk(_ reach: Int, from pos: UInt64?, to target: UInt64) -> Int {
+            let steps = pos.map { target - $0 } ?? target &+ 1
+            let capped = steps >= UInt64(limit) ? limit : Int(steps)
+            return min(limit - 1, reach + capped)
+        }
+        // Spans of cached items as (index, depth, last index of the span); a leaf's span ends at
+        // itself. Ends are non-increasing towards the top and depths strictly increasing.
+        var open: [(index: UInt64, depth: UInt64, end: UInt64)] = []
+        var pos: UInt64? = nil
+        var reachAtPos = -1
+        for index in items.keys.sorted() {
+            guard let item = items[index] else { continue }
+            let depth: UInt64
+            let descendants: UInt64
+            switch (item.treeShapeValue(.treeDepth), item.treeShapeValue(.descendantCount)) {
+            case (.failure(let violation), _), (.success, .failure(let violation)):
+                throw fail(index, violation)
+            case (.success(let d), .success(let c)):
+                depth = d
+                descendants = c
+            }
+            if depth >= UInt64(limit) || (descendants > 0 && depth + 1 >= UInt64(limit)) {
+                throw StoreError.maxModelTreeDepthExceeded(
+                    modelID: id, index: index, limit: maxModelTreeDepth, treeDepth: depth
+                )
+            }
+            let remaining = itemCount > index ? itemCount - index : 0
+            if descendants >= remaining {
+                throw fail(index, .descendantCountOutOfRange(
+                    descendantCount: descendants, itemCount: itemCount
+                ))
+            }
+            // Close every span that ends before `index`; the position right after each is no
+            // deeper than its owner. At `index` itself that bound applies to this item.
+            var boundHere: (index: UInt64, depth: UInt64)?
+            while let top = open.last, top.end < index {
+                let after = top.end + 1
+                var bound: (index: UInt64, depth: UInt64)?
+                while let owner = open.last, owner.end == top.end {
+                    if bound == nil || owner.depth < bound!.depth {
+                        bound = (index: owner.index, depth: owner.depth)
+                    }
+                    open.removeLast()
+                }
+                if after == index {
+                    boundHere = bound
+                } else if let bound {
+                    reachAtPos = min(walk(reachAtPos, from: pos, to: after), Int(bound.depth))
+                    pos = after
+                }
+            }
+            let reachable = walk(reachAtPos, from: pos, to: index)
+            if Int(depth) > reachable {
+                throw fail(index, .depthJump(treeDepth: depth, deepestReachable: UInt64(max(reachable, 0))))
+            }
+            if let boundHere, depth > boundHere.depth {
+                throw fail(index, .outsideParentSpan(parentIndex: boundHere.index))
+            }
+            // `descendants < itemCount - index`, so the span end cannot overflow.
+            let end = index + descendants
+            if let owner = open.last, depth <= owner.depth || end > owner.end {
+                throw fail(index, .outsideParentSpan(parentIndex: owner.index))
+            }
+            open.append((index: index, depth: depth, end: end))
+            pos = index
+            reachAtPos = Int(depth)
+        }
     }
 
     /// Constructs a model pre-populated with an initial contiguous range of items.
@@ -279,6 +462,7 @@ public struct Model: Equatable, Sendable, CustomStringConvertible {
             }
         }
 
+        noteTreeShape(items)
         let n = UInt64(items.count)
         if n > 0 {
             shiftCachedIndices(fromIndex: index, delta: Int64(n))
@@ -369,6 +553,7 @@ public struct Model: Equatable, Sendable, CustomStringConvertible {
         index: UInt64?,
         items: [ModelItem]
     ) throws {
+        noteTreeShape(items)
         for (i, item) in items.enumerated() {
             if let baseIdx = index {
                 let targetIdx = baseIdx + UInt64(i)
@@ -436,6 +621,7 @@ public struct Model: Equatable, Sendable, CustomStringConvertible {
             }
         }
 
+        noteTreeShape(items)
         // Remove old cached items in [startIndex, endIndex)
         for idx in startIndex..<endIndex {
             if let old = self.items.removeValue(forKey: idx) {

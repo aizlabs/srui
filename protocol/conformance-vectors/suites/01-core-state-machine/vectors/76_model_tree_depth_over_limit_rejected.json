@@ -1,0 +1,109 @@
+{
+  "name": "model_tree_depth_over_limit_rejected",
+  "description": "With max_model_tree_depth 4, a chain of five levels puts index 4 at tree_depth 4 and the transaction is refused explicitly (§4 inv. 13, §26).",
+  "spec_sections": [
+    "§4",
+    "§8",
+    "§12.1",
+    "§22.5",
+    "§26"
+  ],
+  "initial_revision": 0,
+  "initial_limits": {
+    "max_model_tree_depth": 4
+  },
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Files"
+          }
+        },
+        {
+          "type": "CREATE_MODEL",
+          "model_id": 10,
+          "model_type": "Tree",
+          "item_count": 0
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Tree",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "model_ref": 10
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "MODEL_INSERT",
+        "model_id": 10,
+        "index": 0,
+        "items": [
+          {
+            "item_id": 400,
+            "value": "L0",
+            "properties": {
+              "tree_depth": 0,
+              "descendant_count": 4
+            }
+          },
+          {
+            "item_id": 401,
+            "value": "L1",
+            "properties": {
+              "tree_depth": 1,
+              "descendant_count": 3
+            }
+          },
+          {
+            "item_id": 402,
+            "value": "L2",
+            "properties": {
+              "tree_depth": 2,
+              "descendant_count": 2
+            }
+          },
+          {
+            "item_id": 403,
+            "value": "L3",
+            "properties": {
+              "tree_depth": 3,
+              "descendant_count": 1
+            }
+          },
+          {
+            "item_id": 404,
+            "value": "L4",
+            "properties": {
+              "tree_depth": 4,
+              "descendant_count": 0
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "max_model_tree_depth_exceeded",
+    "failed_op_index": 0,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

@@ -63,6 +63,10 @@ public final class ControlFactory {
     /// Promoted and local selection per collection node, kept across remounts (§6.3, §22.5).
     var collectionSelectionMemory: [NodeId: CollectionSelectionMemory] = [:]
 
+    /// Locally collapsed Tree items per node and model, kept across remounts (§22.5). Pruned
+    /// with `pruneCollectionSelectionMemory(keeping:)`; an empty set removes the entry.
+    var collectionDisclosureMemory: [NodeId: (modelID: ModelId?, collapsed: Set<ItemId>)] = [:]
+
     /// Key-equivalent hook every Surface window's content view consults first (PX-016-G01).
     /// `LayoutRenderer` points it at its `ShortcutRouter`.
     public var shortcutKeyEquivalentHandler: (@MainActor (NSEvent, NSWindow) -> Bool)?
@@ -537,7 +541,9 @@ public final class ControlFactory {
                 }
             } else if let adapter = handle.modelAdapter as? OutlineCollectionAdapter,
                       let outlineView = outlineView(in: handle) {
-                if property == .modelRef {
+                if property == .columns {
+                    adapter.setColumns(value?.asList?.compactMap { $0.asString }, outlineView: outlineView)
+                } else if property == .modelRef {
                     let modelID = value?.asUnsignedInt.map { ModelId($0) }
                     let model = modelID.flatMap { store?.getModel($0) }
                     adapter.update(model: model, modelID: modelID, outlineView: outlineView)
@@ -547,7 +553,7 @@ public final class ControlFactory {
                 } else if property == .items {
                     if adapter.isModelBacked { break }
                     let rows = inlineOutlineRows(from: value)
-                    adapter.update(rows: rows, outlineView: outlineView)
+                    adapter.update(rows: rows, cells: inlineOutlineCells(from: value), outlineView: outlineView)
                 }
             }
 
@@ -675,11 +681,15 @@ public final class ControlFactory {
             }
         } else if let adapter = handle.modelAdapter as? OutlineCollectionAdapter,
                   let outlineView = outlineView(in: handle) {
+            adapter.setColumns(
+                node.getProperty(.columns)?.asList?.compactMap { $0.asString },
+                outlineView: outlineView
+            )
             if let modelID = node.modelRef {
                 adapter.update(model: store.getModel(modelID), modelID: modelID, outlineView: outlineView)
             } else {
-                let rows = inlineOutlineRows(from: node.getProperty(.items))
-                adapter.update(rows: rows, outlineView: outlineView)
+                let items = node.getProperty(.items)
+                adapter.update(rows: inlineOutlineRows(from: items), cells: inlineOutlineCells(from: items), outlineView: outlineView)
             }
             let mode = node.getProperty(.selectionMode)?.asEnumToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
             adapter.selectionMode = mode
@@ -765,19 +775,17 @@ public final class ControlFactory {
         return (scrollView, nil, adapter)
     }
 
+    /// One NSOutlineView per Tree (§8, §22.7). `columns` are reconciled like a Table's with the
+    /// first as the outline column and a visible header; without `columns` the Tree keeps one
+    /// header-less column. Local disclosure is reported as `.expansionChanged` (§7.6, §22.5), and
+    /// the collapsed set survives remounts through `collectionDisclosureMemory`.
     private func makeOutline(for node: Node, store: SemanticStore?) -> (NSView, NSWindow?, AnyObject?) {
         let scrollView = NSScrollView(frame: .zero)
         scrollView.hasVerticalScroller = true
         scrollView.borderType = .bezelBorder
         let outlineView = NSOutlineView(frame: .zero)
-        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("tree"))
-        column.title = "Tree"
-        column.width = 180
-        column.minWidth = 120
-        column.resizingMask = .autoresizingMask
         outlineView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
-        outlineView.addTableColumn(column)
-        outlineView.headerView = nil
+        let columnValues = node.getProperty(.columns)?.asList?.compactMap { $0.asString }
 
         let modelID = node.modelRef
         let model = modelID.flatMap { store?.getModel($0) }
@@ -801,6 +809,16 @@ public final class ControlFactory {
         adapter.onLocalSelection = { [weak self] nodeID, itemIDs in
             self?.noteLocalSelection(nodeID: nodeID, itemIDs: itemIDs)
         }
+        adapter.onExpansionChanged = { [weak self] nodeID, itemID, expanded in
+            self?.onInteraction?(.expansionChanged(nodeID: nodeID, itemID: itemID, expanded: expanded))
+        }
+        adapter.onCollapsedItemsChanged = { [weak self] nodeID, modelID, collapsed in
+            self?.noteCollapsedItems(nodeID: nodeID, modelID: modelID, collapsed: collapsed)
+        }
+        if let memory = collectionDisclosureMemory[node.id], memory.modelID == modelID {
+            adapter.seedCollapsedItems(memory.collapsed)
+        }
+        adapter.setColumns(columnValues, outlineView: outlineView)
         outlineView.dataSource = adapter
         outlineView.delegate = adapter
         scrollView.documentView = outlineView
@@ -839,6 +857,19 @@ public final class ControlFactory {
     private func inlineOutlineRows(from value: Value?) -> [String] {
         guard let values = value?.asList else { return [] }
         return values.map { $0.asString ?? ($0 == .null ? "" : $0.description) }
+    }
+
+    /// Inline Tree items projected into column cells like Table rows (§8).
+    private func inlineOutlineCells(from value: Value?) -> [[String]] {
+        (value?.asList ?? []).map(cells(from:))
+    }
+
+    func noteCollapsedItems(nodeID: NodeId, modelID: ModelId?, collapsed: Set<ItemId>) {
+        if collapsed.isEmpty {
+            collectionDisclosureMemory.removeValue(forKey: nodeID)
+        } else {
+            collectionDisclosureMemory[nodeID] = (modelID, collapsed)
+        }
     }
 
     func tableView(in handle: RenderHandle) -> NSTableView? {

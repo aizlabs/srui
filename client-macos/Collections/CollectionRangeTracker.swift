@@ -5,6 +5,12 @@
 // Page-aligns the visible/prefetch window, subtracts cached and in-flight coverage,
 // and emits contiguous missing segments only (§8, §22.7).
 //
+// A hierarchical Tree with collapsed items shows several disjoint index runs at once. Its windows
+// are page-aligned per run with `alignedWindows(visibleSegments:hidden:itemCount:)`, which removes
+// the hidden (collapsed) index intervals again, so a request never names an index no row shows;
+// `requests(windows:...)` then emits one request per window piece with the same pending and
+// cache coverage rules as the single-window path (§8, §22.5, §22.7).
+//
 
 import Dispatch
 import SemanticModel
@@ -56,21 +62,45 @@ public struct CollectionRangeTracker: Equatable, Sendable {
         modelID: ModelId,
         nowNanos: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) -> [CollectionRangeRequest] {
-        expireStalePending(nowNanos: nowNanos)
-        guard itemCount > 0, visibleCount > 0 else {
+        guard itemCount > 0, visibleCount > 0,
+              let window = alignedWindow(
+                  visibleStart: visibleStart,
+                  visibleCount: visibleCount,
+                  itemCount: itemCount
+              ) else {
+            expireStalePending(nowNanos: nowNanos)
             pending.removeAll(keepingCapacity: false)
             return []
         }
-        guard let window = alignedWindow(
-            visibleStart: visibleStart,
-            visibleCount: visibleCount,
-            itemCount: itemCount
-        ) else {
+        return requests(
+            windows: [window],
+            model: model,
+            nodeID: nodeID,
+            modelID: modelID,
+            nowNanos: nowNanos
+        )
+    }
+
+    /// Returns contiguous missing segments inside each of `windows`, which must be sorted and
+    /// disjoint (for example the result of `alignedWindows(visibleSegments:hidden:itemCount:)`).
+    ///
+    /// Each window yields at most one request spanning its first to last hole, exactly like the
+    /// single-window path; in-flight coverage outside every window is forgotten.
+    public mutating func requests(
+        windows: [Range<UInt64>],
+        model: Model,
+        nodeID: NodeId,
+        modelID: ModelId,
+        nowNanos: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> [CollectionRangeRequest] {
+        expireStalePending(nowNanos: nowNanos)
+        let windows = windows.filter { $0.lowerBound < $0.upperBound }
+        guard windows.isEmpty == false else {
             pending.removeAll(keepingCapacity: false)
             return []
         }
 
-        pending = pending.filter { $0.range.overlaps(window) }
+        pending = pending.filter { window in windows.contains { $0.overlaps(window.range) } }
 
         var covered: [Range<UInt64>] = pending.map(\.range)
         for cached in model.cachedRanges() {
@@ -79,22 +109,51 @@ public struct CollectionRangeTracker: Equatable, Sendable {
             }
         }
 
-        let holes = subtract(covers: covered, from: [window])
-        guard let first = holes.first, let last = holes.last else {
-            return []
-        }
-        let merged = first.lowerBound..<last.upperBound
-        pending.append(PendingWindow(range: merged, issuedAtNanos: nowNanos))
-        let count = merged.upperBound - merged.lowerBound
-        guard count > 0 else { return [] }
-        return [
-            CollectionRangeRequest(
-                nodeID: nodeID,
-                modelID: modelID,
-                startIndex: merged.lowerBound,
-                count: count
+        var requests: [CollectionRangeRequest] = []
+        for window in windows {
+            let holes = subtract(covers: covered, from: [window])
+            guard let first = holes.first, let last = holes.last else { continue }
+            let merged = first.lowerBound..<last.upperBound
+            let count = merged.upperBound - merged.lowerBound
+            guard count > 0 else { continue }
+            pending.append(PendingWindow(range: merged, issuedAtNanos: nowNanos))
+            covered.append(merged)
+            requests.append(
+                CollectionRangeRequest(
+                    nodeID: nodeID,
+                    modelID: modelID,
+                    startIndex: merged.lowerBound,
+                    count: count
+                )
             )
-        ]
+        }
+        return requests
+    }
+
+    /// Page-aligns each visible index run and removes the `hidden` intervals again (§8, §22.5).
+    ///
+    /// `visibleSegments` are the index runs the prefetch row window shows, in ascending order;
+    /// `hidden` are the sorted, merged collapsed intervals. The result is sorted and disjoint and
+    /// never contains a hidden index, so a request can only name rows the user could scroll to
+    /// without expanding anything.
+    public static func alignedWindows(
+        visibleSegments: [Range<UInt64>],
+        hidden: [Range<UInt64>],
+        itemCount: UInt64
+    ) -> [Range<UInt64>] {
+        guard itemCount > 0 else { return [] }
+        var aligned: [Range<UInt64>] = []
+        for segment in visibleSegments where segment.lowerBound < segment.upperBound {
+            let start = alignDown(segment.lowerBound, page: pageSize)
+            let end = min(itemCount, alignUp(segment.upperBound, page: pageSize))
+            guard start < end else { continue }
+            if let last = aligned.last, start <= last.upperBound {
+                aligned[aligned.count - 1] = last.lowerBound..<max(last.upperBound, end)
+            } else {
+                aligned.append(start..<end)
+            }
+        }
+        return subtract(covers: hidden, from: aligned).sorted { $0.lowerBound < $1.lowerBound }
     }
 
     public static func alignedWindow(

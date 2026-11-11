@@ -1,0 +1,144 @@
+{
+  "name": "model_tree_stale_ancestor_after_insert_rejected",
+  "description": "Inserting a child at the end of A's span and then updating A without growing its descendant_count leaves the child outside A's span; the shape is judged after the model's last operation, so the failure is reported at operation 1 and nothing is committed (§8, §12.1).",
+  "spec_sections": [
+    "§4",
+    "§8",
+    "§12.1",
+    "§22.5",
+    "§26"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Files"
+          }
+        },
+        {
+          "type": "CREATE_MODEL",
+          "model_id": 10,
+          "model_type": "Tree",
+          "item_count": 0
+        },
+        {
+          "type": "MODEL_INSERT",
+          "model_id": 10,
+          "index": 0,
+          "items": [
+            {
+              "item_id": 101,
+              "value": "A",
+              "properties": {
+                "tree_depth": 0,
+                "descendant_count": 3
+              }
+            },
+            {
+              "item_id": 102,
+              "value": "B",
+              "properties": {
+                "tree_depth": 1,
+                "descendant_count": 1
+              }
+            },
+            {
+              "item_id": 103,
+              "value": "C",
+              "properties": {
+                "tree_depth": 2,
+                "descendant_count": 0
+              }
+            },
+            {
+              "item_id": 104,
+              "value": "D",
+              "properties": {
+                "tree_depth": 1,
+                "descendant_count": 0
+              }
+            },
+            {
+              "item_id": 105,
+              "value": "E",
+              "properties": {
+                "tree_depth": 0,
+                "descendant_count": 1
+              }
+            },
+            {
+              "item_id": 106,
+              "value": "F",
+              "properties": {
+                "tree_depth": 1,
+                "descendant_count": 0
+              }
+            }
+          ]
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Tree",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "model_ref": 10
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "MODEL_INSERT",
+        "model_id": 10,
+        "index": 4,
+        "items": [
+          {
+            "item_id": 107,
+            "value": "G",
+            "properties": {
+              "tree_depth": 1,
+              "descendant_count": 0
+            }
+          }
+        ]
+      },
+      {
+        "type": "MODEL_UPDATE",
+        "model_id": 10,
+        "index": null,
+        "items": [
+          {
+            "item_id": 101,
+            "value": "A",
+            "properties": {
+              "tree_depth": 0,
+              "descendant_count": 3
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "model_tree_outside_parent_span",
+    "failed_op_index": 1,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

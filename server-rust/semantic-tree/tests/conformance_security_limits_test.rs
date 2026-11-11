@@ -8,7 +8,8 @@
 //! runs; this file covers the two halves those cannot reach:
 //!
 //! 1. every §26 store limit class refuses at its boundary — depth, node count, string length,
-//!    value depth, list elements, record properties, transaction operations, and the model limits;
+//!    value depth, list elements, record properties, transaction operations, and the model limits,
+//!    including the hierarchical model depth `max_model_tree_depth` (PX-018-G01);
 //! 2. §27's payload-class rule: nothing the server sends is executable on the client.
 //!
 //! Suite 1's vectors exercise several of these too, but §32 item 9 must stand alone: running the
@@ -29,6 +30,49 @@ fn root(store: &mut SemanticStore) -> NodeId {
         .create_node(id, TypeRef::SURFACE, None, None, [])
         .expect("root surface");
     id
+}
+
+/// §26: a hierarchical model deeper than `max_model_tree_depth` levels is refused at the boundary
+/// and the whole transaction is rolled back (§8, §12.1).
+#[test]
+fn test_max_model_tree_depth_refuses_at_the_boundary() {
+    let model = ModelId::new(7);
+    let item = |id: u64, depth: u64| {
+        ModelItem::new(
+            ItemId::new(id),
+            Value::Null,
+            [
+                (PropertyRef::TREE_DEPTH, Value::UnsignedInt(depth)),
+                (PropertyRef::DESCENDANT_COUNT, Value::UnsignedInt(0)),
+            ],
+        )
+    };
+    let mut store = store_with(StoreLimits {
+        max_model_tree_depth: 4,
+        ..StoreLimits::default()
+    });
+    store
+        .apply_transaction(
+            Revision::INITIAL,
+            vec![
+                Operation::create_model(model, TypeRef::TREE, 10),
+                // The deepest admitted level, alone in a sparse cache.
+                Operation::model_reset_range(model, 5, [item(1, 3)], None),
+            ],
+        )
+        .expect("tree_depth 3 is inside a 4-level limit");
+    let err = store
+        .apply_transaction(
+            store.revision(),
+            vec![Operation::model_reset_range(model, 8, [item(2, 4)], None)],
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.conformance_code(),
+        Some("max_model_tree_depth_exceeded")
+    );
+    assert_eq!(store.revision(), Revision::new(1));
+    assert_eq!(store.get_model(model).unwrap().cached_item_count(), 1);
 }
 
 /// §26: a tree deeper than `max_tree_depth` is refused at the boundary, not truncated.
@@ -457,6 +501,7 @@ fn test_default_limits_are_finite() {
             "max_items_per_model_operation",
             limits.max_items_per_model_operation,
         ),
+        ("max_model_tree_depth", limits.max_model_tree_depth),
     ] {
         assert!(value > 0, "{name} must be positive");
         assert!(

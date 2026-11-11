@@ -2,6 +2,7 @@
 
 import Accessibility
 import AppKit
+import Collections
 import Foundation
 import Protocol
 import RendererAppKit
@@ -407,6 +408,62 @@ struct SemanticInspectionAutomationTests {
         }
     }
 
+    @Test("Native and inspected Tree disclosure each send one EXPANSION_CHANGED without a reply")
+    @MainActor
+    func treeDisclosureSendsOneExpansionChangedWithoutAwaitingAReply() async throws {
+        // PX-018-G01 (§7.6, §22.5): the collapse is applied locally before anything is sent, and
+        // the server never answers; exactly one wire event carries value=bool and items=[ItemId].
+        try await withHarness { harness in
+            let handle = try #require(harness.renderer.registry.handle(for: SemanticInspectionFixture.treeID))
+            let adapter = try #require(handle.modelAdapter as? OutlineCollectionAdapter)
+            let outlineView = try #require((handle.view as? NSScrollView)?.documentView as? NSOutlineView)
+
+            #expect(adapter.setExpanded(false, itemID: SemanticInspectionFixture.treeParent, outlineView: outlineView))
+            #expect(adapter.isExpanded(SemanticInspectionFixture.treeParent) == false)
+            #expect(outlineView.numberOfRows == 1, "the collapse is local and immediate")
+
+            try await AsyncTestSupport.eventuallyAsync(
+                timeout: .roundTrip,
+                description: "native EXPANSION_CHANGED sent"
+            ) {
+                await harness.transport.recordedEvents().count == 1
+            }
+            let native = try #require(await harness.transport.recordedEvents().first)
+            #expect(native.logicalClass == .input)
+            #expect(native.event.eventType == .EVENT_EXPANSION_CHANGED)
+            #expect(native.event.nodeId == SemanticInspectionFixture.treeID)
+            #expect(native.event.observedRevision == Revision(1))
+            #expect(native.event.arguments == [
+                .VALUE: .bool(false),
+                .ITEMS: .list([.itemID(SemanticInspectionFixture.treeParent)]),
+            ])
+
+            let inspector = harness.controller.makeSemanticInspector()
+            let tree = try #require(inspector.find(role: .tree, label: SemanticInspectionFixture.treeLabel))
+            let inspected = try await tree.setExpanded(SemanticInspectionFixture.treeParent, true)
+            #expect(inspected.eventType == .EVENT_EXPANSION_CHANGED)
+            #expect(inspected.arguments == [
+                .VALUE: .bool(true),
+                .ITEMS: .list([.itemID(SemanticInspectionFixture.treeParent)]),
+            ])
+
+            let captured = await harness.transport.recordedEvents()
+            #expect(captured.map(\.event.eventType) == [.EVENT_EXPANSION_CHANGED, .EVENT_EXPANSION_CHANGED])
+            #expect(captured.map(\.event.eventSeq) == [1, 2])
+
+            // Only Tree emits it (§7.6).
+            let list = try #require(inspector.find(role: .list, label: SemanticInspectionFixture.collectionLabel))
+            do {
+                _ = try await list.setExpanded(ItemId(1), false)
+                Issue.record("Expected List expansion to be unsupported")
+            } catch SemanticAutomationError.unsupportedAction(let nodeID, let eventType) {
+                #expect(nodeID == SemanticInspectionFixture.collectionID)
+                #expect(eventType == .EVENT_EXPANSION_CHANGED)
+            }
+            #expect(await harness.transport.recordedEvents().count == 2)
+        }
+    }
+
     @Test("A node that does not emit ACTIVATE is rejected without an outbound event")
     @MainActor
     func unsupportedActionIsRejectedWithoutAnOutboundEvent() async throws {
@@ -615,11 +672,16 @@ private enum SemanticInspectionFixture {
     static let progressID = NodeId(4)
     static let editorID = NodeId(5)
     static let collectionID = NodeId(6)
+    static let treeID = NodeId(7)
+    static let treeModelID = ModelId(70)
+    static let treeParent = ItemId(701)
+    static let treeChild = ItemId(702)
 
     static let approveLabel = "Approve"
     static let sentinelLabel = "Sentinel"
     static let progressLabel = "Status"
     static let collectionLabel = "Items"
+    static let treeLabel = "Files"
 
     static var operations: [SemanticModel.Operation] {
         [
@@ -663,6 +725,32 @@ private enum SemanticInspectionFixture {
                 parentID: surfaceID,
                 properties: [
                     Property(property: .label, value: .string(collectionLabel)),
+                ]
+            ),
+            .createModel(id: treeModelID, modelType: .tree, itemCount: 0),
+            .modelInsert(
+                id: treeModelID,
+                index: 0,
+                items: [
+                    ModelItem(
+                        itemID: treeParent,
+                        value: .string("src"),
+                        properties: [.treeDepth: .unsignedInt(0), .descendantCount: .unsignedInt(1)]
+                    ),
+                    ModelItem(
+                        itemID: treeChild,
+                        value: .string("main.swift"),
+                        properties: [.treeDepth: .unsignedInt(1), .descendantCount: .unsignedInt(0)]
+                    ),
+                ]
+            ),
+            .createNode(
+                id: treeID,
+                nodeType: .tree,
+                parentID: surfaceID,
+                properties: [
+                    Property(property: .label, value: .string(treeLabel)),
+                    Property(property: .modelRef, value: .unsignedInt(treeModelID.value)),
                 ]
             ),
         ]
@@ -740,6 +828,7 @@ private final class SemanticInspectionHarness {
                     && renderer.registry.handle(for: SemanticInspectionFixture.progressID) != nil
                     && renderer.registry.handle(for: SemanticInspectionFixture.editorID) != nil
                     && renderer.registry.handle(for: SemanticInspectionFixture.collectionID) != nil
+                    && renderer.registry.handle(for: SemanticInspectionFixture.treeID) != nil
             }
             return harness
         } catch {

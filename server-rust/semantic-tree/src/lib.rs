@@ -16,11 +16,13 @@
 //! - §12.1: Revisions and transactions ([`Revision`], [`Transaction`], [`Operation`])
 //! - §12.2: Commits are state-consistency boundaries, not render frames
 //! - §8: Collection models ([`Model`]) and the cache-independent promoted-selection rules
-//!   ([`is_selectable_collection`], [`StoreError::InvalidCollectionSelection`])
+//!   ([`is_selectable_collection`], [`StoreError::InvalidCollectionSelection`]); hierarchical
+//!   models in depth-first preorder, shaped by the item properties `tree_depth` and
+//!   `descendant_count` ([`Model::validate_tree_shape`], [`ModelTreeViolation`])
 //! - §13: Core mutation operations ([`SemanticStore`])
 //! - §14: Resource model (large blobs are resources, not properties)
 //! - §15: Capability negotiation ([`CapabilitySet`], [`Profile`], [`ServerCapabilities`])
-//! - §26: Mandatory limits ([`StoreLimits`])
+//! - §26: Mandatory limits ([`StoreLimits`], including [`DEFAULT_MAX_MODEL_TREE_DEPTH`])
 
 pub mod capability;
 pub mod event;
@@ -64,10 +66,10 @@ pub use shortcut::{
 };
 
 pub use store::{
-    is_selectable_collection, Node, SemanticStore, StoreError, StoreLimits,
+    is_selectable_collection, ModelTreeViolation, Node, SemanticStore, StoreError, StoreLimits,
     DEFAULT_MAX_CACHED_ITEMS_PER_MODEL, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
-    DEFAULT_MAX_MODEL_COUNT, DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH,
-    DEFAULT_MAX_TRANSACTION_OPERATIONS, DEFAULT_MAX_TREE_DEPTH,
+    DEFAULT_MAX_MODEL_COUNT, DEFAULT_MAX_MODEL_TREE_DEPTH, DEFAULT_MAX_NODE_COUNT,
+    DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TRANSACTION_OPERATIONS, DEFAULT_MAX_TREE_DEPTH,
 };
 
 pub use transaction::{

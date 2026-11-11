@@ -483,7 +483,7 @@ fn test_standard_and_custom_events_wire_byte_roundtrip() {
             EditSeq::new(1).unwrap(),
         ),
         // 6. EXPANSION_CHANGED
-        Event::expansion_changed(6, "exp-1", 100, 15, true),
+        Event::expansion_changed(6, "exp-1", 100, 15, 7u64, true),
         // 7. VIEWPORT_CHANGED
         Event::viewport_changed(7, "vp-1", 100, 16, Size::new(1440.0, 900.0)),
         // 8. Rich Custom Event with ClientInstanceId and multiple arguments

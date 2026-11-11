@@ -1,0 +1,91 @@
+{
+  "name": "model_tree_unreachable_depth_across_gap_rejected",
+  "description": "Depth grows by at most one level per index, so an item three levels below a root two indices earlier is unreachable even though the index between is uncached (§6.3, §8).",
+  "spec_sections": [
+    "§4",
+    "§8",
+    "§12.1",
+    "§22.5",
+    "§26"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Files"
+          }
+        },
+        {
+          "type": "CREATE_MODEL",
+          "model_id": 10,
+          "model_type": "Tree",
+          "item_count": 4
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Tree",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "model_ref": 10
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "MODEL_RESET_RANGE",
+        "model_id": 10,
+        "start_index": 0,
+        "items": [
+          {
+            "item_id": 1101,
+            "value": "A",
+            "properties": {
+              "tree_depth": 0,
+              "descendant_count": 3
+            }
+          }
+        ],
+        "total_count": null
+      },
+      {
+        "type": "MODEL_RESET_RANGE",
+        "model_id": 10,
+        "start_index": 2,
+        "items": [
+          {
+            "item_id": 1103,
+            "value": "C",
+            "properties": {
+              "tree_depth": 3,
+              "descendant_count": 0
+            }
+          }
+        ],
+        "total_count": null
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "model_tree_depth_jump",
+    "failed_op_index": 1,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

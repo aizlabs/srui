@@ -92,6 +92,8 @@ public let standardPropertiesTable: [(id: UInt32, name: String)] = [
     (29, "columns"),
     (30, "selection_mode"),
     (31, "shortcut"),
+    (32, "tree_depth"),
+    (33, "descendant_count"),
 ]
 
 /// Runtime value kinds declared by the standard property registry.
@@ -142,6 +144,8 @@ public func standardPropertyValueType(_ property: PropertyRef) -> StandardProper
     case 29: return .list
     case 30: return .enumToken
     case 31: return .string
+    case 32: return .unsignedInt
+    case 33: return .unsignedInt
     default: return nil
     }
 }
@@ -296,6 +300,8 @@ public func lookupStandardProperty(_ name: String) -> UInt32? {
     case "columns": return 29
     case "selection_mode": return 30
     case "shortcut": return 31
+    case "tree_depth": return 32
+    case "descendant_count": return 33
     default: return nil
     }
 }
@@ -333,6 +339,8 @@ public func lookupStandardPropertyName(_ id: UInt32) -> String? {
     case 29: return "columns"
     case 30: return "selection_mode"
     case 31: return "shortcut"
+    case 32: return "tree_depth"
+    case 33: return "descendant_count"
     default: return nil
     }
 }
@@ -867,6 +875,10 @@ extension PropertyRef {
     public static let SELECTION_MODE = PropertyRef.standard(30)
     public static let shortcut = PropertyRef.standard(31)
     public static let SHORTCUT = PropertyRef.standard(31)
+    public static let treeDepth = PropertyRef.standard(32)
+    public static let TREE_DEPTH = PropertyRef.standard(32)
+    public static let descendantCount = PropertyRef.standard(33)
+    public static let DESCENDANT_COUNT = PropertyRef.standard(33)
 }
 
 // MARK: - Standard EnumToken Constants

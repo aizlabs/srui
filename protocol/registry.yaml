@@ -413,6 +413,19 @@ properties:
     value_type: string
     description: "Platform-neutral keyboard shortcut (§7.7, §22.5). A string in the closed canonical grammar [primary+][shift+][alt+]<key>, at most 32 bytes, where <key> is one lowercase ASCII letter or digit, or one of return, escape, tab, space, delete, up, down, left, right, home, end, page_up, page_down, f1-f12; primary is Command on macOS and Control elsewhere, and every key except f1-f12 requires primary. Admitted on Button (ACTIVATE exactly as a click), Toggle (VALUE_CHANGED exactly as a click), and TextInput, TextArea, List, Table, Tree and RichText (local focus only, no event); refused on every other node type and when duplicated within one window-owning Surface (a nested Surface shares the enclosing one's scope). Unknown tokens, duplicate or misordered modifiers and over-length values fail at decode and apply (§4 inv. 13). Fallback: a client without support ignores it; the node stays reachable by pointer, Tab and accessibility."
 
+  # Hierarchical model shape (§8, §22.5, §22.7, §26)
+  - id: 32
+    name: tree_depth
+    category: control_specific
+    value_type: uint64
+    description: "Model item property: the item's depth in a hierarchical model whose index space is the depth-first preorder of the whole forest (§8). 0 is a root; absent means 0. Bounded by the §26 limit max_model_tree_depth, which counts levels (default 256, so tree_depth < 256). Index 0 has depth 0, and where items i and i+1 are both cached, tree_depth(i+1) <= tree_depth(i) + 1. A violation fails the whole transaction explicitly (§4 inv. 13, §12.1). Fallback: a client without support renders the preorder flat with correct identity and selection."
+
+  - id: 33
+    name: descendant_count
+    category: control_specific
+    value_type: uint64
+    description: "Model item property: the size of the item's subtree excluding the item itself, so its descendants occupy indices index+1 through index+descendant_count of the preorder (§8). Absent means 0. index + descendant_count < item_count; every cached item inside the span is deeper than the item and keeps its own span inside it, and a cached item right after the span is no deeper than the item. Disclosure is local (§22.5): collapsing an item hides exactly its span. A violation fails the whole transaction explicitly (§4 inv. 13, §12.1). Fallback: a client without support renders the preorder flat."
+
 enums:
   - id: 1
     name: TextRole

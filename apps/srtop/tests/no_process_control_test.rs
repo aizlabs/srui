@@ -892,9 +892,9 @@ fn is_table_selection(tokens: &[Tok]) -> bool {
 }
 
 /// The follow toggle (PX-017), whose `VALUE_CHANGED` handler turns follow on
-/// or off for the process the server already resolved as selected. It
-/// re-promotes the followed row's item ID and never signals, opens for
-/// control or reconfigures a process.
+/// or off for the process the server already resolved as selected. It names
+/// the followed row's item ID in the table's `keep_visible` hint and never
+/// signals, opens for control or reconfigures a process.
 const FOLLOW_TOGGLE_CHANGE: (&str, &str) = ("FOLLOW_TOGGLE", "VALUE_CHANGED");
 
 /// Whether an `on(..)` argument list is exactly the follow toggle's

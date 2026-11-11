@@ -789,6 +789,7 @@ impl Inspector {
                 process,
                 format!("{DETAILS_HEAD}: not shown"),
                 format!("{METRICS_HEAD}: not shown"),
+                format!("{COMMAND_HEAD}: not shown"),
             );
         }
         let ended = kept.is_none() || selected.details == Details::Ended;

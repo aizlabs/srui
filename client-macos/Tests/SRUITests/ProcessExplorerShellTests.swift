@@ -1,4 +1,4 @@
-// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012/PX-013/PX-014/PX-015: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
+// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012/PX-013/PX-014/PX-015/PX-016: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
 import Testing
 import Foundation
 import AppKit
@@ -733,6 +733,322 @@ struct ProcessExplorerShellTests {
         #expect(renderer.registry.handle(for: NodeId(5)) === tableHandle)
         print("PX-015 native SSH evidence: window \(window.windowNumber); frozen at client revision \(frozenRevision.value) for 1.2 s with no app mutation; frozenRows=\(frozenRows); filtered while paused=\(filtered); refused=\(refusedStatus); resumed status=\(status.stringValue); freshness=\(freshness.stringValue); rows=\(Self.nativeRows(table)); itemIDs=\(Self.modelItemIDs(applier)); revision=\(applier.lastAppliedRevision.value)")
         await controller.stop()
+    }
+
+    /// PX-016: the basic workflow without a mouse. The explorer publishes the standard `shortcut`
+    /// property (PX-016-G01) on its existing controls, and the unchanged generic client binds
+    /// them. Real key-down `NSEvent`s go through the window's `performKeyEquivalent(with:)`, and
+    /// typing, arrows, paging and Delete through the first responder's own `keyDown(with:)`, as
+    /// AppKit delivers them. The test host never activates, so the router's key-window seam is
+    /// set, as in G01's native tests; every other guard is the real one. The fixture lists 60
+    /// processes, three named exactly `worker` at rows 10, 30 and 50.
+    @Test(.timeLimit(.minutes(1)))
+    @MainActor
+    func theBasicWorkflowRunsFromTheKeyboardWithDiscoverableAccessibleShortcuts() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-repeated-names"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        renderer.textEditingSession.debounceNanoseconds = 0
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer over SSH with its shortcuts") {
+            applier.lastAppliedRevision.value >= 1
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(Self.samplingStatusID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        SurfacePresentation.forHostApplication().present(window)
+        window.contentView?.layoutSubtreeIfNeeded()
+        let router = renderer.layoutRenderer.shortcutRouter
+        router.isWindowKey = { $0 === window }
+        func view<T>(_ id: UInt64, as _: T.Type = T.self) throws -> T {
+            try #require(renderer.registry.handle(for: NodeId(id))?.view as? T, "node \(id)")
+        }
+        let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
+        let table = try #require((tableHandle.view as? NSScrollView)?.documentView as? NSTableView)
+        let searchField: NSTextField = try view(Self.searchInputID)
+        let filterField: NSTextField = try view(Self.filterInputID)
+        let searchStatus: NSTextField = try view(Self.searchStatusID)
+        let filterStatus: NSTextField = try view(Self.filterStatusID)
+        let samplingStatus: NSTextField = try view(Self.samplingStatusID)
+        let refresh: NSButton = try view(Self.samplingRefreshID)
+        let pause: NSButton = try view(Self.samplingPauseID)
+        let sortByPID: NSButton = try view(Self.sortButtonIDs[0])
+        let sortByName: NSButton = try view(Self.sortButtonIDs[1])
+        let inspectorStatus: NSTextField = try view(Self.inspectorLineIDs[0])
+        let commandScroll: NSScrollView = try view(Self.inspectorCommandID)
+        let commandText = try #require(commandScroll.documentView as? NSTextView)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "all 60 rows") {
+            table.numberOfRows == 60 && refresh.isEnabled
+        }
+        let initialRows = Self.nativeRows(table)
+        let identities = Self.modelItemIDs(applier)
+
+        // Discoverable and accessible, in reading order: every shortcut is bound, none is
+        // reserved, and each control states its label, its enabled state and its shortcut.
+        var reading: [NSObject] = []
+        for binding in Self.keyboardShortcuts {
+            let handle = try #require(renderer.registry.handle(for: NodeId(binding.id)), "node \(binding.id)")
+            #expect(handle.shortcutDiagnostic == nil, "\(binding.label): \(String(describing: handle.shortcutDiagnostic))")
+            #expect(handle.shortcutBinding?.shortcut.canonical == binding.shortcut, "\(binding.label)")
+            #expect(handle.accessibilityMetadata.shortcut == binding.display, "\(binding.label)")
+            let element = handle.view
+            #expect(element.accessibilityLabel() == binding.label, "\(binding.label) is announced by its label")
+            #expect(element.toolTip == "\(binding.label) (\(binding.display))")
+            #expect(element.accessibilityHelp()?.hasSuffix("Keyboard shortcut \(binding.display)") == true,
+                    "\(binding.label): help \(String(describing: element.accessibilityHelp()))")
+            if let inner = (element as? NSScrollView)?.documentView {
+                // The focused table or text announces the shortcut too.
+                #expect(inner.accessibilityHelp()?.hasSuffix("Keyboard shortcut \(binding.display)") == true, "\(binding.label)")
+            }
+            if let control = element as? NSControl {
+                #expect(control.isAccessibilityEnabled() == binding.initiallyEnabled,
+                        "\(binding.label) is announced as \(binding.initiallyEnabled ? "enabled" : "disabled")")
+                #expect(control.isEnabled == binding.initiallyEnabled)
+            }
+            reading.append(element)
+        }
+        #expect(renderer.registry.allHandles.allSatisfy { $0.shortcutDiagnostic == nil }, "no shortcut is refused")
+        let order = Self.accessibilityOrder(of: reading, under: try #require(window.contentView))
+        #expect(order == Array(reading.indices),
+                "the accessibility tree reads the controls in the published order: \(order)")
+
+        // A shortcut whose control is disabled does nothing: nothing is searched for yet.
+        #expect(window.performKeyEquivalent(with: try Self.keyEvent("g", [.command], keyCode: 5, in: window)) == false)
+        #expect(router.lastRefusal == .disabled)
+
+        // Find: Command-F focuses the search field; letters typed there are text, not shortcuts.
+        #expect(window.performKeyEquivalent(with: try Self.keyEvent("f", [.command], keyCode: 3, in: window)))
+        let searchEditor = try #require(window.firstResponder as? NSTextView)
+        #expect(searchEditor.delegate === searchField, "the search field owns input")
+        // An input method's composition owns input: even an enabled control's shortcut waits.
+        searchEditor.setMarkedText("かな", selectedRange: NSRange(location: 2, length: 0),
+                                   replacementRange: searchEditor.selectedRange)
+        #expect(searchEditor.hasMarkedText())
+        let refreshKey = try Self.keyEvent("r", [.command], keyCode: 15, in: window)
+        #expect(window.performKeyEquivalent(with: refreshKey) == false)
+        #expect(router.lastRefusal == .markedText)
+        #expect(searchEditor.hasMarkedText(), "the composition is untouched")
+        searchEditor.setMarkedText("", selectedRange: NSRange(location: 0, length: 0),
+                                   replacementRange: NSRange(location: NSNotFound, length: 0))
+        #expect(!searchEditor.hasMarkedText() && searchEditor.string.isEmpty)
+        // Copy stays the text field's: the reserved combination is never the application's.
+        #expect(window.performKeyEquivalent(with: try Self.keyEvent("c", [.command], keyCode: 8, in: window)) == false)
+        try Self.typeKeys("worker", in: window)
+        // The whole query, not a prefix typed on the way to it, has been searched for.
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the first match") {
+            searchStatus.stringValue.contains("\"worker\": 3 matches in 60 shown rows · match 1 of 3 at row 10 of 60")
+                && table.selectedRowIndexes == IndexSet(integer: 9)
+        }
+        #expect(searchField.stringValue == "worker" || searchEditor.string == "worker")
+        // Command-G and Shift-Command-G step through the matches while the field keeps focus.
+        var selections = [table.selectedRow]
+        let steps: [(modifiers: NSEvent.ModifierFlags, nth: Int, row: Int)] = [
+            ([.command], 2, 29), ([.command], 3, 49), ([.command, .shift], 2, 29),
+        ]
+        for (modifiers, nth, row) in steps {
+            #expect(window.performKeyEquivalent(with: try Self.keyEvent("g", modifiers, keyCode: 5, in: window)))
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "match \(nth) at row \(row + 1)") {
+                searchStatus.stringValue.contains("match \(nth) of 3 at row \(row + 1) of 60")
+                    && table.selectedRowIndexes == IndexSet(integer: row)
+            }
+            selections.append(table.selectedRow)
+        }
+        #expect(selections == [9, 29, 49, 29])
+
+        // Select: Command-L focuses the table; its own arrow keys move the selection, and the
+        // inspector follows each native selection. Paging scrolls locally and selects nothing.
+        #expect(window.performKeyEquivalent(with: try Self.keyEvent("l", [.command], keyCode: 37, in: window)))
+        #expect(window.firstResponder === table)
+        let down = try Self.keyEvent(Self.functionKey(NSDownArrowFunctionKey), [.numericPad, .function], keyCode: 125, in: window)
+        #expect(window.performKeyEquivalent(with: down) == false, "an arrow is the table's, never a shortcut")
+        table.keyDown(with: down)
+        #expect(table.selectedRowIndexes == IndexSet(integer: 30))
+        let row30 = initialRows[30]
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on row 31") {
+            inspectorStatus.stringValue.hasPrefix("Selected process: PID \(row30[0]) · \(row30[1])")
+        }
+        // The last match revealed the end of the table, so page up.
+        let visibleBefore = table.visibleRect
+        table.keyDown(with: try Self.keyEvent(Self.functionKey(NSPageUpFunctionKey), [.function], keyCode: 116, in: window))
+        // AppKit may animate the page scroll.
+        try await AsyncTestSupport.eventually(timeout: .seconds(5), description: "the table paged up locally from \(visibleBefore)") {
+            table.visibleRect.origin.y < visibleBefore.origin.y
+        }
+        #expect(table.selectedRowIndexes == IndexSet(integer: 30), "paging moves the viewport, not the selection")
+        table.keyDown(with: try Self.keyEvent(Self.functionKey(NSUpArrowFunctionKey), [.numericPad, .function], keyCode: 126, in: window))
+        #expect(table.selectedRowIndexes == IndexSet(integer: 29))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector back on the second worker") {
+            inspectorStatus.stringValue.hasPrefix("Selected process: PID \(initialRows[29][0]) · worker")
+        }
+
+        // Inspect: Command-I focuses the inspector's selectable command line.
+        #expect(window.performKeyEquivalent(with: try Self.keyEvent("i", [.command], keyCode: 34, in: window)))
+        #expect(window.firstResponder === commandText)
+        #expect(commandText.isSelectable && !commandText.isEditable)
+
+        // Sort: Command-2 sorts by name, Command-1 back by PID; each is the button's own click.
+        #expect(window.performKeyEquivalent(with: try Self.keyEvent("2", [.command], keyCode: 19, in: window)))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the order by name") {
+            sortByName.title == "Sort by Name \u{2191}" && Self.nativeRows(table) == Self.modelRows(applier)
+                && Self.nativeRows(table) != initialRows
+        }
+        #expect(window.performKeyEquivalent(with: try Self.keyEvent("1", [.command], keyCode: 18, in: window)))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the order by PID") {
+            sortByPID.title == "Sort by PID \u{2191}" && Self.nativeRows(table) == initialRows
+        }
+
+        // Filter: Option-Command-F focuses the filter field; typing filters on the server.
+        #expect(window.performKeyEquivalent(with: try Self.keyEvent("f", [.command, .option], keyCode: 3, in: window)))
+        #expect((window.firstResponder as? NSTextView)?.delegate === filterField)
+        try Self.typeKeys("worker", in: window)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the filtered table") {
+            filterStatus.stringValue.contains("\"worker\"") && table.numberOfRows == 3
+        }
+        #expect(Self.nativeRows(table).allSatisfy { $0[1] == "worker" })
+
+        // Reset: refocusing a field selects its whole text, so one Delete clears it.
+        #expect(window.performKeyEquivalent(with: try Self.keyEvent("l", [.command], keyCode: 37, in: window)))
+        #expect(window.performKeyEquivalent(with: try Self.keyEvent("f", [.command, .option], keyCode: 3, in: window)))
+        let filterEditor = try #require(window.firstResponder as? NSTextView)
+        #expect(filterEditor.selectedRange == NSRange(location: 0, length: 6), "the whole filter is selected")
+        try Self.typeKeys("\u{7F}", in: window)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the filter reset") {
+            filterStatus.stringValue.contains("showing all") && table.numberOfRows == 60
+        }
+        #expect(window.performKeyEquivalent(with: try Self.keyEvent("f", [.command], keyCode: 3, in: window)))
+        let refocusedSearch = try #require(window.firstResponder as? NSTextView)
+        #expect(refocusedSearch.selectedRange == NSRange(location: 0, length: 6), "the whole query is selected")
+        try Self.typeKeys("\u{7F}", in: window)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the search reset") {
+            searchStatus.stringValue.contains("Search: none")
+        }
+        #expect(Self.nativeRows(table) == initialRows && Self.modelItemIDs(applier) == identities)
+        // With no search, Next is disabled again, and so are both reset buttons with nothing to
+        // reset: their shortcuts do nothing.
+        let refused: [(key: String, modifiers: NSEvent.ModifierFlags, keyCode: UInt16, what: String)] = [
+            ("g", [.command], 5, "Next match"),
+            ("u", [.command, .option], 32, "All visible users"),
+            ("r", [.command, .option], 15, "Restore default columns"),
+        ]
+        for (key, modifiers, keyCode, what) in refused {
+            #expect(window.performKeyEquivalent(with: try Self.keyEvent(key, modifiers, keyCode: keyCode, in: window)) == false, "\(what)")
+            #expect(router.lastRefusal == .disabled, "\(what)")
+        }
+
+        // Pause: Option-Command-P pauses; Refresh now is then disabled and Command-R does nothing.
+        #expect(window.performKeyEquivalent(with: try Self.keyEvent("p", [.command, .option], keyCode: 35, in: window)))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the paused view") {
+            samplingStatus.stringValue.hasPrefix("Paused at ") && pause.title == "Resume view" && !refresh.isEnabled
+        }
+        #expect(!refresh.isAccessibilityEnabled(), "Refresh now is announced as disabled while paused")
+        let pausedRevision = applier.lastAppliedRevision
+        #expect(window.performKeyEquivalent(with: refreshKey) == false)
+        #expect(router.lastRefusal == .disabled)
+        try await Task.sleep(for: .milliseconds(600))
+        #expect(applier.lastAppliedRevision == pausedRevision, "a refused Command-R sends nothing")
+        #expect(samplingStatus.stringValue.hasPrefix("Paused at "))
+        // Resume, then Command-R refreshes like the button.
+        #expect(window.performKeyEquivalent(with: try Self.keyEvent("p", [.command, .option], keyCode: 35, in: window)))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the resumed view") {
+            pause.title == "Pause view" && refresh.isEnabled && !samplingStatus.stringValue.hasPrefix("Paused")
+        }
+        #expect(window.performKeyEquivalent(with: refreshKey))
+        #expect(router.lastRefusal == nil)
+
+        // The native controls were built once and kept throughout.
+        #expect(renderer.registry.handle(for: NodeId(5)) === tableHandle)
+        print("PX-016 native SSH evidence: window \(window.windowNumber); shortcuts=\(Self.keyboardShortcuts.map { "\($0.label)=\($0.display)" }); accessibility order=\(order); selections=\(selections); inspector=\(inspectorStatus.stringValue); filter=\(filterStatus.stringValue); search=\(searchStatus.stringValue); sampling=\(samplingStatus.stringValue); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
+    /// PX-016's bindings in the published reading order, with the label, the macOS rendering
+    /// and the enabled state of a live, unsearched view at default columns.
+    fileprivate struct KeyboardBinding {
+        let id: UInt64
+        let label: String
+        let shortcut: String
+        let display: String
+        let initiallyEnabled: Bool
+    }
+
+    fileprivate static let keyboardShortcuts: [KeyboardBinding] = [
+        KeyboardBinding(id: 62, label: "Pause view", shortcut: "primary+alt+p", display: "⌥⌘P", initiallyEnabled: true),
+        KeyboardBinding(id: 63, label: "Refresh now", shortcut: "primary+r", display: "⌘R", initiallyEnabled: true),
+        KeyboardBinding(id: 26, label: "Filter processes", shortcut: "primary+alt+f", display: "⌥⌘F", initiallyEnabled: true),
+        KeyboardBinding(id: 51, label: "All visible users", shortcut: "primary+alt+u", display: "⌥⌘U", initiallyEnabled: false),
+        KeyboardBinding(id: 43, label: "Find processes", shortcut: "primary+f", display: "⌘F", initiallyEnabled: true),
+        KeyboardBinding(id: 44, label: "Previous match", shortcut: "primary+shift+g", display: "⇧⌘G", initiallyEnabled: false),
+        KeyboardBinding(id: 45, label: "Next match", shortcut: "primary+g", display: "⌘G", initiallyEnabled: false),
+        KeyboardBinding(id: 21, label: "Sort by PID", shortcut: "primary+1", display: "⌘1", initiallyEnabled: true),
+        KeyboardBinding(id: 22, label: "Sort by Name", shortcut: "primary+2", display: "⌘2", initiallyEnabled: true),
+        KeyboardBinding(id: 23, label: "Sort by Resident", shortcut: "primary+3", display: "⌘3", initiallyEnabled: true),
+        KeyboardBinding(id: 24, label: "Sort by CPU", shortcut: "primary+4", display: "⌘4", initiallyEnabled: true),
+        KeyboardBinding(id: 41, label: "Restore default columns", shortcut: "primary+alt+r", display: "⌥⌘R", initiallyEnabled: false),
+        KeyboardBinding(id: 5, label: "Processes", shortcut: "primary+l", display: "⌘L", initiallyEnabled: true),
+        KeyboardBinding(id: 60, label: "Command line and executable", shortcut: "primary+i", display: "⌘I", initiallyEnabled: true),
+    ]
+
+    /// A real key-down event; named keys match by `keyCode`, characters by the layout.
+    @MainActor
+    fileprivate static func keyEvent(
+        _ characters: String, _ modifiers: NSEvent.ModifierFlags = [], keyCode: UInt16, in window: NSWindow
+    ) throws -> NSEvent {
+        try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: 0,
+            windowNumber: window.windowNumber, context: nil, characters: characters,
+            charactersIgnoringModifiers: characters, isARepeat: false, keyCode: keyCode
+        ))
+    }
+
+    fileprivate static func functionKey(_ key: Int) -> String {
+        String(Character(UnicodeScalar(UInt32(key))!))
+    }
+
+    /// US-layout key codes for the characters the keyboard test types.
+    fileprivate static let typedKeyCodes: [Character: UInt16] = [
+        "w": 13, "o": 31, "r": 15, "k": 40, "e": 14, "\u{7F}": 51,
+    ]
+
+    /// Types `text` into the first responder through its own `keyDown(with:)`. Each key is
+    /// first offered as a key equivalent, which no plain key is: letters are text.
+    @MainActor
+    fileprivate static func typeKeys(_ text: String, in window: NSWindow) throws {
+        let editor = try #require(window.firstResponder as? NSTextView, "a text editor owns input")
+        for character in text {
+            let event = try keyEvent(String(character), keyCode: try #require(typedKeyCodes[character]), in: window)
+            #expect(window.performKeyEquivalent(with: event) == false, "a typed \(character) is never a shortcut")
+            editor.keyDown(with: event)
+        }
+    }
+
+    /// The order in which a depth-first walk of the native accessibility tree under `root`
+    /// reaches each of `targets`: the order an assistive technology reads them. A control is
+    /// reached as itself or as its cell, which AppKit exposes in the control's place.
+    @MainActor
+    fileprivate static func accessibilityOrder(of targets: [NSObject], under root: NSView) -> [Int] {
+        var order: [Int] = []
+        func visit(_ element: Any, depth: Int) {
+            guard let object = element as? NSObject else { return }
+            if let index = targets.firstIndex(where: { $0 === object || ($0 as? NSControl)?.cell === object }) {
+                order.append(index)
+                return
+            }
+            guard depth < 32, !(object is NSTableView), !(object is NSTextView) else { return }
+            let children: [Any]
+            if let view = object as? NSView {
+                children = view.accessibilityChildren() ?? []
+            } else if let element = object as? NSAccessibilityElement {
+                children = element.accessibilityChildren() ?? []
+            } else {
+                children = []
+            }
+            for child in children { visit(child, depth: depth + 1) }
+        }
+        visit(root, depth: 0)
+        return order
     }
 
     // PX-015: the sampling controls.

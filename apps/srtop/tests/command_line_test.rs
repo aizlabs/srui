@@ -199,14 +199,21 @@ fn the_selected_processs_arguments_show_as_inert_lines_and_every_other_target_ha
         let node = store.get_node(INSPECTOR_COMMAND).unwrap();
         assert_eq!(node.node_type, TypeRef::RICHTEXT);
         assert_eq!(node.get_property(READ_ONLY), Some(&Value::Bool(true)));
-        // Plain text and nothing else: no action, no resource, no link.
+        // Plain text and nothing else: no action, no resource, no link. Its
+        // keyboard shortcut (PX-016) only moves local focus to the text and
+        // sends no event (§22.5).
+        assert_eq!(
+            node.get_property(PropertyRef::SHORTCUT),
+            Some(&Value::String("primary+i".into()))
+        );
         for property in node.properties.keys() {
             assert!(
                 [
                     PropertyRef::TEXT,
                     PropertyRef::LABEL,
                     PropertyRef::ACCESSIBLE_DESCRIPTION,
-                    PropertyRef::READ_ONLY
+                    PropertyRef::READ_ONLY,
+                    PropertyRef::SHORTCUT
                 ]
                 .contains(property),
                 "the command line carries {property:?}"

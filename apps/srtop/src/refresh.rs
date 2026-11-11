@@ -4325,6 +4325,13 @@ mod tests {
                     "\u{20000}".repeat(crate::sampling::MAX_INTERVAL_INPUT_BYTES / 4),
                 )?;
                 ui.set(SAMPLING_PAUSE, LABEL, crate::sampling::RESUME_LABEL)?;
+                // PX-016: the filter field at its cap, so the filter group
+                // below is measured with its value at its widest.
+                ui.set(
+                    crate::FILTER_INPUT,
+                    VALUE,
+                    "\u{20000}".repeat(crate::filter::MAX_FILTER_QUERY_BYTES / 4),
+                )?;
                 Ok(())
             })
             .unwrap();
@@ -4374,6 +4381,90 @@ mod tests {
             crate::INTERVAL_APPLY,
             SAMPLING_STATUS,
         ]);
+        // PX-016: the keyboard shortcuts travel on controls in five of the
+        // charged groups. Each group is measured with its shortcuts against
+        // its reserve, and the shortcuts' own cost is stated.
+        let without_shortcuts = |ids: &[NodeId]| {
+            session.with_store(|store| {
+                ids.iter()
+                    .map(|id| {
+                        let node = store.get_node(*id).unwrap();
+                        let operation = Operation::create_node(
+                            *id,
+                            node.node_type,
+                            node.parent_id,
+                            None,
+                            node.properties
+                                .iter()
+                                .filter(|(property, _)| {
+                                    **property != srui_semantic_tree::PropertyRef::SHORTCUT
+                                })
+                                .map(|(property, value)| (*property, value.clone())),
+                        );
+                        srui_protocol::framed_payload_len(&srui_protocol::SruiMessage {
+                            msg: Some(srui_protocol::srui_message::Msg::Transaction(
+                                srui_protocol::Transaction {
+                                    base_revision: 0,
+                                    new_revision: 0,
+                                    priority: 0,
+                                    operations: vec![operation.to_wire()],
+                                },
+                            )),
+                        })
+                    })
+                    .sum::<usize>()
+            })
+        };
+        let bound: Vec<NodeId> = crate::KEYBOARD_SHORTCUTS
+            .iter()
+            .map(|(node, _)| *node)
+            .collect();
+        let shortcut_bytes = encoded(&bound) - without_shortcuts(&bound);
+        assert!(
+            shortcut_bytes > 0 && shortcut_bytes <= 32 * crate::KEYBOARD_SHORTCUTS.len(),
+            "{} shortcuts cost {shortcut_bytes} bytes",
+            crate::KEYBOARD_SHORTCUTS.len()
+        );
+        let filter = encoded(&[crate::FILTER_ROW, crate::FILTER_INPUT, crate::FILTER_STATUS]);
+        let search = encoded(&[
+            crate::SEARCH_ROW,
+            SEARCH_INPUT,
+            crate::SEARCH_PREVIOUS,
+            crate::SEARCH_NEXT,
+            PID_INPUT,
+            crate::PID_GO,
+            SEARCH_STATUS,
+        ]);
+        let owner = encoded(&[
+            crate::OWNER_ROW,
+            crate::OWNER_MINE,
+            crate::OWNER_ALL,
+            OWNER_INPUT,
+            PID_SET_INPUT,
+            crate::OWNER_STATUS,
+        ]);
+        let mut structure = vec![
+            crate::SURFACE,
+            crate::COLUMN,
+            crate::HEADING,
+            crate::TABLE,
+            crate::SORT_ROW,
+            crate::COLUMN_CHOOSER_ROW,
+        ];
+        structure.extend(crate::SORT_BUTTONS.map(|(button, _)| button));
+        structure.extend(crate::COLUMN_CHOOSER_BUTTONS.map(|(button, _)| button));
+        let structure = encoded(&structure);
+        for (group, size, reserve) in [
+            ("filter controls", filter, FILTER_RESERVE_BYTES),
+            ("search controls", search, SEARCH_RESERVE_BYTES),
+            ("user filter", owner, OWNER_RESERVE_BYTES),
+            ("shell structure", structure, SNAPSHOT_SHELL_BYTES),
+        ] {
+            assert!(
+                size <= reserve,
+                "the widest {group} encode to {size} bytes, above their {reserve} byte reserve"
+            );
+        }
         assert!(
             sampling <= SAMPLING_RESERVE_BYTES,
             "the widest sampling controls encode to {sampling} bytes, above their {SAMPLING_RESERVE_BYTES} byte reserve"
@@ -4449,6 +4540,12 @@ mod tests {
         );
         println!(
             "PX-015 sampling controls at their widest: encoded={sampling} reserve={SAMPLING_RESERVE_BYTES}"
+        );
+        println!(
+            "PX-016 shortcuts: {} bound, {shortcut_bytes} bytes; filter={filter}/{FILTER_RESERVE_BYTES} \
+             search={search}/{SEARCH_RESERVE_BYTES} owner={owner}/{OWNER_RESERVE_BYTES} \
+             structure={structure}/{SNAPSHOT_SHELL_BYTES}",
+            crate::KEYBOARD_SHORTCUTS.len()
         );
     }
 

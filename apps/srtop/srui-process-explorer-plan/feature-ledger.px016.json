@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-016",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Discoverable keyboard shortcuts for search, filter, refresh, pause, inspect, sort and reset through the standard shortcut property (PX-016-G01) on existing controls; native focus, table movement, paging, scrolling and text selection stay client-local; no new node, handler, event, protocol, registry, SDK, renderer or client source change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX016-001",
+      "feature": "Fourteen shortcuts in the standard grammar on existing controls, set in the shell's creating commit: Option-Command-P Pause view/Resume view, Command-R Refresh now, Option-Command-F filter field, Option-Command-U All visible users, Command-F search field, Shift-Command-G / Command-G Previous / Next match, Command-1..4 sort by PID, Name, Resident, CPU, Option-Command-R Restore default columns, Command-L table, Command-I inspector command line; every value canonical, unique in the window, carrying primary, and on a node type that admits a shortcut",
+      "scope": "PX-016/lib (src/lib.rs) KEYBOARD_SHORTCUTS, initialize_rows; tests::keyboard_shortcuts_are_canonical_unique_modified_and_on_admitted_controls",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-016",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-016.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX016-002",
+      "feature": "A button shortcut is the button's click: the client dispatches the same ACTIVATE through the same target/action, so no handler, event shape or audit pair is added; a disabled control's shortcut does nothing (Refresh now while paused, Next match with no match, All visible users and Restore default columns with nothing to reset) and event validation still refuses a forged event",
+      "scope": "PX-016/lib (src/lib.rs) install_sort_handlers, install_search_handlers, install_owner_handlers, install_column_handlers, install_sampling_handlers (unchanged); tests/no_process_control_test.rs (unchanged); client-macos/Tests/SRUITests/ProcessExplorerShellTests.swift theBasicWorkflowRunsFromTheKeyboardWithDiscoverableAccessibleShortcuts",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-016",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-016.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX016-003",
+      "feature": "Focus-only shortcuts and client-local interaction: the search and filter fields, the table and the command line only take local focus and send nothing; arrow keys move the native table selection, which is reported as SELECTION_CHANGED and followed by the inspector; Page Up scrolls the table locally without changing the selection; refocusing a field selects its whole text, so one Delete resets the filter or the search",
+      "scope": "PX-016/client-macos/Tests/SRUITests/ProcessExplorerShellTests.swift theBasicWorkflowRunsFromTheKeyboardWithDiscoverableAccessibleShortcuts; tests/command_line_test.rs the_selected_processs_arguments_show_as_inert_lines_and_every_other_target_has_its_own_state",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-016",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-016.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX016-004",
+      "feature": "Input ownership and reserved combinations: letters typed into the search and filter fields are never key equivalents; no shortcut dispatches while the search field holds input-method marked text; Command-C in a field is not consumed by the window's key-equivalent path; the client binds every srtop shortcut and reports no reserved or refused one",
+      "scope": "PX-016/client-macos/Tests/SRUITests/ProcessExplorerShellTests.swift theBasicWorkflowRunsFromTheKeyboardWithDiscoverableAccessibleShortcuts",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-016",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-016.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX016-005",
+      "feature": "Discoverability and accessibility on the real AppKit client: each bound control's tooltip is its label with the formatted shortcut, its accessibility help ends with Keyboard shortcut <shortcut> (the table's and command line's inner views too), its accessibility label is its published label, its accessibility enabled state matches the published state, and a depth-first walk of the native accessibility tree reaches the fourteen controls in the published reading order",
+      "scope": "PX-016/client-macos/Tests/SRUITests/ProcessExplorerShellTests.swift theBasicWorkflowRunsFromTheKeyboardWithDiscoverableAccessibleShortcuts, accessibilityOrder",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-016",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-016.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX016-006",
+      "feature": "Budgets: the fourteen shortcuts cost 288 encoded bytes; with them, the filter, search, user-filter and shell-structure groups are measured on the encoder against FILTER_RESERVE_BYTES, SEARCH_RESERVE_BYTES, OWNER_RESERVE_BYTES and SNAPSHOT_SHELL_BYTES, and the sampling and command-line groups against their existing reserves; the row-less snapshot frame stays inside its allowances; no reserve changed",
+      "scope": "PX-016/refresh (src/refresh.rs) the_shell_status_and_summary_fit_their_snapshot_allowances",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-016",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-016.md"
+      ]
+    }
+  ]
+}

@@ -1641,3 +1641,73 @@ fn a_disclosure_report_for_an_item_that_became_a_leaf_is_still_mirrored() {
         .text(FOLLOW_STATUS)
         .starts_with("Following PID 30 · xray · hidden under collapsed PID 10 · alpha"));
 }
+
+/// Codex review round 3: a `SELECTION_CHANGED` the client sent just before a
+/// sample moved the selected row under a parent it keeps collapsed arrives
+/// after that sample committed. The client has since dropped the selection
+/// (`OutlineCollectionAdapter.update` restores it only to a shown row, and a
+/// later expand restores nothing), so the delayed report leaves the
+/// inspector cleared and does not retarget follow.
+#[test]
+fn a_delayed_selection_of_a_row_now_hidden_by_a_collapsed_parent_is_not_applied() {
+    let mut source = family(&[
+        (10, "alpha", 0, 10),
+        (11, "beta", 10, 11),
+        (30, "xray", 0, 60),
+        (40, "zulu", 0, 70),
+    ]);
+    let mut h = harness(&mut source);
+    h.show_tree(true);
+    let alpha = h.item_of(10);
+    let xray = h.item_of(30);
+    let zulu = h.item_of(40);
+    h.select(TREE, zulu);
+    h.follow(true);
+    h.disclose(alpha, false);
+    // The user clicks `xray` while it is a shown root; before that report
+    // arrives, a sample reparents it under the collapsed `alpha`.
+    let observed = h.revision();
+    for record in &mut source.records {
+        if record.key.pid == Observed::Known(30) {
+            record.lineage = Lineage::new(10, 60);
+        }
+    }
+    h.sample(&mut source);
+    assert_eq!(
+        h.tree().iter().find(|row| row.pid == 30).unwrap().parent,
+        "10"
+    );
+    // The delayed report, made at the earlier revision.
+    h.seq += 1;
+    let wire = DomainEvent::new(
+        None,
+        h.seq,
+        format!("tree-event-{}", h.seq),
+        observed,
+        TREE,
+        TypeRef::EVENT_SELECTION_CHANGED,
+        vec![(PropertyRef::VALUE, Value::ItemId(xray))],
+    )
+    .with_client_instance_id(CLIENT.to_vec())
+    .to_wire();
+    let outcome = h.session.process_event(&wire).expect("event admitted");
+    assert!(
+        matches!(outcome, EventOutcome::Processed { .. }),
+        "{outcome:?}"
+    );
+    h.sync();
+    assert_eq!(h.text(INSPECTOR_STATUS), NO_SELECTION_STATUS);
+    assert_eq!(
+        h.view().follow().following(),
+        Some(zulu),
+        "follow stays on zulu"
+    );
+    assert!(h.text(FOLLOW_STATUS).starts_with("Following PID 40 · zulu"));
+    // It stays cleared through the next sample.
+    h.sample(&mut source);
+    assert_eq!(h.text(INSPECTOR_STATUS), NO_SELECTION_STATUS);
+    // Once `alpha` is expanded, `xray` can be selected again.
+    h.disclose(alpha, true);
+    h.select(TREE, xray);
+    assert!(h.text(INSPECTOR_STATUS).contains("PID 30"));
+}

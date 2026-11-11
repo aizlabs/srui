@@ -2117,7 +2117,10 @@ impl ProcessView {
     /// the shown collection's selection is the user's: a report from the
     /// hidden one — sent before a switch reached that client — names rows it
     /// no longer holds, and is ignored rather than taken for an empty
-    /// selection, so it neither clears the inspector nor stops follow.
+    /// selection, so it neither clears the inspector nor stops follow. A
+    /// report naming a tree row now hidden under a collapsed parent is a
+    /// selection the client has since dropped: the inspector is cleared and
+    /// follow is left as it is.
     pub fn select_item_in(
         &mut self,
         session: &Session,
@@ -2128,11 +2131,26 @@ impl ProcessView {
             return Ok(Refreshed::default());
         }
         let row = item.and_then(|item| self.rows.iter().find(|row| row.item_id == item).cloned());
-        match &row {
-            Some(row) => self.inspector.select(row),
-            None => self.inspector.refuse(item),
+        // A row hidden under a parent the client keeps collapsed cannot be
+        // selected there: a report naming one was sent before a commit moved
+        // the row under that parent, and the client has since dropped the
+        // selection (`OutlineCollectionAdapter.update` restores it only to a
+        // shown row, with selection events suppressed, and a later expand
+        // restores nothing). The client now has no selection, so neither has
+        // the inspector; follow is not a selection and stays on its process
+        // (PX-018).
+        let hidden = row
+            .as_ref()
+            .is_some_and(|row| self.hidden_under(&self.rows, row.item_id).is_some());
+        if hidden {
+            self.inspector.clear();
+        } else {
+            match &row {
+                Some(row) => self.inspector.select(row),
+                None => self.inspector.refuse(item),
+            }
+            self.follow.selected(row.as_ref());
         }
-        self.follow.selected(row.as_ref());
         let mut plan = self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
         let follow = self.follow_table_effects(&plan);
         plan.extend(follow);

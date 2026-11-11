@@ -1549,3 +1549,95 @@ fn a_sample_between_a_search_reveal_and_its_expansion_report_keeps_the_match() {
         .text(FOLLOW_STATUS)
         .starts_with("Following PID 11 · beta · item 2 of 3 in the tree"));
 }
+
+/// Codex review round 2: the client reports a disclosure change only for an
+/// item with children in the revision it acted on, but a sample can take the
+/// item's last child before the report arrives. The server applies the
+/// report all the same, as the client did: when `alpha`, expanded on the
+/// client, gains a child again, that child is shown, so the inspector keeps
+/// the selected `xray` and follow reports it in the tree.
+#[test]
+fn a_disclosure_report_for_an_item_that_became_a_leaf_is_still_mirrored() {
+    let mut source = family(&[
+        (10, "alpha", 0, 10),
+        (11, "beta", 10, 11),
+        (30, "xray", 0, 60),
+    ]);
+    let mut h = harness(&mut source);
+    h.show_tree(true);
+    let alpha = h.item_of(10);
+    let xray = h.item_of(30);
+    h.select(TREE, xray);
+    h.follow(true);
+    h.disclose(alpha, false);
+    // The client expands `alpha` again; before its report arrives, a sample
+    // takes `alpha`'s last child.
+    source
+        .records
+        .retain(|record| record.key.pid != Observed::Known(11));
+    h.sample(&mut source);
+    assert_eq!(
+        h.tree()
+            .iter()
+            .find(|row| row.pid == 10)
+            .unwrap()
+            .descendants,
+        0
+    );
+    h.disclose(alpha, true);
+    assert!(
+        !h.view().collapsed().contains(&alpha),
+        "the late report is mirrored"
+    );
+    // `xray` is reparented under `alpha`, which the client shows expanded.
+    for record in &mut source.records {
+        if record.key.pid == Observed::Known(30) {
+            record.lineage = Lineage::new(10, 60);
+        }
+    }
+    h.sample(&mut source);
+    assert_eq!(
+        h.tree().iter().find(|row| row.pid == 30).unwrap().parent,
+        "10"
+    );
+    assert!(
+        h.text(INSPECTOR_STATUS).contains("PID 30"),
+        "{}",
+        h.text(INSPECTOR_STATUS)
+    );
+    assert!(h
+        .text(FOLLOW_STATUS)
+        .starts_with("Following PID 30 · xray · item 2 of 2 in the tree"));
+    // The symmetric case: the client collapses `alpha` while `xray` is under
+    // it, and before that report arrives a sample moves `xray` back to the
+    // top. The collapse is mirrored all the same, and hides `xray` when it
+    // returns under `alpha`.
+    let set_parent = |source: &mut Fixed, parent: u32| {
+        for record in &mut source.records {
+            if record.key.pid == Observed::Known(30) {
+                record.lineage = Lineage::new(parent, 60);
+            }
+        }
+    };
+    set_parent(&mut source, 0);
+    h.sample(&mut source);
+    assert_eq!(
+        h.tree()
+            .iter()
+            .find(|row| row.pid == 10)
+            .unwrap()
+            .descendants,
+        0
+    );
+    h.disclose(alpha, false);
+    assert!(
+        h.view().collapsed().contains(&alpha),
+        "the late collapse is mirrored"
+    );
+    set_parent(&mut source, 10);
+    h.sample(&mut source);
+    assert_eq!(h.text(INSPECTOR_STATUS), NO_SELECTION_STATUS);
+    assert!(h
+        .text(FOLLOW_STATUS)
+        .starts_with("Following PID 30 · xray · hidden under collapsed PID 10 · alpha"));
+}

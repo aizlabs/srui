@@ -2482,7 +2482,10 @@ impl ProcessView {
     /// Follow is not a selection and stays on its process; its status says it
     /// is hidden under the collapsed parent until that is expanded again.
     /// A report from the hidden collection, about an item the tree does not
-    /// hold, or one that changes nothing, publishes nothing.
+    /// hold, or one that changes nothing, publishes nothing. A report about
+    /// an item that has become a leaf since the client acted is applied: the
+    /// client keeps that item's state, and its children hide or show by it
+    /// when they return.
     pub fn expansion_changed(
         &mut self,
         session: &Session,
@@ -2493,10 +2496,13 @@ impl ProcessView {
         if node != TREE || self.mode != ViewMode::Tree {
             return Ok(Refreshed::default());
         }
-        let Some(row) = self.rows.iter().find(|row| row.item_id == item) else {
-            return Ok(Refreshed::default());
-        };
-        if !row.tree.as_ref().is_some_and(|place| place.descendants > 0) {
+        // The client reports only an item that had children in the revision
+        // it acted on (`OutlineCollectionAdapter.setExpanded`), but a sample
+        // may have taken its last child since: the report is applied whatever
+        // the item's children are now, exactly as the client applied it, and
+        // ignored only for an item the tree no longer holds, which the client
+        // has dropped from its own collapsed set (`pruneCollapsedItems`).
+        if !self.rows.iter().any(|row| row.item_id == item) {
             return Ok(Refreshed::default());
         }
         let changed = if expanded {

@@ -37,6 +37,11 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
     public var hasExplicitColumns: Bool = false
     public var selectionMode: StandardSelectionMode = .none
     public var onSelectionChanged: (@MainActor (NodeId, ItemId) -> Void)?
+    /// A user action left the collection with no selected row: reported as `SELECTION_CHANGED`
+    /// with no `value` (§7.6; `spec/registries.md` §4.4). Never called for a server-driven
+    /// deselection (a commit, a promotion or its withdrawal), which runs with selection events
+    /// suppressed.
+    public var onSelectionCleared: (@MainActor (NodeId) -> Void)?
     public var onRangeRequest: (@MainActor (CollectionRangeRequest) -> Void)?
     /// User-originated selection changes, including an empty selection (§22.5). Unlike
     /// `onSelectionChanged` this is not a semantic event; the renderer uses it to keep a local
@@ -492,6 +497,12 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
         pendingPromotion = nil
         localSelectionSincePromotion = true
         onLocalSelection?(nodeID, selectedIDs)
+        // The user left nothing selected: tell the server once, with no item (§7.6;
+        // spec/registries.md §4.4). A partial deselection in multiple mode is not reported.
+        guard tableView.selectedRowIndexes.isEmpty == false else {
+            onSelectionCleared?(nodeID)
+            return
+        }
         guard selectedIDs.isEmpty == false else { return }
 
         if selectionMode == .single {

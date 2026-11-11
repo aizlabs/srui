@@ -616,9 +616,16 @@ impl GalleryApp {
         event: &WireEvent,
     ) -> Result<(), SessionError> {
         let started = Instant::now();
-        let item = decode_item_id(event).ok_or_else(|| {
-            SessionError::InvalidInput("SELECTION_CHANGED requires an item id value".to_string())
-        })?;
+        let item = match decode_selection(event) {
+            Some(SelectionChange::Item(item)) => item,
+            // No `value`: the user left the collection with nothing selected (§7.6;
+            // spec/registries.md §4.4). That is a clear, never a malformed event.
+            Some(SelectionChange::Cleared) => return self.on_selection_cleared(collection, event),
+            None => return Err(SessionError::InvalidInput(
+                "SELECTION_CHANGED requires an item id value, or no value for a cleared selection"
+                    .to_string(),
+            )),
+        };
         let model = collection.model();
         let trigger = event_trigger(event, format!("item {}", item.get()));
 
@@ -657,6 +664,31 @@ impl GalleryApp {
                     Collection::Table => state.table_selection = Some(item),
                 }
             }
+            Text::set_text_for(ui, ids::COLL_SELECTION, text)?;
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    /// Forgets the collection's recorded selection: the user left it with nothing selected.
+    fn on_selection_cleared(
+        &self,
+        collection: Collection,
+        event: &WireEvent,
+    ) -> Result<(), SessionError> {
+        let started = Instant::now();
+        let trigger = event_trigger(event, "cleared".to_string());
+        self.commit(trigger, Vec::new(), Some(started), move |ui, state| {
+            let text = match collection {
+                Collection::List => {
+                    state.list_selection = None;
+                    "List selection cleared \u{b7} nothing is selected"
+                }
+                Collection::Table => {
+                    state.table_selection = None;
+                    "Table selection cleared \u{b7} nothing is selected"
+                }
+            };
             Text::set_text_for(ui, ids::COLL_SELECTION, text)?;
             Ok(())
         })
@@ -739,11 +771,13 @@ fn decode_bool(event: &WireEvent) -> Option<bool> {
     }
 }
 
-fn decode_item_id(event: &WireEvent) -> Option<ItemId> {
-    match decode_semantic_event(event)?.value_arg() {
-        Some(Value::ItemId(item)) => Some(*item),
-        Some(Value::UnsignedInt(raw)) => Some(ItemId::new(*raw)),
-        _ => None,
+/// Reads a `SELECTION_CHANGED`: an item, a cleared selection (no `value`), or `None` when
+/// malformed. A bare unsigned integer is still read as an item, as before.
+fn decode_selection(event: &WireEvent) -> Option<SelectionChange> {
+    let decoded = decode_semantic_event(event)?;
+    match decoded.value_arg() {
+        Some(Value::UnsignedInt(raw)) => Some(SelectionChange::Item(ItemId::new(*raw))),
+        _ => decoded.selection_change(),
     }
 }
 

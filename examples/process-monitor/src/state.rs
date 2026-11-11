@@ -369,6 +369,15 @@ impl MonitorState {
         true
     }
 
+    /// Forgets a client's selection: the user left the table with nothing selected
+    /// (spec/registries.md §4.4). Returns whether one was held.
+    pub fn clear_selection_for_client(&mut self, client_instance_id: &[u8]) -> bool {
+        self.data
+            .client_selections
+            .remove(client_instance_id)
+            .is_some()
+    }
+
     /// Records a client selection, accepting it only if the item exists in the visible model.
     pub fn select(&mut self, item: ItemId) -> bool {
         if self.data.visible.iter().any(|row| row.item_id == item) {

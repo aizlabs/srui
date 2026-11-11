@@ -1078,6 +1078,12 @@ public final class SessionController: @unchecked Sendable {
                     action: .selectionChanged(itemID),
                     renderer: renderer
                 )
+            case .selectionCleared(let nodeID):
+                self.enqueueNativeSemanticAction(
+                    nodeID: nodeID,
+                    action: .selectionCleared,
+                    renderer: renderer
+                )
             case .expansionChanged(let nodeID, let itemID, let expanded):
                 self.enqueueNativeSemanticAction(
                     nodeID: nodeID,
@@ -1352,7 +1358,7 @@ public final class SessionController: @unchecked Sendable {
                 eventType: request.action.eventType
             )
         }
-        if case .selectionChanged = request.action,
+        if request.action.eventType == .EVENT_SELECTION_CHANGED,
            node.nodeType == .list || node.nodeType == .table || node.nodeType == .tree {
             let modeToken = node.getProperty(.selectionMode)?.asEnumToken
             let selectionMode = modeToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
@@ -1460,6 +1466,16 @@ public final class SessionController: @unchecked Sendable {
                         nodeId: request.nodeID,
                         observedRevision: request.observedRevision,
                         itemId: itemID,
+                        binding: ownership.binding,
+                        sessionIncarnation: ownership.sessionIncarnation,
+                        maxFlushGeneration: drainCutoff,
+                        semanticRequest: request
+                    )
+                case .selectionCleared:
+                    return try await self.sendSelectionChanged(
+                        nodeId: request.nodeID,
+                        observedRevision: request.observedRevision,
+                        itemId: nil,
                         binding: ownership.binding,
                         sessionIncarnation: ownership.sessionIncarnation,
                         maxFlushGeneration: drainCutoff,
@@ -2551,11 +2567,13 @@ public final class SessionController: @unchecked Sendable {
         )
     }
 
+    /// `itemId` `nil` sends a cleared selection: `SELECTION_CHANGED` with no `value` (§7.6;
+    /// `spec/registries.md` §4.4).
     @discardableResult
     private func sendSelectionChanged(
         nodeId: NodeId,
         observedRevision: Revision,
-        itemId: ItemId,
+        itemId: ItemId?,
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation,
         maxFlushGeneration: UInt64,
@@ -2585,6 +2603,15 @@ public final class SessionController: @unchecked Sendable {
             return false
         }) else {
             throw SessionDispatchError.resumeNotConfirmed
+        }
+        guard let itemId else {
+            return try await outbox.sendSelectionCleared(
+                nodeId: nodeId,
+                observedRevision: observedRevision,
+                binding: binding,
+                sessionIncarnation: sessionIncarnation,
+                via: transport
+            )
         }
         return try await outbox.sendSelectionChanged(
             nodeId: nodeId,

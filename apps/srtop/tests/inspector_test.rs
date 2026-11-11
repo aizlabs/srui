@@ -19,7 +19,7 @@ use srui_process_explorer::catalogue::ProcessField;
 use srui_process_explorer::command::CommandContext;
 use srui_process_explorer::inspector::{
     DetailRead, DetailReadsIdle, DetailSource, ProcessDetails, ProcessState, StartTime,
-    MAX_INSPECTOR_LINE_BYTES, NO_SELECTION_STATUS,
+    CLEARED_SELECTION_STATUS, MAX_INSPECTOR_LINE_BYTES, NO_SELECTION_STATUS,
 };
 use srui_process_explorer::owner::Accounts;
 use srui_process_explorer::refresh::{lock_view, ProcessView, SharedView};
@@ -795,11 +795,10 @@ fn an_unknown_stale_or_malformed_selection_is_refused_without_a_detail_read() {
         [String::new(), String::new(), String::new()]
     );
 
-    // Not an item at all: a PID-shaped number, a string, and nothing.
+    // Not an item at all: a PID-shaped number and a string.
     for (seq, arguments) in [
         (2, vec![(PropertyRef::VALUE, Value::UnsignedInt(200))]),
         (3, vec![(PropertyRef::VALUE, Value::String("200".into()))]),
-        (4, vec![]),
     ] {
         harness.select_with(seq, arguments);
         assert_eq!(
@@ -807,6 +806,11 @@ fn an_unknown_stale_or_malformed_selection_is_refused_without_a_detail_read() {
             "Selected process: none · the selection named no row; nothing was read"
         );
     }
+
+    // No value at all: the user left the table with nothing selected
+    // (PX-017-G02). Nothing is read for it either.
+    harness.select_with(4, vec![]);
+    assert_eq!(harness.lines()[0], CLEARED_SELECTION_STATUS);
 
     // A row the filter hides is not published, so its item is refused too.
     let hidden = harness.item_of(300);

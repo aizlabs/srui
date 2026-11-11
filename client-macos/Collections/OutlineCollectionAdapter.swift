@@ -135,6 +135,9 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
     public private(set) var modelID: ModelId?
     public var selectionMode: StandardSelectionMode = .none
     public var onSelectionChanged: (@MainActor (NodeId, ItemId) -> Void)?
+    /// A user action left the tree with no selected row, with the same rules as
+    /// `TableCollectionAdapter.onSelectionCleared` (§7.6; `spec/registries.md` §4.4).
+    public var onSelectionCleared: (@MainActor (NodeId) -> Void)?
     public var onRangeRequest: (@MainActor (CollectionRangeRequest) -> Void)?
     /// User-originated selection changes, including an empty selection (§22.5).
     public var onLocalSelection: (@MainActor (NodeId, [ItemId]) -> Void)?
@@ -389,9 +392,15 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
         } else {
             collapsedItemIDs.insert(itemID)
         }
+        let hadSelection = !outlineView.selectedRowIndexes.isEmpty
         applyDisclosureChange(in: outlineView)
         onCollapsedItemsChanged?(nodeID, modelID, collapsedItemIDs)
         onExpansionChanged?(nodeID, itemID, expanded)
+        if hadSelection, outlineView.selectedRowIndexes.isEmpty {
+            // The user's collapse hid every selected row, which leaves the tree with nothing
+            // selected: reported like any user deselection (spec/registries.md §4.4).
+            noteUserClearedSelection()
+        }
         resolvePendingPromotion(in: outlineView)
         rebaselineKeepVisibleAfterDisclosureChange()
         emitRequestsAfterDisclosureChange(in: outlineView)
@@ -816,11 +825,24 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
             return item?.itemID
         }
         pendingPromotion = nil
+        guard outlineView.selectedRowIndexes.isEmpty == false else {
+            noteUserClearedSelection()
+            return
+        }
         localSelectionSincePromotion = true
         onLocalSelection?(nodeID, selected)
         for itemID in selected {
             onSelectionChanged?(nodeID, itemID)
         }
+    }
+
+    /// A user action left the tree with nothing selected: kept locally and reported once as
+    /// `SELECTION_CHANGED` with no `value` (§7.6, §22.5; `spec/registries.md` §4.4).
+    private func noteUserClearedSelection() {
+        guard selectionMode != .none else { return }
+        localSelectionSincePromotion = true
+        onLocalSelection?(nodeID, [])
+        onSelectionCleared?(nodeID)
     }
 
     // MARK: - Private

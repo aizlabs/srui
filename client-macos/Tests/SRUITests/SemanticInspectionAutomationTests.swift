@@ -397,6 +397,16 @@ struct SemanticInspectionAutomationTests {
             } catch {
                 Issue.record("Expected unsupportedAction, got \(error)")
             }
+            // A cleared selection is a SELECTION_CHANGED too, refused the same way (PX-017-G02).
+            do {
+                _ = try await collection.clearSelection()
+                Issue.record("Expected default-none collection clear to be unsupported")
+            } catch SemanticAutomationError.unsupportedAction(let nodeID, let eventType) {
+                #expect(nodeID == SemanticInspectionFixture.collectionID)
+                #expect(eventType == .EVENT_SELECTION_CHANGED)
+            } catch {
+                Issue.record("Expected unsupportedAction, got \(error)")
+            }
 
             let sentinel = try #require(
                 inspector.find(role: .button, label: SemanticInspectionFixture.sentinelLabel)

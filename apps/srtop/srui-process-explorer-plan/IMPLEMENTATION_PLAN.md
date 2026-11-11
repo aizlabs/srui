@@ -862,6 +862,30 @@ Apply the standing completion contract. Record evidence in `docs/process-explore
 
 ---
 
+#### PX-017-G02 — Report a user-cleared collection selection
+
+**Phase:** B · **Scope size:** M · **Status:** planned · **Gate:** R1-prerequisite
+**Dependencies:** PX-017
+**Read:** D1 §§4 inv. 13, 6.3, 7.6, 7.7, 8, 18.2, 22.5, 27, 32; registry List (17), Table (18), Tree (19), event SELECTION_CHANGED (3)
+
+##### Build
+
+When a user action leaves a List, Table or Tree with no selected item, the client sends exactly one SELECTION_CHANGED with no `value` argument, meaning "nothing is selected now". Servers treat it as clearing that client's selection, never as malformed; a `value` that is present but not an ItemId stays malformed. A deselection the server causes (a promotion withdrawal, a commit that removes the selected row, a promotion waiting for an uncached item, a restore on remount) still sends nothing. Multiple selection stays one event per selected item, and a partial deselection in multiple mode stays unreported. Specify it in spec/registries.md (collection `value` entry and the standard-events section) without editing the read-only design document; no registry ID, proto or framing change. Rust `Event::selection_cleared` and `Event::selection_change` returning `SelectionChange::{Item, Cleared}`, re-exported by the SDK; Swift `Event.selectionCleared`. The client carries it through `SemanticInteraction.selectionCleared`, `SessionController` native dispatch, `EventOutbox.sendSelectionCleared` (retained and replayed like any event) and the in-process automation action `SemanticAction.selectionCleared`. `TableCollectionAdapter` and `OutlineCollectionAdapter` report it from the selection delegate when the selection becomes empty, and a Tree reports it when a user collapse hides every selected row; server-driven changes stay suppressed and PX-011-G01 withdrawal is unchanged. The ui-gallery and process-monitor examples clear their recorded selection instead of rejecting or ignoring it, so process-monitor's Kill Selected can no longer reach a deselected process. srtop says the selection was cleared: the inspector clears, follow stops with that reason, and turning follow on afterwards is refused. No application-specific client path.
+
+##### Out of scope
+
+No new registry entry or wire field, no per-item deselection events in multiple mode, no change to promotion or keep_visible semantics, no Tabs/Select/ChoiceGroup behaviour (they have no empty selection), no edit of the read-only design document, and no tree-mode srtop work (PX-018).
+
+##### Verification / acceptance criteria
+
+Each new test fails with the behaviour reverted. Rust: the cleared constructor and reader, including malformed values and other event types, and a wire roundtrip of the argumentless event. Native AppKit adapter tests: a user deselect sends exactly one cleared event; a commit removing the selected row, a promotion, its withdrawal, a pending promotion and an empty restore send none; a user deselect after a promotion is reported and the later withdrawal stays a no-op; multiple selection is unchanged and only a full clear is reported; a Tree collapse that hides the selection is reported once and one that keeps it shown is not. Session and outbox: the cleared event is encoded with no arguments, sent in order through the native path, retained, and replayed unchanged on same-session resume; the automation action is refused for selection_mode none. Native SSH against srtop: `deselectAll(nil)` through the table delegate clears the inspector, stops follow with its reason and clears the hint, and turning follow on afterwards is refused, including select, deselect, then follow on. Example and srtop unit tests cover the cleared event, and process-monitor's Kill Selected refuses after a clear.
+
+##### Handoff and completion
+
+Apply the standing completion contract. Record evidence in `docs/process-explorer/completions/PX-017-G02.md`, update the individual feature ledger, and commit only this bounded change after required checks pass. A gate remains open if a required behavior or native test is missing.
+
+---
+
 #### PX-018-G01 — Hierarchical model-backed Tree with local disclosure
 
 **Phase:** B · **Scope size:** L · **Status:** planned · **Gate:** R1-prerequisite

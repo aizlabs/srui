@@ -10,6 +10,9 @@
 //!   event-specific arguments.
 //! - **§18.2 Retry Safety & Deduplication**: Every event that can cause side effects contains a stable
 //!   `event_id` unique within session lifetime, enabling retry-safe delivery across network disconnects.
+//! - **§7.6 Selection**: `SELECTION_CHANGED` names one selected `ItemId` in `value`, or carries no
+//!   `value` when a user action left the collection with nothing selected ([`SelectionChange`],
+//!   `spec/registries.md` §4.4).
 //! - **§18.3 / §22.6 Native text editing**: `TEXT_EDIT` carries a positive per-editor `edit_seq` and a
 //!   whole-value `TEXT` snapshot; other event types omit `edit_seq`.
 //! - **§27 Server Validation**: The server validates every client event against the current graph
@@ -22,6 +25,19 @@ use crate::value::{Size, Value};
 use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroU64;
+
+/// What one `SELECTION_CHANGED` reports (§7.6; `spec/registries.md` §4.4).
+///
+/// A user's selection of one item, or a user action that left the collection with nothing
+/// selected. Multiple selection is one event per selected item; a partial deselection in multiple
+/// mode is not reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SelectionChange {
+    /// The user selected this item.
+    Item(ItemId),
+    /// A user action left the collection with no selected item.
+    Cleared,
+}
 
 /// Protocol-wide maximum encoded event identifier length (§7.7, §18.2, §26).
 pub const MAX_EVENT_ID_BYTES: usize = 64;
@@ -357,6 +373,47 @@ impl Event {
             TypeRef::EVENT_SELECTION_CHANGED,
             [(PropertyRef::VALUE, Value::ItemId(item_id.into()))],
         )
+    }
+
+    /// Convenience constructor for a cleared collection selection (`SELECTION_CHANGED` with no
+    /// `value`, §7.6; `spec/registries.md` §4.4).
+    ///
+    /// A client sends it once when a user action leaves a `List`, `Table` or `Tree` with no
+    /// selected item. It means "nothing is selected now" and is never malformed; a deselection the
+    /// server caused is never reported. [`Self::selection_change`] reads it back as
+    /// [`SelectionChange::Cleared`].
+    pub fn selection_cleared(
+        event_seq: u64,
+        event_id: impl Into<EventId>,
+        observed_revision: impl Into<Revision>,
+        node_id: impl Into<NodeId>,
+    ) -> Self {
+        Self::new(
+            None,
+            event_seq,
+            event_id,
+            observed_revision,
+            node_id,
+            TypeRef::EVENT_SELECTION_CHANGED,
+            std::iter::empty(),
+        )
+    }
+
+    /// Reads what a `SELECTION_CHANGED` event reports (§7.6; `spec/registries.md` §4.4).
+    ///
+    /// A `value` holding an [`ItemId`] is [`SelectionChange::Item`]; no `value` at all is
+    /// [`SelectionChange::Cleared`]. Returns `None` for any other event type, or when `value`
+    /// holds anything but an `ItemId` (a row index or a string, say): a malformed report is never
+    /// guessed at, and is never read as a clear.
+    pub fn selection_change(&self) -> Option<SelectionChange> {
+        if self.event_type != TypeRef::EVENT_SELECTION_CHANGED {
+            return None;
+        }
+        match self.get_argument(PropertyRef::VALUE) {
+            None => Some(SelectionChange::Cleared),
+            Some(Value::ItemId(item)) => Some(SelectionChange::Item(*item)),
+            Some(_) => None,
+        }
     }
 
     /// Convenience constructor for text edit events (`TEXT_EDIT`, §7.6, §22.6).

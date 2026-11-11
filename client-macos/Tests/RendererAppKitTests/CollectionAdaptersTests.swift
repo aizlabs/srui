@@ -141,6 +141,114 @@ struct CollectionAdaptersTests {
         #expect(selections.map(\.1) == [ItemId(100), ItemId(200)])
     }
 
+    /// PX-017-G02: a user action that leaves nothing selected is reported exactly once, with no
+    /// item (`SELECTION_CHANGED` with no `value`, spec/registries.md §4.4). A deselection the
+    /// server causes — a commit removing the row, a promotion, its withdrawal, a restore — is
+    /// never reported. A user deselect after a promotion still leaves the withdrawal a no-op.
+    @Test
+    func tableAdapterReportsAUserClearedSelectionOnceAndNoServerDeselection() throws {
+        var selections: [ItemId] = []
+        var cleared: [NodeId] = []
+        let rows = (1...4).map {
+            TableCollectionAdapter.TableRow(itemID: ItemId(UInt64($0)), cells: ["Row \($0)"])
+        }
+        let adapter = TableCollectionAdapter(
+            nodeID: 41,
+            rows: rows,
+            selectionMode: .single,
+            onSelectionChanged: { _, itemID in selections.append(itemID) }
+        )
+        adapter.onSelectionCleared = { cleared.append($0) }
+        var local: [[ItemId]] = []
+        adapter.onLocalSelection = { _, itemIDs in local.append(itemIDs) }
+        let tableView = NSTableView()
+        tableView.dataSource = adapter
+        tableView.delegate = adapter
+
+        // User selects, then deselects (the same delegate path as a click in empty space or
+        // Command-click on the selected row): one clear, and the empty selection is kept locally.
+        tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        tableView.deselectAll(nil)
+        #expect(selections == [ItemId(2)])
+        #expect(cleared == [NodeId(41)])
+        #expect(local.last == [])
+        // Nothing to deselect: no change, nothing reported.
+        tableView.deselectAll(nil)
+        #expect(cleared == [NodeId(41)])
+
+        // A commit removing the selected row deselects it without a report.
+        tableView.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
+        adapter.update(rows: rows.filter { $0.itemID != ItemId(3) }, tableView: tableView)
+        #expect(tableView.selectedRowIndexes.isEmpty)
+
+        // A promotion and its withdrawal of the untouched promoted row: no report.
+        adapter.applyPromotion(ItemId(1), reveal: false, tableView: tableView)
+        #expect(tableView.selectedRowIndexes == IndexSet(integer: 0))
+        adapter.applyPromotion(nil, reveal: false, tableView: tableView)
+        #expect(tableView.selectedRowIndexes.isEmpty)
+
+        // A promotion of an item not yet in the replica clears the selection while it waits.
+        tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        adapter.applyPromotion(ItemId(99), reveal: false, tableView: tableView)
+        #expect(tableView.selectedRowIndexes.isEmpty)
+
+        // Restoring an empty local selection on remount: no report.
+        tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        adapter.restoreLocalSelection([], tableView: tableView)
+        #expect(tableView.selectedRowIndexes.isEmpty)
+        #expect(cleared == [NodeId(41)], "a server-driven deselection is never reported")
+
+        // Promote, then the user deselects: reported once; the later withdrawal keeps the user's
+        // (empty) selection and reports nothing (PX-011-G01).
+        adapter.applyPromotion(ItemId(2), reveal: false, tableView: tableView)
+        #expect(tableView.selectedRowIndexes == IndexSet(integer: 1))
+        tableView.deselectAll(nil)
+        #expect(cleared == [NodeId(41), NodeId(41)])
+        #expect(adapter.localSelectionSincePromotion)
+        adapter.applyPromotion(nil, reveal: false, tableView: tableView)
+        #expect(tableView.selectedRowIndexes.isEmpty)
+        #expect(cleared.count == 2)
+        #expect(selections == [ItemId(2), ItemId(3), ItemId(2), ItemId(1)])
+
+        // selection_mode none never reports anything.
+        adapter.selectionMode = .none
+        adapter.tableViewSelectionDidChange(
+            Notification(name: NSTableView.selectionDidChangeNotification, object: tableView)
+        )
+        #expect(cleared.count == 2)
+    }
+
+    /// PX-017-G02: multiple selection stays one event per selected item; a change that leaves
+    /// some items selected never reports which were deselected; only a change to nothing
+    /// selected is reported as a clear.
+    @Test
+    func tableAdapterMultipleSelectionReportsOnlyAFullClear() throws {
+        var selections: [ItemId] = []
+        var cleared = 0
+        let adapter = TableCollectionAdapter(
+            nodeID: 42,
+            rows: (1...3).map {
+                TableCollectionAdapter.TableRow(itemID: ItemId(UInt64($0)), cells: ["Row \($0)"])
+            },
+            selectionMode: .multiple,
+            onSelectionChanged: { _, itemID in selections.append(itemID) }
+        )
+        adapter.onSelectionCleared = { _ in cleared += 1 }
+        let tableView = NSTableView()
+        tableView.allowsMultipleSelection = true
+        tableView.dataSource = adapter
+        tableView.delegate = adapter
+
+        tableView.selectRowIndexes(IndexSet([0, 2]), byExtendingSelection: false)
+        #expect(selections == [ItemId(1), ItemId(3)])
+        tableView.deselectRow(2)
+        #expect(selections == [ItemId(1), ItemId(3), ItemId(1)])
+        #expect(cleared == 0, "a partial deselection is not a clear")
+        tableView.deselectRow(0)
+        #expect(cleared == 1)
+        #expect(selections.count == 3)
+    }
+
     @Test
     func tableAdapterPreservesSelectionAcrossComplexUpdates() throws {
         var selections: [(NodeId, ItemId)] = []

@@ -2386,7 +2386,11 @@ struct ProcessExplorerShellTests {
         }
         let again = Self.modelItemIDs(applier)[try #require(row4102())]
         #expect(again != item, "a returning record is a new row")
-        #expect(native() == ended, "the inspector never shows the PID's next record")
+        // The scripted record reuses its own token, so it is the same instance to the server: the
+        // exited record stands while it is listed, and a later departure would only renew it. The
+        // inspector stays on the old row's record and never shows the new row (PX-021).
+        #expect(isTombstone(native()), "the inspector never shows the PID's next record: \(native())")
+        #expect(native()[0].hasPrefix(exited))
         print("PX-013/PX-021 native SSH evidence (tombstone): window \(window.windowNumber); selected item \(item); returning item \(again); inspector=\(native()); command=\(tombstoneCommand); revision=\(applier.lastAppliedRevision.value)")
         await controller.stop()
     }

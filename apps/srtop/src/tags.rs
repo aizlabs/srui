@@ -340,18 +340,26 @@ impl Tags {
                         )
                     })
                     .collect();
-                let mut clause = if named.is_empty() {
-                    format!("{historical} historical")
+                // Every historical tag is counted once: the named ones, then
+                // the rest, of which the forgotten ones are a part.
+                let clause = if named.is_empty() {
+                    // All of them are forgotten: none is kept to name.
+                    if historical == 1 {
+                        "1 historical, forgotten".to_string()
+                    } else {
+                        format!("{historical} historical, all forgotten")
+                    }
                 } else {
-                    format!("{historical} historical: {}", named.join("; "))
+                    let mut clause = format!("{historical} historical: {}", named.join("; "));
+                    let unnamed = historical - named.len() as u64;
+                    if unnamed > 0 {
+                        clause.push_str(&format!(" and {unnamed} more"));
+                    }
+                    if forgotten > 0 {
+                        clause.push_str(&format!(" ({forgotten} forgotten)"));
+                    }
+                    clause
                 };
-                let unnamed = historical - named.len() as u64;
-                if unnamed > 0 {
-                    clause.push_str(&format!(" and {unnamed} more"));
-                }
-                if forgotten > 0 {
-                    clause.push_str(&format!(" ({forgotten} forgotten)"));
-                }
                 clauses.push(clause);
             }
         }

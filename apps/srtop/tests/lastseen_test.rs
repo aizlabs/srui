@@ -10,6 +10,7 @@
 //! * A PID replacement is a distinct live item.
 //! * Retention expires deterministically under a fake clock.
 
+use srui_process_explorer::inspector::{DetailRead, DetailRequest};
 use srui_process_explorer::lastseen::{
     Departure, Exit, Unobserved, MAX_TOMBSTONES, MAX_TOMBSTONE_AGE,
 };
@@ -19,8 +20,8 @@ use srui_process_explorer::source::{
     BootId, CappedRecords, Completeness, CpuInterval, CpuUsage, CreationToken, DisplayName,
     EnumerationIssue, HostId, IssueScope, Lineage, MissingReason, Observed, PidLedger,
     PidNamespaceId, ProcessKey, ProcessRecord, ProcessSnapshot, ProcessSource, SkippedRecords,
-    SnapshotTime, SourceId, SystemSample, ThreadScan, ThreadsSource, KIND_NOT_COLLECTED,
-    OWNER_NOT_COLLECTED,
+    SnapshotTime, SourceId, SystemSample, TaskKind, ThreadIdentity, ThreadRecords, ThreadScan,
+    ThreadsSource, KIND_NOT_COLLECTED, OWNER_NOT_COLLECTED,
 };
 use srui_process_explorer::{MODEL, TREE_MODEL};
 use srui_sdk::{ItemId, Value};
@@ -115,12 +116,18 @@ fn unenumerable(records: Vec<ProcessRecord>) -> Step {
 /// Publishes `steps` in turn, one second apart, then repeats the last.
 struct Script {
     steps: Vec<Step>,
+    /// What each step says about threads; `NotProvided` past its end.
+    threads: Vec<ThreadScan>,
     next: usize,
 }
 
 impl Script {
     fn new(steps: Vec<Step>) -> Self {
-        Self { steps, next: 0 }
+        Self {
+            steps,
+            threads: Vec::new(),
+            next: 0,
+        }
     }
 }
 
@@ -142,7 +149,11 @@ impl ProcessSource for Script {
             capped: CappedRecords::none(),
             completeness,
             system: SystemSample::not_provided(),
-            threads: ThreadScan::NotProvided,
+            threads: self
+                .threads
+                .get(index)
+                .cloned()
+                .unwrap_or(ThreadScan::NotProvided),
         }
     }
 }
@@ -534,7 +545,7 @@ fn retention_expires_deterministically_under_a_fake_clock() {
     assert_eq!(
         h.inspector(),
         [
-            "Selected process: PID 300 · worker · its last-observed record is no longer kept (kept at most 10 minutes); select another row".to_string(),
+            "Selected process: PID 300 · worker · its last-observed record is no longer kept (records are kept at most 10 minutes, 64 records and 32 KiB, the oldest dropped first); select another row".to_string(),
             "Name: worker · PID 300 · Owner: unavailable".to_string(),
             "State, parent and start time: none: the record is no longer kept".to_string(),
             "CPU and resident memory: none: the record is no longer kept".to_string(),
@@ -693,4 +704,383 @@ fn a_selected_thread_gets_a_tombstone_and_a_hidden_one_does_not() {
     view.set_user_threads(&session, Some(false)).unwrap();
     view.refresh(&session, &mut source).unwrap();
     assert!(view.last_seen().is_empty(), "{:?}", view.last_seen().len());
+}
+
+// ---- Correction round 1 ----
+
+/// F1: a historical tag that aged out is counted once, not twice; the
+/// status says it is forgotten, on a sample that could not even read the
+/// process list (N1).
+#[test]
+fn an_aged_out_historical_tag_is_counted_once_even_on_an_unreadable_scan() {
+    let clock = Arc::new(FakeClock(Mutex::new(Duration::from_secs(10))));
+    let injected: Arc<dyn MonotonicClock> = clock.clone();
+    let mut h = Harness::with(
+        vec![
+            complete(vec![record(1, "init", "init"), record(300, "w", "worker")]),
+            complete(vec![record(1, "init", "init")]),
+            unreadable_root(),
+        ],
+        |view| view.with_clock(injected),
+    );
+    h.select(300, "worker");
+    h.view.request_tags(&h.session, TagRequest::Toggle).unwrap();
+    h.select(1, "init");
+    h.refresh();
+    assert!(h.view.tags_status().starts_with(&format!(
+        "Tags: 0 tagged · 1 historical: PID 300 · worker exited, last observed {}",
+        at(0)
+    )));
+    clock.set(Duration::from_secs(10) + MAX_TOMBSTONE_AGE);
+    h.refresh();
+    assert_eq!(h.view.historical_tags().len(), 0);
+    assert_eq!(h.view.last_seen().forgotten_tags(), 1);
+    assert_eq!(
+        h.view.tags_status(),
+        "Tags: 0 tagged · 1 historical, forgotten · Tagged PID 300 · worker",
+        "one historical tag, counted once"
+    );
+    h.view.request_tags(&h.session, TagRequest::Clear).unwrap();
+    assert!(h
+        .view
+        .tags_status()
+        .ends_with("Cleared 0 tags and 1 historical; the selection is unchanged"));
+}
+
+/// N1: tombstones age on samples that could not read the process list too:
+/// age is time on the injected clock, not a scan outcome.
+#[test]
+fn a_tombstone_expires_while_the_process_list_is_unreadable() {
+    let clock = Arc::new(FakeClock(Mutex::new(Duration::from_secs(10))));
+    let injected: Arc<dyn MonotonicClock> = clock.clone();
+    let mut h = Harness::with(
+        vec![
+            complete(vec![record(1, "init", "init"), record(300, "w", "worker")]),
+            complete(vec![record(1, "init", "init")]),
+            unreadable_root(),
+        ],
+        |view| view.with_clock(injected),
+    );
+    h.select(300, "worker");
+    h.refresh();
+    assert_eq!(h.view.last_seen().len(), 1);
+    clock.set(Duration::from_secs(10) + MAX_TOMBSTONE_AGE - Duration::from_nanos(1));
+    h.refresh();
+    assert_eq!(h.view.last_seen().len(), 1, "short of the bound");
+    assert!(h.status().contains("exited"), "{}", h.status());
+    clock.set(Duration::from_secs(10) + MAX_TOMBSTONE_AGE);
+    h.refresh();
+    assert!(h.view.last_seen().is_empty());
+    assert!(
+        h.status()
+            .contains("its last-observed record is no longer kept"),
+        "{}",
+        h.status()
+    );
+}
+
+/// F2: a process left out at the row limit reads "no longer observed";
+/// listed again, its record goes (it was observed after all), and the
+/// inspector, still on the old row, says so. Selected again and then really
+/// exiting, it leaves a fresh record: the new verdict, the last scan that
+/// listed it, its latest cells.
+#[test]
+fn an_instance_listed_again_after_eviction_gets_a_fresh_record_when_it_exits() {
+    let mut grown = record(300, "w", "worker");
+    grown.resident = Observed::Known(64 << 20);
+    let mut h = Harness::with(
+        vec![
+            complete(vec![
+                record(1, "init", "init"),
+                record(300, "w", "worker"),
+                record(301, "o", "other"),
+            ]),
+            unenumerable(vec![
+                record(1, "init", "init"),
+                record(400, "n", "new"),
+                record(401, "m", "newer"),
+            ]),
+            complete(vec![
+                record(1, "init", "init"),
+                record(300, "w", "worker"),
+                record(301, "o", "other"),
+            ]),
+            complete(vec![
+                record(1, "init", "init"),
+                grown,
+                record(301, "o", "other"),
+            ]),
+            complete(vec![record(1, "init", "init"), record(301, "o", "other")]),
+        ],
+        |view| view.with_published_limit(3),
+    );
+    let first = h.select(300, "worker");
+    h.refresh();
+    let evicted = h.view.last_seen().get(&key(300, "w", host())).unwrap();
+    assert_eq!(
+        evicted.departure(),
+        Departure::NotObserved(Unobserved::Evicted)
+    );
+    // Listed again: the record that said "no longer observed" goes.
+    h.refresh();
+    let again = h.item(300, "worker").expect("listed again");
+    assert_ne!(again, first);
+    assert!(h.view.last_seen().is_empty());
+    assert_eq!(
+        h.status(),
+        "Selected process: PID 300 · worker · listed again after it was no longer observed, under a new row; select that row to inspect it"
+    );
+    h.select(300, "worker");
+    h.refresh();
+    let live = h.inspector()[3].clone();
+    assert_eq!(live, "CPU: 25.0% · Resident: 64.0 MiB");
+    // It really exits.
+    h.refresh();
+    let tombstone = h.view.last_seen().get(&key(300, "w", host())).unwrap();
+    assert_eq!(tombstone.departure(), Departure::Exited(Exit::Unlisted));
+    assert_eq!(
+        tombstone.last_observed(),
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(EPOCH + 3))
+    );
+    assert_eq!(
+        h.status(),
+        format!(
+            "Selected process: PID 300 · worker · exited: a scan that accounts for its PID no longer lists it · last observed {}; a historical record: no action applies to it",
+            at(3)
+        )
+    );
+    assert_eq!(
+        h.inspector()[3],
+        format!("Last sampled · {live} · last observed {}", at(3))
+    );
+}
+
+/// Kills M8a: only watched processes leave records. Seventy unwatched
+/// processes exiting in one scan with the target never push its record out.
+#[test]
+fn a_mass_exit_of_unwatched_processes_keeps_the_watched_record() {
+    let mut first = vec![record(1, "init", "init"), record(300, "w", "worker")];
+    first.extend((0..70u32).map(|n| record(2000 + n, &format!("u{n}"), &format!("u{n}"))));
+    let mut h = Harness::new(vec![
+        complete(first),
+        complete(vec![record(1, "init", "init")]),
+    ]);
+    h.select(300, "worker");
+    h.refresh();
+    assert_eq!(h.view.last_seen().len(), 1);
+    assert_eq!(
+        h.view
+            .last_seen()
+            .get(&key(300, "w", host()))
+            .map(|tombstone| tombstone.departure()),
+        Some(Departure::Exited(Exit::Unlisted))
+    );
+    assert_eq!(h.view.last_seen().dropped(), 0);
+}
+
+/// Kills M12: a detail read that found the record gone establishes the exit
+/// that a scan which only evicted the row cannot.
+#[test]
+fn a_detail_read_establishes_an_exit_the_scan_could_not() {
+    let mut h = Harness::with(
+        vec![
+            complete(vec![
+                record(1, "init", "init"),
+                record(300, "w", "worker"),
+                record(301, "o", "other"),
+            ]),
+            unenumerable(vec![
+                record(1, "init", "init"),
+                record(400, "n", "new"),
+                record(401, "m", "newer"),
+            ]),
+        ],
+        |view| view.with_published_limit(3),
+    );
+    h.select(300, "worker");
+    let request = DetailRequest {
+        key: key(300, "w", host()),
+        generation: h.view.inspector().generation(),
+    };
+    h.view
+        .details_read(&h.session, &request, DetailRead::Ended)
+        .unwrap();
+    assert!(h.status().contains("exited: its record was gone when its details were read · its row leaves with the next sample"), "{}", h.status());
+    h.refresh();
+    assert_eq!(
+        h.view
+            .last_seen()
+            .get(&key(300, "w", host()))
+            .map(|tombstone| tombstone.departure()),
+        Some(Departure::Exited(Exit::DetailRead))
+    );
+    assert!(
+        h.status()
+            .contains("· exited: its record was gone when its details were read · last observed "),
+        "{}",
+        h.status()
+    );
+}
+
+fn thread_record(pid: u32, ptoken: &str, tid: u32, ttoken: &str, name: &str) -> ProcessRecord {
+    let mut thread = record(pid, ptoken, name);
+    thread.key.thread = Some(ThreadIdentity {
+        tid,
+        creation: CreationToken::Opaque(ttoken.into()),
+    });
+    thread.kind = Observed::Known(TaskKind::Thread);
+    thread.lineage = Lineage::new(pid, u64::from(tid));
+    thread
+}
+
+/// The threads one scan read; `unreadable` names processes whose threads it
+/// could not read.
+fn threads_read(records: Vec<ProcessRecord>, unreadable: &[u32]) -> ThreadScan {
+    let mut read = ThreadRecords::with_limit(16);
+    read.records = records;
+    for pid in unreadable {
+        read.unreadable.record(*pid);
+    }
+    ThreadScan::Read(read)
+}
+
+fn server() -> ProcessRecord {
+    let mut process = record(200, "srv", "server");
+    process.kind = Observed::Known(TaskKind::Process {
+        threads: Observed::Known(2),
+    });
+    process
+}
+
+fn t200() -> ProcessRecord {
+    thread_record(200, "srv", 200, "t200", "server")
+}
+
+fn t201() -> ProcessRecord {
+    thread_record(200, "srv", 201, "t201", "worker-1")
+}
+
+/// A view over `scans` with user threads shown, its first sample taken, and
+/// `worker-1` (TID 201) selected.
+fn threads_shown(
+    scans: Vec<(Step, ThreadScan)>,
+    adjust: impl FnOnce(ProcessView) -> ProcessView,
+) -> Harness {
+    let (steps, threads): (Vec<Step>, Vec<ThreadScan>) = scans.into_iter().unzip();
+    let session = Session::mint();
+    let mut source = Script::new(steps);
+    source.threads = threads;
+    let (view, _) = ProcessView::start(&session, &mut source).unwrap();
+    let mut h = Harness {
+        session,
+        view: adjust(view),
+        source,
+    };
+    h.view.set_user_threads(&h.session, Some(true)).unwrap();
+    h.refresh();
+    let item = h.session.with_store(|store| {
+        store
+            .get_model(MODEL)
+            .unwrap()
+            .items
+            .values()
+            .find(|item| matches!(&item.value, Value::List(cells) if cells[1] == Value::String("worker-1".into())))
+            .map(|item| item.item_id)
+    });
+    h.view
+        .select_item(&h.session, Some(item.expect("worker-1 is shown")))
+        .unwrap();
+    h
+}
+
+fn thread_departure(h: &Harness) -> Option<Departure> {
+    h.view
+        .last_seen()
+        .iter()
+        .find(|tombstone| tombstone.key().is_thread())
+        .map(|tombstone| tombstone.departure())
+}
+
+/// Kills M11: a sample that read no threads says nothing about a thread.
+#[test]
+fn a_thread_dropped_by_a_sample_that_read_no_threads_is_not_exited() {
+    let base = || complete(vec![record(1, "init", "init"), server()]);
+    let mut h = threads_shown(
+        vec![
+            (base(), threads_read(vec![t200(), t201()], &[])),
+            (base(), threads_read(vec![t200(), t201()], &[])),
+            (base(), ThreadScan::NotProvided),
+        ],
+        |view| view,
+    );
+    h.refresh();
+    assert_eq!(
+        thread_departure(&h),
+        Some(Departure::NotObserved(Unobserved::ThreadsNotRead))
+    );
+    assert!(
+        h.status().contains(
+            "no longer observed: the sample read no threads; whether it exited is unknown"
+        ),
+        "{}",
+        h.status()
+    );
+}
+
+/// Kills M10: a thread kept because its process's threads could not be
+/// read, then left out at the row limit, is not exited.
+#[test]
+fn a_thread_kept_by_the_thread_ledger_then_left_out_is_not_exited() {
+    let mut h = threads_shown(
+        vec![
+            (
+                complete(vec![record(1, "init", "init"), server()]),
+                threads_read(vec![t200(), t201()], &[]),
+            ),
+            (
+                complete(vec![record(1, "init", "init"), server()]),
+                threads_read(vec![t200(), t201()], &[]),
+            ),
+            (
+                complete(vec![
+                    record(1, "init", "init"),
+                    server(),
+                    record(400, "n", "new"),
+                ]),
+                threads_read(vec![t200()], &[200]),
+            ),
+        ],
+        |view| view.with_published_limit(4),
+    );
+    h.refresh();
+    assert_eq!(
+        thread_departure(&h),
+        Some(Departure::NotObserved(Unobserved::Evicted))
+    );
+}
+
+/// Kills M13: a thread whose process is no longer observed is not exited.
+#[test]
+fn a_thread_of_a_process_no_longer_observed_is_not_exited() {
+    let elsewhere = |mut record: ProcessRecord| {
+        record.key.pid_namespace = Observed::Known(PidNamespaceId(99));
+        record
+    };
+    let base = || vec![record(1, "init", "init"), server()];
+    let mut h = threads_shown(
+        vec![
+            (complete(base()), threads_read(vec![t200(), t201()], &[])),
+            (complete(base()), threads_read(vec![t200(), t201()], &[])),
+            (
+                complete(base().into_iter().map(elsewhere).collect()),
+                threads_read(vec![elsewhere(t200()), elsewhere(t201())], &[]),
+            ),
+        ],
+        |view| view,
+    );
+    h.refresh();
+    assert_eq!(
+        thread_departure(&h),
+        Some(Departure::NotObserved(Unobserved::WithProcess))
+    );
 }

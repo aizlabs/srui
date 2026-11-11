@@ -954,18 +954,22 @@ impl ProcessView {
     /// not in the next one, `kept` (PX-021), and drops the tombstones that
     /// are too old or no longer watched. Watched means the inspector's
     /// target, the followed process, or a tagged process.
+    ///
+    /// A tombstone that only said "no longer observed" of an instance this
+    /// scan lists again, `listed`, is dropped first: its last-observed time
+    /// is no longer true. An established exit is final and stays.
     fn record_departures(
         &mut self,
         kept: impl Fn(ItemId) -> bool,
+        listed: impl Fn(&ProcessKey) -> bool,
         evidence: &Evidence<'_>,
         sampled_at: SystemTime,
     ) {
         let now = self.clock.now();
-        let inspected: Option<ProcessKey> =
-            self.inspector.selected_row().map(|row| row.key.clone());
-        let followed: Option<ProcessKey> = self.follow.followed().map(|row| row.key.clone());
+        let (inspected, followed) = self.watched_keys();
         let watched =
             |key: &ProcessKey| inspected.as_ref() == Some(key) || followed.as_ref() == Some(key);
+        self.last_seen.drop_relisted(listed);
         let mut left = Vec::new();
         for row in &self.unfiltered_rows {
             if kept(row.item_id) {
@@ -996,6 +1000,28 @@ impl ProcessView {
             self.last_seen.record(tombstone);
         }
         self.last_seen.expire(now, watched);
+    }
+
+    /// The inspector's target and the followed process (PX-021).
+    fn watched_keys(&self) -> (Option<ProcessKey>, Option<ProcessKey>) {
+        (
+            self.inspector.selected_row().map(|row| row.key.clone()),
+            self.follow.followed().map(|row| row.key.clone()),
+        )
+    }
+
+    /// Drops the tombstones that are too old by the injected clock, or no
+    /// longer watched (PX-021), on every sample the view accepts, whatever
+    /// the scan could read: age is time, not a scan outcome. Says whether a
+    /// historical tag went.
+    fn expire_tombstones(&mut self) -> bool {
+        let now = self.clock.now();
+        let (inspected, followed) = self.watched_keys();
+        let before = self.last_seen.forgotten_tags();
+        self.last_seen.expire(now, |key| {
+            inspected.as_ref() == Some(key) || followed.as_ref() == Some(key)
+        });
+        self.last_seen.forgotten_tags() != before
     }
 
     /// The most rows this view will publish.
@@ -1067,6 +1093,8 @@ impl ProcessView {
         }
         // This sample ends a resume: the sampling status says live again.
         self.sampling.published_sample();
+        // Tombstones age on every accepted sample, a failed one too (PX-021).
+        let tags_expired = self.expire_tombstones();
         // A snapshot this app cannot identify is not evidence that any process
         // ended. It is published as an error over the last-known rows, exactly
         // like a scan that could not list the process filesystem at all.
@@ -1178,15 +1206,44 @@ impl ProcessView {
         if confirmed_empty && retention.is_global() {
             // Every row is kept on this path, so nothing has left: no tag is
             // retired and no tombstone recorded (PX-020, PX-021).
-            return self.publish_status_only(session, source_status, snapshot, rejected, summary);
+            return self.publish_status_only(
+                session,
+                source_status,
+                snapshot,
+                rejected,
+                summary,
+                tags_expired,
+            );
         }
         // A watched process this generation no longer holds leaves a
         // tombstone that says how it left (PX-021), recorded now whatever the
         // commits do: it is what the server knows, not what a client holds.
         {
             let evidence = Evidence::new(snapshot, &retention, &thread_retention, &live_processes);
+            // The thread instances this scan listed, built only if a thread
+            // tombstone asks.
+            let listed_threads: std::cell::OnceCell<HashSet<&ProcessKey>> =
+                std::cell::OnceCell::new();
+            let listed = |key: &ProcessKey| {
+                if key.is_thread() {
+                    listed_threads
+                        .get_or_init(|| {
+                            unfiltered_target
+                                .iter()
+                                .filter(|row| {
+                                    row.key.is_thread() && confirmed_ids.contains(&row.item_id)
+                                })
+                                .map(|row| &row.key)
+                                .collect()
+                        })
+                        .contains(key)
+                } else {
+                    live_processes.contains(key)
+                }
+            };
             self.record_departures(
                 |item| confirmed_ids.contains(&item) || unconfirmed.contains(&item),
+                listed,
                 &evidence,
                 snapshot.sampled_at.0,
             );
@@ -1587,6 +1644,7 @@ impl ProcessView {
         snapshot: &ProcessSnapshot,
         rejected: Option<String>,
         summary: summary::Properties,
+        tags_expired: bool,
     ) -> Result<Refreshed, SessionError> {
         let retained = self.rows.len();
         let counts = RefreshCounts {
@@ -1627,6 +1685,21 @@ impl ProcessView {
             self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
         result.controls += inspector.len();
         plan.extend(inspector);
+        // A historical tag that aged out on this sample leaves the tags
+        // status now, not at the next readable scan (PX-021).
+        if tags_expired {
+            let counts = self
+                .visible_in(
+                    self.mode,
+                    &self.unfiltered_rows,
+                    &self.unconfirmed,
+                    &self.gaps,
+                )
+                .tags;
+            let tags = self.tags_effects(counts);
+            result.controls += tags.len();
+            plan.extend(tags);
+        }
         if plan.is_empty() {
             // An identical failure republishes nothing at all.
             self.ids.retain(&self.unfiltered_rows);

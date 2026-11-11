@@ -447,17 +447,19 @@ impl LastSeen {
         self.forgotten_tags
     }
 
-    /// Keeps `tombstone`, unless one for the same instance is already kept:
-    /// the first record of a departure stands, and only gains a tag. Then
-    /// drops the oldest beyond the count and byte bounds.
+    /// Keeps `tombstone`, the newest, replacing any earlier record of the
+    /// same instance: a second departure means the collection held it again
+    /// in between, so only the latest departure's sample, time and verdict
+    /// are true. Then drops the oldest beyond the count and byte bounds.
     pub(crate) fn record(&mut self, tombstone: Tombstone) {
-        if let Some(kept) = self
+        if let Some(at) = self
             .entries
-            .iter_mut()
-            .find(|kept| kept.key() == tombstone.key())
+            .iter()
+            .position(|kept| kept.key() == tombstone.key())
         {
-            kept.tagged |= tombstone.tagged;
-            return;
+            if let Some(earlier) = self.entries.remove(at) {
+                self.bytes -= earlier.bytes;
+            }
         }
         self.bytes += tombstone.bytes;
         self.entries.push_back(tombstone);
@@ -474,6 +476,25 @@ impl LastSeen {
                 self.forgotten_tags += 1;
             }
         }
+    }
+
+    /// Drops every tombstone that said only "no longer observed" of an
+    /// instance a scan lists again (`listed`): it was observed after all, so
+    /// its last-observed time and verdict are no longer true. A historical
+    /// tag dropped so is not forgotten, and is not put back on a row
+    /// (PX-020). An established exit is final: the kernel never reuses a PID
+    /// with the same start time within a boot, so only a source that reuses
+    /// its own tokens lists an exited instance again, and that record stays.
+    pub(crate) fn drop_relisted(&mut self, listed: impl Fn(&ProcessKey) -> bool) {
+        let mut kept = VecDeque::with_capacity(self.entries.len());
+        for tombstone in std::mem::take(&mut self.entries) {
+            if !tombstone.departure.exited() && listed(tombstone.key()) {
+                self.bytes -= tombstone.bytes;
+            } else {
+                kept.push_back(tombstone);
+            }
+        }
+        self.entries = kept;
     }
 
     /// Makes the tombstone of `key` a historical tag, if one is kept, and
@@ -710,19 +731,175 @@ mod tests {
         assert_eq!(stone.observed_text(), "last observed: time unknown");
     }
 
+    /// F1 (correction round 1): the tags status counts every historical tag
+    /// once, whether none, one, three or more are named, and after the age,
+    /// count and byte bounds forgot some or all of them.
     #[test]
-    fn a_second_departure_of_the_same_instance_keeps_the_first_record() {
-        let all = rows(vec![record(1, "a")]);
+    fn the_tags_status_counts_every_historical_tag_once() {
+        use crate::tags::{TagCounts, Tags};
+        let status = |seen: &LastSeen| Tags::default().status(TagCounts::default(), seen);
+        let named =
+            |pid: u32| format!("PID {pid} · p exited, last observed 1970-01-01 00:00:00 UTC");
+        let tagged = |row: &Row, left: Duration| {
+            let mut stone = tombstone(row.clone(), left);
+            stone.tagged = true;
+            stone
+        };
+        let all = rows(
+            (0..=MAX_TOMBSTONES as u32)
+                .map(|pid| record(pid, "p"))
+                .collect(),
+        );
         let mut seen = LastSeen::default();
-        seen.record(tombstone(all[0].clone(), Duration::ZERO));
+        assert_eq!(
+            status(&seen),
+            "Tags: none · a tag marks a process instance on this server and changes no process"
+        );
+        seen.record(tagged(&all[0], Duration::ZERO));
+        assert_eq!(
+            status(&seen),
+            format!("Tags: 0 tagged · 1 historical: {}", named(0))
+        );
+        seen.record(tagged(&all[1], Duration::ZERO));
+        seen.record(tagged(&all[2], Duration::ZERO));
+        assert_eq!(
+            status(&seen),
+            format!(
+                "Tags: 0 tagged · 3 historical: {}; {}; {}",
+                named(2),
+                named(1),
+                named(0)
+            )
+        );
+        seen.record(tagged(&all[3], Duration::from_secs(1)));
+        seen.record(tagged(&all[4], Duration::from_secs(1)));
+        assert_eq!(
+            status(&seen),
+            format!(
+                "Tags: 0 tagged · 5 historical: {}; {}; {} and 2 more",
+                named(4),
+                named(3),
+                named(2)
+            )
+        );
+        // Age: the three that left first go; two are still named.
+        seen.expire(MAX_TOMBSTONE_AGE, |_| false);
+        assert_eq!(
+            status(&seen),
+            format!(
+                "Tags: 0 tagged · 5 historical: {}; {} and 3 more (3 forgotten)",
+                named(4),
+                named(3)
+            )
+        );
+        // Age again: none is left to name, and the count is not doubled.
+        seen.expire(MAX_TOMBSTONE_AGE + Duration::from_secs(1), |_| false);
+        assert_eq!(
+            status(&seen),
+            "Tags: 0 tagged · 5 historical, all forgotten"
+        );
+        assert_eq!(seen.untag_all(), 5);
+        // One forgotten alone.
+        seen.record(tagged(&all[0], Duration::ZERO));
+        seen.expire(MAX_TOMBSTONE_AGE, |_| false);
+        assert_eq!(status(&seen), "Tags: 0 tagged · 1 historical, forgotten");
+        assert_eq!(seen.untag_all(), 1);
+        // Count: one past the bound.
+        for row in &all {
+            seen.record(tagged(row, Duration::ZERO));
+        }
+        let total = MAX_TOMBSTONES + 1;
+        assert_eq!(
+            status(&seen),
+            format!(
+                "Tags: 0 tagged · {total} historical: {}; {}; {} and {} more (1 forgotten)",
+                named(MAX_TOMBSTONES as u32),
+                named(MAX_TOMBSTONES as u32 - 1),
+                named(MAX_TOMBSTONES as u32 - 2),
+                total - 3
+            )
+        );
+        assert_eq!(seen.untag_all(), total as u64);
+        // Bytes: the widest names, one past what fits.
+        let long = "n".repeat(crate::source::MAX_DISPLAY_NAME_CHARS);
+        let wide = rows(
+            (0..MAX_TOMBSTONES as u32)
+                .map(|pid| record(pid, &format!("{long}{pid:04}")))
+                .collect(),
+        );
+        let mut seen = LastSeen::default();
+        let fit = MAX_TOMBSTONE_BYTES / tombstone(wide[0].clone(), Duration::ZERO).bytes();
+        for row in wide.iter().take(fit + 1) {
+            seen.record(tagged(row, Duration::ZERO));
+        }
+        assert_eq!(seen.forgotten_tags(), 1);
+        let text = status(&seen);
+        assert!(
+            text.starts_with(&format!(
+                "Tags: 0 tagged · {} historical: PID {fit} · ",
+                fit + 1
+            )),
+            "{text}"
+        );
+        // The long names cut the status to its bound, so its tail is cut too.
+        assert!(text.len() <= crate::tags::MAX_TAGS_STATUS_BYTES + '…'.len_utf8());
+    }
+
+    #[test]
+    fn a_second_departure_of_the_same_instance_replaces_the_first_record() {
+        let all = rows(vec![record(1, "a"), record(2, "b")]);
+        let mut seen = LastSeen::default();
+        let mut first = tombstone(all[0].clone(), Duration::ZERO);
+        first.departure = Departure::NotObserved(Unobserved::Evicted);
+        first.tagged = true;
+        seen.record(first);
+        seen.record(tombstone(all[1].clone(), Duration::ZERO));
         let mut again = tombstone(all[0].clone(), Duration::from_secs(1));
-        again.departure = Departure::NotObserved(Unobserved::Evicted);
-        again.tagged = true;
+        again.last_observed = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(9));
         seen.record(again);
-        assert_eq!(seen.len(), 1);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen.bytes(),
+            seen.iter().map(Tombstone::bytes).sum::<usize>()
+        );
         let kept = seen.get(&all[0].key).unwrap();
         assert_eq!(kept.departure(), Departure::Exited(Exit::Unlisted));
-        assert!(kept.is_tagged());
-        assert_eq!(kept.left_clock, Duration::ZERO);
+        assert_eq!(kept.left_clock, Duration::from_secs(1));
+        assert_eq!(
+            kept.last_observed(),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(9))
+        );
+        assert!(!kept.is_tagged(), "the latest departure's own watch");
+        assert_eq!(
+            seen.iter().last().map(|t| t.key().clone()),
+            Some(all[0].key.clone()),
+            "the newest record is the newest entry"
+        );
+    }
+
+    #[test]
+    fn a_relisted_instance_drops_only_a_no_longer_observed_record() {
+        let all = rows(vec![record(1, "a"), record(2, "b"), record(3, "c")]);
+        let mut seen = LastSeen::default();
+        let mut unobserved = tombstone(all[0].clone(), Duration::ZERO);
+        unobserved.departure = Departure::NotObserved(Unobserved::Evicted);
+        unobserved.tagged = true;
+        seen.record(unobserved);
+        seen.record(tombstone(all[1].clone(), Duration::ZERO));
+        seen.record(tombstone(all[2].clone(), Duration::ZERO));
+        let listed = |key: &ProcessKey| key == &all[0].key || key == &all[1].key;
+        seen.drop_relisted(listed);
+        assert!(seen.get(&all[0].key).is_none(), "observed again");
+        assert!(
+            seen.get(&all[1].key).is_some(),
+            "an established exit is final"
+        );
+        assert!(seen.get(&all[2].key).is_some(), "not listed");
+        assert_eq!(seen.forgotten_tags(), 0, "not forgotten: observed");
+        assert_eq!(seen.dropped(), 0);
+        assert_eq!(
+            seen.bytes(),
+            seen.iter().map(Tombstone::bytes).sum::<usize>()
+        );
     }
 }

@@ -57,7 +57,9 @@
 //! observed` otherwise; once the record is no longer kept, it says so.
 use crate::catalogue::ProcessField;
 use crate::command::{CommandContext, COMMAND_HEAD, NO_SELECTION_COMMAND, UNCOLLECTED_COMMAND};
-use crate::lastseen::{Departure, Exit, LastSeen, Tombstone, MAX_TOMBSTONE_AGE};
+use crate::lastseen::{
+    Departure, Exit, LastSeen, Tombstone, MAX_TOMBSTONES, MAX_TOMBSTONE_AGE, MAX_TOMBSTONE_BYTES,
+};
 use crate::metric::format_utc;
 use crate::owner::{AccountName, AccountNames};
 use crate::projection::Row;
@@ -558,12 +560,26 @@ fn historical_view(
     process: String,
     noun: &str,
     tombstone: Option<&Tombstone>,
+    relisted: bool,
 ) -> InspectorView {
     let Some(tombstone) = tombstone else {
+        if relisted {
+            // A scan listed the instance again after it was no longer
+            // observed: its record was dropped, and the row it is listed
+            // under is a new one the client never selected.
+            return InspectorView::bounded(
+                format!("{head} · listed again after it was no longer observed, under a new row; select that row to inspect it"),
+                process,
+                format!("{DETAILS_HEAD}: none: select its new row"),
+                format!("{METRICS_HEAD}: none: select its new row"),
+                format!("{COMMAND_HEAD}: none: select its new row"),
+            );
+        }
         return InspectorView::bounded(
             format!(
-                "{head} · its last-observed record is no longer kept (kept at most {} minutes); select another row",
-                MAX_TOMBSTONE_AGE.as_secs() / 60
+                "{head} · its last-observed record is no longer kept (records are kept at most {} minutes, {MAX_TOMBSTONES} records and {} KiB, the oldest dropped first); select another row",
+                MAX_TOMBSTONE_AGE.as_secs() / 60,
+                MAX_TOMBSTONE_BYTES / 1024
             ),
             process,
             format!("{DETAILS_HEAD}: none: the record is no longer kept"),
@@ -848,7 +864,9 @@ impl Inspector {
             owner_text(&row.owner, names)
         );
         if kept.is_none() {
-            return historical_view(head, process, noun, tombstone);
+            let relisted =
+                tombstone.is_none() && unfiltered.iter().any(|row| row.key == selected.row.key);
+            return historical_view(head, process, noun, tombstone, relisted);
         }
         if selected.details == Details::Ended {
             // The detail read established the exit while the row is still

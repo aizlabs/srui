@@ -265,6 +265,52 @@ final class ModelTreeStoreTests: XCTestCase {
         XCTAssertEqual(codeAndIndex(result)?.1, 0)
     }
 
+    /// The replica applies the SDK's whole-model replacement (`TreeModel::replace_ops`) as sent:
+    /// `MODEL_RESET_RANGE` rewrites only its own range, so a smaller forest needs the old tail
+    /// deleted by index range first, in the same transaction.
+    func testShrinkingAPopulatedTreeDeletesTheOldTailBeforeTheReset() throws {
+        let applier = try applierWithNested()
+        let before = applier.store
+        let leaf = [treeItem(1, 0, 0)]
+        let resetAlone = applier.apply(baseRevision: applier.lastAppliedRevision, operations: [
+            .modelResetRange(id: model, startIndex: 0, items: leaf, totalCount: 1),
+        ])
+        XCTAssertEqual(codeAndIndex(resetAlone)?.0, "model_tree_descendant_count_out_of_range")
+        XCTAssertEqual(applier.store, before)
+
+        let replaced = applier.apply(baseRevision: applier.lastAppliedRevision, operations: [
+            .modelDelete(id: model, index: 1, count: 5, itemIds: []),
+            .modelResetRange(id: model, startIndex: 0, items: leaf, totalCount: 1),
+        ])
+        XCTAssertNil(codeAndIndex(replaced))
+        let shrunk = try XCTUnwrap(applier.store.getModel(model))
+        XCTAssertEqual(shrunk.itemCount, 1)
+        XCTAssertEqual(shrunk.cachedItemCount, 1)
+        XCTAssertEqual(shrunk.indexOf(ItemId(1)), 0)
+    }
+
+    func testShrinkingReusesAnItemIdFromTheOldTail() throws {
+        let applier = try applierWithNested()
+        // F (index 5) becomes the only root; the tail delete runs first, so F is no duplicate.
+        let result = applier.apply(baseRevision: applier.lastAppliedRevision, operations: [
+            .modelDelete(id: model, index: 1, count: 5, itemIds: []),
+            .modelResetRange(id: model, startIndex: 0, items: [treeItem(6, 0, 0)], totalCount: 1),
+        ])
+        XCTAssertNil(codeAndIndex(result))
+        XCTAssertEqual(applier.store.getModel(model)?.indexOf(ItemId(6)), 0)
+        XCTAssertEqual(applier.store.getModel(model)?.cachedItemCount, 1)
+    }
+
+    func testReplacingAPopulatedTreeWithAnEmptyForestEmptiesTheModel() throws {
+        let applier = try applierWithNested()
+        let result = applier.apply(baseRevision: applier.lastAppliedRevision, operations: [
+            .modelDelete(id: model, index: 0, count: 6, itemIds: []),
+        ])
+        XCTAssertNil(codeAndIndex(result))
+        XCTAssertEqual(applier.store.getModel(model)?.itemCount, 0)
+        XCTAssertEqual(applier.store.getModel(model)?.cachedItemCount, 0)
+    }
+
     func testEveryApplyPathEnforcesTheShape() throws {
         let bad: [StoreOperation] = [
             .createModel(id: model, modelType: .tree, itemCount: 0),

@@ -465,8 +465,10 @@ fn the_inspector_stays_on_its_process_when_sorting_moves_its_row_and_never_shows
     assert_eq!(probe.calls(), ["b", "b"]);
 
     // B ends and a new process takes PID 200 in the same scan: a new key, so
-    // a new item. The inspector says B ended and never reads or shows the
-    // newcomer.
+    // a new item. The inspector shows B's tombstone (PX-021): the complete
+    // scan lists PID 200 under another instance, so B exited; its last read
+    // details and last sampled metrics, marked historical. It never reads or
+    // shows the newcomer.
     harness.source.records[1] = record(200, "b2", "newcomer", Observed::Known(0), 1);
     harness.refresh();
     harness.idle();
@@ -475,16 +477,13 @@ fn the_inspector_stays_on_its_process_when_sorting_moves_its_row_and_never_shows
     let [status, process, details, metrics] = harness.lines();
     assert_eq!(
         status,
-        "Selected process: PID 200 · beta · this process has ended; select another row"
+        "Selected process: PID 200 · beta · exited: its PID now names a newer process · last observed 2027-01-15 08:00:00 UTC; a historical record: no action applies to it"
     );
     assert!(process.starts_with("Name: beta · PID 200"), "{process}");
-    assert_eq!(
-        details,
-        "State, parent and start time: none: the process has ended"
-    );
+    assert!(details.starts_with("Last read · State: "), "{details}");
     assert_eq!(
         metrics,
-        "CPU and resident memory: none: the process has ended"
+        "Last sampled · CPU: 25.0% · Resident: 3.0 MiB · last observed 2027-01-15 08:00:00 UTC"
     );
     assert_eq!(probe.calls(), ["b", "b"], "the newcomer is never read");
     assert_eq!(harness.view().inspector().selected(), Some(b));
@@ -502,7 +501,7 @@ fn the_inspector_stays_on_its_process_when_sorting_moves_its_row_and_never_shows
     harness.idle();
     assert_eq!(
         harness.lines()[0],
-        "Selected process: PID 500 · epsilon · this process has ended; select another row"
+        "Selected process: PID 500 · epsilon · exited: its record was gone when its details were read · its row leaves with the next sample; a historical record: no action applies to it"
     );
     harness.refresh();
     harness.idle();
@@ -758,7 +757,7 @@ fn no_selection_loading_denied_ended_and_not_provided_are_distinct() {
     harness.refresh();
     assert_eq!(
         harness.lines()[0],
-        "Selected process: PID 100 · alpha · this process has ended; select another row"
+        "Selected process: PID 100 · alpha · exited: a scan that accounts for its PID no longer lists it · last observed 2027-01-15 08:00:00 UTC; a historical record: no action applies to it"
     );
 
     // A source without details still shows the row's own fields.

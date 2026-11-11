@@ -543,7 +543,7 @@ fn a_disappeared_process_never_transfers_follow_to_its_reused_pid() {
     assert!(!h.checked(), "the checkbox is off");
     assert_eq!(
         h.status(),
-        "Follow stopped: PID 6010 · tracked has ended · a new process that reuses its PID is not followed; select a row and turn follow on again"
+        "Follow stopped: PID 6010 · tracked exited · a new process that reuses its PID is not followed; select a row and turn follow on again"
     );
     assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
     assert_eq!(hints_since(&h.session, before), Vec::<ItemId>::new());
@@ -556,7 +556,10 @@ fn a_disappeared_process_never_transfers_follow_to_its_reused_pid() {
         }
     );
     match h.property(INSPECTOR_STATUS, TEXT) {
-        Some(Value::String(text)) => assert!(text.contains("this process has ended"), "{text}"),
+        Some(Value::String(text)) => assert!(
+            text.contains("exited: its PID now names a newer process"),
+            "{text}"
+        ),
         other => panic!("{other:?}"),
     }
     let after = h.revision();

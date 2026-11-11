@@ -635,7 +635,8 @@ fn the_inspector_and_follow_name_a_thread_and_see_it_end() {
     // newcomer or any other row.
     h.sample(&mut source);
     assert!(
-        h.text(INSPECTOR_STATUS).contains("this thread has ended"),
+        h.text(INSPECTOR_STATUS)
+            .contains("exited: a scan that read its process's threads no longer lists it"),
         "{}",
         h.text(INSPECTOR_STATUS)
     );

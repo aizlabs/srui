@@ -462,16 +462,14 @@ fn descendant_tags_are_frozen_survive_filters_and_turn_historical_when_a_process
     assert_ne!(newcomer, cc, "a reused PID is another process instance");
     assert_eq!(h.tagged(), set(&[10, 12, 13]));
     assert!(
-        h.status()
-            .starts_with("Tags: 3 tagged · 1 no longer listed: PID 11 · cc · "),
+        h.status().starts_with(
+            "Tags: 3 tagged · 1 historical: PID 11 · cc exited, last observed 2027-01-15 08:00:0"
+        ),
         "{}",
         h.status()
     );
     assert_eq!(h.view().tags().tagged(), 3);
-    assert_eq!(
-        h.view().tags().history().collect::<Vec<_>>(),
-        ["PID 11 · cc"]
-    );
+    assert_eq!(h.view().historical_tags(), ["PID 11 · cc"]);
 
     // Tagging the newcomer tags it alone, under its own identity.
     h.select(11);
@@ -492,7 +490,7 @@ fn descendant_tags_are_frozen_survive_filters_and_turn_historical_when_a_process
         h.status(),
         "Tags: none · a tag marks a process instance on this server and changes no process · Cleared 4 tags and 1 historical; the selection is unchanged"
     );
-    assert_eq!(h.view().tags().historical(), 0);
+    assert_eq!(h.view().historical_tags().len(), 0);
     assert_only_tag_cells_and_status(&h.operations_since(revision));
     assert_eq!(h.text(INSPECTOR_STATUS), inspector);
 }
@@ -664,7 +662,7 @@ fn threads_are_never_tagged_and_a_hidden_kernel_thread_tag_is_counted() {
         "{}",
         h.status()
     );
-    assert_eq!(h.view().tags().historical(), 0, "hiding is not ending");
+    assert_eq!(h.view().historical_tags().len(), 0, "hiding is not ending");
     // Hiding user threads drops thread rows only; no tag changes.
     h.with_view(|view, session| {
         view.set_user_threads(session, Some(false)).unwrap();
@@ -674,7 +672,7 @@ fn threads_are_never_tagged_and_a_hidden_kernel_thread_tag_is_counted() {
         view.set_kernel_threads(session, Some(true)).unwrap();
     });
     assert_eq!(h.view().tags().tagged(), 2);
-    assert_eq!(h.view().tags().historical(), 0);
+    assert_eq!(h.view().historical_tags().len(), 0);
     assert_eq!(h.tagged(), set(&[2, 200]));
 }
 
@@ -736,17 +734,17 @@ fn historical_tags_are_bounded_newest_kept_and_cleared() {
     assert_eq!(h.view().tags().tagged(), children as usize + 1);
     h.sample(&mut source);
     assert_eq!(h.view().tags().tagged(), 1);
-    assert_eq!(h.view().tags().historical(), MAX_HISTORICAL_TAGS);
+    assert_eq!(h.view().historical_tags().len(), MAX_HISTORICAL_TAGS);
     // The oldest six were forgotten; the newest are named.
-    let history: Vec<String> = h.view().tags().history().map(str::to_string).collect();
+    let history: Vec<String> = h.view().historical_tags();
     assert_eq!(history.first().map(String::as_str), Some("PID 1007 · c7"));
     assert_eq!(history.last().map(String::as_str), Some("PID 1070 · c70"));
     assert_eq!(
         h.status(),
-        "Tags: 1 tagged · 70 no longer listed: PID 1070 · c70, PID 1069 · c69, PID 1068 · c68 and 67 more (6 forgotten) · Tagged PID 1000 · root and 70 sampled descendants; processes started later are not added"
+        "Tags: 1 tagged · 70 historical: PID 1070 · c70 exited, last observed 2027-01-15 08:00:01 UTC; PID 1069 · c69 exited, last observed 2027-01-15 08:00:01 UTC; PID 1068 · c68 exited, last observed 2027-01-15 08:00:01 UTC and 67 more (6 forgotten) · Tagged PID 1000 · root and 70 sampled descendants; processes started later are not added"
     );
     h.click(TAGS_CLEAR);
-    assert_eq!(h.view().tags().historical(), 0);
+    assert_eq!(h.view().historical_tags().len(), 0);
     assert!(h
         .status()
         .ends_with("Cleared 1 tag and 70 historical; the selection is unchanged"));
@@ -855,10 +853,22 @@ fn a_newcomer_beside_a_kept_earlier_instance_of_its_pid_is_not_tagged() {
     );
     h.sample(&mut source);
     assert!(h.tagged().is_empty());
+    // The complete scan lists PID 11 under the newcomer only, so `cc`
+    // exited (PX-021), last observed by the first scan: the unenumerable
+    // one only kept it.
     assert!(
-        h.status()
-            .starts_with("Tags: 0 tagged · 1 no longer listed: PID 11 · cc"),
+        h.status().starts_with(
+            "Tags: 0 tagged · 1 historical: PID 11 · cc exited, last observed 2027-01-15 08:00:01 UTC"
+        ),
         "{}",
         h.status()
+    );
+    let view = h.view();
+    let tombstone = view.last_seen().tagged().next().expect("cc's tombstone");
+    assert_eq!(
+        tombstone.departure(),
+        srui_process_explorer::lastseen::Departure::Exited(
+            srui_process_explorer::lastseen::Exit::Replaced
+        )
     );
 }

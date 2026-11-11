@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-021",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Last-observed records: a bounded tombstone for a watched process instance (the inspector's target, the followed process, a tagged process) that leaves the collection, holding its identity, last row, last CPU and resident memory, last read details and last-observed time; 'exited' only when a scan or detail read positively establishes it, 'no longer observed' otherwise; bounded by count, age and bytes on an injected monotonic clock; historical tags are tombstones; no process-changing action; no protocol, registry, SDK, renderer or client source change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md",
+      "K1": "https://docs.kernel.org/filesystems/proc.html"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX021-001",
+      "feature": "A bounded tombstone for each watched process instance that leaves the server-side collection: watched means the inspector's target, the followed process or a tagged process, and nothing else; the record holds the whole ProcessKey, the last row (name, owner, every cell, so the last CPU share and resident memory), the state, parent and start time the inspector last read (never the command line, executable or working directory, which can carry secrets), the sample time of the last scan that listed it (carried across scans that only kept it) and the scan it left with; recorded when the sample is applied, whatever its commits do",
+      "scope": "PX-021/lastseen (src/lastseen.rs) Tombstone, LastSeen.record; refresh (src/refresh.rs) record_departures, last_observed, unconfirmed_since, confirmed_at; tests/lastseen_test.rs an_exiting_worker_leaves_an_inspectable_tombstone_that_no_request_takes; tests/procfs_test.rs live::a_live_worker_that_exits_leaves_a_tombstone_and_a_degraded_scan_claims_no_exit",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-021",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-021.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX021-002",
+      "feature": "Exit versus no longer observed: 'exited' only when a scan that accounts for every entry it did not publish (Retention::Skipped without the PID) and that observed the same host, boot and PID namespace no longer lists the PID, lists it with another creation token, or found the record vanished; or when the detail read found the record gone; a thread exited when its process's task listing was read without its TID, or with its process; everything else (eviction of a kept row, an unconfirmed scan identity, a sample that read no threads) says 'no longer observed; whether it exited is unknown'; no exit code, cause or unsampled history",
+      "scope": "PX-021/lastseen (src/lastseen.rs) Evidence, Departure, Exit, Unobserved; tests/lastseen_test.rs an_inaccessible_scan_never_records_an_exit, a_row_left_out_at_the_row_limit_is_no_longer_observed; tests/procfs_test.rs procfs_absences_establish_exits_and_inaccessible_records_never_do",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-021",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-021.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX021-003",
+      "feature": "An inaccessible scan records no exit: an unreadable or rejected process list keeps every row and records nothing; a denied record is kept; a scan whose host identity was not read names its absences 'no longer observed'",
+      "scope": "PX-021/refresh (src/refresh.rs) apply status-only path before record_departures; tests/lastseen_test.rs an_inaccessible_scan_never_records_an_exit; tests/procfs_test.rs procfs_absences_establish_exits_and_inaccessible_records_never_do and the live test's simulated unreadable and degraded scans",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-021",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-021.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX021-004",
+      "feature": "A PID replacement is a distinct live item: the earlier instance's tombstone says 'exited: its PID now names a newer process' while the newcomer is a new row, item ID and live inspector target",
+      "scope": "PX-021/tests/lastseen_test.rs a_pid_replacement_is_a_distinct_live_item; tests/inspector_test.rs the_inspector_stays_on_its_process_when_sorting_moves_its_row_and_never_shows_a_reused_pid; tests/follow_test.rs a_disappeared_process_never_transfers_follow_to_its_reused_pid",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-021",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-021.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX021-005",
+      "feature": "Retention bounded by count (MAX_TOMBSTONES 64), age (MAX_TOMBSTONE_AGE 600 s after it left, by the view's injected MonotonicClock, at each sample) and estimated bytes (MAX_TOMBSTONE_BYTES 32 KiB), oldest first; a record no longer watched goes at the next sample; tested at and past each bound under a fake clock",
+      "scope": "PX-021/lastseen (src/lastseen.rs) LastSeen.expire, record, drop_oldest, Tombstone.bytes; refresh (src/refresh.rs) ProcessView::with_clock; src/lastseen.rs tests; tests/lastseen_test.rs retention_expires_deterministically_under_a_fake_clock, the_count_bound_keeps_the_newest_tombstones; tests/tags_test.rs historical_tags_are_bounded_newest_kept_and_cleared",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-021",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-021.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX021-006",
+      "feature": "Historical state shown unmistakably and never acted on: the inspector shows the tombstone with its verdict, last read details, last sampled CPU and resident memory and last-observed time as 'a historical record: no action applies to it', or that the record is no longer kept; follow and tag requests refuse it; the follow status and PX-020's historical tags use the same verdict ('exited' or 'no longer observed'), replacing PX-013's 'has ended' and PX-020's 'no longer listed'",
+      "scope": "PX-021/inspector (src/inspector.rs) historical_view, view; follow (src/follow.rs) track, turn_on; tags (src/tags.rs) status, clear, retire; refresh (src/refresh.rs) tag_target, request_tags, settle_tags; client-macos ProcessExplorerShellTests inspectorReportsASelectedProcessThatEndedAndNeverItsPIDsNextRecord",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-021",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-021.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX021-007",
+      "feature": "Interactions: filters, the tree and its collapsed mirror, threads (a selected thread gets a tombstone; a hidden one is deselected first and gets none), tags, follow, pause (a paused view records and expires nothing) and failed commits (a failed sample still records; a failed Clear tags keeps the historical tags)",
+      "scope": "PX-021/tests/lastseen_test.rs a_filtered_out_target_is_not_historical_until_it_leaves, the_tree_shows_the_same_tombstone, a_selected_thread_gets_a_tombstone_and_a_hidden_one_does_not, a_paused_view_records_nothing_until_it_resumes; src/refresh.rs tag_commit_tests a_failed_sample_records_the_tombstone_and_the_next_publication_shows_it, a_failed_clear_keeps_the_historical_tags, a_failed_sample_keeps_an_ended_process_tagged_until_one_commits; tests/no_process_control_test.rs",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-021",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-021.md"
+      ]
+    }
+  ]
+}

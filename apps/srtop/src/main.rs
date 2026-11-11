@@ -1,13 +1,13 @@
 //! Existing sessiond runtime/SSH bridge host for the PX-001 shell (§§12, 20, 27, 29).
 use srui_process_explorer::{
-    initialize, install_column_handlers, install_filter_handlers, install_inspector,
-    install_owner_handlers, install_sampling_handlers, install_search_handlers,
+    initialize, install_column_handlers, install_filter_handlers, install_follow_handlers,
+    install_inspector, install_owner_handlers, install_sampling_handlers, install_search_handlers,
     install_sort_handlers,
     procfs::ProcFsSource,
     refresh::{poll, ProcessView, DEFAULT_REFRESH_INTERVAL},
     sampling::parse_interval,
     source::{
-        FakeProcessSource, ProcessSource, RepeatedNamesSource, ScriptedFakeSource,
+        FakeProcessSource, FollowSource, ProcessSource, RepeatedNamesSource, ScriptedFakeSource,
         SyntheticProcessSource,
     },
     update_title, FIXTURE_TITLE,
@@ -32,6 +32,9 @@ enum Collection {
     Fake,
     /// The PX-011 fixture: three processes named exactly `worker`.
     RepeatedNames,
+    /// The PX-017 fixture: one process that changes CPU rank on every sample,
+    /// then ends while a new process reuses its PID.
+    Follow,
     Sequence,
     Live,
     Scale(usize),
@@ -63,6 +66,8 @@ where
     // The sampling controls record requests on the view and wake the one
     // refresh loop below; they start no timer of their own (PX-015).
     install_sampling_handlers(session, &view);
+    // Follow selected process re-promotes the followed row (PX-017).
+    install_follow_handlers(session, &view);
     // The inspector reads details through its own reader of the source's
     // records, on its own bounded worker (PX-013).
     install_inspector(session, &view, source.details());
@@ -77,8 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--socket")) {
         return Err("usage: srtop --socket PATH [--smoke-fixture] \
-             [--fake-source | --fake-repeated-names | --fake-sequence | --live-source | --procfs \
-             | --scale-source COUNT] \
+             [--fake-source | --fake-repeated-names | --fake-follow | --fake-sequence \
+             | --live-source | --procfs | --scale-source COUNT] \
              [--refresh-interval-ms MS | --scale-interval-ms MS]"
             .into());
     }
@@ -90,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(value) = args.next() {
         let select = |current: &mut Collection, chosen| {
             if *current != Collection::None {
-                return Err("choose one of --fake-source, --fake-repeated-names, --fake-sequence, --live-source (or --procfs) or --scale-source");
+                return Err("choose one of --fake-source, --fake-repeated-names, --fake-follow, --fake-sequence, --live-source (or --procfs) or --scale-source");
             }
             *current = chosen;
             Ok(())
@@ -99,6 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some("--smoke-fixture") if !fixture => fixture = true,
             Some("--fake-source") => select(&mut collection, Collection::Fake)?,
             Some("--fake-repeated-names") => select(&mut collection, Collection::RepeatedNames)?,
+            Some("--fake-follow") => select(&mut collection, Collection::Follow)?,
             Some("--fake-sequence") => select(&mut collection, Collection::Sequence)?,
             Some("--live-source") | Some("--procfs") => select(&mut collection, Collection::Live)?,
             Some("--scale-source") => {
@@ -154,6 +160,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Collection::RepeatedNames => collect(
             &session,
             RepeatedNamesSource,
+            interval,
+            &shutdown,
+            &mut connections,
+        ),
+        Collection::Follow => collect(
+            &session,
+            FollowSource::default(),
             interval,
             &shutdown,
             &mut connections,

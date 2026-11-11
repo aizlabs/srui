@@ -114,6 +114,8 @@ fn the_summary_is_published_as_text_and_progress_and_nothing_else() {
                     TypeRef::TEXT_INPUT,
                     // The inspector's read-only command line (PX-014).
                     TypeRef::RICHTEXT,
+                    // The follow checkbox (PX-017).
+                    TypeRef::TOGGLE,
                 ]
                 .contains(&node.node_type),
                 "node {id} is a {:?}",

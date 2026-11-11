@@ -567,6 +567,14 @@ impl Inspector {
         }
     }
 
+    /// The row the inspector describes, as it was when selected (PX-017).
+    pub(crate) fn selected_row(&self) -> Option<&Row> {
+        match &self.selection {
+            Selection::Process(selected) => Some(&selected.row),
+            _ => None,
+        }
+    }
+
     /// Detail results dropped because their target was no longer current.
     pub fn stale_results(&self) -> u64 {
         self.stale

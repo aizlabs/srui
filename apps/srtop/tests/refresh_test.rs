@@ -6,9 +6,9 @@ use srui_process_explorer::refresh::{refresh_status, RefreshCounts};
 use srui_process_explorer::source::*;
 use srui_process_explorer::summary::{FRESHNESS_TEXT, LAYOUT, SUMMARY};
 use srui_process_explorer::{
-    start_from_source, COLUMN, COLUMN_CHOOSER_ROW, FILTER_ROW, FILTER_STATUS, HEADING, INSPECTOR,
-    MODEL, OWNER_ROW, OWNER_STATUS, SAMPLING_ROW, SEARCH_ROW, SHELL_NODE_COUNT, SORT_ROW, STATUS,
-    SURFACE, TABLE,
+    start_from_source, COLUMN, COLUMN_CHOOSER_ROW, FILTER_ROW, FILTER_STATUS, FOLLOW_ROW, HEADING,
+    INSPECTOR, MODEL, OWNER_ROW, OWNER_STATUS, SAMPLING_ROW, SEARCH_ROW, SHELL_NODE_COUNT,
+    SORT_ROW, STATUS, SURFACE, TABLE,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
 use srui_sdk::{EnumToken, ItemId, NodeId, Operation, TextRole, Value, ROLE, TEXT};
@@ -124,6 +124,7 @@ fn assert_shell_intact(session: &Session) {
                     SEARCH_ROW,
                     SORT_ROW,
                     COLUMN_CHOOSER_ROW,
+                    FOLLOW_ROW,
                     TABLE,
                     INSPECTOR
                 ]

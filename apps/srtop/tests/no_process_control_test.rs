@@ -36,7 +36,8 @@
 //!   button with `ACTIVATE` or the user or PID-set field with `TEXT_EDIT` (PX-012), or
 //!   exactly `TABLE` with `SELECTION_CHANGED`, the inspector's one selection input
 //!   (PX-013), or a sampling button with `ACTIVATE` or the interval field with
-//!   `TEXT_EDIT` (PX-015); `on_result`, `on_text_edit`
+//!   `TEXT_EDIT` (PX-015), or exactly `FOLLOW_TOGGLE` with `VALUE_CHANGED`
+//!   (PX-017); `on_result`, `on_text_edit`
 //!   and a model range provider unconditionally; `include`, called or
 //!   renamed; or a macro definition (`macro_rules!`), whose expansion can
 //!   assemble tokens this audit never sees together. Attributes come from an
@@ -654,6 +655,7 @@ fn scan(level: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
                                 is_sort_button_activation(tokens)
                                     || is_filter_input_text_edit(tokens)
                                     || is_table_selection(tokens)
+                                    || is_follow_toggle(tokens)
                             }
                             _ => false,
                         };
@@ -887,6 +889,37 @@ fn is_table_selection(tokens: &[Tok]) -> bool {
     };
     bare(arguments.first()).as_deref() == Some(TABLE_SELECTION.0)
         && bare(arguments.get(1)).as_deref() == Some(TABLE_SELECTION.1)
+}
+
+/// The follow toggle (PX-017), whose `VALUE_CHANGED` handler turns follow on
+/// or off for the process the server already resolved as selected. It
+/// re-promotes the followed row's item ID and never signals, opens for
+/// control or reconfigures a process.
+const FOLLOW_TOGGLE_CHANGE: (&str, &str) = ("FOLLOW_TOGGLE", "VALUE_CHANGED");
+
+/// Whether an `on(..)` argument list is exactly the follow toggle's
+/// `VALUE_CHANGED` registration: the bare constants `FOLLOW_TOGGLE` and
+/// `VALUE_CHANGED`. Any other node, event type, path or computed argument is
+/// not the allowance.
+fn is_follow_toggle(tokens: &[Tok]) -> bool {
+    let mut arguments: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    for token in tokens {
+        match token {
+            Tok::Punct(',', _) => arguments.push(std::mem::take(&mut current)),
+            Tok::Ident(name, _, _) => current.push(name.clone()),
+            _ => current.push('\u{0}'.to_string()),
+        }
+    }
+    arguments.push(current);
+    let bare = |argument: Option<&Vec<String>>| -> Option<String> {
+        match argument?.as_slice() {
+            [only] if !only.is_empty() => Some(only.clone()),
+            _ => None,
+        }
+    };
+    bare(arguments.first()).as_deref() == Some(FOLLOW_TOGGLE_CHANGE.0)
+        && bare(arguments.get(1)).as_deref() == Some(FOLLOW_TOGGLE_CHANGE.1)
 }
 
 /// Every violation in the production tokens of one source file.

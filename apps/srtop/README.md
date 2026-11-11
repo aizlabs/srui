@@ -184,6 +184,7 @@ The basic workflow runs without a mouse (PX-016). srtop publishes the standard `
 | ⌘G | `primary+g` | Next match | the button's click |
 | ⌘1 … ⌘4 | `primary+1` … `primary+4` | Sort by PID, Name, Resident, CPU | the button's click |
 | ⌥⌘R | `primary+alt+r` | Restore default columns | the button's click |
+| ⇧⌘F | `primary+shift+f` | Follow selected process | the checkbox's click: turns follow on or off (PX-017) |
 | ⌘L | `primary+l` | Processes (the table) | focuses the table |
 | ⌘I | `primary+i` | Command line and executable | focuses the inspector's selectable command line |
 
@@ -194,6 +195,22 @@ The basic workflow runs without a mouse (PX-016). srtop publishes the standard `
 - **Sort shortcuts follow the sort buttons, not the column positions.** The sort buttons keep their order when the column chooser moves a column, so ⌘1 always sorts by PID. Per-column shortcuts are offered because Tab reaches buttons only when macOS Keyboard navigation (Full Keyboard Access) is on, which it is not by default.
 - **Reset.** Focusing a field with its shortcut, or with Tab, selects its whole text, so ⌥⌘F then Delete clears the filter, and ⌘F then Delete clears the search. ⌥⌘U shows every user again, and ⌥⌘R restores the default columns.
 - **Without a mouse:** ⌘F, type a name, ⌘G until the match is the one, ⌘L and the arrow keys to move the selection, ⌘I to read and copy the command line, ⌥⌘F and type a filter, then ⌥⌘F and Delete to reset.
+
+## Following a process
+
+A row between the column chooser and the table holds a standard **Follow selected process** checkbox (⇧⌘F) and a status line (PX-017). Follow is a server-side setting; the checkbox shows the value the server holds.
+
+- **Selection and follow are separate.** With follow off, the client keeps a selected row on its process, under its item ID, when a sample or a sort moves it (§22.5). It never scrolls for it, so the table stays wherever you scrolled it, even if the selected process moves out of view. No sample ever selects or scrolls anything.
+- **Turning follow on** follows the process the inspector describes, and scrolls it into view at once. The status says `Following PID 6010 · tracked · row 12 of 60 · …`. With nothing selected, or a selected process that is hidden or has ended, the server refuses with the reason (`Follow: off · nothing is selected; select a row, then turn follow on`) and the checkbox goes back to off.
+- **While follow is on**, whenever a sample, a sort or a filter moves the followed process to another row, the server promotes its item ID again (the generic promoted selection of PX-011-G01). The client selects the row and scrolls the least distance that shows it. Its item ID never changes, and no row is added for it.
+- **Scrolling yourself** is local. It never changes the selection and never turns follow off. The table stays where you put it until the followed process changes row; then follow brings it back into view. To look elsewhere for longer, turn follow off.
+- **Sticky, until you change it.** Selecting another row, with a click, the arrow keys or a search match, follows that row instead. If you clicked another row just before a follow update reached the client, so that the update replaced your click, the server sees from the event's `observed_revision` that your click came first, and selects your row again.
+- **Follow stops by itself, and says why**, when the followed process ends (`Follow stopped: PID 6010 · tracked has ended · a new process that reuses its PID is not followed; …`) or is no longer shown because a filter hid it or the row limit left it out. The checkbox turns off. Follow never moves to another row by itself. A new process that reuses the PID is a different item, and it is never followed, selected or scrolled to.
+- **One view.** Follow is bound to the process table, the only view srtop has. A tree view (PX-018) must carry follow over or stop it explicitly.
+- **Shared.** Like the filters, follow belongs to the session, so every client of one srtop sees the same setting and the same followed process.
+- **Bounds.** The status is at most 512 bytes; the three nodes are charged a fixed 2048-byte reserve (`FOLLOW_RESERVE_BYTES`) against the catch-up snapshot.
+
+`--fake-follow` is the deterministic fixture for this: 60 processes, where only `tracked` (PID 6010) changes CPU rank, one step per sample, and at the sixth sample it has ended and a new process reuses its PID.
 
 ## Refresh
 

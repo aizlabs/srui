@@ -1142,6 +1142,126 @@ impl ProcessSource for RepeatedNamesSource {
     }
 }
 
+/// Status label of the follow fixture (PX-017). Like every source, it states
+/// what its data is: a script, never a host.
+pub const FOLLOW_STATUS_TEXT: &str = "Read-only · Fake follow sequence";
+
+/// PX-017's fixture: [`FollowSource::RECORDS`] processes, PID
+/// `FIRST_PID + row`, named `task-NN`, except one named `tracked` with PID
+/// [`FollowSource::TRACKED_PID`]. Every other process's CPU share is a fixed,
+/// distinct value, so under the CPU sort (busiest first) they keep their order
+/// and only `tracked` moves: each snapshot is the next step of
+/// [`FollowSource::RANKS`], which places `tracked` at that CPU rank. At step
+/// [`FollowSource::REUSED_STEP`] that process has ended and a new process
+/// reuses its PID and name, under a new creation token. Steps past the end
+/// repeat the last one. Each step's sample time is one second after the
+/// last, so a step that moves no row still publishes its freshness line.
+///
+/// This is a fixture, not an observation: it reads no process, no clock and no
+/// file, and it names itself as synthetic in every published status.
+#[derive(Debug, Default)]
+pub struct FollowSource {
+    step: usize,
+}
+
+impl FollowSource {
+    pub const SOURCE: &'static str = "fake-follow-v1";
+    pub const RECORDS: usize = 60;
+    pub const FIRST_PID: u32 = 6001;
+    /// The followed process's PID, at row 9 in PID order.
+    pub const TRACKED_PID: u32 = 6010;
+    /// The CPU rank (0 is the busiest) of the process holding
+    /// [`Self::TRACKED_PID`] at each step.
+    pub const RANKS: [usize; 7] = [0, 55, 55, 40, 50, 2, 2];
+    /// The first step at which the PID belongs to a new process.
+    pub const REUSED_STEP: usize = 5;
+
+    /// The step this source will publish next.
+    pub fn step(&self) -> usize {
+        self.step
+    }
+
+    /// The CPU ticks per second of the untracked process at `row`: distinct,
+    /// four apart, busiest first in row order.
+    fn ticks(row: usize) -> u64 {
+        300 - 4 * row as u64
+    }
+
+    /// The records of one step.
+    pub fn records(step: usize) -> Vec<ProcessRecord> {
+        let step = step.min(Self::RANKS.len() - 1);
+        let tracked_row = (Self::TRACKED_PID - Self::FIRST_PID) as usize;
+        let others: Vec<u64> = (0..Self::RECORDS)
+            .filter(|row| *row != tracked_row)
+            .map(Self::ticks)
+            .collect();
+        // Strictly between the neighbours at this rank, so the rank is exact.
+        let rank = Self::RANKS[step];
+        let tracked_ticks = match rank {
+            0 => others[0] + 2,
+            _ => others[rank - 1] - 2,
+        };
+        let one_second = |ticks| {
+            CpuUsage::Measured(CpuInterval {
+                ticks,
+                ticks_per_second: 100,
+                elapsed: Duration::from_secs(1),
+            })
+        };
+        (0..Self::RECORDS)
+            .map(|row| {
+                let pid = Self::FIRST_PID + row as u32;
+                let (name, token, ticks) = if row == tracked_row {
+                    let token = if step >= Self::REUSED_STEP {
+                        "tracked-reused"
+                    } else {
+                        "tracked"
+                    };
+                    ("tracked".to_string(), token.to_string(), tracked_ticks)
+                } else {
+                    (
+                        format!("task-{row:02}"),
+                        format!("task-{row}"),
+                        Self::ticks(row),
+                    )
+                };
+                ProcessRecord {
+                    owner: OWNER_NOT_COLLECTED,
+                    key: ProcessKey {
+                        source: SourceId(Self::SOURCE.into()),
+                        ..FakeProcessSource::key(&token, Observed::Known(pid))
+                    },
+                    display_name: DisplayName::from(name.as_str()),
+                    resident: Observed::Known(4096),
+                    cpu: one_second(ticks),
+                }
+            })
+            .collect()
+    }
+}
+
+impl ProcessSource for FollowSource {
+    fn status_text(&self) -> &str {
+        FOLLOW_STATUS_TEXT
+    }
+
+    fn snapshot(&mut self) -> ProcessSnapshot {
+        let step = self.step;
+        self.step += 1;
+        ProcessSnapshot {
+            source: SourceId(Self::SOURCE.into()),
+            sampled_at: SnapshotTime(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + step as u64),
+            ),
+            records: Self::records(step),
+            vanished: 0,
+            capped: CappedRecords::none(),
+            completeness: Completeness::Complete,
+            system: FakeProcessSource::system(),
+        }
+    }
+}
+
 /// Status label of the scripted fixture sequence. Like every source, it states
 /// what its data is: a script, never a host.
 pub const SEQUENCE_STATUS_TEXT: &str = "Read-only · Fake process sequence";

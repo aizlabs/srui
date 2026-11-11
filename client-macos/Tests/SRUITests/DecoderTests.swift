@@ -763,6 +763,40 @@ final class DecoderTests: XCTestCase {
         }
     }
 
+    /// PX-016-G01 (§4 inv. 13, §26): the three committed malformed `shortcut` vectors are refused by
+    /// both Swift decode paths with the same reason the Rust decoder reports (expected.json).
+    func testMalformedShortcutVectorsRejectedByBothSwiftDecoders() throws {
+        let expected = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: conformanceVectorsDir.appendingPathComponent("expected.json"))
+        ) as? [String: Any]
+        let malformed = try XCTUnwrap(expected?["malformed_vectors"] as? [String: Any])
+        for name in [
+            "malformed_shortcut_over_length",
+            "malformed_shortcut_unknown_token",
+            "malformed_shortcut_duplicate_modifier",
+        ] {
+            let spec = try XCTUnwrap(malformed[name] as? [String: Any], name)
+            let rustError = try XCTUnwrap(spec["expected_error"] as? String)
+            let fileURL = conformanceVectorsDir.appendingPathComponent("\(name).bin")
+            let message = try decodeFramedMessage(from: Data(contentsOf: fileURL))
+            guard case .transaction(let wire) = message.msg else {
+                XCTFail("Expected a transaction in \(name)")
+                continue
+            }
+            XCTAssertThrowsError(
+                try ProtocolDecoder().validateAndConvertTransaction(wire: wire), name
+            ) { error in
+                let decodeError = error as? ProtocolDecodeError
+                XCTAssertEqual(decodeError?.conformanceCode, "invalid_shortcut", name)
+                // Rust prefixes its transaction wrapper; the reason after it is identical.
+                XCTAssertEqual(
+                    "wire transaction error: \(decodeError?.description ?? "")", rustError, name
+                )
+            }
+            XCTAssertThrowsError(try Transaction(wire: wire), name)
+        }
+    }
+
     // MARK: - §22.2 Thread Safety / Off-Main Execution Test
 
     func testDecodeOffMainThreadSafety() async throws {

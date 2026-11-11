@@ -202,6 +202,25 @@ STATE_MACHINE_VECTORS_ADDED_AFTER_SPLIT = (
     "51_collection_selection_mode_none_rejected.json",
     "52_collection_selection_row_index_rejected.json",
     "53_collection_selection_disable_while_promoted_rejected.json",
+    # PX-016-G01: platform-neutral semantic keyboard shortcuts (§4 inv. 13, §7.4, §22.5, §26).
+    "54_shortcut_admitted_widgets_success.json",
+    "55_shortcut_refused_on_unadmitted_type_rejected.json",
+    "56_shortcut_refused_on_surface_create_rejected.json",
+    "57_shortcut_bare_printable_key_rejected.json",
+    "58_shortcut_unknown_token_rejected.json",
+    "59_shortcut_duplicate_modifier_rejected.json",
+    "60_shortcut_misordered_modifier_rejected.json",
+    "61_shortcut_over_length_rejected.json",
+    "62_shortcut_non_string_rejected.json",
+    "63_shortcut_duplicate_in_surface_rejected.json",
+    "64_shortcut_same_value_in_two_surfaces_success.json",
+    "65_shortcut_move_into_conflicting_surface_rejected.json",
+    "66_shortcut_swap_through_clear_success.json",
+    # PX-016-G01 round 1: a nested Surface shares the window-owning Surface's scope.
+    "67_shortcut_duplicate_across_nested_surface_rejected.json",
+    # PX-016-G01 round 2: a nested holder refuses an outer duplicate; sibling nested Surfaces.
+    "68_shortcut_outer_duplicate_of_nested_holder_rejected.json",
+    "69_shortcut_sibling_nested_surfaces_duplicate_rejected.json",
 )
 
 

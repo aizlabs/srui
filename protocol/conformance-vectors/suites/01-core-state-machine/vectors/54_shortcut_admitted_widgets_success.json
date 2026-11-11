@@ -1,0 +1,262 @@
+{
+  "name": "shortcut_admitted_widgets_success",
+  "description": "Every admitted node type accepts a canonical shortcut at CREATE_NODE, SET_PROPERTY and BATCH_PROPERTY_SET, and CLEAR_PROPERTY removes one; Button and Toggle dispatch their click event, the editors and collections take local focus (§7.4, §7.6, §22.5).",
+  "spec_sections": [
+    "§4",
+    "§7.4",
+    "§7.6",
+    "§7.7",
+    "§12.1",
+    "§22.5",
+    "§26"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Shortcuts"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Button",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "label": "Refresh",
+            "shortcut": "primary+r"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 3,
+          "node_type": "Toggle",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "label": "Follow",
+            "shortcut": "primary+shift+f"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 4,
+          "node_type": "TextInput",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "label": "Filter",
+            "shortcut": "primary+alt+l"
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "CREATE_NODE",
+        "node_id": 5,
+        "node_type": "TextArea",
+        "parent_id": 1,
+        "child_index": null,
+        "properties": {
+          "label": "Notes",
+          "shortcut": "primary+shift+alt+n"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 6,
+        "node_type": "List",
+        "parent_id": 1,
+        "child_index": null,
+        "properties": {
+          "label": "Hosts",
+          "shortcut": "primary+1"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 7,
+        "node_type": "Table",
+        "parent_id": 1,
+        "child_index": null,
+        "properties": {
+          "label": "Processes",
+          "shortcut": "primary+2"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 8,
+        "node_type": "Tree",
+        "parent_id": 1,
+        "child_index": null,
+        "properties": {
+          "label": "Tree",
+          "shortcut": "primary+3"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 9,
+        "node_type": "RichText",
+        "parent_id": 1,
+        "child_index": null,
+        "properties": {
+          "label": "Details",
+          "shortcut": "primary+4"
+        }
+      },
+      {
+        "type": "SET_PROPERTY",
+        "node_id": 2,
+        "property": "shortcut",
+        "value": "f5"
+      },
+      {
+        "type": "BATCH_PROPERTY_SET",
+        "node_id": 3,
+        "properties": [
+          {
+            "property": "label",
+            "value": "Follow selection"
+          },
+          {
+            "property": "shortcut",
+            "value": "primary+shift+return"
+          }
+        ]
+      },
+      {
+        "type": "CLEAR_PROPERTY",
+        "node_id": 4,
+        "property": "shortcut"
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "success",
+    "committed_revision": 2,
+    "store_state": {
+      "node_count": 9,
+      "roots": [
+        1
+      ],
+      "nodes": {
+        "1": {
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "ordered_children": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "properties": {
+            "label": "Shortcuts"
+          }
+        },
+        "2": {
+          "node_id": 2,
+          "node_type": "Button",
+          "parent_id": 1,
+          "ordered_children": [],
+          "properties": {
+            "label": "Refresh",
+            "shortcut": "f5"
+          }
+        },
+        "3": {
+          "node_id": 3,
+          "node_type": "Toggle",
+          "parent_id": 1,
+          "ordered_children": [],
+          "properties": {
+            "label": "Follow selection",
+            "shortcut": "primary+shift+return"
+          }
+        },
+        "4": {
+          "node_id": 4,
+          "node_type": "TextInput",
+          "parent_id": 1,
+          "ordered_children": [],
+          "properties": {
+            "label": "Filter"
+          }
+        },
+        "5": {
+          "node_id": 5,
+          "node_type": "TextArea",
+          "parent_id": 1,
+          "ordered_children": [],
+          "properties": {
+            "label": "Notes",
+            "shortcut": "primary+shift+alt+n"
+          }
+        },
+        "6": {
+          "node_id": 6,
+          "node_type": "List",
+          "parent_id": 1,
+          "ordered_children": [],
+          "properties": {
+            "label": "Hosts",
+            "shortcut": "primary+1"
+          }
+        },
+        "7": {
+          "node_id": 7,
+          "node_type": "Table",
+          "parent_id": 1,
+          "ordered_children": [],
+          "properties": {
+            "label": "Processes",
+            "shortcut": "primary+2"
+          }
+        },
+        "8": {
+          "node_id": 8,
+          "node_type": "Tree",
+          "parent_id": 1,
+          "ordered_children": [],
+          "properties": {
+            "label": "Tree",
+            "shortcut": "primary+3"
+          }
+        },
+        "9": {
+          "node_id": 9,
+          "node_type": "RichText",
+          "parent_id": 1,
+          "ordered_children": [],
+          "properties": {
+            "label": "Details",
+            "shortcut": "primary+4"
+          }
+        }
+      },
+      "model_count": 0,
+      "models": {}
+    }
+  }
+}

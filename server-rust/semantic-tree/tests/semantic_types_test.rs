@@ -253,7 +253,7 @@ fn test_standard_registry_lookups() {
         TypeRef::TOOLBAR
     );
 
-    // Check all 30 standard property constants match registry.yaml
+    // Check all 31 standard property constants match registry.yaml
     assert_eq!(
         resolve_standard_property("label").unwrap(),
         PropertyRef::LABEL
@@ -374,6 +374,12 @@ fn test_standard_registry_lookups() {
         resolve_standard_property("selection_mode").unwrap(),
         PropertyRef::SELECTION_MODE
     );
+    assert_eq!(
+        resolve_standard_property("shortcut").unwrap(),
+        PropertyRef::SHORTCUT
+    );
+    assert_eq!(PropertyRef::SHORTCUT, PropertyRef::standard(31));
+    assert_eq!(STANDARD_PROPERTIES.len(), 31);
 
     // Check all 27 standard node types round-trip with their names
     for (id, name) in STANDARD_NODE_TYPES {
@@ -382,7 +388,7 @@ fn test_standard_registry_lookups() {
         assert_eq!(TypeRef::resolve_standard(name).unwrap(), type_ref);
     }
 
-    // Check all 30 standard properties round-trip with their names
+    // Check all 31 standard properties round-trip with their names
     for (id, name) in STANDARD_PROPERTIES {
         let prop_ref = PropertyRef::standard(*id);
         assert_eq!(prop_ref.standard_name(), Some(*name));

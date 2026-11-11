@@ -44,6 +44,41 @@ struct SemanticInspectorTests {
         #expect(snapshot[NodeId(404)] == nil)
     }
 
+    /// PX-016-G01 (§22.8, §22.9, §32 suite 11): the snapshot carries the canonical shortcut and,
+    /// when bound on this platform, its formatted text; a reserved combination has no display.
+    @Test("Snapshot exposes each node's shortcut and its platform display")
+    func snapshotExposesShortcuts() throws {
+        var store = SemanticStore()
+        try store.createNode(id: NodeId(1), nodeType: .surface)
+        try store.createNode(id: NodeId(2), nodeType: .button, parentID: NodeId(1), properties: [
+            (.label, .string("Refresh")), (.shortcut, .string("primary+shift+r")),
+        ])
+        try store.createNode(id: NodeId(3), nodeType: .button, parentID: NodeId(1), properties: [
+            (.label, .string("Copy")), (.shortcut, .string("primary+c")),
+        ])
+        try store.createNode(id: NodeId(4), nodeType: .textInput, parentID: NodeId(1))
+        let source = SemanticInspectionSourceSnapshot(
+            transaction: TransactionSnapshot(store: store, revision: Revision(1)),
+            epoch: SemanticInspectionEpoch(1)
+        )
+        let snapshot = makeInspector(source: source).snapshot()
+
+        let refresh = try #require(snapshot.node(NodeId(2)))
+        #expect(refresh.shortcut == "primary+shift+r")
+        #expect(refresh.shortcutDisplay == "⇧⌘R")
+        #expect(refresh.properties[.shortcut] == .string("primary+shift+r"))
+        // A shortcut is not an action: the advertised events are the registry's, unchanged.
+        #expect(refresh.supportedEventTypes == [.EVENT_ACTIVATE])
+
+        let copy = try #require(snapshot.node(NodeId(3)))
+        #expect(copy.shortcut == "primary+c")
+        #expect(copy.shortcutDisplay == nil)
+
+        let field = try #require(snapshot.node(NodeId(4)))
+        #expect(field.shortcut == nil)
+        #expect(field.shortcutDisplay == nil)
+    }
+
     @Test("Each query takes a fresh source while old snapshots remain immutable")
     func freshAndImmutableSnapshots() throws {
         let firstSource = try makeSource(buttonLabel: "Before", revision: 1, epoch: 9)

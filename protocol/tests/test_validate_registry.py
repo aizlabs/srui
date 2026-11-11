@@ -318,6 +318,10 @@ def test_expected_json_matches_fixtures_and_registry() -> None:
         "malformed_activate_nonzero_edit_seq",
         "malformed_terminal_input_empty",
         "malformed_terminal_data_empty",
+        # PX-016-G01: the standard `shortcut` property's closed grammar (§4 inv. 13, §26).
+        "malformed_shortcut_over_length",
+        "malformed_shortcut_unknown_token",
+        "malformed_shortcut_duplicate_modifier",
     }
     assert required_malformed <= malformed.keys()
 
@@ -369,3 +373,11 @@ def test_expected_json_matches_fixtures_and_registry() -> None:
         malformed["malformed_terminal_data_empty"]["expected_error"]
         == "empty TerminalData frame is forbidden"
     )
+    for key in (
+        "malformed_shortcut_over_length",
+        "malformed_shortcut_unknown_token",
+        "malformed_shortcut_duplicate_modifier",
+    ):
+        assert malformed[key]["expected_error"].startswith(
+            "wire transaction error: invalid shortcut: "
+        ), key

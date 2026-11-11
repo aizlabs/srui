@@ -3,6 +3,9 @@
 //! Provides high-level typed builder, accessor, session, transaction, and event routing
 //! abstractions on top of the core SRUI semantic tree and transaction engine (§6.3, §7.1–§7.7, §8,
 //! §12, §29). [`selection`] lets a server promote a collection's selection to semantic state.
+//! Admitted widgets (`Button`, `Toggle`, `TextInput`, `TextArea`, `List`, `Table`, `Tree`,
+//! `RichText`) expose the standard `shortcut` property through `shortcut`/`set_shortcut`/
+//! `clear_shortcut`, validated by the store against [`Shortcut`] (§4 inv. 13, §7.7, §22.5, §26).
 
 pub mod selection;
 pub mod session;
@@ -18,6 +21,12 @@ pub use srui_semantic_tree::{
     encode_transaction, encode_value, CapabilitySet, ClientInstanceId, EditSeq, EnumToken, Event,
     EventId, EventValidationError, NegotiationError, NodeRecord, Profile, ResourceHash, Revision,
     ServerCapabilities, Transaction, TxnError, WireError,
+};
+
+// Platform-neutral keyboard shortcuts (§7.7, §22.5)
+pub use srui_semantic_tree::{
+    shortcut_behavior, NamedKey, Shortcut, ShortcutBehavior, ShortcutError, ShortcutKey,
+    MAX_SHORTCUT_BYTES,
 };
 
 // Resource CAS API (§14)

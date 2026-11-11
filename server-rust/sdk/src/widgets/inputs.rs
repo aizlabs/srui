@@ -207,6 +207,11 @@ impl_bool_prop!(
     PropertyRef::READ_ONLY,
     "Whether the input is read-only (§7.4)."
 );
+impl_shortcut_prop!(
+    TextInput,
+    TextInputBuilder,
+    "Keyboard shortcut moving local focus to the field; no event is sent (§22.5)."
+);
 impl_common_state_props!(TextInput, TextInputBuilder);
 impl_common_layout_props!(TextInput, TextInputBuilder);
 
@@ -412,6 +417,11 @@ impl_bool_prop!(
     op_clear_read_only_for,
     PropertyRef::READ_ONLY,
     "Whether the text area is read-only (§7.4)."
+);
+impl_shortcut_prop!(
+    TextArea,
+    TextAreaBuilder,
+    "Keyboard shortcut moving local focus to the text area; no event is sent (§22.5)."
 );
 impl_common_state_props!(TextArea, TextAreaBuilder);
 impl_common_layout_props!(TextArea, TextAreaBuilder);

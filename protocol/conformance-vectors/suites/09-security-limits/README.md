@@ -13,6 +13,8 @@ scripts/run-conformance --suite 9
 
 Code-driven suite: no shared fixtures. This suite asserts behaviour against the registry tables `build.rs` and `generate_swift_registry.py` already generate, rather than introducing a second copy of the registry.
 
+Malformed shortcuts (PX-016-G01): `malformed_shortcut_over_length.bin`, `malformed_shortcut_unknown_token.bin` and `malformed_shortcut_duplicate_modifier.bin` (listed in `expected.json`) are refused on decode by Rust (`shortcut_test`) and by both Swift decode paths (`DecoderTests`, `ShortcutStoreTests`), with the same reason; the 32-byte bound is checked before parsing. Both parsers split on the `+` byte and assert the shared table `shortcut_grammar_cases.json` row for row.
+
 ## Runners
 
 **Rust**
@@ -21,6 +23,7 @@ Code-driven suite: no shared fixtures. This suite asserts behaviour against the 
 cargo test --manifest-path server-rust/Cargo.toml -p srui-sessiond --test security_limits_test
 cargo test --manifest-path server-rust/Cargo.toml -p srui-protocol --test framing_decoder_matrix_test
 cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test conformance_security_limits_test
+cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test shortcut_test
 ```
 
 **Swift**
@@ -31,4 +34,5 @@ swift test --package-path client-macos --filter DecoderTests
 swift test --package-path client-macos --filter SSHTransportPostureTests
 swift test --package-path client-macos --filter TransactionRateLimiterTests
 swift test --package-path client-macos --filter SecurityLimitsConformanceTests
+swift test --package-path client-macos --filter ShortcutStoreTests
 ```

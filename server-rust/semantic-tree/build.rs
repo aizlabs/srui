@@ -116,8 +116,8 @@ fn main() {
     );
     assert_eq!(
         registry.properties.len(),
-        30,
-        "Expected 30 standard properties, parsed {}",
+        31,
+        "Expected 31 standard properties, parsed {}",
         registry.properties.len()
     );
     assert_eq!(

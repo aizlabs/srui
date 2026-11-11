@@ -91,6 +91,7 @@ public let standardPropertiesTable: [(id: UInt32, name: String)] = [
     (28, "action_key"),
     (29, "columns"),
     (30, "selection_mode"),
+    (31, "shortcut"),
 ]
 
 /// Runtime value kinds declared by the standard property registry.
@@ -140,6 +141,7 @@ public func standardPropertyValueType(_ property: PropertyRef) -> StandardProper
     case 28: return .string
     case 29: return .list
     case 30: return .enumToken
+    case 31: return .string
     default: return nil
     }
 }
@@ -293,6 +295,7 @@ public func lookupStandardProperty(_ name: String) -> UInt32? {
     case "action_key": return 28
     case "columns": return 29
     case "selection_mode": return 30
+    case "shortcut": return 31
     default: return nil
     }
 }
@@ -329,6 +332,7 @@ public func lookupStandardPropertyName(_ id: UInt32) -> String? {
     case 28: return "action_key"
     case 29: return "columns"
     case 30: return "selection_mode"
+    case 31: return "shortcut"
     default: return nil
     }
 }
@@ -861,6 +865,8 @@ extension PropertyRef {
     public static let COLUMNS = PropertyRef.standard(29)
     public static let selectionMode = PropertyRef.standard(30)
     public static let SELECTION_MODE = PropertyRef.standard(30)
+    public static let shortcut = PropertyRef.standard(31)
+    public static let SHORTCUT = PropertyRef.standard(31)
 }
 
 // MARK: - Standard EnumToken Constants

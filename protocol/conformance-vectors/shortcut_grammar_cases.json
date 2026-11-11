@@ -1,0 +1,305 @@
+{
+  "description": "Shared parser parity table for the standard `shortcut` property (PX-016-G01; \u00a74 inv. 13, \u00a726). Rust (server-rust/semantic-tree/tests/shortcut_test.rs) and Swift (client-macos/Tests/SemanticModelTests/ShortcutStoreTests.swift) both assert every row: the outcome category, the offending token and the exact message. Tokens are split on the '+' byte of the UTF-8 encoding; message tokens render printable ASCII as itself, '\"' and '\\\\' backslash-escaped, and every other scalar as \\\\u{hex}.",
+  "cases": [
+    {
+      "input": "primary+r",
+      "outcome": "ok",
+      "canonical": "primary+r"
+    },
+    {
+      "input": "primary+shift+r",
+      "outcome": "ok",
+      "canonical": "primary+shift+r"
+    },
+    {
+      "input": "primary+alt+r",
+      "outcome": "ok",
+      "canonical": "primary+alt+r"
+    },
+    {
+      "input": "primary+shift+alt+r",
+      "outcome": "ok",
+      "canonical": "primary+shift+alt+r"
+    },
+    {
+      "input": "primary+0",
+      "outcome": "ok",
+      "canonical": "primary+0"
+    },
+    {
+      "input": "primary+9",
+      "outcome": "ok",
+      "canonical": "primary+9"
+    },
+    {
+      "input": "primary+return",
+      "outcome": "ok",
+      "canonical": "primary+return"
+    },
+    {
+      "input": "primary+shift+alt+page_down",
+      "outcome": "ok",
+      "canonical": "primary+shift+alt+page_down"
+    },
+    {
+      "input": "f1",
+      "outcome": "ok",
+      "canonical": "f1"
+    },
+    {
+      "input": "f12",
+      "outcome": "ok",
+      "canonical": "f12"
+    },
+    {
+      "input": "shift+f5",
+      "outcome": "ok",
+      "canonical": "shift+f5"
+    },
+    {
+      "input": "alt+f3",
+      "outcome": "ok",
+      "canonical": "alt+f3"
+    },
+    {
+      "input": "primary+f10",
+      "outcome": "ok",
+      "canonical": "primary+f10"
+    },
+    {
+      "input": "",
+      "outcome": "empty",
+      "message": "a shortcut must not be empty"
+    },
+    {
+      "input": "primary+shift+alt+page_down_xxxxx",
+      "outcome": "too_long",
+      "message": "a shortcut is at most 32 bytes, got 33"
+    },
+    {
+      "input": "cmd+r",
+      "outcome": "unknown_token",
+      "token": "cmd",
+      "message": "unknown shortcut token \"cmd\""
+    },
+    {
+      "input": "primary+R",
+      "outcome": "unknown_token",
+      "token": "R",
+      "message": "unknown shortcut token \"R\""
+    },
+    {
+      "input": "Primary+r",
+      "outcome": "unknown_token",
+      "token": "Primary",
+      "message": "unknown shortcut token \"Primary\""
+    },
+    {
+      "input": "primary+",
+      "outcome": "unknown_token",
+      "token": "",
+      "message": "unknown shortcut token \"\""
+    },
+    {
+      "input": "+r",
+      "outcome": "unknown_token",
+      "token": "",
+      "message": "unknown shortcut token \"\""
+    },
+    {
+      "input": "primary++r",
+      "outcome": "unknown_token",
+      "token": "",
+      "message": "unknown shortcut token \"\""
+    },
+    {
+      "input": "primary+f13",
+      "outcome": "unknown_token",
+      "token": "f13",
+      "message": "unknown shortcut token \"f13\""
+    },
+    {
+      "input": "primary+f01",
+      "outcome": "unknown_token",
+      "token": "f01",
+      "message": "unknown shortcut token \"f01\""
+    },
+    {
+      "input": "primary+f0",
+      "outcome": "unknown_token",
+      "token": "f0",
+      "message": "unknown shortcut token \"f0\""
+    },
+    {
+      "input": "primary+f100",
+      "outcome": "unknown_token",
+      "token": "f100",
+      "message": "unknown shortcut token \"f100\""
+    },
+    {
+      "input": "primary+comma",
+      "outcome": "unknown_token",
+      "token": "comma",
+      "message": "unknown shortcut token \"comma\""
+    },
+    {
+      "input": "primary+primary+r",
+      "outcome": "duplicate_modifier",
+      "token": "primary",
+      "message": "modifier \"primary\" appears more than once"
+    },
+    {
+      "input": "primary+shift+shift",
+      "outcome": "duplicate_modifier",
+      "token": "shift",
+      "message": "modifier \"shift\" appears more than once"
+    },
+    {
+      "input": "shift+primary+r",
+      "outcome": "misordered_modifier",
+      "token": "primary",
+      "message": "modifier \"primary\" is out of the canonical primary, shift, alt order"
+    },
+    {
+      "input": "primary+shift",
+      "outcome": "missing_key",
+      "message": "a shortcut must end in a key"
+    },
+    {
+      "input": "r",
+      "outcome": "requires_primary",
+      "token": "r",
+      "message": "key \"r\" requires the primary modifier; only f1-f12 may be bare"
+    },
+    {
+      "input": "shift+return",
+      "outcome": "requires_primary",
+      "token": "return",
+      "message": "key \"return\" requires the primary modifier; only f1-f12 may be bare"
+    },
+    {
+      "input": "primary+\u00e9",
+      "outcome": "unknown_token",
+      "token": "\u00e9",
+      "message": "unknown shortcut token \"\\u{e9}\""
+    },
+    {
+      "input": "shift+primary+\u0301",
+      "outcome": "misordered_modifier",
+      "token": "primary",
+      "message": "modifier \"primary\" is out of the canonical primary, shift, alt order"
+    },
+    {
+      "input": "shift+primary+\u0f37)",
+      "outcome": "misordered_modifier",
+      "token": "primary",
+      "message": "modifier \"primary\" is out of the canonical primary, shift, alt order"
+    },
+    {
+      "input": "primary+primary+\u0301",
+      "outcome": "duplicate_modifier",
+      "token": "primary",
+      "message": "modifier \"primary\" appears more than once"
+    },
+    {
+      "input": "alt+alt+\u0301+super+2",
+      "outcome": "duplicate_modifier",
+      "token": "alt",
+      "message": "modifier \"alt\" appears more than once"
+    },
+    {
+      "input": "shift+shift+\u0301+\\\u1039(+right",
+      "outcome": "duplicate_modifier",
+      "token": "shift",
+      "message": "modifier \"shift\" appears more than once"
+    },
+    {
+      "input": "\u0301+alt",
+      "outcome": "unknown_token",
+      "token": "\u0301",
+      "message": "unknown shortcut token \"\\u{301}\""
+    },
+    {
+      "input": "tab\u0308",
+      "outcome": "unknown_token",
+      "token": "tab\u0308",
+      "message": "unknown shortcut token \"tab\\u{308}\""
+    },
+    {
+      "input": "\u0000+w+K+shift+w",
+      "outcome": "unknown_token",
+      "token": "\u0000",
+      "message": "unknown shortcut token \"\\u{0}\""
+    },
+    {
+      "input": "\n+alt+shift+1+shift",
+      "outcome": "unknown_token",
+      "token": "\n",
+      "message": "unknown shortcut token \"\\u{a}\""
+    },
+    {
+      "input": "alt+\u1bec\ud83d\udc98t@",
+      "outcome": "unknown_token",
+      "token": "\u1bec\ud83d\udc98t@",
+      "message": "unknown shortcut token \"\\u{1bec}\\u{1f498}t@\""
+    },
+    {
+      "input": "primary+\"",
+      "outcome": "unknown_token",
+      "token": "\"",
+      "message": "unknown shortcut token \"\\\"\""
+    },
+    {
+      "input": "primary+\\",
+      "outcome": "unknown_token",
+      "token": "\\",
+      "message": "unknown shortcut token \"\\\\\""
+    },
+    {
+      "input": "\u0301",
+      "outcome": "unknown_token",
+      "token": "\u0301",
+      "message": "unknown shortcut token \"\\u{301}\""
+    },
+    {
+      "input": "primary+\u0301",
+      "outcome": "unknown_token",
+      "token": "\u0301",
+      "message": "unknown shortcut token \"\\u{301}\""
+    },
+    {
+      "input": "f\u0301",
+      "outcome": "unknown_token",
+      "token": "f\u0301",
+      "message": "unknown shortcut token \"f\\u{301}\""
+    },
+    {
+      "input": "primary+e\u0301",
+      "outcome": "unknown_token",
+      "token": "e\u0301",
+      "message": "unknown shortcut token \"e\\u{301}\""
+    },
+    {
+      "input": "primary+\u212a",
+      "outcome": "unknown_token",
+      "token": "\u212a",
+      "message": "unknown shortcut token \"\\u{212a}\""
+    },
+    {
+      "input": "primary+\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9",
+      "outcome": "too_long",
+      "message": "a shortcut is at most 32 bytes, got 34"
+    },
+    {
+      "input": "primary+shift+alt+page_down+xxx\u00e9",
+      "outcome": "too_long",
+      "message": "a shortcut is at most 32 bytes, got 33"
+    },
+    {
+      "input": "primary+shift+alt+page_down+xx\u00e9",
+      "outcome": "unknown_token",
+      "token": "page_down",
+      "message": "unknown shortcut token \"page_down\""
+    }
+  ]
+}

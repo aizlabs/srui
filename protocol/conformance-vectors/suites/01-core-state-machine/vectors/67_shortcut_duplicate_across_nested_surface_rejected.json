@@ -1,0 +1,99 @@
+{
+  "name": "shortcut_duplicate_across_nested_surface_rejected",
+  "description": "A nested Surface is rendered inline in the window-owning Surface, so it shares that Surface's uniqueness scope: a duplicate inside it is refused, and the preceding distinct key is discarded with the transaction (§7.4, §12.1; PX-016-G01 round 1).",
+  "spec_sections": [
+    "§4",
+    "§7.4",
+    "§7.6",
+    "§7.7",
+    "§12.1",
+    "§22.5",
+    "§26"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Shortcuts"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Button",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "label": "Refresh",
+            "shortcut": "primary+r"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 3,
+          "node_type": "Button",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "label": "Pause",
+            "shortcut": "primary+p"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 10,
+          "node_type": "Surface",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "label": "Nested panel"
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "CREATE_NODE",
+        "node_id": 11,
+        "node_type": "Button",
+        "parent_id": 10,
+        "child_index": null,
+        "properties": {
+          "label": "Inner refresh",
+          "shortcut": "primary+n"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 12,
+        "node_type": "Button",
+        "parent_id": 10,
+        "child_index": null,
+        "properties": {
+          "label": "Inner refresh twin",
+          "shortcut": "primary+r"
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "duplicate_shortcut",
+    "failed_op_index": 1,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

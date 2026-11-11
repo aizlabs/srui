@@ -145,6 +145,8 @@ public enum ValueConversionError: Error, Hashable, Equatable, Sendable, CustomSt
     case missingField(String)
     case invalidResourceHashLength(Int)
     case invalidNestedStructure(String)
+    /// A standard `shortcut` value outside the closed canonical grammar (§4 inv. 13, §26).
+    case invalidShortcut(String)
 
     public var description: String {
         switch self {
@@ -154,6 +156,8 @@ public enum ValueConversionError: Error, Hashable, Equatable, Sendable, CustomSt
             return "expected 32-byte resource hash, got \(len) bytes"
         case .invalidNestedStructure(let msg):
             return "invalid nested structure: \(msg)"
+        case .invalidShortcut(let reason):
+            return "invalid shortcut: \(reason)"
         }
     }
 }

@@ -60,6 +60,51 @@ fn event_of(store: &SemanticStore, target: NodeId, name: &str) -> Event {
     )
 }
 
+/// PX-016-G01 (§7.6, §7.7, §22.5): a keyboard shortcut is not an event. The registry defines no
+/// shortcut event type, so a shortcut on a Button can only produce the ordinary `ACTIVATE` a click
+/// produces, on a Toggle the ordinary `VALUE_CHANGED`, and on a focus target nothing at all. The
+/// encoded event of a shortcut-bearing Button is therefore byte-identical to a click's; the server
+/// still validates it like any other, and refuses it with `NodeDisabled` when the node is disabled.
+#[test]
+fn test_a_shortcut_produces_only_the_ordinary_semantic_event() {
+    for &(_, name) in STANDARD_EVENTS {
+        assert!(
+            !name.to_ascii_uppercase().contains("SHORTCUT") && !name.contains("KEY"),
+            "event '{name}' would make a shortcut its own wire event"
+        );
+    }
+
+    let shortcut = (PropertyRef::SHORTCUT, Value::from("primary+r"));
+    let (with_shortcut, target) = store_with(TypeRef::BUTTON, vec![shortcut.clone()]);
+    let (without_shortcut, _) = store_with(TypeRef::BUTTON, vec![]);
+    let from_shortcut = event_of(&with_shortcut, target, "ACTIVATE");
+    let from_click = event_of(&without_shortcut, target, "ACTIVATE");
+    assert_eq!(encode_event(&from_shortcut), encode_event(&from_click));
+    from_shortcut
+        .validate(&with_shortcut)
+        .expect("an enabled shortcut Button accepts ACTIVATE");
+
+    // A forged ACTIVATE to a disabled shortcut Button is refused like any other.
+    let (disabled, target) = store_with(
+        TypeRef::BUTTON,
+        vec![shortcut.clone(), (PropertyRef::ENABLED, Value::from(false))],
+    );
+    assert!(matches!(
+        event_of(&disabled, target, "ACTIVATE").validate(&disabled),
+        Err(EventValidationError::NodeDisabled(id)) if id == target
+    ));
+
+    // A Toggle's shortcut produces VALUE_CHANGED, refused the same way when disabled.
+    let (toggle, target) = store_with(
+        TypeRef::TOGGLE,
+        vec![shortcut, (PropertyRef::ENABLED, Value::from(false))],
+    );
+    assert!(matches!(
+        event_of(&toggle, target, "VALUE_CHANGED").validate(&toggle),
+        Err(EventValidationError::NodeDisabled(_))
+    ));
+}
+
 /// §7.6/§7.7: the registered event table partitions cleanly, and every coordinate event is a
 /// `POINTER_*`. Asserted against the generated table, not a restated list.
 #[test]

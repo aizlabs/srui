@@ -29,17 +29,22 @@ public struct RenderAccessibilityMetadata: Equatable, Sendable {
     public internal(set) var description: String?
     public internal(set) var valueDescription: String?
     public internal(set) var actions: [String]
+    /// Platform-formatted bound shortcut (e.g. `⇧⌘R`), shown in the tooltip and accessibility help
+    /// (§22.8). `nil` when the node has no shortcut or its shortcut is not bound here.
+    public internal(set) var shortcut: String?
 
     public init(
         label: String? = nil,
         description: String? = nil,
         valueDescription: String? = nil,
-        actions: [String] = []
+        actions: [String] = [],
+        shortcut: String? = nil
     ) {
         self.label = label
         self.description = description
         self.valueDescription = valueDescription
         self.actions = actions
+        self.shortcut = shortcut
     }
 }
 
@@ -60,6 +65,10 @@ public final class RenderHandle {
     public internal(set) var textAdapter: NativeTextEditorAdapter?
     /// Content hash of the resource most recently referenced by this node (§14).
     public internal(set) var pendingResourceHash: ResourceHash?
+    /// Native key equivalent of the node's `shortcut`, when bound (PX-016-G01; §7.7, §22.5).
+    public internal(set) var shortcutBinding: AppKitShortcutBinding?
+    /// Why the node's `shortcut` is not bound (reserved, invalid or not admitted), if it is not.
+    public internal(set) var shortcutDiagnostic: ShortcutDiagnostic?
 
     internal var propertyConstraints: [PropertyRef: [NSLayoutConstraint]] = [:]
 

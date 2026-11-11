@@ -819,3 +819,100 @@ fn test_widget_trait_and_generic_delete() {
     assert!(!store.contains_node(row.id()));
     assert!(!store.contains_node(btn.id()));
 }
+
+/// PX-016-G01 (§7.4, §7.6, §7.7, §22.5): every admitted widget exposes `shortcut` through its
+/// builder and `set_shortcut`/`clear_shortcut`; the store refuses a malformed value, a duplicate
+/// within the Surface, and a shortcut on a widget type that does not admit one.
+#[test]
+fn test_shortcut_builder_set_and_clear_on_every_admitted_widget() {
+    let mut store = SemanticStore::new();
+    let surface = Surface::builder(1u64)
+        .label("Shortcuts")
+        .create(&mut store)
+        .expect("surface");
+
+    let button = Button::builder(2u64)
+        .parent(surface.id())
+        .label("Refresh")
+        .shortcut("primary+r")
+        .create(&mut store)
+        .expect("button");
+    let toggle = Toggle::checkbox(3u64)
+        .parent(surface.id())
+        .label("Follow")
+        .shortcut(Shortcut::parse("primary+shift+f").expect("canonical"))
+        .create(&mut store)
+        .expect("toggle");
+    let input = TextInput::builder(4u64)
+        .parent(surface.id())
+        .shortcut("primary+l")
+        .create(&mut store)
+        .expect("text input");
+    let area = TextArea::builder(5u64)
+        .parent(surface.id())
+        .shortcut("primary+alt+n")
+        .create(&mut store)
+        .expect("text area");
+    let list = List::builder(6u64)
+        .parent(surface.id())
+        .shortcut("primary+1")
+        .create(&mut store)
+        .expect("list");
+    let table = Table::builder(7u64)
+        .parent(surface.id())
+        .shortcut("primary+2")
+        .create(&mut store)
+        .expect("table");
+    let tree = Tree::builder(8u64)
+        .parent(surface.id())
+        .shortcut("primary+3")
+        .create(&mut store)
+        .expect("tree");
+    let rich = RichText::builder(9u64)
+        .parent(surface.id())
+        .shortcut("f6")
+        .create(&mut store)
+        .expect("rich text");
+
+    assert_eq!(button.shortcut(&store), Some("primary+r"));
+    assert_eq!(toggle.shortcut(&store), Some("primary+shift+f"));
+    assert_eq!(input.shortcut(&store), Some("primary+l"));
+    assert_eq!(area.shortcut(&store), Some("primary+alt+n"));
+    assert_eq!(list.shortcut(&store), Some("primary+1"));
+    assert_eq!(table.shortcut(&store), Some("primary+2"));
+    assert_eq!(tree.shortcut(&store), Some("primary+3"));
+    assert_eq!(rich.shortcut(&store), Some("f6"));
+    for id in 2u64..=9 {
+        assert!(store
+            .get_node(NodeId::new(id))
+            .unwrap()
+            .has_property(PropertyRef::SHORTCUT));
+    }
+
+    // SET and CLEAR through the typed handle and the operation forms.
+    button.set_shortcut(&mut store, "f5").expect("set");
+    assert_eq!(Button::get_shortcut(&store, button.id()), Some("f5"));
+    assert_eq!(
+        button.op_set_shortcut("primary+r"),
+        Operation::set_property(button.id(), PropertyRef::SHORTCUT, "primary+r")
+    );
+    assert_eq!(
+        button.op_clear_shortcut(),
+        Operation::clear_property(button.id(), PropertyRef::SHORTCUT)
+    );
+    button.clear_shortcut(&mut store).expect("clear");
+    assert_eq!(button.shortcut(&store), None);
+
+    // Refusals surface as store errors, never silent drops.
+    let bare = toggle.set_shortcut(&mut store, "f").unwrap_err();
+    assert_eq!(bare.conformance_code(), "invalid_shortcut");
+    let duplicate = toggle.set_shortcut(&mut store, "primary+l").unwrap_err();
+    assert_eq!(duplicate.conformance_code(), "duplicate_shortcut");
+    assert_eq!(toggle.shortcut(&store), Some("primary+shift+f"));
+    let refused = Text::builder(10u64)
+        .parent(surface.id())
+        .property(PropertyRef::SHORTCUT, "primary+t")
+        .create(&mut store)
+        .unwrap_err();
+    assert_eq!(refused.conformance_code(), "shortcut_not_admitted");
+}

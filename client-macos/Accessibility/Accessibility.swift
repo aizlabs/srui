@@ -4,6 +4,10 @@
 //
 // Platform-neutral semantic inspection and trusted in-process automation.
 //
+// Each node snapshot carries its canonical `shortcut` and, when this platform binds it, the
+// platform-formatted text (PX-016-G01; §22.8, §22.9). A shortcut is not an action: automation
+// still acts only through `perform(_:)` and the normal event path.
+//
 
 import SemanticModel
 
@@ -161,6 +165,11 @@ public struct SemanticNodeSnapshot: Equatable, Sendable {
     public let supportedEventTypes: [TypeRef]
     /// Complete sparse semantic properties for inspection by advanced consumers.
     public let properties: [PropertyRef: Value]
+    /// Canonical standard `shortcut` value, e.g. `primary+shift+r` (§7.7).
+    public let shortcut: String?
+    /// The shortcut as this platform presents it, e.g. `⇧⌘R`; `nil` when there is none or the
+    /// platform reserves the combination, so it is not bound (§22.8, §22.9).
+    public let shortcutDisplay: String?
 
     public init(
         id: NodeId,
@@ -179,7 +188,9 @@ public struct SemanticNodeSnapshot: Equatable, Sendable {
         actionKey: String?,
         actions: [String],
         supportedEventTypes: [TypeRef],
-        properties: [PropertyRef: Value]
+        properties: [PropertyRef: Value],
+        shortcut: String? = nil,
+        shortcutDisplay: String? = nil
     ) {
         self.id = id
         self.role = role
@@ -198,6 +209,8 @@ public struct SemanticNodeSnapshot: Equatable, Sendable {
         self.actions = actions
         self.supportedEventTypes = supportedEventTypes
         self.properties = properties
+        self.shortcut = shortcut
+        self.shortcutDisplay = shortcutDisplay
     }
 }
 
@@ -425,6 +438,10 @@ public struct SemanticInspector: Sendable {
                 selected: properties[.selected]?.asBool ?? false,
                 validationState: properties[.validationState]?.asEnumToken
             )
+            let shortcut = properties[.shortcut]?.asString
+            let shortcutDisplay = shortcut
+                .flatMap { try? Shortcut(parsing: $0) }
+                .flatMap { $0.reservedEntry() == nil ? $0.displayString() : nil }
             let actions: [String]
             if case .list(let actionValues)? = properties[.actions] {
                 actions = actionValues.compactMap { $0.asString }
@@ -450,7 +467,9 @@ public struct SemanticInspector: Sendable {
                     actionKey: properties[.actionKey]?.asString,
                     actions: actions,
                     supportedEventTypes: standardEventsEmitted(by: node.nodeType),
-                    properties: properties
+                    properties: properties,
+                    shortcut: shortcut,
+                    shortcutDisplay: shortcutDisplay
                 )
             )
 

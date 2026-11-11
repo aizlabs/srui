@@ -1,0 +1,149 @@
+{
+  "name": "shortcut_same_value_in_two_surfaces_success",
+  "description": "Uniqueness is scoped to a Surface: two Surfaces may each bind primary+r (§7.4).",
+  "spec_sections": [
+    "§4",
+    "§7.4",
+    "§7.6",
+    "§7.7",
+    "§12.1",
+    "§22.5",
+    "§26"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Shortcuts"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Button",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "label": "Refresh",
+            "shortcut": "primary+r"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 3,
+          "node_type": "Button",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "label": "Pause",
+            "shortcut": "primary+p"
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "CREATE_NODE",
+        "node_id": 10,
+        "node_type": "Surface",
+        "parent_id": null,
+        "child_index": null,
+        "properties": {
+          "label": "Second window"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 11,
+        "node_type": "Button",
+        "parent_id": 10,
+        "child_index": null,
+        "properties": {
+          "label": "Refresh",
+          "shortcut": "primary+r"
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "success",
+    "committed_revision": 2,
+    "store_state": {
+      "node_count": 5,
+      "roots": [
+        1,
+        10
+      ],
+      "nodes": {
+        "1": {
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "ordered_children": [
+            2,
+            3
+          ],
+          "properties": {
+            "label": "Shortcuts"
+          }
+        },
+        "2": {
+          "node_id": 2,
+          "node_type": "Button",
+          "parent_id": 1,
+          "ordered_children": [],
+          "properties": {
+            "label": "Refresh",
+            "shortcut": "primary+r"
+          }
+        },
+        "3": {
+          "node_id": 3,
+          "node_type": "Button",
+          "parent_id": 1,
+          "ordered_children": [],
+          "properties": {
+            "label": "Pause",
+            "shortcut": "primary+p"
+          }
+        },
+        "10": {
+          "node_id": 10,
+          "node_type": "Surface",
+          "parent_id": null,
+          "ordered_children": [
+            11
+          ],
+          "properties": {
+            "label": "Second window"
+          }
+        },
+        "11": {
+          "node_id": 11,
+          "node_type": "Button",
+          "parent_id": 10,
+          "ordered_children": [],
+          "properties": {
+            "label": "Refresh",
+            "shortcut": "primary+r"
+          }
+        }
+      },
+      "model_count": 0,
+      "models": {}
+    }
+  }
+}

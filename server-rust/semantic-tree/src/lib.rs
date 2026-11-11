@@ -9,7 +9,9 @@
 //! - §6.4: Type and property references, namespaces ([`TypeRef`], [`PropertyRef`], [`STANDARD_NAMESPACE_ID`])
 //! - §6.5: Typed value representation ([`Value`], semantic tuples, lists, small records)
 //! - §7.6: Standard events ([`Event`], [`STANDARD_EVENTS`])
-//! - §7.7: Semantic input routing ([`Event`], [`EventId`])
+//! - §7.7: Semantic input routing ([`Event`], [`EventId`]); the standard `shortcut` property's
+//!   closed canonical grammar and node-type admission ([`Shortcut`], [`shortcut_behavior`],
+//!   [`MAX_SHORTCUT_BYTES`]), checked at decode and apply (§4 inv. 13, §22.5, §26)
 //! - §12: Persistent object graph and mutation stream
 //! - §12.1: Revisions and transactions ([`Revision`], [`Transaction`], [`Operation`])
 //! - §12.2: Commits are state-consistency boundaries, not render frames
@@ -24,6 +26,7 @@ pub mod capability;
 pub mod event;
 pub mod ids;
 pub mod model;
+pub mod shortcut;
 pub mod store;
 pub mod transaction;
 pub mod value;
@@ -54,6 +57,11 @@ pub use ids::{
 };
 
 pub use model::{Model, ModelItem};
+
+pub use shortcut::{
+    escape_token, shortcut_behavior, NamedKey, Shortcut, ShortcutBehavior, ShortcutError,
+    ShortcutKey, MAX_SHORTCUT_BYTES,
+};
 
 pub use store::{
     is_selectable_collection, Node, SemanticStore, StoreError, StoreLimits,

@@ -71,6 +71,11 @@ public enum DirtyClassifier {
         case .accessibleDescription, .valueDescription, .actions:
             return .accessibilityOnly(nodeID: nodeID, property: property)
 
+        // A shortcut rebinds the handle's key equivalent and its tooltip/help in place; it never
+        // changes the view tree (PX-016-G01; §7.7, §22.8, §23).
+        case .shortcut:
+            return .accessibilityOnly(nodeID: nodeID, property: property)
+
         case .resource:
             return .resourceArrival(nodeID: nodeID, property: property)
 

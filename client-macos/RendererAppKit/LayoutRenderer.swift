@@ -22,12 +22,20 @@ public final class LayoutRenderer {
     /// Whether surfaces have been ordered on screen, so a remount can restore visibility.
     private var surfacesShown = false
 
+    /// Local dispatch of the standard `shortcut` property for this renderer's surfaces.
+    public let shortcutRouter: ShortcutRouter
+
     public init(
         registry: RenderRegistry = RenderRegistry(),
         controlFactory: ControlFactory = ControlFactory()
     ) {
         self.registry = registry
         self.controlFactory = controlFactory
+        let router = ShortcutRouter(registry: registry)
+        self.shortcutRouter = router
+        controlFactory.shortcutKeyEquivalentHandler = { [weak router] event, window in
+            router?.handleKeyEquivalent(event, in: window) ?? false
+        }
     }
 
     /// Rebuilds every handle from `store`.
@@ -51,6 +59,7 @@ public final class LayoutRenderer {
                 try self.mount(nodeID: rootID, from: store)
             }
         }
+        shortcutRouter.store = store
         if preserveLocalText {
             try controlFactory.textEditingSession.withPreservedLocalText(remount)
         } else {
@@ -60,6 +69,8 @@ public final class LayoutRenderer {
         if surfacesShown {
             showWindows()
         }
+        // A remount rebuilds every view, so the Tab order is recomputed from the new hierarchy.
+        recalculateKeyViewLoops()
         let present = Set(registry.allHandles.map(\.nodeID))
         applyPromotedSelections(store: store, explicit: promotedNodeIDs, only: nil)
         controlFactory.pruneCollectionSelectionMemory(keeping: present)
@@ -77,6 +88,7 @@ public final class LayoutRenderer {
     ) throws -> [DirtyClassification] {
         let classifications = DirtyClassifier.classify(transaction)
         let promotedNodeIDs = Self.promotionTargets(of: transaction, in: newStore)
+        shortcutRouter.store = newStore
         if classifications.contains(where: \.isStructureAffecting) {
             RendererDiagnostics.log(
                 "transaction revision=\(transaction.newRevision) structural; remounting"
@@ -200,6 +212,15 @@ public final class LayoutRenderer {
                 for: node,
                 explicit: explicit.contains(handle.nodeID)
             )
+        }
+    }
+
+    /// Rebuilds each Surface window's key-view loop from its current view hierarchy (§22.5).
+    func recalculateKeyViewLoops() {
+        for handle in registry.surfaceHandles {
+            guard let window = handle.window else { continue }
+            window.autorecalculatesKeyViewLoop = true
+            window.recalculateKeyViewLoop()
         }
     }
 

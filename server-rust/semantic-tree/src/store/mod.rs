@@ -6,6 +6,13 @@
 //! index), and it is held only while `selection_mode` is `single` or `multiple`. Whether the item
 //! exists is not checked here, because a sparse replica may legitimately not cache it; the SDK
 //! refuses an unknown item against the authoritative store instead.
+//!
+//! Standard property 31 `shortcut` (§4 inv. 13, §7.4, §7.7, §22.5, §26) is checked on every
+//! mutation that can set it or change its scope: the value must be in the closed canonical
+//! grammar of [`crate::shortcut`], the node type must admit it, and no two nodes of one tree —
+//! the window-owning root `Surface` and everything under it, nested `Surface`s included, since
+//! the renderer mounts those inline in the same window — may hold the same shortcut. Checks run per operation, like every other store rule, so the Swift replica
+//! reaches the same verdict at the same operation index.
 
 pub mod error;
 pub mod limits;
@@ -20,6 +27,7 @@ pub use node::Node;
 
 use crate::ids::{ItemId, ModelId, NodeId, PropertyRef, StandardSelectionMode, TypeRef};
 use crate::model::{Model, ModelItem};
+use crate::shortcut::{shortcut_behavior, Shortcut, ShortcutError};
 use crate::transaction::{Operation, Revision};
 use crate::value::Value;
 use std::collections::{HashMap, HashSet};
@@ -68,6 +76,28 @@ fn validate_collection_selection(
             node_id,
             reason: "selection_mode is none or absent, so no selection can be promoted".to_string(),
         });
+    }
+    Ok(())
+}
+
+/// Validates one `shortcut` value against the grammar and the node type's admission (§7.4, §26).
+fn validate_shortcut_value(
+    node_id: NodeId,
+    node_type: TypeRef,
+    value: &Value,
+) -> Result<(), StoreError> {
+    let Value::String(text) = value else {
+        return Err(StoreError::InvalidShortcut {
+            node_id,
+            reason: ShortcutError::NotAString.to_string(),
+        });
+    };
+    Shortcut::parse(text).map_err(|e| StoreError::InvalidShortcut {
+        node_id,
+        reason: e.to_string(),
+    })?;
+    if shortcut_behavior(node_type).is_none() {
+        return Err(StoreError::ShortcutNotAdmitted { node_id, node_type });
     }
     Ok(())
 }
@@ -290,6 +320,110 @@ impl SemanticStore {
         1 + max_child_depth
     }
 
+    /// The node that scopes shortcut uniqueness for `id`: the root of its tree.
+    ///
+    /// In the standard profile that root is the window-owning `Surface`. A nested `Surface` is
+    /// rendered inline inside the enclosing window (`LayoutRenderer.attach`), so it shares the
+    /// root's scope: two equal shortcuts there would compete for one window's key equivalents.
+    fn shortcut_scope(&self, id: NodeId) -> NodeId {
+        let mut current = id;
+        while let Some(parent) = self.nodes.get(&current).and_then(|n| n.parent_id) {
+            current = parent;
+        }
+        current
+    }
+
+    /// Finds a node in `scope`'s subtree, other than those in `exclude`, that already holds
+    /// `shortcut`.
+    ///
+    /// lc-debt: O(nodes in the tree) per shortcut-setting operation; an index from
+    /// (scope, shortcut) to NodeId would make it O(1) at the cost of maintaining it on every
+    /// MOVE_NODE/DELETE_NODE.
+    fn find_shortcut_holder(
+        &self,
+        scope: NodeId,
+        shortcut: &str,
+        exclude: &HashSet<NodeId>,
+    ) -> Option<NodeId> {
+        let mut stack = vec![scope];
+        while let Some(id) = stack.pop() {
+            let Some(node) = self.nodes.get(&id) else {
+                continue;
+            };
+            if !exclude.contains(&id)
+                && matches!(
+                    node.get_property(PropertyRef::SHORTCUT),
+                    Some(Value::String(s)) if s == shortcut
+                )
+            {
+                return Some(id);
+            }
+            stack.extend(node.ordered_children.iter().copied());
+        }
+        None
+    }
+
+    /// Refuses `value` for `node_id` (inside `scope`) when another node of the scope holds it.
+    fn check_shortcut_unique(
+        &self,
+        node_id: NodeId,
+        scope: NodeId,
+        value: &Value,
+    ) -> Result<(), StoreError> {
+        let Value::String(shortcut) = value else {
+            return Ok(());
+        };
+        let exclude = HashSet::from([node_id]);
+        if let Some(existing) = self.find_shortcut_holder(scope, shortcut, &exclude) {
+            return Err(StoreError::DuplicateShortcut {
+                node_id,
+                existing,
+                shortcut: shortcut.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Shortcut checks for a MOVE_NODE that would re-parent `id` under `new_parent_id`.
+    fn check_move_keeps_shortcuts_unique(
+        &self,
+        id: NodeId,
+        new_parent_id: Option<NodeId>,
+    ) -> Result<(), StoreError> {
+        let Some(new_parent) = new_parent_id else {
+            // A new root is its own scope; its subtree's shortcuts were already unique.
+            return Ok(());
+        };
+        let destination = self.shortcut_scope(new_parent);
+        if destination == self.shortcut_scope(id) {
+            return Ok(());
+        }
+        // Every shortcut the moved subtree carries joins the destination tree.
+        let mut moved = HashSet::new();
+        let mut carried = Vec::new();
+        let mut stack = vec![id];
+        while let Some(current) = stack.pop() {
+            let Some(node) = self.nodes.get(&current) else {
+                continue;
+            };
+            moved.insert(current);
+            if let Some(Value::String(s)) = node.get_property(PropertyRef::SHORTCUT) {
+                carried.push((current, s.clone()));
+            }
+            stack.extend(node.ordered_children.iter().copied());
+        }
+        for (holder, shortcut) in carried {
+            if let Some(existing) = self.find_shortcut_holder(destination, &shortcut, &moved) {
+                return Err(StoreError::DuplicateShortcut {
+                    node_id: holder,
+                    existing,
+                    shortcut,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Creates a new node in the graph (§13 CREATE_NODE, §6.2, §26).
     pub fn create_node(
         &mut self,
@@ -349,6 +483,18 @@ impl SemanticStore {
             last_assigned(&prop_list, PropertyRef::VALUE),
             last_assigned(&prop_list, PropertyRef::SELECTION_MODE),
         )?;
+        for (prop, val) in &prop_list {
+            if *prop == PropertyRef::SHORTCUT {
+                validate_shortcut_value(id, node_type, val)?;
+            }
+        }
+        if let (Some(shortcut), Some(pid)) =
+            (last_assigned(&prop_list, PropertyRef::SHORTCUT), parent_id)
+        {
+            if self.nodes.contains_key(&pid) {
+                self.check_shortcut_unique(id, self.shortcut_scope(pid), shortcut)?;
+            }
+        }
 
         // 5. Validate insertion index if parent specified
         if let Some(pid) = parent_id {
@@ -465,6 +611,15 @@ impl SemanticStore {
     ) -> Result<Option<Value>, StoreError> {
         self.limits.validate_value(&val)?;
         self.validate_property_references(prop, &val)?;
+        if prop == PropertyRef::SHORTCUT {
+            let node_type = self
+                .nodes
+                .get(&id)
+                .ok_or(StoreError::NodeNotFound(id))?
+                .node_type;
+            validate_shortcut_value(id, node_type, &val)?;
+            self.check_shortcut_unique(id, self.shortcut_scope(id), &val)?;
+        }
         let node = self
             .nodes
             .get_mut(&id)
@@ -513,6 +668,14 @@ impl SemanticStore {
             let mode = last_assigned(&prop_list, PropertyRef::SELECTION_MODE)
                 .or_else(|| node.get_property(PropertyRef::SELECTION_MODE));
             validate_collection_selection(id, node.node_type, value, mode)?;
+            for (prop, val) in &prop_list {
+                if *prop == PropertyRef::SHORTCUT {
+                    validate_shortcut_value(id, node.node_type, val)?;
+                }
+            }
+            if let Some(shortcut) = last_assigned(&prop_list, PropertyRef::SHORTCUT) {
+                self.check_shortcut_unique(id, self.shortcut_scope(id), shortcut)?;
+            }
         }
 
         let node = self
@@ -601,6 +764,9 @@ impl SemanticStore {
                 });
             }
         }
+
+        // Shortcut uniqueness within the destination Surface (§7.4).
+        self.check_move_keeps_shortcuts_unique(id, new_parent_id)?;
 
         // 4. Remove from old location
         match old_parent_id {

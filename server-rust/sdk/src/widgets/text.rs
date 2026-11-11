@@ -238,5 +238,10 @@ impl_bool_prop!(
     PropertyRef::READ_ONLY,
     "Whether the text is read-only (§7.4)."
 );
+impl_shortcut_prop!(
+    RichText,
+    RichTextBuilder,
+    "Keyboard shortcut moving local focus to the selectable text; no event is sent (§22.5)."
+);
 impl_common_state_props!(RichText, RichTextBuilder);
 impl_common_layout_props!(RichText, RichTextBuilder);

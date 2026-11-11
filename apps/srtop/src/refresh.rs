@@ -6687,6 +6687,83 @@ mod disclosure_commit_tests {
         assert!(!view.collapsed.contains(&alpha));
     }
 
+    /// A view switch that does not commit (`republish_in`, with no entry
+    /// before the switch's rows) leaves the mirror and the inspector as they
+    /// were: the client still shows the tree, `alpha` collapsed and `xray`
+    /// selected.
+    #[test]
+    fn a_failed_switch_away_from_the_tree_keeps_the_mirror_and_the_inspector() {
+        let mut source = Family::new(&[
+            (10, "alpha", 0, 10),
+            (11, "beta", 10, 11),
+            (30, "xray", 0, 60),
+        ]);
+        let (session, mut view) = tree(&mut source);
+        let alpha = item(&view, 10);
+        let xray = item(&view, 30);
+        view.select_item_in(&session, TREE, Some(xray)).unwrap();
+        collapse(&session, &mut view, 10);
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.set_view(&session, Some(false)).is_err());
+        }
+        assert_eq!(view.view_mode(), ViewMode::Tree);
+        assert!(
+            view.collapsed.contains(&alpha),
+            "the client keeps alpha collapsed"
+        );
+        assert_eq!(view.inspector().selected(), Some(xray));
+        // The switch that commits starts the table with nothing collapsed.
+        view.set_view(&session, Some(false)).unwrap();
+        assert!(view.collapsed.is_empty());
+        assert_eq!(view.inspector().selected(), Some(xray));
+    }
+
+    /// A filter republish that does not commit leaves the mirror and the
+    /// inspector as they were, although it would have pruned the collapsed
+    /// `rho` it hides and cleared the inspector for the `xray` it moves
+    /// under the collapsed `alpha`.
+    #[test]
+    fn a_failed_filter_republish_keeps_the_mirror_and_the_inspector() {
+        let mut source = Family::new(&[
+            (10, "alpha", 0, 10),
+            (11, "beta", 10, 11),
+            (12, "mid", 10, 12),
+            (13, "xray", 12, 13),
+            (20, "rho", 0, 20),
+            (21, "sigma", 20, 21),
+        ]);
+        let (session, mut view) = tree(&mut source);
+        view.set_filter(&session, "alpha | beta | xray | rho | sigma")
+            .unwrap();
+        let alpha = item(&view, 10);
+        let rho = item(&view, 20);
+        let xray = item(&view, 13);
+        view.select_item_in(&session, TREE, Some(xray)).unwrap();
+        collapse(&session, &mut view, 10);
+        collapse(&session, &mut view, 20);
+        let both: HashSet<ItemId> = [alpha, rho].into_iter().collect();
+        assert_eq!(
+            view.inspector().selected(),
+            Some(xray),
+            "xray is a shown root"
+        );
+        {
+            // The filter's pending status commits first; its republish fails.
+            let _armed = commit_fault::arm(1);
+            assert!(view
+                .set_filter(&session, "alpha | beta | mid | xray")
+                .is_err());
+        }
+        assert_eq!(view.collapsed, both, "nothing pruned");
+        assert_eq!(view.inspector().selected(), Some(xray), "nothing cleared");
+        // The filter that commits hides rho and puts xray under alpha.
+        view.set_filter(&session, "alpha | beta | mid | xray")
+            .unwrap();
+        assert_eq!(view.collapsed, [alpha].into_iter().collect());
+        assert_eq!(view.inspector().selected(), None);
+    }
+
     /// The reveal opens exactly the collapsed items whose subtree holds the
     /// match, at every level, and no collapsed sibling or other root.
     #[test]

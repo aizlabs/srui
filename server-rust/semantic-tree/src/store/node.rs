@@ -1,4 +1,4 @@
-use crate::ids::{ModelId, NodeId, PropertyRef, TypeRef};
+use crate::ids::{ItemId, ModelId, NodeId, PropertyRef, TypeRef};
 use crate::value::Value;
 use std::collections::HashMap;
 
@@ -47,6 +47,20 @@ impl Node {
     /// Returns an iterator over all defined properties on this node.
     pub fn iter_properties(&self) -> impl Iterator<Item = (&PropertyRef, &Value)> {
         self.properties.iter()
+    }
+
+    /// Returns the server-promoted selection of a `List`, `Table` or `Tree` (§6.3, §8).
+    ///
+    /// A collection's standard `value` property, when present, is an [`ItemId`] the server has
+    /// explicitly promoted from local presentation state to semantic state. It names an item
+    /// identity, never a row index. Other node types, and a collection without `value`, return
+    /// `None`.
+    pub fn promoted_selection(&self) -> Option<ItemId> {
+        if !super::is_selectable_collection(self.node_type) {
+            return None;
+        }
+        self.get_property(PropertyRef::VALUE)
+            .and_then(Value::as_item_id)
     }
 
     /// Returns the referenced `ModelId` if this node has a `model_ref` property defined (§8).

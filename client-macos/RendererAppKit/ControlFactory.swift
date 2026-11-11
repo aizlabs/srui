@@ -60,6 +60,9 @@ public final class ControlFactory {
 
     public let extensionMountResolver: ExtensionMountResolver
 
+    /// Promoted and local selection per collection node, kept across remounts (§6.3, §22.5).
+    var collectionSelectionMemory: [NodeId: CollectionSelectionMemory] = [:]
+
     public init(
         textEditingSession: TextEditingSession = TextEditingSession(),
         terminalSession: TerminalSession = TerminalSession(),
@@ -730,6 +733,9 @@ public final class ControlFactory {
                 self?.onCollectionRangeRequest?(request)
             }
         )
+        adapter.onLocalSelection = { [weak self] nodeID, itemIDs in
+            self?.noteLocalSelection(nodeID: nodeID, itemIDs: itemIDs)
+        }
         tableView.dataSource = adapter
         tableView.delegate = adapter
         scrollView.documentView = tableView
@@ -774,6 +780,9 @@ public final class ControlFactory {
                 self?.onCollectionRangeRequest?(request)
             }
         )
+        adapter.onLocalSelection = { [weak self] nodeID, itemIDs in
+            self?.noteLocalSelection(nodeID: nodeID, itemIDs: itemIDs)
+        }
         outlineView.dataSource = adapter
         outlineView.delegate = adapter
         scrollView.documentView = outlineView
@@ -814,7 +823,7 @@ public final class ControlFactory {
         return values.map { $0.asString ?? ($0 == .null ? "" : $0.description) }
     }
 
-    private func tableView(in handle: RenderHandle) -> NSTableView? {
+    func tableView(in handle: RenderHandle) -> NSTableView? {
         guard let table = (handle.view as? NSScrollView)?.documentView as? NSTableView,
               !(table is NSOutlineView) else {
             return nil
@@ -822,7 +831,7 @@ public final class ControlFactory {
         return table
     }
 
-    private func outlineView(in handle: RenderHandle) -> NSOutlineView? {
+    func outlineView(in handle: RenderHandle) -> NSOutlineView? {
         (handle.view as? NSScrollView)?.documentView as? NSOutlineView
     }
 

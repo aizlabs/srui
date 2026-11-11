@@ -299,6 +299,9 @@ fn commit_ops_locked(
         ui.apply_op(op)
             .map_err(|error| ModelRangeError::Session(SessionError::Store(error).to_string()))?;
     }
+    // Same promoted-selection settlement as every other commit (§6.3, §8).
+    ui.settle_promoted_selections()
+        .map_err(|error| ModelRangeError::Session(SessionError::Store(error).to_string()))?;
     let (staged, recorded) = ui.into_staged_and_ops();
     let commit = AuthoritativeCommit::new(base_revision, recorded);
     let permit = guard.journal.prepare(&commit).map_err(SessionError::from)?;
@@ -1327,5 +1330,56 @@ mod tests {
         worker.await.unwrap();
         inbox.submit(request(node_id, model_id, 0, 1, session.current_revision()));
         assert!(inbox.try_pop().is_none());
+    }
+
+    /// §6.3, §8: a range fulfilment that replaces the promoted item's index with another item
+    /// clears the promotion in the same authoritative `MODEL_RESET_RANGE` commit.
+    #[tokio::test]
+    async fn range_fulfilment_that_replaces_the_promoted_item_clears_the_promotion() {
+        let (session, node_id, model_id) = table_and_model(20);
+        session
+            .transaction(|ui| {
+                ui.set(
+                    node_id,
+                    srui_semantic_tree::PropertyRef::SELECTION_MODE,
+                    Value::EnumToken(srui_semantic_tree::EnumToken::SELECTION_MODE_SINGLE),
+                )?;
+                ui.apply_op(&Operation::model_reset_range(
+                    model_id,
+                    0,
+                    (0..10).map(item_at),
+                    None,
+                ))?;
+                ui.promote_selection(node_id, ItemId::new(5))
+            })
+            .expect("promotion");
+        // The provider renumbers every row, so ItemId 5 no longer exists at index 4.
+        let renumbering: ModelRangeProvider = Arc::new(|query: ModelRangeQuery| {
+            Box::pin(async move {
+                Ok((0..query.count)
+                    .map(|offset| {
+                        let index = query.start_index + offset;
+                        ModelItem::with_value(ItemId::new(1_000 + index), format!("row-{index}"))
+                    })
+                    .collect())
+            })
+        });
+        session.register_model_range_provider(model_id, renumbering);
+        let revision = session.current_revision();
+        let outcome = session
+            .fulfill_model_range_request(request(node_id, model_id, 0, 20, revision))
+            .await
+            .expect("fulfil");
+        assert!(matches!(outcome, ModelRangeFulfillment::Committed { .. }));
+        session.with_store(|store| {
+            assert_eq!(store.get_node(node_id).unwrap().promoted_selection(), None);
+        });
+        let replayed = session
+            .collect_replayed_transactions(revision)
+            .expect("replay");
+        assert!(replayed[0].operations.iter().any(|op| {
+            matches!(&op.op, Some(srui_protocol::operation::Op::ClearProperty(clear))
+                if clear.node_id == node_id.get())
+        }));
     }
 }

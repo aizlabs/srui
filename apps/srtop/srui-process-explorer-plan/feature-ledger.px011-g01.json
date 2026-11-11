@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-011-G01",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Generic server-promoted selection and reveal for List, Table and Tree collections (§6.3, §7.4, §7.6, §8, §22.5, §22.7, §22.8): the standard value property names an ItemId only, store rules shared by Rust and Swift with conformance vectors, an SDK promotion API with explicit failures and delete settlement, and generic native AppKit selection, one-time reveal and accessibility notification; no Process Explorer feature work and no application-specific client path",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX011G01-001",
+      "feature": "A List, Table or Tree holds a server-promoted selection in its standard value property (registry property 13) as an ItemId, documented in the property 13 registry description with its fallback (a client without support keeps local-only selection); no proto or codegen change. The Rust and Swift stores refuse, identically on every replica, a value that is not an ItemId (a row index is never a selection) and a promotion held while selection_mode is none or absent, including disabling selection while promoted; an uncached ItemId is not a replica error",
+      "scope": "PX-011-G01/semantic-tree store (store/mod.rs validate_collection_selection, Node::promoted_selection), Swift SemanticStore.validateCollectionSelection, conformance vectors 50-53 in suite 01",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-011-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-011-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX011G01-002",
+      "feature": "SDK UiTransaction::promote_selection and List/Table/Tree::promote_selection refuse an unknown ItemId with ItemNotFound (no row-index fallback), selection_mode none, a non-collection or model-less node, and otherwise record a one-item MODEL_RESET_RANGE carrying the authoritative item followed by SET_PROPERTY(value = ItemId); a raw SET_PROPERTY, CREATE_NODE or BATCH_PROPERTY_SET promoting an item the authoritative model does not hold is refused with ItemNotFound at commit and the transaction rolls back; clear_promoted_selection withdraws a promotion",
+      "scope": "PX-011-G01/sdk selection.rs and widgets/collections.rs; sdk/tests/selection_test.rs",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-011-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-011-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX011G01-003",
+      "feature": "Any commit that removes the promoted item from its collection's authoritative model (MODEL_DELETE, MODEL_RESET_RANGE including eviction, positional MODEL_UPDATE, model_ref change or clear) clears the promotion in the same commit, while a delete+re-insert move under sorting keeps it and deleting the node removes it; settlement runs on SDK, sessiond and range-fulfilment commits, a pre-built commit_transaction leaving a dangling promotion is refused, and a resync snapshot restores the promotion and its item",
+      "scope": "PX-011-G01/sdk selection.rs PromotionTracker and dangling_promotions, sdk/session.rs, sessiond/session.rs transaction_with_result and commit_transaction, sessiond/session/model_range.rs, sessiond/session/snapshot.rs; sdk/tests/selection_test.rs and sessiond unit tests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-011-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-011-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX011G01-004",
+      "feature": "The generic AppKit renderer selects the promoted ItemId's NSTableView/NSOutlineView row and scrolls it into view once per promotion operation, posts the selectedRowsChanged accessibility notification, does not echo SELECTION_CHANGED, keeps a later local click local (SELECTION_CHANGED emitted, not overwritten by unrelated or structural commits, nor by withdrawing the promotion, which deselects only an untouched promoted row), lets a later promotion replace it, maps an absent ItemId to no row and waits until the item arrives through the range machinery, and restores the promotion on remount, resync and reconnect without re-revealing an unchanged one",
+      "scope": "PX-011-G01/client-macos Collections TableCollectionAdapter, OutlineCollectionAdapter, CollectionPromotion; RendererAppKit CollectionSelectionPromotion.swift, LayoutRenderer; Tests/RendererAppKitTests/CollectionSelectionPromotionTests.swift",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-011-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-011-G01.md"
+      ]
+    }
+  ]
+}

@@ -10,6 +10,10 @@ public enum LayoutRendererError: Error, Equatable, Sendable {
 
 /// Retained hierarchy coordinator. Scalar mutations and model content updates update existing
 /// handles in place; graph mutations and model creation take a conservative full-remount path.
+///
+/// A committed operation on a List/Table/Tree `value` is a server promotion of its selection
+/// (§6.3): it is applied after that commit's model refresh and reveals the row once. Other commits
+/// and remounts restore the selection without revealing (`CollectionSelectionPromotion.swift`).
 @MainActor
 public final class LayoutRenderer {
     public let registry: RenderRegistry
@@ -26,7 +30,16 @@ public final class LayoutRenderer {
         self.controlFactory = controlFactory
     }
 
-    public func mount(store: SemanticStore, preserveLocalText: Bool = false) throws {
+    /// Rebuilds every handle from `store`.
+    ///
+    /// - Parameter promotedNodeIDs: collections whose `value` the committed transaction set or
+    ///   cleared; their promoted selection is applied as a new promotion (§6.3). Every other
+    ///   collection restores its selection from semantic state and local memory.
+    public func mount(
+        store: SemanticStore,
+        preserveLocalText: Bool = false,
+        promotedNodeIDs: Set<NodeId> = []
+    ) throws {
         RendererDiagnostics.log(
             "mount begin revision=\(store.revision) roots=\(store.rootIDs.count)"
         )
@@ -48,6 +61,8 @@ public final class LayoutRenderer {
             showWindows()
         }
         let present = Set(registry.allHandles.map(\.nodeID))
+        applyPromotedSelections(store: store, explicit: promotedNodeIDs, only: nil)
+        controlFactory.pruneCollectionSelectionMemory(keeping: present)
         controlFactory.textEditingSession.syncPresentNodes(present)
         Task {
             await controlFactory.terminalSession.syncPresentNodes(present)
@@ -61,11 +76,12 @@ public final class LayoutRenderer {
         newStore: SemanticStore
     ) throws -> [DirtyClassification] {
         let classifications = DirtyClassifier.classify(transaction)
+        let promotedNodeIDs = Self.promotionTargets(of: transaction, in: newStore)
         if classifications.contains(where: \.isStructureAffecting) {
             RendererDiagnostics.log(
                 "transaction revision=\(transaction.newRevision) structural; remounting"
             )
-            try mount(store: newStore, preserveLocalText: true)
+            try mount(store: newStore, preserveLocalText: true, promotedNodeIDs: promotedNodeIDs)
             return classifications
         }
 
@@ -91,6 +107,8 @@ public final class LayoutRenderer {
                 ) else { continue }
                 if isCollectionProperty(property) {
                     affectedCollectionNodeIDs.insert(nodeID)
+                } else if promotedNodeIDs.contains(nodeID), property == .value {
+                    continue
                 } else {
                     try apply(property: property, nodeID: nodeID, store: newStore)
                 }
@@ -103,6 +121,8 @@ public final class LayoutRenderer {
                 for property in properties {
                     if isCollectionProperty(property.property) {
                         affectedCollectionNodeIDs.insert(nodeID)
+                    } else if promotedNodeIDs.contains(nodeID), property.property == .value {
+                        continue
                     } else {
                         try apply(property: property.property, nodeID: nodeID, store: newStore)
                     }
@@ -137,7 +157,50 @@ public final class LayoutRenderer {
             )
         }
 
+        // After the model refresh, so the promoted item's row reflects this commit (§6.3, §8).
+        if !promotedNodeIDs.isEmpty {
+            applyPromotedSelections(store: newStore, explicit: promotedNodeIDs, only: promotedNodeIDs)
+        }
+
         return classifications
+    }
+
+    /// Collections whose promoted selection (`value`) an operation of `transaction` sets or clears.
+    static func promotionTargets(of transaction: Transaction, in store: SemanticStore) -> Set<NodeId> {
+        var targets: Set<NodeId> = []
+        for operation in transaction.operations {
+            let nodeID: NodeId
+            switch operation {
+            case .setProperty(let id, let property, _), .clearProperty(let id, let property):
+                guard property == .value else { continue }
+                nodeID = id
+            case .batchPropertySet(let id, let properties):
+                guard properties.contains(where: { $0.property == .value }) else { continue }
+                nodeID = id
+            default:
+                continue
+            }
+            if let node = store.getNode(nodeID), isSelectableCollection(node.nodeType) {
+                targets.insert(nodeID)
+            }
+        }
+        return targets
+    }
+
+    private func applyPromotedSelections(
+        store: SemanticStore,
+        explicit: Set<NodeId>,
+        only: Set<NodeId>?
+    ) {
+        for handle in registry.allHandles where isSelectableCollection(handle.nodeType) {
+            if let only, !only.contains(handle.nodeID) { continue }
+            guard let node = store.getNode(handle.nodeID) else { continue }
+            controlFactory.applyPromotedSelection(
+                in: handle,
+                for: node,
+                explicit: explicit.contains(handle.nodeID)
+            )
+        }
     }
 
     public func showWindows() {

@@ -5,7 +5,7 @@ Edition 1.2 · 12 September 2026. Use the authoritative SRUI v0.6 design and the
 ## PX-011 — Add find-next/find-previous and jump to PID
 
 **Phase:** B · **Scope size:** S · **Status:** planned · **Gate:** none
-**Dependencies:** PX-010-G01
+**Dependencies:** PX-010-G01, PX-011-G01
 **Read:** D1 §§6–8, 12, 22, 29; D2 T9–T11, T16, T21
 
 ### Standing execution contract

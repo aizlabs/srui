@@ -15,6 +15,7 @@ These fixtures encode the formal behavioral invariants of the SRUI distributed s
 - **Rollback on Failure (§12.1)**: Speculative execution where any failing operation discards the entire transaction with zero side effects.
 - **Safety Limits (§26)**: Enforcement of tree depth, node count, transaction operation count, string length, and collection model bounds.
 - **Collection Models (§8, §13)**: Large-scale virtualized data mutation (`CREATE_MODEL`, `MODEL_INSERT`, `MODEL_UPDATE`, `MODEL_RESET_RANGE`, `MODEL_DELETE`).
+- **Promoted Collection Selection (§6.3, §7.6, §8)**: A `List`/`Table`/`Tree` `value` holds a server-promoted selection only as an `ItemId`, and only while `selection_mode` is `single` or `multiple` (vectors 50–53). Item presence is not a store rule, because a sparse replica may not cache the item.
 - **Semantic-Not-Paint (§4.7, §4.16, §4.17, §32.3)**: Standard Widget Profile contains only semantic intent and state, strictly forbidding display frame cadence, paint instructions, and mandatory absolute pixel geometry.
 
 ---
@@ -153,6 +154,7 @@ Properties are encoded as JSON primitives or typed objects:
 | `item_not_found` | `StoreError::ItemNotFound` | §8, §13 |
 | `model_index_out_of_bounds` | `StoreError::ModelIndexOutOfBounds` | §8, §13 |
 | `duplicate_item_id` | `StoreError::DuplicateItemId` | §8, §13 |
+| `invalid_collection_selection` | `StoreError::InvalidCollectionSelection` | §6.3, §7.6, §8 |
 | `invalid_model_delete` | `StoreError::InvalidModelDelete` | §8, §13 |
 | `cycle_detected` | `StoreError::CycleDetected` | §13 |
 | `child_index_out_of_bounds` | `StoreError::ChildIndexOutOfBounds` | §13 |

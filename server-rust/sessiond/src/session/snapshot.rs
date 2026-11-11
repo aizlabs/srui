@@ -314,6 +314,68 @@ mod tests {
         );
     }
 
+    /// §6.3, §18: a resync snapshot restores a promoted collection selection and its item, and a
+    /// sessiond commit that deletes the promoted item clears the promotion in that commit.
+    #[test]
+    fn resync_snapshot_restores_the_promoted_selection_from_semantic_state() {
+        use srui_semantic_tree::{ItemId, ModelId, ModelItem, Operation, PropertyRef, Value};
+
+        let model = ModelId::new(7);
+        let table = NodeId::new(2);
+        let session = crate::Session::new("promoted-selection");
+        session
+            .transaction(|ui| {
+                ui.create_node(NodeId::new(1), TypeRef::SURFACE, None, None, [])?;
+                ui.apply_op(&Operation::create_model(model, TypeRef::TABLE, 0))?;
+                ui.apply_op(&Operation::model_insert(
+                    model,
+                    0,
+                    (1..=50u64).map(|i| ModelItem::with_value(ItemId::new(i), Value::from(i))),
+                ))?;
+                ui.create_node(
+                    table,
+                    TypeRef::TABLE,
+                    Some(NodeId::new(1)),
+                    None,
+                    [
+                        (PropertyRef::MODEL_REF, Value::UnsignedInt(model.get())),
+                        (
+                            PropertyRef::SELECTION_MODE,
+                            Value::EnumToken(srui_semantic_tree::EnumToken::SELECTION_MODE_SINGLE),
+                        ),
+                    ],
+                )
+            })
+            .expect("setup");
+        session
+            .transaction(|ui| ui.promote_selection(table, ItemId::new(37)))
+            .expect("promotion");
+
+        let snapshot = session
+            .with_store(export_snapshot_transaction)
+            .expect("representable");
+        let mut replica = SemanticStore::new();
+        for op in &snapshot.operations {
+            replica
+                .apply_operation(op)
+                .expect("replica applies snapshot");
+        }
+        let node = replica.get_node(table).expect("table restored");
+        assert_eq!(node.promoted_selection(), Some(ItemId::new(37)));
+        assert_eq!(
+            replica.get_model(model).unwrap().index_of(ItemId::new(37)),
+            Some(36),
+            "the promoted item is restored with the model"
+        );
+
+        session
+            .transaction(|ui| ui.apply_op(&Operation::model_delete_items(model, [ItemId::new(37)])))
+            .expect("delete");
+        session.with_store(|store| {
+            assert_eq!(store.get_node(table).unwrap().promoted_selection(), None);
+        });
+    }
+
     /// A store that fits stays expressible, and the emitted snapshot is within §26 bounds.
     #[test]
     fn representable_store_exports_within_the_operation_bound() {

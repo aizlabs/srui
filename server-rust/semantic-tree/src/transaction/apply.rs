@@ -48,6 +48,13 @@ impl StagedCommit {
     pub fn new_revision(&self) -> Revision {
         self.new_revision
     }
+
+    /// The store this commit would produce, for authoritative post-conditions checked before it
+    /// is committed (e.g. promoted selections, §6.3).
+    #[must_use]
+    pub fn store(&self) -> &SemanticStore {
+        &self.staged
+    }
 }
 
 impl SemanticStore {

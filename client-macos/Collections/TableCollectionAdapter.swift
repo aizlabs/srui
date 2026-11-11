@@ -5,6 +5,12 @@
 // NSTableView data source for List (one column) and Table (multi-column). Model-backed
 // collections report logical `itemCount` and resolve rows with `getItemByIndex` (§8, §22.7).
 //
+// Selection highlight is local (§7.6, §22.5) unless the server promotes one item to semantic
+// state (§6.3): `applyPromotion` selects that ItemId's row, replacing any local selection, scrolls
+// it into view at most once per promotion, and posts the accessibility selection notification
+// (§22.8). An ItemId the replica does not hold is never mapped to a row index; the promotion
+// waits until the item arrives through the range machinery (§8, §22.7).
+//
 
 import AppKit
 import SemanticModel
@@ -32,6 +38,21 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
     public var selectionMode: StandardSelectionMode = .none
     public var onSelectionChanged: (@MainActor (NodeId, ItemId) -> Void)?
     public var onRangeRequest: (@MainActor (CollectionRangeRequest) -> Void)?
+    /// User-originated selection changes, including an empty selection (§22.5). Unlike
+    /// `onSelectionChanged` this is not a semantic event; the renderer uses it to keep a local
+    /// selection across remounts.
+    public var onLocalSelection: (@MainActor (NodeId, [ItemId]) -> Void)?
+    /// Accessibility notification sink for promoted selections (§22.8). Replaceable for tests.
+    public var postAccessibilityNotification: @MainActor (NSTableView, NSAccessibility.Notification) -> Void = {
+        NSAccessibility.post(element: $0, notification: $1)
+    }
+
+    /// Server-promoted selection last applied to this adapter (§6.3).
+    public private(set) var promotedItemID: ItemId?
+    /// Promotion waiting for its item to reach the replica, and whether it should reveal.
+    public private(set) var pendingPromotion: CollectionPromotion?
+    /// The user changed the selection after the last promotion (§22.5).
+    public private(set) var localSelectionSincePromotion = false
 
     /// Nested-scroll chrome. Public so `ControlFactory` (RendererAppKit) can
     /// wire collections that now live in a separate module.
@@ -267,6 +288,7 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
         restoreSelection(selectedItemIDs, in: tableView)
         refreshRowAccessibility(in: tableView)
         refreshNestedChrome(tableView: tableView)
+        resolvePendingPromotion(in: tableView)
     }
 
     public func update(model: Model?, modelID: ModelId?, tableView: NSTableView) {
@@ -304,7 +326,86 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
         restoreSelection(selectedItemIDs, in: tableView)
         refreshRowAccessibility(in: tableView)
         refreshNestedChrome(tableView: tableView)
+        resolvePendingPromotion(in: tableView)
         emitVisibleRangeRequests(from: tableView)
+    }
+
+    // MARK: - Server-promoted selection (§6.3, §7.6, §8, §22.5, §22.7, §22.8)
+
+    /// Applies a promotion or its withdrawal (`nil`).
+    ///
+    /// The promoted row replaces any local selection without emitting `SELECTION_CHANGED`: the
+    /// server already knows its own state (§7.6). `reveal` scrolls the row into view once. A
+    /// collection with `selection_mode` none ignores the promotion; the store refuses it anyway.
+    ///
+    /// Withdrawal (`nil`) never touches a selection the user made after the promotion: that
+    /// selection is local and was already reported with `SELECTION_CHANGED` (§22.5). Only when the
+    /// user has not changed the selection since the promotion, and the promoted row is still the
+    /// whole selection, is that row deselected. Like any server-driven selection change (a row
+    /// removed by a commit, for example) the deselection emits no `SELECTION_CHANGED`.
+    public func applyPromotion(_ itemID: ItemId?, reveal: Bool, tableView: NSTableView) {
+        let previous = promotedItemID
+        let userChangedSelection = localSelectionSincePromotion
+        promotedItemID = itemID
+        pendingPromotion = nil
+        localSelectionSincePromotion = false
+        guard let itemID else {
+            if !userChangedSelection, let previous, let row = row(of: previous),
+               tableView.selectedRowIndexes == IndexSet(integer: row) {
+                clearSelectionForPromotion(in: tableView)
+            }
+            return
+        }
+        guard selectionMode != .none else { return }
+        pendingPromotion = CollectionPromotion(itemID: itemID, reveal: reveal)
+        resolvePendingPromotion(in: tableView)
+    }
+
+    /// Reselects a user's local selection by ItemId without revealing it (§22.5).
+    public func restoreLocalSelection(_ itemIDs: [ItemId], tableView: NSTableView) {
+        pendingPromotion = nil
+        isSuppressingSelectionEvents = true
+        defer { isSuppressingSelectionEvents = false }
+        restoreSelection(itemIDs, in: tableView)
+        refreshRowAccessibility(in: tableView)
+    }
+
+    /// Row currently holding `itemID` in the replica, or `nil`. Never a positional guess (§8).
+    public func row(of itemID: ItemId) -> Int? {
+        if let model {
+            let rowCount = UInt64(CollectionCells.clampedRowCount(model.itemCount))
+            guard let index = model.indexOf(itemID), index < rowCount else { return nil }
+            return Int(index)
+        }
+        return inlineRows.firstIndex { $0.itemID == itemID }
+    }
+
+    private func resolvePendingPromotion(in tableView: NSTableView) {
+        guard let pending = pendingPromotion else { return }
+        guard let row = row(of: pending.itemID) else {
+            // Not in the replica: no row-index fallback. The selection stays empty until the
+            // item arrives (§8, §22.7).
+            clearSelectionForPromotion(in: tableView)
+            return
+        }
+        pendingPromotion = nil
+        isSuppressingSelectionEvents = true
+        tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        isSuppressingSelectionEvents = false
+        if pending.reveal {
+            CollectionPromotion.reveal(row: row, in: tableView)
+        }
+        refreshRowAccessibility(in: tableView)
+        postAccessibilityNotification(tableView, .selectedRowsChanged)
+    }
+
+    private func clearSelectionForPromotion(in tableView: NSTableView) {
+        guard tableView.selectedRowIndexes.isEmpty == false else { return }
+        isSuppressingSelectionEvents = true
+        defer { isSuppressingSelectionEvents = false }
+        tableView.deselectAll(nil)
+        refreshRowAccessibility(in: tableView)
+        postAccessibilityNotification(tableView, .selectedRowsChanged)
     }
 
     /// Test helper: treat `start..<start+count` as the visible window without a live clip view.
@@ -371,6 +472,11 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
         refreshRowAccessibility(in: tableView)
 
         let selectedIDs: [ItemId] = tableView.selectedRowIndexes.compactMap { itemID(at: $0) }
+        // A user's choice after a promotion stays local and cancels a promotion still waiting
+        // for its item (§22.5).
+        pendingPromotion = nil
+        localSelectionSincePromotion = true
+        onLocalSelection?(nodeID, selectedIDs)
         guard selectedIDs.isEmpty == false else { return }
 
         if selectionMode == .single {

@@ -2,8 +2,12 @@
 // SemanticStore.swift
 // SemanticModel
 //
-// Non-authoritative in-memory semantic graph replica store (§6.2, §6.3, §13, §26).
+// Non-authoritative in-memory semantic graph replica store (§6.2, §6.3, §8, §13, §26).
 // Platform-neutral: NEVER import AppKit or Cocoa in this file.
+//
+// A List/Table/Tree `value` is its server-promoted selection (§6.3, §7.6, §8): the store
+// enforces only the cache-independent rules shared with the Rust store — the value is an ItemId,
+// and it is held only while selection_mode is single or multiple.
 //
 // Architectural Invariants (§4):
 // - Invariant 2: The client retains a non-authoritative replica of committed semantic UI state
@@ -17,6 +21,11 @@
 //
 
 import Foundation
+
+/// Returns `true` for the collection node types whose `value` is a promoted selection (§7.6, §8).
+public func isSelectableCollection(_ nodeType: TypeRef) -> Bool {
+    nodeType == .list || nodeType == .table || nodeType == .tree
+}
 
 // MARK: - Semantic Node (§6.2)
 
@@ -108,6 +117,16 @@ public struct Node: Equatable, Sendable, CustomStringConvertible {
     /// Returns an iterator over all defined properties on this node.
     public var propertyEntries: [(PropertyRef, Value)] {
         Array(properties)
+    }
+
+    /// Server-promoted selection of a `List`, `Table` or `Tree` (§6.3, §8).
+    ///
+    /// A collection's standard `value`, when present, is the `ItemId` the server explicitly
+    /// promoted from local presentation state to semantic state. It names an item identity, never
+    /// a row index. Other node types, and a collection without `value`, return `nil`.
+    public var promotedSelection: ItemId? {
+        guard isSelectableCollection(nodeType) else { return nil }
+        return properties[.value]?.asItemID
     }
 
     /// Returns the referenced `ModelId` if this node has a `model_ref` property defined (§8).
@@ -375,6 +394,9 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
     case modelIndexOutOfBounds(index: UInt64, count: UInt64)
     /// Attempted to insert a duplicate ItemId into the collection model.
     case duplicateItemId(modelID: ModelId, itemID: ItemId)
+    /// A List/Table/Tree promoted selection (`value`) is not an `ItemId`, or is held while the
+    /// node's `selection_mode` is absent or `none` (§6.3, §7.4, §8).
+    case invalidCollectionSelection(nodeID: NodeId, reason: String)
     /// Generic operation error when applying an operation.
     case operationError(String)
 
@@ -426,6 +448,8 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
             return "model index \(index) out of bounds (item count: \(count))"
         case .duplicateItemId(let modelID, let itemID):
             return "duplicate item ID \(itemID) in model \(modelID)"
+        case .invalidCollectionSelection(let nodeID, let reason):
+            return "invalid promoted selection on collection node \(nodeID): \(reason)"
         case .operationError(let msg):
             return "operation application error: \(msg)"
         }
@@ -457,6 +481,7 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
         case .itemNotFound: return "item_not_found"
         case .modelIndexOutOfBounds: return "model_index_out_of_bounds"
         case .duplicateItemId: return "duplicate_item_id"
+        case .invalidCollectionSelection: return "invalid_collection_selection"
         case .operationError: return "operation_error"
         }
     }
@@ -925,6 +950,33 @@ public struct SemanticStore: Equatable, Sendable {
         }
     }
 
+    /// Validates the promoted-selection invariant of one collection node's resulting properties.
+    ///
+    /// `value` and `selectionMode` are what the node would hold after the mutation. Both rules are
+    /// cache-independent, so this replica reaches the same verdict as the Rust store (§12.1). An
+    /// `ItemId` this sparse replica does not cache is not an error here (§8).
+    private func validateCollectionSelection(
+        nodeID: NodeId,
+        nodeType: TypeRef,
+        value: Value?,
+        selectionMode: Value?
+    ) throws {
+        guard isSelectableCollection(nodeType), let value else { return }
+        guard value.asItemID != nil else {
+            throw StoreError.invalidCollectionSelection(
+                nodeID: nodeID,
+                reason: "a promoted selection must be an ItemId, never a row index or other value"
+            )
+        }
+        let mode = selectionMode?.asEnumToken.flatMap(StandardSelectionMode.init(enumToken:))
+        guard let mode, mode != .none else {
+            throw StoreError.invalidCollectionSelection(
+                nodeID: nodeID,
+                reason: "selection_mode is none or absent, so no selection can be promoted"
+            )
+        }
+    }
+
     /// Validates referential integrity for semantic properties (e.g. model_ref references an existing model).
     private func validatePropertyReferences(property: PropertyRef, value: Value) throws {
         if property == .modelRef || property == .MODEL_REF {
@@ -995,6 +1047,12 @@ public struct SemanticStore: Equatable, Sendable {
             try validatePropertyValueType(property: prop, value: val)
             try validatePropertyReferences(property: prop, value: val)
         }
+        try validateCollectionSelection(
+            nodeID: id,
+            nodeType: nodeType,
+            value: properties.last(where: { $0.0 == .value })?.1,
+            selectionMode: properties.last(where: { $0.0 == .selectionMode })?.1
+        )
 
         // 5. Validate insertion index bounds
         if let pid = parentID {
@@ -1111,8 +1169,23 @@ public struct SemanticStore: Equatable, Sendable {
         try limitsValue.validate(value: value)
         try validatePropertyValueType(property: property, value: value)
         try validatePropertyReferences(property: property, value: value)
-        guard nodes[nodeID] != nil else {
+        guard let node = nodes[nodeID] else {
             throw StoreError.nodeNotFound(nodeID)
+        }
+        if property == .value {
+            try validateCollectionSelection(
+                nodeID: nodeID,
+                nodeType: node.nodeType,
+                value: value,
+                selectionMode: node.properties[.selectionMode]
+            )
+        } else if property == .selectionMode {
+            try validateCollectionSelection(
+                nodeID: nodeID,
+                nodeType: node.nodeType,
+                value: node.properties[.value],
+                selectionMode: value
+            )
         }
         let previous = nodes[nodeID]?.properties[property]
         nodes[nodeID]?.properties[property] = value
@@ -1125,8 +1198,16 @@ public struct SemanticStore: Equatable, Sendable {
         nodeID: NodeId,
         property: PropertyRef
     ) throws -> Value? {
-        guard nodes[nodeID] != nil else {
+        guard let node = nodes[nodeID] else {
             throw StoreError.nodeNotFound(nodeID)
+        }
+        if property == .selectionMode {
+            try validateCollectionSelection(
+                nodeID: nodeID,
+                nodeType: node.nodeType,
+                value: node.properties[.value],
+                selectionMode: nil
+            )
         }
         return nodes[nodeID]?.properties.removeValue(forKey: property)
     }
@@ -1141,9 +1222,16 @@ public struct SemanticStore: Equatable, Sendable {
             try validatePropertyValueType(property: prop, value: val)
             try validatePropertyReferences(property: prop, value: val)
         }
-        guard nodes[nodeID] != nil else {
+        guard let node = nodes[nodeID] else {
             throw StoreError.nodeNotFound(nodeID)
         }
+        try validateCollectionSelection(
+            nodeID: nodeID,
+            nodeType: node.nodeType,
+            value: properties.last(where: { $0.0 == .value })?.1 ?? node.properties[.value],
+            selectionMode: properties.last(where: { $0.0 == .selectionMode })?.1
+                ?? node.properties[.selectionMode]
+        )
         for (prop, val) in properties {
             nodes[nodeID]?.properties[prop] = val
         }

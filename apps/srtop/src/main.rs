@@ -1,14 +1,16 @@
 //! Existing sessiond runtime/SSH bridge host for the PX-001 shell (§§12, 20, 27, 29).
 use srui_process_explorer::{
     initialize, install_column_handlers, install_filter_handlers, install_inspector,
-    install_owner_handlers, install_search_handlers, install_sort_handlers,
+    install_owner_handlers, install_sampling_handlers, install_search_handlers,
+    install_sort_handlers,
     procfs::ProcFsSource,
-    refresh::{poll, DEFAULT_REFRESH_INTERVAL, MAX_REFRESH_INTERVAL, MIN_REFRESH_INTERVAL},
+    refresh::{poll, ProcessView, DEFAULT_REFRESH_INTERVAL},
+    sampling::parse_interval,
     source::{
         FakeProcessSource, ProcessSource, RepeatedNamesSource, ScriptedFakeSource,
         SyntheticProcessSource,
     },
-    start_from_source, update_title, FIXTURE_TITLE,
+    update_title, FIXTURE_TITLE,
 };
 use srui_sessiond::{handle_connection, Session};
 use srui_unix_security::{
@@ -46,7 +48,9 @@ fn collect<S>(
 where
     S: ProcessSource + Send + 'static,
 {
-    let (view, _) = start_from_source(session, &mut source)?;
+    // The sampling controls state the interval the loop polls at from the
+    // first transaction (PX-015).
+    let (view, _) = ProcessView::start_with_interval(session, &mut source, interval)?;
     // The refresh loop and the sort buttons' handlers share the published view
     // (PX-009). The handlers are installed here, before the socket is served,
     // so a ready instance always answers a click.
@@ -56,6 +60,9 @@ where
     install_column_handlers(session, &view);
     install_search_handlers(session, &view);
     install_owner_handlers(session, &view);
+    // The sampling controls record requests on the view and wake the one
+    // refresh loop below; they start no timer of their own (PX-015).
+    install_sampling_handlers(session, &view);
     // The inspector reads details through its own reader of the source's
     // records, on its own bounded worker (PX-013).
     install_inspector(session, &view, source.details());
@@ -105,22 +112,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 select(&mut collection, Collection::Scale(count))?;
             }
             Some("--refresh-interval-ms") | Some("--scale-interval-ms") if interval.is_none() => {
-                let milliseconds: u64 = args
-                    .next()
-                    .ok_or("missing --refresh-interval-ms MS")?
-                    .to_str()
-                    .ok_or("--refresh-interval-ms MS must be a number")?
-                    .parse()
-                    .map_err(|_| "--refresh-interval-ms MS must be a number")?;
-                let chosen = Duration::from_millis(milliseconds);
-                if !(MIN_REFRESH_INTERVAL..=MAX_REFRESH_INTERVAL).contains(&chosen) {
-                    return Err(format!(
-                        "--refresh-interval-ms must be between {} and {}",
-                        MIN_REFRESH_INTERVAL.as_millis(),
-                        MAX_REFRESH_INTERVAL.as_millis()
-                    )
-                    .into());
-                }
+                // The same validator as the interval field (PX-015).
+                let chosen = parse_interval(
+                    args.next()
+                        .ok_or("missing --refresh-interval-ms MS")?
+                        .to_str()
+                        .ok_or("--refresh-interval-ms MS must be a number")?,
+                )
+                .map_err(|error| format!("--refresh-interval-ms: {error}"))?;
                 interval = Some(chosen);
             }
             _ => return Err("unknown or repeated option".into()),

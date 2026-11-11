@@ -16,7 +16,11 @@
 //! also publishes the user filter's status in the same plan. Since PX-013
 //! every publication that changes the rows also re-plans the selected-process
 //! inspector ([`crate::inspector`]) against the rows it publishes, and the
-//! inspector's detail worker publishes each detail result it accepts.
+//! inspector's detail worker publishes each detail result it accepts. Since
+//! PX-015 the view can be paused ([`crate::sampling`]): a paused view
+//! publishes no sample at all, every control keeps re-projecting the frozen
+//! rows, and the refresh loop's one ticker follows the interval the sampling
+//! controls set.
 //!
 //! Four rules shape this module:
 //!
@@ -101,6 +105,7 @@ use crate::inspector::{
 };
 use crate::owner::{OwnerChoice, OwnerFilter, OwnerView, Scope};
 use crate::projection::{Row, SessionItemIds};
+use crate::sampling::{relabel_freshness, Frozen, IntervalError, Sampling, SamplingView};
 use crate::search::{Search, SearchStep, SearchView};
 use crate::sort::{self, SortOrder};
 use crate::source::{ProcessSnapshot, ProcessSource, Retention};
@@ -108,9 +113,10 @@ use crate::summary::{self, CollectorError, Sample};
 use crate::{
     bounded, initialize_rows, published_status_from, sort_button_of, ColumnAction, ScanReport,
     COLUMN_CHOOSER_BUTTONS, FILTER_INPUT, FILTER_STATUS, INSPECTOR_COMMAND, INSPECTOR_DETAILS,
-    INSPECTOR_METRICS, INSPECTOR_PROCESS, INSPECTOR_STATUS, MAX_PUBLISHED_LABEL_BYTES, MODEL,
-    OWNER_ALL, OWNER_INPUT, OWNER_MINE, OWNER_STATUS, PID_GO, PID_INPUT, PID_SET_INPUT,
-    SEARCH_INPUT, SEARCH_NEXT, SEARCH_PREVIOUS, SEARCH_STATUS, STATUS, TABLE,
+    INSPECTOR_METRICS, INSPECTOR_PROCESS, INSPECTOR_STATUS, INTERVAL_INPUT,
+    MAX_PUBLISHED_LABEL_BYTES, MODEL, OWNER_ALL, OWNER_INPUT, OWNER_MINE, OWNER_STATUS, PID_GO,
+    PID_INPUT, PID_SET_INPUT, SAMPLING_PAUSE, SAMPLING_REFRESH, SAMPLING_STATUS, SEARCH_INPUT,
+    SEARCH_NEXT, SEARCH_PREVIOUS, SEARCH_STATUS, STATUS, TABLE,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
 use srui_sdk::{ItemId, NodeId, Operation, Value, COLUMNS, ENABLED, LABEL, TEXT, VALUE};
@@ -122,7 +128,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio_util::sync::CancellationToken;
 
 /// Sampling interval used unless the operator configures another one.
@@ -277,6 +283,16 @@ pub const INSPECTOR_RESERVE_BYTES: usize = 6144;
 /// with the text at its widest.
 pub const COMMAND_RESERVE_BYTES: usize = 10_240;
 
+/// Bytes reserved for the sampling controls in a catch-up snapshot (PX-015):
+/// the row, the Pause view/Resume view, Refresh now and Apply interval
+/// buttons, the interval `TextInput` with its label, placeholder, description
+/// and a value of at most [`crate::sampling::MAX_INTERVAL_INPUT_BYTES`], and
+/// the status line at [`crate::sampling::MAX_SAMPLING_STATUS_BYTES`]. Charged
+/// at this fixed reserve, so a long sampling status can never shrink the row
+/// budget; `the_shell_status_and_summary_fit_their_snapshot_allowances`
+/// measures it with every value at its widest.
+pub const SAMPLING_RESERVE_BYTES: usize = 2048;
+
 /// Bytes the `CLEAR_PROPERTY` settlement adds when a commit removes the
 /// promoted row (PX-011-G01): a clear carries no value.
 const PROMOTION_CLEAR_BYTES: usize = OPERATION_FRAMING_BYTES + OPERATION_HEADER_BYTES;
@@ -425,6 +441,10 @@ pub struct ProcessView {
     inspector: Inspector,
     /// The inspector's lines as the client holds them (PX-013).
     inspector_published: InspectorView,
+    /// The interval, the pause state and the refresh loop's requests (PX-015).
+    sampling: Sampling,
+    /// The sampling controls as the client holds them (PX-015).
+    sampling_published: SamplingView,
 }
 
 /// The rows every active filter keeps, and what the filters' controls say
@@ -493,6 +513,7 @@ impl ProcessView {
             promoted: &mut self.promoted,
             owner: &mut self.owner_published,
             inspector: &mut self.inspector_published,
+            sampling: &mut self.sampling_published,
         }
     }
 
@@ -515,11 +536,24 @@ impl ProcessView {
     }
 
     /// Publishes the shell and the first snapshot in one transaction, and keeps
-    /// the state a later [`Self::refresh`] diffs against.
+    /// the state a later [`Self::refresh`] diffs against. The sampling
+    /// controls state [`DEFAULT_REFRESH_INTERVAL`].
     pub fn start(
         session: &Session,
         source: &mut impl ProcessSource,
     ) -> Result<(Self, ProcessSnapshot), Box<dyn std::error::Error>> {
+        Self::start_with_interval(session, source, DEFAULT_REFRESH_INTERVAL)
+    }
+
+    /// [`Self::start`], with the sampling controls stating `interval` from
+    /// the first transaction (PX-015), so a loop polling at that interval
+    /// publishes nothing to adopt it.
+    pub fn start_with_interval(
+        session: &Session,
+        source: &mut impl ProcessSource,
+        interval: Duration,
+    ) -> Result<(Self, ProcessSnapshot), Box<dyn std::error::Error>> {
+        let sampling = Sampling::new(interval.clamp(MIN_REFRESH_INTERVAL, MAX_REFRESH_INTERVAL));
         let source_status = source.status_text().to_string();
         let snapshot = source.snapshot();
         let mut ids = SessionItemIds::default();
@@ -574,7 +608,9 @@ impl ProcessView {
             &summary,
             &owner_published,
             true,
+            Some(&sampling),
         )?;
+        let sampling_published = sampling.view();
         ids.retain(&unfiltered_rows);
         let committed_generation = FilterGeneration::INITIAL;
         let filter_status = committed_filter.format_committed_status(
@@ -607,6 +643,8 @@ impl ProcessView {
                 owner_published,
                 inspector: Inspector::default(),
                 inspector_published: InspectorView::initial(true),
+                sampling,
+                sampling_published,
             },
             snapshot,
         ))
@@ -650,6 +688,15 @@ impl ProcessView {
         source_status: &str,
         snapshot: &ProcessSnapshot,
     ) -> Result<Refreshed, SessionError> {
+        // A paused view publishes no sample: its rows, cells and summary stay
+        // those of the revision it was paused at (PX-015). The loop takes no
+        // sample while paused; this refuses one that reaches it all the same.
+        if self.sampling.frozen().is_some() {
+            self.sampling.discard();
+            return Ok(Refreshed::default());
+        }
+        // This sample ends a resume: the sampling status says live again.
+        self.sampling.published_sample();
         // A snapshot this app cannot identify is not evidence that any process
         // ended. It is published as an error over the last-known rows, exactly
         // like a scan that could not list the process filesystem at all.
@@ -748,6 +795,7 @@ impl ProcessView {
             // of the same refresh does not commit.
             plan.push(Planned::new(Effect::Status(status)));
         }
+        plan.extend(self.sampling_effects());
         if filter_status != self.filter_status {
             plan.push(Planned::new(Effect::FilterStatus(filter_status)));
         }
@@ -1078,6 +1126,9 @@ impl ProcessView {
         }
         plan.extend(summary_effects(&self.summary, &summary));
         result.summary = plan.len() - usize::from(result.status_changed);
+        let sampling = self.sampling_effects();
+        result.controls += sampling.len();
+        plan.extend(sampling);
         // This scan confirmed no row, so none is the currently observed
         // instance a PID jump may select (PX-011). The rows themselves stand.
         self.unconfirmed = self.unfiltered_rows.iter().map(|row| row.item_id).collect();
@@ -1286,7 +1337,9 @@ impl ProcessView {
         let visible = self.visible(&self.unfiltered_rows);
         let target = visible.rows;
         let filter_matches = visible.restricted.then_some(visible.matched);
-        let summary = self.summarize_with_matches(filter_matches);
+        // A paused view re-projects its frozen rows, and its freshness line
+        // keeps saying it is paused (PX-015).
+        let summary = self.labelled(self.summarize_with_matches(filter_matches));
         let filter_status = self.filter_status_for(
             target.len(),
             visible.matched,
@@ -1675,6 +1728,194 @@ impl ProcessView {
         self.publish_controls(session, plan)
     }
 
+    /// The sampling interval, the pause state and the loop's requests
+    /// (PX-015).
+    pub fn sampling(&self) -> &Sampling {
+        &self.sampling
+    }
+
+    /// Where this view is frozen, if it is paused (PX-015). The rows it then
+    /// shows are historical data, not the host's current processes: a future
+    /// process-changing action must refuse every target while this is `Some`
+    /// and be disabled on the client. None exists yet.
+    pub fn frozen(&self) -> Option<Frozen> {
+        self.sampling.frozen()
+    }
+
+    /// The sampling controls as this view last published them (PX-015).
+    pub fn sampling_view(&self) -> &SamplingView {
+        &self.sampling_published
+    }
+
+    /// The sampling controls' changes (PX-015).
+    fn sampling_effects(&self) -> Vec<Planned> {
+        let target = self.sampling.view();
+        let published = &self.sampling_published;
+        let mut plan = Vec::new();
+        if target.status != published.status {
+            plan.push(Planned::new(Effect::SamplingStatus(target.status)));
+        }
+        if target.pause_label != published.pause_label {
+            plan.push(Planned::new(Effect::SamplingLabel(target.pause_label)));
+        }
+        if target.refresh_enabled != published.refresh_enabled {
+            plan.push(Planned::new(Effect::SamplingEnabled(
+                target.refresh_enabled,
+            )));
+        }
+        plan
+    }
+
+    /// `summary` with its data-freshness line labelled for the sampling
+    /// state (PX-007, PX-015): paused, resuming, or unlabelled while live.
+    /// Only that line changes; every figure stays the one it was.
+    fn labelled(&self, mut summary: summary::Properties) -> summary::Properties {
+        let key = (summary::FRESHNESS_TEXT, TEXT);
+        if let Some(Value::String(text)) = summary.get(&key) {
+            let text = crate::bounded(
+                &relabel_freshness(text, self.sampling.freshness_prefix()),
+                summary::MAX_SUMMARY_TEXT_BYTES,
+            );
+            summary.insert(key, Value::String(text));
+        }
+        summary
+    }
+
+    /// Applies one Pause view/Resume view click (PX-015), resolved against
+    /// the state this view holds when the click is applied.
+    pub fn toggle_pause(&mut self, session: &Session) -> Result<Refreshed, SessionError> {
+        if self.sampling.frozen().is_some() {
+            self.resume_view(session)
+        } else {
+            self.pause_view(session)
+        }
+    }
+
+    /// Freezes the published view at the session's current revision
+    /// (PX-015). The rows, cells and summary figures stay exactly what that
+    /// revision holds: the refresh loop takes no sample until Resume view,
+    /// and a sample already being taken is discarded when it returns. This
+    /// commits only the sampling controls, the freshness line's label and
+    /// the inspector, so nothing a client already shows is replaced, and
+    /// every other control keeps working on the frozen rows. Pausing a paused
+    /// view changes nothing.
+    pub fn pause_view(&mut self, session: &Session) -> Result<Refreshed, SessionError> {
+        if self.sampling.frozen().is_some() {
+            return Ok(Refreshed::default());
+        }
+        self.sampling.pause(Frozen {
+            revision: session.current_revision(),
+            paused_at: SystemTime::now(),
+        });
+        self.inspector.pause();
+        self.publish_sampling(session)
+    }
+
+    /// Resumes a paused view (PX-015): the sampling status says the view is
+    /// resuming, and the refresh loop takes one sample at once and publishes
+    /// it as one current view — rows keep their item IDs, ended processes
+    /// are deleted and new ones inserted, by the same diff every refresh
+    /// uses. No sample missed while paused was ever taken, so none is
+    /// replayed. Resuming a live view changes nothing.
+    pub fn resume_view(&mut self, session: &Session) -> Result<Refreshed, SessionError> {
+        if self.sampling.frozen().is_none() {
+            return Ok(Refreshed::default());
+        }
+        self.sampling.resume();
+        self.inspector.resume();
+        self.publish_sampling(session)
+    }
+
+    /// Commits the sampling controls, the freshness label and the inspector
+    /// for the current sampling state.
+    fn publish_sampling(&mut self, session: &Session) -> Result<Refreshed, SessionError> {
+        let mut plan = self.sampling_effects();
+        let summary = self.labelled(self.summary.clone());
+        plan.extend(summary_effects(&self.summary, &summary));
+        plan.extend(self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed));
+        self.publish_controls(session, plan)
+    }
+
+    /// Applies one Refresh now click (PX-015): asks the refresh loop for one
+    /// bounded sample through the ordinary refresh path, coalesced with any
+    /// press it has not taken yet. Refused while paused, where the button is
+    /// disabled: a paused view is refreshed only by Resume view. Commits
+    /// nothing itself; says whether a sample was asked for.
+    pub fn refresh_now(&mut self) -> bool {
+        self.sampling.refresh_now()
+    }
+
+    /// Keeps the interval field's text (PX-015), at most
+    /// [`crate::sampling::MAX_INTERVAL_INPUT_BYTES`] of it, and clears a
+    /// refusal of the text it replaced. Nothing is applied until Apply
+    /// interval.
+    pub fn set_interval_input(
+        &mut self,
+        session: &Session,
+        text: &str,
+    ) -> Result<Refreshed, SessionError> {
+        let kept = self.sampling.set_input(text).to_string();
+        let mut plan = self.sampling_effects();
+        if input_value(session, INTERVAL_INPUT) != kept {
+            plan.push(Planned::new(Effect::SamplingValue(kept)));
+        }
+        self.publish_controls(session, plan)
+    }
+
+    /// Applies one Apply interval click (PX-015): the interval field's text
+    /// becomes the sampling interval, or is refused with its reason on the
+    /// sampling status while the previous interval is kept. An accepted
+    /// interval restarts the loop's one ticker, so the next periodic sample
+    /// is one new interval later.
+    pub fn apply_interval(
+        &mut self,
+        session: &Session,
+    ) -> Result<Result<Duration, IntervalError>, SessionError> {
+        let outcome = self.sampling.apply_input();
+        let plan = self.sampling_effects();
+        self.publish_controls(session, plan)?;
+        Ok(outcome)
+    }
+
+    /// Makes `interval` the interval the controls state, as the refresh loop
+    /// starts with it. Publishes nothing when it already is.
+    pub fn adopt_interval(
+        &mut self,
+        session: &Session,
+        interval: Duration,
+    ) -> Result<Refreshed, SessionError> {
+        if self.sampling.interval() == interval {
+            return Ok(Refreshed::default());
+        }
+        self.sampling.set_interval(interval);
+        let kept = self
+            .sampling
+            .set_input(&self.sampling.interval().as_millis().to_string())
+            .to_string();
+        let mut plan = self.sampling_effects();
+        if input_value(session, INTERVAL_INPUT) != kept {
+            plan.push(Planned::new(Effect::SamplingValue(kept)));
+        }
+        self.publish_controls(session, plan)
+    }
+
+    /// Publishes `snapshot`, sampled under `epoch`, if that is still this
+    /// view's epoch and the view is live (PX-015). A sample taken before a
+    /// pause or a resume is discarded, so it can neither change frozen rows
+    /// nor stand in for the sample Resume view asked for.
+    pub fn apply_sampled(
+        &mut self,
+        session: &Session,
+        epoch: u64,
+        source_status: &str,
+        snapshot: &ProcessSnapshot,
+    ) -> Result<Refreshed, SessionError> {
+        if !self.sampling.accepts(epoch) {
+            return Ok(Refreshed::default());
+        }
+        self.apply(session, source_status, snapshot)
+    }
+
     /// The inspector's server-side state (PX-013).
     pub fn inspector(&self) -> &Inspector {
         &self.inspector
@@ -1767,6 +2008,39 @@ fn edited_text(session: &Session, event: &srui_protocol::Event, node: NodeId) ->
         .ok()
         .and_then(|e| e.text_arg().map(|s| s.to_string()))
         .unwrap_or_else(|| input_value(session, node))
+}
+
+/// Dispatches one Pause view/Resume view click to the shared view (PX-015).
+pub fn pause_toggled(view: &std::sync::Mutex<ProcessView>, session: &Session) {
+    if let Err(error) = lock_view(view).toggle_pause(session) {
+        eprintln!("srtop: pause state not published: {error}");
+    }
+}
+
+/// Dispatches one Refresh now click to the shared view (PX-015).
+pub fn refresh_requested(view: &std::sync::Mutex<ProcessView>, _session: &Session) {
+    lock_view(view).refresh_now();
+}
+
+/// Dispatches a `TEXT_EDIT` event on the interval field to the shared view
+/// (PX-015).
+pub fn interval_edited(
+    view: &std::sync::Mutex<ProcessView>,
+    session: &Session,
+    event: &srui_protocol::Event,
+) {
+    let text = edited_text(session, event, INTERVAL_INPUT);
+    if let Err(error) = lock_view(view).set_interval_input(session, &text) {
+        eprintln!("srtop: interval field not published: {error}");
+    }
+}
+
+/// Dispatches one Apply interval click to the shared view (PX-015). A refused
+/// interval is explained on the sampling status, not here.
+pub fn interval_requested(view: &std::sync::Mutex<ProcessView>, session: &Session) {
+    if let Err(error) = lock_view(view).apply_interval(session) {
+        eprintln!("srtop: interval not published: {error}");
+    }
 }
 
 /// Dispatches a `TEXT_EDIT` event on the filter input to the shared view (PX-010).
@@ -1887,6 +2161,10 @@ fn count(plan: &[Planned], result: &mut Refreshed) {
             Effect::Columns(_) | Effect::ChooserLabel { .. } | Effect::ChooserEnabled { .. } => {
                 result.controls += 1
             }
+            Effect::SamplingStatus(_)
+            | Effect::SamplingLabel(_)
+            | Effect::SamplingEnabled(_)
+            | Effect::SamplingValue(_) => result.controls += 1,
             Effect::Delete(_) if planned.moving => {}
             Effect::Insert(_, rows) if planned.moving => result.moved += rows.len(),
             Effect::Delete(ids) => result.deleted += ids.len(),
@@ -2106,7 +2384,8 @@ fn rows_word(count: usize) -> &'static str {
 /// the search controls [`SEARCH_RESERVE_BYTES`] rather than their own (PX-011),
 /// and the user filter [`OWNER_RESERVE_BYTES`] rather than its own (PX-012),
 /// and the inspector [`INSPECTOR_RESERVE_BYTES`] rather than its own (PX-013),
-/// and its command-line view [`COMMAND_RESERVE_BYTES`] rather than its own (PX-014), so
+/// and its command-line view [`COMMAND_RESERVE_BYTES`] rather than its own (PX-014),
+/// and the sampling controls [`SAMPLING_RESERVE_BYTES`] rather than their own (PX-015), so
 /// the rows that fit are a function of the rows alone. A status or summary that
 /// grew because a scan or a collector failed therefore cannot shrink the row
 /// budget and delete a row no scan said had ended.
@@ -2126,7 +2405,8 @@ fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
             + SEARCH_RESERVE_BYTES
             + OWNER_RESERVE_BYTES
             + INSPECTOR_RESERVE_BYTES
-            + COMMAND_RESERVE_BYTES,
+            + COMMAND_RESERVE_BYTES
+            + SAMPLING_RESERVE_BYTES,
     );
     let mut spent = 0usize;
     let mut kept = 0usize;
@@ -2328,6 +2608,14 @@ enum Effect {
         node: NodeId,
         text: String,
     },
+    /// The sampling status text set (PX-015).
+    SamplingStatus(String),
+    /// The Pause view/Resume view button's label set (PX-015).
+    SamplingLabel(String),
+    /// The Refresh now button enabled or disabled (PX-015).
+    SamplingEnabled(bool),
+    /// The interval field's value set to what the server keeps (PX-015).
+    SamplingValue(String),
     Delete(Vec<ItemId>),
     Insert(u64, Vec<Row>),
     Update(Vec<Row>),
@@ -2352,6 +2640,8 @@ struct Published<'a> {
     owner: &'a mut OwnerView,
     /// The inspector's lines as announced (PX-013).
     inspector: &'a mut InspectorView,
+    /// The sampling controls as announced (PX-015).
+    sampling: &'a mut SamplingView,
 }
 
 /// The planned operations that turn the `published` summary into `target`:
@@ -2418,6 +2708,18 @@ impl Planned {
             Effect::InspectorText { node, text } => {
                 Operation::set_property(*node, TEXT, Value::String(text.clone()))
             }
+            Effect::SamplingStatus(text) => {
+                Operation::set_property(SAMPLING_STATUS, TEXT, Value::String(text.clone()))
+            }
+            Effect::SamplingLabel(label) => {
+                Operation::set_property(SAMPLING_PAUSE, LABEL, Value::String(label.clone()))
+            }
+            Effect::SamplingEnabled(enabled) => {
+                Operation::set_property(SAMPLING_REFRESH, ENABLED, Value::Bool(*enabled))
+            }
+            Effect::SamplingValue(value) => {
+                Operation::set_property(INTERVAL_INPUT, VALUE, Value::String(value.clone()))
+            }
             Effect::Delete(ids) => Operation::model_delete_items(MODEL, ids.iter().copied()),
             Effect::Insert(index, rows) => {
                 Operation::model_insert(MODEL, *index, rows.iter().map(Row::to_model_item))
@@ -2481,6 +2783,10 @@ impl Effect {
             Self::OwnerStatus(text) => VALUE_FRAMING_BYTES + text.len(),
             Self::OwnerValue { value, .. } => VALUE_FRAMING_BYTES + value.len(),
             Self::InspectorText { text, .. } => VALUE_FRAMING_BYTES + text.len(),
+            Self::SamplingStatus(text) | Self::SamplingLabel(text) | Self::SamplingValue(text) => {
+                VALUE_FRAMING_BYTES + text.len()
+            }
+            Self::SamplingEnabled(_) => VALUE_FRAMING_BYTES + SCALAR_VALUE_BYTES,
             Self::SearchStatus(text) => VALUE_FRAMING_BYTES + text.len(),
             Self::SearchValue { value, .. } => VALUE_FRAMING_BYTES + value.len(),
             // The `SET_PROPERTY` of the item ID, and a whole second operation:
@@ -2511,6 +2817,7 @@ impl Effect {
             promoted,
             owner,
             inspector,
+            sampling,
         } = published;
         match self {
             Self::InspectorText { node, text } => {
@@ -2535,7 +2842,10 @@ impl Effect {
                     owner.all = *enabled;
                 }
             }
-            Self::OwnerValue { .. } => {}
+            Self::OwnerValue { .. } | Self::SamplingValue(_) => {}
+            Self::SamplingStatus(text) => sampling.status.clone_from(text),
+            Self::SamplingLabel(label) => sampling.pause_label.clone_from(label),
+            Self::SamplingEnabled(enabled) => sampling.refresh_enabled = *enabled,
             Self::Promote(row) => **promoted = Some(row.item_id),
             Self::Status(text) => status.clone_from(text),
             Self::FilterStatus(text) => filter_status.clone_from(text),
@@ -3045,6 +3355,15 @@ pub fn lock_view(view: &Mutex<ProcessView>) -> std::sync::MutexGuard<'_, Process
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// The loop's one ticker: its first tick one `interval` from now, never at
+/// once, so a new interval neither fires a burst nor keeps the old phase.
+fn ticker_every(interval: Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    // A slow scan must not make the next ticks fire back to back.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker
+}
+
 /// Polls `source` until `shutdown` is cancelled, publishing each difference.
 ///
 /// A failed sample never ends the loop and never empties the table: the error is
@@ -3054,6 +3373,16 @@ pub fn lock_view(view: &Mutex<ProcessView>) -> std::sync::MutexGuard<'_, Process
 /// published in the order it holds at that moment (PX-009): a sort request
 /// applied while a scan was running is never overwritten by that scan's
 /// result, which is published in the newer order.
+///
+/// Since PX-015 the loop follows the view's sampling controls
+/// ([`crate::sampling`]). It owns the only timer: one ticker, replaced — never
+/// joined by a second — when the interval changes or the view resumes, and
+/// not polled at all while the view is paused, when no sample is taken. A
+/// Refresh now press or a Resume view wakes it through the view's one
+/// [`tokio::sync::Notify`] for one sample through this same path. A sample is
+/// published only if the view's epoch is still the one it was taken under.
+/// The ticker and the wake belong to this future, so cancelling `shutdown`
+/// ends them with it; nothing is left running.
 pub async fn poll<S>(
     view: SharedView,
     mut source: S,
@@ -3063,15 +3392,44 @@ pub async fn poll<S>(
 ) where
     S: ProcessSource + Send + 'static,
 {
-    let mut ticker = tokio::time::interval(interval);
-    // A slow scan must not make the next ticks fire back to back.
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The first tick is immediate, and the first snapshot is already published.
-    ticker.tick().await;
+    let wake = {
+        let mut held = lock_view(&view);
+        if let Err(error) = held.adopt_interval(&session, interval) {
+            eprintln!("srtop: interval not published: {error}");
+        }
+        held.sampling.wake_handle()
+    };
+    let mut interval = lock_view(&view).sampling.interval();
+    let mut ticker = ticker_every(interval);
+    let mut paused = false;
     loop {
-        tokio::select! {
+        // The first snapshot is already published, so the first periodic
+        // sample is one interval from now. `biased`, so a ready shutdown always
+        // wins; which of the wake and the tick is taken when both are ready
+        // decides nothing, because the request read below does: a tick of a
+        // ticker the request retires is ignored either way (PR #95 review, F2).
+        let mut ticked = tokio::select! {
+            biased;
             _ = shutdown.cancelled() => return,
-            _ = ticker.tick() => {}
+            _ = wake.notified() => false,
+            _ = ticker.tick(), if !paused => true,
+        };
+        let request = lock_view(&view).sampling.take_request();
+        paused = request.paused;
+        if request.retime || request.interval != interval {
+            interval = request.interval;
+            ticker = ticker_every(interval);
+            // That tick belonged to the ticker just retired. Only an explicit
+            // request (Resume view) samples now; a new interval waits one new
+            // interval, however long the scan before it ran.
+            ticked = false;
+        }
+        if paused || !(ticked || request.sample_now) {
+            continue;
+        }
+        if request.sample_now && !request.retime {
+            // The next periodic sample is one interval after this one.
+            ticker = ticker_every(interval);
         }
         // Reading a host's process filesystem blocks; keep it off the runtime.
         let sampled = tokio::task::spawn_blocking(move || {
@@ -3088,7 +3446,8 @@ pub async fn poll<S>(
         };
         source = returned;
         let status = source.status_text().to_string();
-        if let Err(error) = lock_view(&view).apply(&session, &status, &snapshot) {
+        let published = lock_view(&view).apply_sampled(&session, request.epoch, &status, &snapshot);
+        if let Err(error) = published {
             // The store is unchanged by a failed transaction and the view still
             // holds what the client holds, so the next tick simply tries again.
             eprintln!("srtop: refresh not published: {error}");
@@ -3659,7 +4018,8 @@ mod tests {
                 + SEARCH_RESERVE_BYTES
                 + OWNER_RESERVE_BYTES
                 + INSPECTOR_RESERVE_BYTES
-                + COMMAND_RESERVE_BYTES);
+                + COMMAND_RESERVE_BYTES
+                + SAMPLING_RESERVE_BYTES);
         let mut published = Vec::new();
         for system in [
             SystemSample::not_provided(),
@@ -3887,6 +4247,8 @@ mod tests {
             mine: true,
             all: true,
         };
+        // PX-015: the sampling controls of a collecting view.
+        let sampling = crate::sampling::Sampling::new(MAX_REFRESH_INTERVAL);
         crate::initialize_rows(
             &session,
             Vec::new(),
@@ -3894,6 +4256,7 @@ mod tests {
             &widest_summary(),
             &owner,
             false,
+            Some(&sampling),
         )
         .unwrap();
         // PX-011: every search value at its widest — the status at its bound,
@@ -3946,6 +4309,22 @@ mod tests {
                     crate::command::MAX_COMMAND_TEXT_BYTES,
                 );
                 ui.set(INSPECTOR_COMMAND, TEXT, widest_command.as_str())?;
+                // PX-015: the sampling status and the interval field at
+                // their widest, cut mark included.
+                ui.set(
+                    SAMPLING_STATUS,
+                    TEXT,
+                    crate::bounded(
+                        &"\u{20000}".repeat(crate::sampling::MAX_SAMPLING_STATUS_BYTES / 4 + 1),
+                        crate::sampling::MAX_SAMPLING_STATUS_BYTES,
+                    ),
+                )?;
+                ui.set(
+                    INTERVAL_INPUT,
+                    VALUE,
+                    "\u{20000}".repeat(crate::sampling::MAX_INTERVAL_INPUT_BYTES / 4),
+                )?;
+                ui.set(SAMPLING_PAUSE, LABEL, crate::sampling::RESUME_LABEL)?;
                 Ok(())
             })
             .unwrap();
@@ -3987,6 +4366,22 @@ mod tests {
             INSPECTOR_METRICS,
         ]);
         let command = encoded(&[INSPECTOR_COMMAND]);
+        let sampling = encoded(&[
+            crate::SAMPLING_ROW,
+            SAMPLING_PAUSE,
+            SAMPLING_REFRESH,
+            INTERVAL_INPUT,
+            crate::INTERVAL_APPLY,
+            SAMPLING_STATUS,
+        ]);
+        assert!(
+            sampling <= SAMPLING_RESERVE_BYTES,
+            "the widest sampling controls encode to {sampling} bytes, above their {SAMPLING_RESERVE_BYTES} byte reserve"
+        );
+        assert!(
+            sampling > SAMPLING_RESERVE_BYTES / 2,
+            "the reserve must be measured against sampling controls that really are wide: {sampling}"
+        );
         assert!(
             command <= COMMAND_RESERVE_BYTES,
             "the widest command line encodes to {command} bytes, above its {COMMAND_RESERVE_BYTES} byte reserve"
@@ -4029,6 +4424,7 @@ mod tests {
                     + OWNER_RESERVE_BYTES
                     + INSPECTOR_RESERVE_BYTES
                     + COMMAND_RESERVE_BYTES
+                    + SAMPLING_RESERVE_BYTES
                     + TRANSACTION_ENVELOPE_BYTES,
             "a snapshot with no row is {frame} bytes, above the allowances the row budget \
              leaves for it"
@@ -4043,12 +4439,16 @@ mod tests {
                 + OWNER_RESERVE_BYTES
                 + INSPECTOR_RESERVE_BYTES
                 + COMMAND_RESERVE_BYTES
+                + SAMPLING_RESERVE_BYTES
         );
         println!(
             "PX-013 inspector at its widest: encoded={inspector} reserve={INSPECTOR_RESERVE_BYTES}"
         );
         println!(
             "PX-014 command line at its widest: encoded={command} reserve={COMMAND_RESERVE_BYTES}"
+        );
+        println!(
+            "PX-015 sampling controls at their widest: encoded={sampling} reserve={SAMPLING_RESERVE_BYTES}"
         );
     }
 

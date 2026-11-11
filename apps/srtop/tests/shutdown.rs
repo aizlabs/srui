@@ -1,6 +1,13 @@
 //! Real owned-process regression for normal stop/restart cycles.
+use srui_process_explorer::{INTERVAL_APPLY, INTERVAL_INPUT, SAMPLING_PAUSE};
+use srui_protocol::{
+    decode_framed, encode_framed, srui_message::Msg, ClientHello, EventAckStatus, SruiMessage,
+};
+use srui_semantic_tree::{EditSeq, Event as DomainEvent};
+use srui_sessiond::CORE_VERSION;
 use std::{
     fs,
+    io::{Read, Write},
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -132,7 +139,7 @@ fn a_polling_instance_stops_and_releases_its_socket() {
 fn an_out_of_range_refresh_interval_is_refused_without_publishing_a_socket() {
     let directory = SocketDirectory::new();
     let socket = directory.0.join("s.sock");
-    for interval in ["0", "1", "600000", "not-a-number"] {
+    for interval in ["0", "1", "600000", "not-a-number", "+50", "1.5", "50ms", ""] {
         let exit = Command::new(env!("CARGO_BIN_EXE_srtop"))
             .arg("--socket")
             .arg(&socket)
@@ -168,6 +175,150 @@ fn two_sources_are_refused() {
             .unwrap();
         assert!(!exit.success(), "{pair:?} must be refused");
         assert!(!socket.exists());
+    }
+}
+
+/// A blocking client of a running instance, for driving its sampling
+/// controls the way a real client does (PX-015).
+struct Client {
+    stream: UnixStream,
+    buffer: Vec<u8>,
+    seq: u64,
+}
+
+const CLIENT_INSTANCE: &[u8] = b"px015-shutdown-client";
+
+impl Client {
+    /// Connects, says hello and waits for the catch-up snapshot.
+    fn attach(socket: &Path) -> Self {
+        let stream = UnixStream::connect(socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut client = Self {
+            stream,
+            buffer: Vec::new(),
+            seq: 0,
+        };
+        client.send(&SruiMessage {
+            msg: Some(Msg::ClientHello(ClientHello {
+                core_version: CORE_VERSION.to_string(),
+                profiles: vec!["org.srui.standard-widgets/1".to_string()],
+                client_instance_id: CLIENT_INSTANCE.to_vec(),
+                ..ClientHello::default()
+            })),
+        });
+        loop {
+            if let Some(Msg::Transaction(transaction)) = client.next().msg {
+                if transaction.base_revision == 0 {
+                    return client;
+                }
+            }
+        }
+    }
+
+    fn send(&mut self, message: &SruiMessage) {
+        self.stream
+            .write_all(&encode_framed(message).unwrap())
+            .unwrap();
+    }
+
+    fn next(&mut self) -> SruiMessage {
+        loop {
+            let mut value = 0_usize;
+            let mut prefix = None;
+            for (index, byte) in self.buffer.iter().take(10).enumerate() {
+                value |= usize::from(byte & 0x7f) << (7 * index);
+                if byte & 0x80 == 0 {
+                    prefix = Some(index + 1);
+                    break;
+                }
+            }
+            if let Some(prefix) = prefix {
+                if self.buffer.len() >= prefix + value {
+                    let frame: Vec<u8> = self.buffer.drain(..prefix + value).collect();
+                    return decode_framed(&frame).unwrap();
+                }
+            }
+            let mut chunk = [0_u8; 64 * 1024];
+            let read = self.stream.read(&mut chunk).expect("the server answers");
+            assert!(read > 0, "the server closed the connection");
+            self.buffer.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    /// Sends `event` and waits until the server settles it as processed.
+    fn settle(&mut self, event: srui_protocol::Event) {
+        self.send(&SruiMessage {
+            msg: Some(Msg::Event(event)),
+        });
+        loop {
+            if let Some(Msg::ServerEventAck(ack)) = self.next().msg {
+                assert_eq!(
+                    ack.status,
+                    EventAckStatus::Processed as i32,
+                    "not processed: {ack:?}"
+                );
+                return;
+            }
+        }
+    }
+
+    fn click(&mut self, node: srui_sdk::NodeId) {
+        self.seq += 1;
+        let event = DomainEvent::activate(self.seq, format!("px015-click-{}", self.seq), 0, node)
+            .with_client_instance_id(CLIENT_INSTANCE.to_vec())
+            .to_wire();
+        self.settle(event);
+    }
+
+    fn type_into(&mut self, node: srui_sdk::NodeId, text: &str) {
+        self.seq += 1;
+        let event = DomainEvent::text_edit(
+            self.seq,
+            format!("px015-edit-{}", self.seq),
+            0u64,
+            node.get(),
+            text,
+            EditSeq::new(self.seq).unwrap(),
+        )
+        .with_client_instance_id(CLIENT_INSTANCE.to_vec())
+        .to_wire();
+        self.settle(event);
+    }
+}
+
+/// PX-015: every sampling state a real client can put a collecting instance
+/// in — paused, resumed, retimed, and paused again with the client gone —
+/// still stops on a normal signal and releases the socket. The one ticker
+/// belongs to the session's refresh loop, not to a connection: a client that
+/// disconnects ends only its own connection task, and the loop, its ticker
+/// and its wake end with the instance.
+#[test]
+fn a_paused_or_retimed_instance_stops_and_releases_its_socket() {
+    for signal in ["-TERM", "-INT"] {
+        let directory = SocketDirectory::new();
+        let socket = directory.0.join("s.sock");
+        let mut server =
+            Server::start_with(&socket, &["--fake-sequence", "--refresh-interval-ms", "50"]);
+        let mut client = Client::attach(&socket);
+        client.click(SAMPLING_PAUSE);
+        thread::sleep(Duration::from_millis(200));
+        client.click(SAMPLING_PAUSE);
+        client.type_into(INTERVAL_INPUT, "75");
+        client.click(INTERVAL_APPLY);
+        client.type_into(INTERVAL_INPUT, "60");
+        client.click(INTERVAL_APPLY);
+        thread::sleep(Duration::from_millis(200));
+        client.click(SAMPLING_PAUSE);
+        // The client goes away while the view is paused.
+        drop(client);
+        thread::sleep(Duration::from_millis(100));
+        // A new client attaches to the same paused session.
+        let reattached = Client::attach(&socket);
+        drop(reattached);
+        server.stop(signal);
+        assert!(!socket.exists(), "shutdown left its socket behind");
     }
 }
 

@@ -35,7 +35,8 @@
 //!   filter, search or PID field with `TEXT_EDIT` (PX-010, PX-011), a user-filter
 //!   button with `ACTIVATE` or the user or PID-set field with `TEXT_EDIT` (PX-012), or
 //!   exactly `TABLE` with `SELECTION_CHANGED`, the inspector's one selection input
-//!   (PX-013); `on_result`, `on_text_edit`
+//!   (PX-013), or a sampling button with `ACTIVATE` or the interval field with
+//!   `TEXT_EDIT` (PX-015); `on_result`, `on_text_edit`
 //!   and a model range provider unconditionally; `include`, called or
 //!   renamed; or a macro definition (`macro_rules!`), whose expansion can
 //!   assemble tokens this audit never sees together. Attributes come from an
@@ -774,15 +775,22 @@ const SEARCH_BUTTON_CONSTANTS: &[&str] = &["SEARCH_PREVIOUS", "SEARCH_NEXT", "PI
 /// owners' rows are shown, and touch no process.
 const OWNER_BUTTON_CONSTANTS: &[&str] = &["OWNER_MINE", "OWNER_ALL"];
 
+/// The sampling buttons (PX-015), whose `ACTIVATE` handlers pause or resume
+/// this app's published view, ask the refresh loop for one read-only sample,
+/// or apply the interval field the server kept, and touch no process.
+const SAMPLING_BUTTON_CONSTANTS: &[&str] =
+    &["SAMPLING_PAUSE", "SAMPLING_REFRESH", "INTERVAL_APPLY"];
+
 /// The text inputs whose `TEXT_EDIT` handlers are allowed: the filter input
 /// (PX-010), the search and PID fields (PX-011), and the user and PID-set
-/// fields (PX-012).
+/// fields (PX-012), and the sampling interval field (PX-015).
 const TEXT_INPUT_CONSTANTS: &[&str] = &[
     "FILTER_INPUT",
     "SEARCH_INPUT",
     "PID_INPUT",
     "OWNER_INPUT",
     "PID_SET_INPUT",
+    "INTERVAL_INPUT",
 ];
 
 /// Whether an `on(..)` argument list is one of the sort buttons' `ACTIVATE`
@@ -820,6 +828,7 @@ fn is_sort_button_activation(tokens: &[Tok]) -> bool {
             || COLUMN_CHOOSER_CONSTANTS.contains(&name)
             || SEARCH_BUTTON_CONSTANTS.contains(&name)
             || OWNER_BUTTON_CONSTANTS.contains(&name)
+            || SAMPLING_BUTTON_CONSTANTS.contains(&name)
     ) && event.as_deref() == Some("ACTIVATE")
 }
 
@@ -1583,6 +1592,47 @@ fn the_source_audit_reports_every_known_bypass() {
             "session.on(owner_controls[i], TEXT_EDIT, |_, _| {});",
             "handler",
         ),
+        // PX-015: the sampling controls are allowed only in their exact shape.
+        (
+            "the pause button under a text edit",
+            "session.on(SAMPLING_PAUSE, TEXT_EDIT, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the refresh button under a selection event",
+            "session.on(SAMPLING_REFRESH, SELECTION_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the apply-interval button under a value change",
+            "session.on(INTERVAL_APPLY, VALUE_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the interval field under ACTIVATE",
+            "session.on(INTERVAL_INPUT, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the sampling status as a button",
+            "session.on(SAMPLING_STATUS, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the sampling row as a button",
+            "session.on(SAMPLING_ROW, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a computed sampling target",
+            "session.on(sampling_buttons[i], ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a sampling button by path",
+            "session.on(crate::SAMPLING_PAUSE, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
         // PX-013: the table's SELECTION_CHANGED is allowed only in its exact
         // shape: the bare `TABLE` and the bare `SELECTION_CHANGED`.
         (
@@ -1691,6 +1741,11 @@ fn the_source_audit_reports_every_known_bypass() {
         "session.on(PID_SET_INPUT, TEXT_EDIT, move |session, event| { refresh::pid_set_edited(&pids, session, event); });",
         // the inspector's one selection input, as PX-013 installs it
         "session.on(TABLE, SELECTION_CHANGED, move |session, event| { refresh::selection_changed(&selected, session, event); });",
+        // the sampling controls' registrations, as PX-015 installs them
+        "session.on(SAMPLING_PAUSE, ACTIVATE, move |session, _| { refresh::pause_toggled(&pause, session); });",
+        "session.on(SAMPLING_REFRESH, ACTIVATE, move |session, _| { refresh::refresh_requested(&now, session); });",
+        "session.on(INTERVAL_INPUT, TEXT_EDIT, move |session, event| { refresh::interval_edited(&interval, session, event); });",
+        "session.on(INTERVAL_APPLY, ACTIVATE, move |session, _| { refresh::interval_requested(&apply, session); });",
         "let kind = std::fs::symlink_metadata(&path)?;",
         "use std::fs::File;",
         "use std::os::unix::fs::MetadataExt;",

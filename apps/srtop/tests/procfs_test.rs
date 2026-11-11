@@ -3643,6 +3643,116 @@ mod live {
         );
     }
 
+    /// PX-015 acceptance on a real host: a paused view keeps exactly the rows
+    /// it shows while test-owned workers start and end, and Resume view
+    /// converges on the host as it is now in one sample. The production loop
+    /// polls the live process filesystem throughout.
+    #[test]
+    fn a_paused_view_keeps_its_rows_while_test_owned_workers_start_and_end() {
+        use srui_process_explorer::install_sampling_handlers;
+        use srui_process_explorer::refresh::{lock_view, poll, ProcessView};
+        use std::sync::{Arc, Mutex};
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let interval = Duration::from_millis(200);
+            let session = Arc::new(Session::mint());
+            let mut source = ProcFsSource::live();
+            let mut ending = Worker::start();
+            let (view, _) =
+                ProcessView::start_with_interval(&session, &mut source, interval).unwrap();
+            let view = Arc::new(Mutex::new(view));
+            install_sampling_handlers(&session, &view);
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let polling = tokio::spawn(poll(
+                Arc::clone(&view),
+                source,
+                Arc::clone(&session),
+                interval,
+                shutdown.child_token(),
+            ));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while row_for(&session, ending.pid()).is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the worker reached the collection"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let own = row_for(&session, std::process::id())
+                .expect("the test process is in the collection")
+                .0;
+
+            lock_view(&view).toggle_pause(&session).unwrap();
+            let frozen = lock_view(&view).frozen().expect("paused");
+            // A scan already running when the pause landed returns and is
+            // discarded.
+            tokio::time::sleep(interval).await;
+            let rows = all_rows(&session);
+            let revision = session.current_revision();
+            // The host changes: one worker starts, the other ends.
+            let started = Worker::start();
+            ending.0.kill().unwrap();
+            ending.0.wait().unwrap();
+            tokio::time::sleep(interval * 5).await;
+            assert_eq!(all_rows(&session), rows, "a paused view keeps its rows");
+            assert_eq!(session.current_revision(), revision);
+            assert!(row_for(&session, started.pid()).is_none());
+            assert!(
+                row_for(&session, ending.pid()).is_some(),
+                "the ended worker is still shown"
+            );
+
+            lock_view(&view).toggle_pause(&session).unwrap();
+            let resumed = Instant::now();
+            let deadline = resumed + Duration::from_secs(10);
+            while row_for(&session, started.pid()).is_none()
+                || row_for(&session, ending.pid()).is_some()
+            {
+                assert!(Instant::now() < deadline, "resume converged on the host");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let converged = resumed.elapsed();
+            assert_eq!(
+                row_for(&session, std::process::id()).map(|(id, _)| id),
+                Some(own),
+                "a process that kept running keeps its item ID across the pause"
+            );
+            let discarded = lock_view(&view).sampling().discarded();
+            shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(10), polling)
+                .await
+                .expect("the loop stops")
+                .expect("the loop does not panic");
+            println!(
+                "PX-015 live evidence: interval={interval:?} frozen_at_revision={} \
+                 rows_frozen={} started_pid={} ended_pid={} paused_for={:?} \
+                 converged_after={converged:?} discarded_samples={discarded} revision={}",
+                frozen.revision,
+                rows.len(),
+                started.pid(),
+                ending.pid(),
+                interval * 5,
+                session.current_revision(),
+            );
+        });
+    }
+
+    fn all_rows(session: &Session) -> Vec<(ItemId, Value)> {
+        session.with_store(|store| {
+            store
+                .get_model(MODEL)
+                .unwrap()
+                .items
+                .values()
+                .map(|item| (item.item_id, item.value.clone()))
+                .collect()
+        })
+    }
+
     /// PX-005 acceptance on a real host: a bounded allocation this test owns
     /// moves the resident value the collector publishes for this very process,
     /// and the number it publishes agrees with the kernel's own `VmRSS` for the

@@ -112,6 +112,8 @@ fn the_summary_is_published_as_text_and_progress_and_nothing_else() {
                     TypeRef::BUTTON,
                     // The command filter input (PX-010).
                     TypeRef::TEXT_INPUT,
+                    // The inspector's read-only command line (PX-014).
+                    TypeRef::RICHTEXT,
                 ]
                 .contains(&node.node_type),
                 "node {id} is a {:?}",

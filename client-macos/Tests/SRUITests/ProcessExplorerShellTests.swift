@@ -1,4 +1,4 @@
-// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012/PX-013: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
+// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012/PX-013/PX-014: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
 import Testing
 import Foundation
 import AppKit
@@ -1047,6 +1047,116 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
+    /// PX-014: the selected process's command line is one standard read-only `RichText`, which
+    /// the generic client renders as a non-editable, selectable `NSTextView`. A process whose
+    /// arguments carry quotes, a newline, an ESC byte, shell metacharacters, a bidirectional
+    /// override and a secret shows them as inert escaped text, one argument per line; the text
+    /// carries no link and is copied by the native text system's own selection writer; another
+    /// account's process shows its denied paths; and the server's own output never contains the
+    /// secret.
+    @Test(.timeLimit(.minutes(1)))
+    @MainActor
+    func commandLineIsSelectableInertNativeTextAndNoSecretReachesTheServerLog() async throws {
+        let log = FileManager.default.temporaryDirectory
+            .appendingPathComponent("px014-srtop-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: log) }
+        let harness = try await Self.launch(arguments: ["--fake-source"], serverLog: log)
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer with its command line") {
+            applier.lastAppliedRevision == Revision(1)
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(Self.inspectorCommandID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        let table = try #require((renderer.registry.handle(for: NodeId(5))?.view as? NSScrollView)?.documentView as? NSTableView)
+        let commandHandle = try #require(renderer.registry.handle(for: NodeId(Self.inspectorCommandID)))
+        let scroll = try #require(commandHandle.view as? NSScrollView, "a RichText is a scrolling text view")
+        let textView = try #require(scroll.documentView as? NSTextView)
+        // Normal native text: selectable, never editable, and nothing that turns text into a link
+        // or an action.
+        #expect(textView.isSelectable)
+        #expect(!textView.isEditable)
+        #expect(!textView.isAutomaticLinkDetectionEnabled)
+        #expect(!textView.isAutomaticDataDetectionEnabled)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "no process selected") {
+            textView.string == "Command line: no process selected"
+        }
+
+        // PID 4101: every tricky argument as inert text.
+        table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "PID 4101's command line") {
+            textView.string == Self.workerACommand
+        }
+        #expect(Self.modelText(applier, NodeId(Self.inspectorCommandID)) == Self.workerACommand)
+        #expect(textView.isSelectable && !textView.isEditable, "an update keeps the view read-only")
+        #expect(!textView.string.unicodeScalars.contains { [0x1b, 0x202e, 0x2028, 0x7f].contains($0.value) },
+                "no control or bidirectional character reaches the native view")
+        #expect(textView.string.components(separatedBy: "\n").count == 11, "one line per argument and per path")
+        let storage = try #require(textView.textStorage)
+        var linked = 0
+        storage.enumerateAttribute(.link, in: NSRange(location: 0, length: storage.length)) { value, _, _ in
+            if value != nil { linked += 1 }
+        }
+        #expect(linked == 0, "a server path or argument is never a link")
+        window.contentView?.layoutSubtreeIfNeeded()
+        #expect(scroll.frame.width > 0 && scroll.frame.height > 0, "the command line is laid out: \(scroll.frame)")
+        // Copy uses the native text system: select everything and write the selection to a
+        // private pasteboard (never the user's general one) through the writer Copy uses.
+        textView.setSelectedRange(NSRange(location: 0, length: (textView.string as NSString).length))
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("org.srui.px014.\(UUID().uuidString)"))
+        defer { pasteboard.releaseGlobally() }
+        #expect(textView.selectedRange() == NSRange(location: 0, length: (textView.string as NSString).length))
+        #expect(textView.writeSelection(to: pasteboard, types: textView.writablePasteboardTypes))
+        #expect(pasteboard.string(forType: .string) == Self.workerACommand)
+        let copiedWorkerA = pasteboard.string(forType: .string)?.count ?? 0
+
+        // PID 4102, another account's process: its arguments, and its paths denied.
+        table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "PID 4102's command line") {
+            textView.string == Self.workerBCommand
+        }
+        #expect(!textView.string.contains("hunter2"), "nothing of the earlier target remains")
+        // The helper: its whole record denied.
+        table.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the helper's command line") {
+            textView.string == "Command line: permission denied"
+        }
+        #expect(renderer.registry.handle(for: NodeId(Self.inspectorCommandID)) === commandHandle,
+                "the command line was updated in place")
+        print("PX-014 native SSH evidence: window \(window.windowNumber); view=\(type(of: textView)) selectable=\(textView.isSelectable) editable=\(textView.isEditable) linkDetection=\(textView.isAutomaticLinkDetectionEnabled) links=\(linked) frame=\(scroll.frame) copiedCharacters=\(copiedWorkerA) lines=\(Self.workerACommand.components(separatedBy: "\n").count); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+        let logged = try Data(contentsOf: log)
+        #expect(!String(decoding: logged, as: UTF8.self).contains("hunter2-SECRET"), "the server never logs an argument")
+        print("PX-014 native server log: \(logged.count) bytes; secret present: \(String(decoding: logged, as: UTF8.self).contains("hunter2-SECRET"))")
+    }
+
+    // PX-014: the inspector's command line and the fake fixture's views of it.
+    fileprivate static let inspectorCommandID: UInt64 = 60
+    fileprivate static let workerACommand = #"""
+    Command line (argv on the server, shown as text, never run): 8 arguments, 182 bytes
+    argv[0] · 33 bytes · /usr/libexec/srtop-fixture/worker
+    argv[1] · 13 bytes · --role=worker
+    argv[2] · 21 bytes · --label=it's "quoted"
+    argv[3] · 17 bytes · line one\nline two
+    argv[4] · 12 bytes · \x1b[31mred\x1b[0m
+    argv[5] · 43 bytes · ; rm -rf / # $(touch /tmp/px014) `id` | tee
+    argv[6] · 10 bytes · \u{202e}gpj.exe
+    argv[7] · 25 bytes · --password=hunter2-SECRET
+    Executable on the server: /usr/libexec/srtop-fixture/worker
+    Working directory on the server: /home/alice/work
+    """#
+    fileprivate static let workerBCommand = #"""
+    Command line (argv on the server, shown as text, never run): 2 arguments, 21 bytes
+    argv[0] · 6 bytes · worker
+    argv[1] · 13 bytes · --role=worker
+    Executable on the server: permission denied
+    Working directory on the server: permission denied
+    """#
+
     // PX-013: the inspector's four lines.
     fileprivate static let inspectorMetricsID: UInt64 = 59
     fileprivate static let inspectorLineIDs: [UInt64] = [56, 57, 58, 59]
@@ -1490,7 +1600,7 @@ struct ProcessExplorerShellTests {
     /// configuration for it. Missing prerequisites fail; nothing is skipped.
     @MainActor
     private static func launch(
-        binary: String = "apps/srtop/target/debug/srtop", arguments: [String]
+        binary: String = "apps/srtop/target/debug/srtop", arguments: [String], serverLog: URL? = nil
     ) async throws -> Harness {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
@@ -1528,9 +1638,19 @@ struct ProcessExplorerShellTests {
 
             server.executableURL = appBinary
             server.arguments = ["--socket", socket] + arguments
-            // A test process must never inherit the test binary's stdio.
-            server.standardOutput = FileHandle.nullDevice
-            server.standardError = FileHandle.nullDevice
+            // A test process must never inherit the test binary's stdio. PX-014 keeps the
+            // server's own output in a file it then reads, to show what the server logged.
+            if let serverLog {
+                guard FileManager.default.createFile(atPath: serverLog.path, contents: nil) else {
+                    throw CocoaError(.fileWriteUnknown)
+                }
+                let logHandle = try FileHandle(forWritingTo: serverLog)
+                server.standardOutput = logHandle
+                server.standardError = logHandle
+            } else {
+                server.standardOutput = FileHandle.nullDevice
+                server.standardError = FileHandle.nullDevice
+            }
             try server.run()
             try await AsyncTestSupport.eventually(timeout: .seconds(5), description: "srtop private socket") {
                 FileManager.default.fileExists(atPath: socket)

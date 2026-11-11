@@ -38,7 +38,14 @@
 //!
 //! The native highlight stays local presentation state (§22.5): the server
 //! never selects a row because a user clicked one.
+//!
+//! Since PX-014 the same read also returns the target's command line,
+//! executable and working directory ([`crate::command`]), shown in one
+//! selectable `RichText` under the four lines. They are read only here, for
+//! the current target, and are bound to its `(ProcessKey, SelectionGeneration)`
+//! exactly like its state.
 use crate::catalogue::ProcessField;
+use crate::command::{CommandContext, COMMAND_HEAD, NO_SELECTION_COMMAND, UNCOLLECTED_COMMAND};
 use crate::metric::format_utc;
 use crate::owner::{AccountName, AccountNames};
 use crate::projection::Row;
@@ -166,6 +173,9 @@ pub struct ProcessDetails {
     /// threads' parent), never "root" and never "unavailable".
     pub parent: Observed<u32>,
     pub started: Observed<StartTime>,
+    /// The command line, executable and working directory (PX-014), read in
+    /// the same visit to the same record.
+    pub command: CommandContext,
 }
 
 /// What one detail read found.
@@ -425,13 +435,16 @@ impl Default for Inspector {
     }
 }
 
-/// The inspector's four lines, as published.
+/// The inspector's four lines and its command-line view, as published.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InspectorView {
     pub status: String,
     pub process: String,
     pub details: String,
     pub metrics: String,
+    /// The command-line view's text (PX-014), at most
+    /// [`crate::command::MAX_COMMAND_TEXT_BYTES`].
+    pub command: String,
 }
 
 impl InspectorView {
@@ -445,17 +458,30 @@ impl InspectorView {
                 UNCOLLECTED_INSPECTOR_STATUS
             }
             .to_string(),
+            command: if collected {
+                NO_SELECTION_COMMAND
+            } else {
+                UNCOLLECTED_COMMAND
+            }
+            .to_string(),
             ..Self::default()
         }
     }
 
-    fn bounded(status: String, process: String, details: String, metrics: String) -> Self {
+    fn bounded(
+        status: String,
+        process: String,
+        details: String,
+        metrics: String,
+        command: String,
+    ) -> Self {
         let cut = |text: String| crate::bounded(&text, MAX_INSPECTOR_LINE_BYTES);
         Self {
             status: cut(status),
             process: cut(process),
             details: cut(details),
             metrics: cut(metrics),
+            command: crate::bounded(&command, crate::command::MAX_COMMAND_TEXT_BYTES),
         }
     }
 }
@@ -659,7 +685,13 @@ impl Inspector {
                     None => "Selected process: none · the selection named no row; nothing was read"
                         .to_string(),
                 };
-                return InspectorView::bounded(status, String::new(), String::new(), String::new());
+                return InspectorView::bounded(
+                    status,
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    format!("{COMMAND_HEAD}: nothing was read"),
+                );
             }
             Selection::Process(selected) => selected,
         };
@@ -702,6 +734,7 @@ impl Inspector {
                 process,
                 format!("{DETAILS_HEAD}: none: the process has ended"),
                 format!("{METRICS_HEAD}: none: the process has ended"),
+                format!("{COMMAND_HEAD}: none: the process has ended"),
             );
         }
         let Some(shown) = shown else {
@@ -710,25 +743,32 @@ impl Inspector {
                 process,
                 format!("{DETAILS_HEAD}: not shown"),
                 format!("{METRICS_HEAD}: not shown"),
+                format!("{COMMAND_HEAD}: not shown"),
             );
         };
-        let (state, details) = match &selected.details {
-            Details::Read(details) => (String::new(), details_text(details)),
+        let (state, details, command) = match &selected.details {
+            Details::Read(details) => {
+                (String::new(), details_text(details), details.command.text())
+            }
             Details::Loading => (
                 " · loading details".to_string(),
                 format!("{DETAILS_HEAD}: loading"),
+                format!("{COMMAND_HEAD}: loading"),
             ),
             Details::NotProvided => (
                 " · this source provides no details".to_string(),
                 format!("{DETAILS_HEAD}: not provided by this source"),
+                format!("{COMMAND_HEAD}: not provided by this source"),
             ),
             Details::Unreadable(MissingReason::Denied) => (
                 " · details: permission denied".to_string(),
                 format!("{DETAILS_HEAD}: permission denied"),
+                format!("{COMMAND_HEAD}: permission denied"),
             ),
             Details::Unreadable(MissingReason::Unavailable) => (
                 " · details unavailable".to_string(),
                 format!("{DETAILS_HEAD}: unavailable"),
+                format!("{COMMAND_HEAD}: unavailable"),
             ),
             Details::Ended => unreachable!("an ended target returned above"),
         };
@@ -746,6 +786,7 @@ impl Inspector {
                 cell_text(shown, ProcessField::Cpu),
                 cell_text(shown, ProcessField::Resident)
             ),
+            command,
         )
     }
 }
@@ -807,6 +848,7 @@ mod tests {
             state: Observed::Missing(MissingReason::Denied),
             parent: Observed::Known(0),
             started: Observed::Missing(MissingReason::Unavailable),
+            command: CommandContext::missing(MissingReason::Denied),
         };
         assert_eq!(
             details_text(&details),

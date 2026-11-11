@@ -107,10 +107,10 @@ use crate::source::{ProcessSnapshot, ProcessSource, Retention};
 use crate::summary::{self, CollectorError, Sample};
 use crate::{
     bounded, initialize_rows, published_status_from, sort_button_of, ColumnAction, ScanReport,
-    COLUMN_CHOOSER_BUTTONS, FILTER_INPUT, FILTER_STATUS, INSPECTOR_DETAILS, INSPECTOR_METRICS,
-    INSPECTOR_PROCESS, INSPECTOR_STATUS, MAX_PUBLISHED_LABEL_BYTES, MODEL, OWNER_ALL, OWNER_INPUT,
-    OWNER_MINE, OWNER_STATUS, PID_GO, PID_INPUT, PID_SET_INPUT, SEARCH_INPUT, SEARCH_NEXT,
-    SEARCH_PREVIOUS, SEARCH_STATUS, STATUS, TABLE,
+    COLUMN_CHOOSER_BUTTONS, FILTER_INPUT, FILTER_STATUS, INSPECTOR_COMMAND, INSPECTOR_DETAILS,
+    INSPECTOR_METRICS, INSPECTOR_PROCESS, INSPECTOR_STATUS, MAX_PUBLISHED_LABEL_BYTES, MODEL,
+    OWNER_ALL, OWNER_INPUT, OWNER_MINE, OWNER_STATUS, PID_GO, PID_INPUT, PID_SET_INPUT,
+    SEARCH_INPUT, SEARCH_NEXT, SEARCH_PREVIOUS, SEARCH_STATUS, STATUS, TABLE,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
 use srui_sdk::{ItemId, NodeId, Operation, Value, COLUMNS, ENABLED, LABEL, TEXT, VALUE};
@@ -268,6 +268,14 @@ pub const OWNER_RESERVE_BYTES: usize = 4096;
 /// `the_shell_status_and_summary_fit_their_snapshot_allowances` measures it
 /// with every line at its widest.
 pub const INSPECTOR_RESERVE_BYTES: usize = 6144;
+
+/// Bytes reserved for the inspector's command-line view in a catch-up snapshot
+/// (PX-014): one `RichText` with its label, description and read-only flag,
+/// and its text at [`crate::command::MAX_COMMAND_TEXT_BYTES`]. Charged at this
+/// fixed reserve, so a long command line can never shrink the row budget;
+/// `the_shell_status_and_summary_fit_their_snapshot_allowances` measures it
+/// with the text at its widest.
+pub const COMMAND_RESERVE_BYTES: usize = 10_240;
 
 /// Bytes the `CLEAR_PROPERTY` settlement adds when a commit removes the
 /// promoted row (PX-011-G01): a clear carries no value.
@@ -1622,6 +1630,7 @@ impl ProcessView {
             (INSPECTOR_PROCESS, target.process, &published.process),
             (INSPECTOR_DETAILS, target.details, &published.details),
             (INSPECTOR_METRICS, target.metrics, &published.metrics),
+            (INSPECTOR_COMMAND, target.command, &published.command),
         ]
         .into_iter()
         .filter(|(_, now, was)| now != *was)
@@ -2096,7 +2105,8 @@ fn rows_word(count: usize) -> &'static str {
 /// the command filter controls [`FILTER_RESERVE_BYTES`] rather than their own (PX-010), and
 /// the search controls [`SEARCH_RESERVE_BYTES`] rather than their own (PX-011),
 /// and the user filter [`OWNER_RESERVE_BYTES`] rather than its own (PX-012),
-/// and the inspector [`INSPECTOR_RESERVE_BYTES`] rather than its own (PX-013), so
+/// and the inspector [`INSPECTOR_RESERVE_BYTES`] rather than its own (PX-013),
+/// and its command-line view [`COMMAND_RESERVE_BYTES`] rather than its own (PX-014), so
 /// the rows that fit are a function of the rows alone. A status or summary that
 /// grew because a scan or a collector failed therefore cannot shrink the row
 /// budget and delete a row no scan said had ended.
@@ -2115,7 +2125,8 @@ fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
             + FILTER_RESERVE_BYTES
             + SEARCH_RESERVE_BYTES
             + OWNER_RESERVE_BYTES
-            + INSPECTOR_RESERVE_BYTES,
+            + INSPECTOR_RESERVE_BYTES
+            + COMMAND_RESERVE_BYTES,
     );
     let mut spent = 0usize;
     let mut kept = 0usize;
@@ -2509,6 +2520,8 @@ impl Effect {
                     &mut inspector.process
                 } else if *node == INSPECTOR_DETAILS {
                     &mut inspector.details
+                } else if *node == INSPECTOR_COMMAND {
+                    &mut inspector.command
                 } else {
                     &mut inspector.metrics
                 };
@@ -3645,7 +3658,8 @@ mod tests {
                 + FILTER_RESERVE_BYTES
                 + SEARCH_RESERVE_BYTES
                 + OWNER_RESERVE_BYTES
-                + INSPECTOR_RESERVE_BYTES);
+                + INSPECTOR_RESERVE_BYTES
+                + COMMAND_RESERVE_BYTES);
         let mut published = Vec::new();
         for system in [
             SystemSample::not_provided(),
@@ -3926,44 +3940,61 @@ mod tests {
                 ] {
                     ui.set(node, TEXT, widest.as_str())?;
                 }
+                // PX-014: the command-line view at its widest.
+                let widest_command = crate::bounded(
+                    &"\u{20000}".repeat(crate::command::MAX_COMMAND_TEXT_BYTES / 4 + 1),
+                    crate::command::MAX_COMMAND_TEXT_BYTES,
+                );
+                ui.set(INSPECTOR_COMMAND, TEXT, widest_command.as_str())?;
                 Ok(())
             })
             .unwrap();
         // PX-013: the inspector alone, measured on the encoder against its
         // own reserve.
-        let inspector = session.with_store(|store| {
-            [
-                crate::INSPECTOR,
-                INSPECTOR_STATUS,
-                INSPECTOR_PROCESS,
-                INSPECTOR_DETAILS,
-                INSPECTOR_METRICS,
-            ]
-            .iter()
-            .map(|id| {
-                let node = store.get_node(*id).unwrap();
-                let operation = Operation::create_node(
-                    *id,
-                    node.node_type,
-                    node.parent_id,
-                    None,
-                    node.properties
-                        .iter()
-                        .map(|(property, value)| (*property, value.clone())),
-                );
-                srui_protocol::framed_payload_len(&srui_protocol::SruiMessage {
-                    msg: Some(srui_protocol::srui_message::Msg::Transaction(
-                        srui_protocol::Transaction {
-                            base_revision: 0,
-                            new_revision: 0,
-                            priority: 0,
-                            operations: vec![operation.to_wire()],
-                        },
-                    )),
-                })
+        let encoded = |ids: &[NodeId]| {
+            session.with_store(|store| {
+                ids.iter()
+                    .map(|id| {
+                        let node = store.get_node(*id).unwrap();
+                        let operation = Operation::create_node(
+                            *id,
+                            node.node_type,
+                            node.parent_id,
+                            None,
+                            node.properties
+                                .iter()
+                                .map(|(property, value)| (*property, value.clone())),
+                        );
+                        srui_protocol::framed_payload_len(&srui_protocol::SruiMessage {
+                            msg: Some(srui_protocol::srui_message::Msg::Transaction(
+                                srui_protocol::Transaction {
+                                    base_revision: 0,
+                                    new_revision: 0,
+                                    priority: 0,
+                                    operations: vec![operation.to_wire()],
+                                },
+                            )),
+                        })
+                    })
+                    .sum::<usize>()
             })
-            .sum::<usize>()
-        });
+        };
+        let inspector = encoded(&[
+            crate::INSPECTOR,
+            INSPECTOR_STATUS,
+            INSPECTOR_PROCESS,
+            INSPECTOR_DETAILS,
+            INSPECTOR_METRICS,
+        ]);
+        let command = encoded(&[INSPECTOR_COMMAND]);
+        assert!(
+            command <= COMMAND_RESERVE_BYTES,
+            "the widest command line encodes to {command} bytes, above its {COMMAND_RESERVE_BYTES} byte reserve"
+        );
+        assert!(
+            command > COMMAND_RESERVE_BYTES / 2,
+            "the reserve must be measured against a command line that really is wide: {command}"
+        );
         assert!(
             inspector <= INSPECTOR_RESERVE_BYTES,
             "the widest inspector encodes to {inspector} bytes, above its {INSPECTOR_RESERVE_BYTES} byte reserve"
@@ -3997,6 +4028,7 @@ mod tests {
                     + SEARCH_RESERVE_BYTES
                     + OWNER_RESERVE_BYTES
                     + INSPECTOR_RESERVE_BYTES
+                    + COMMAND_RESERVE_BYTES
                     + TRANSACTION_ENVELOPE_BYTES,
             "a snapshot with no row is {frame} bytes, above the allowances the row budget \
              leaves for it"
@@ -4010,9 +4042,13 @@ mod tests {
                 + SEARCH_RESERVE_BYTES
                 + OWNER_RESERVE_BYTES
                 + INSPECTOR_RESERVE_BYTES
+                + COMMAND_RESERVE_BYTES
         );
         println!(
             "PX-013 inspector at its widest: encoded={inspector} reserve={INSPECTOR_RESERVE_BYTES}"
+        );
+        println!(
+            "PX-014 command line at its widest: encoded={command} reserve={COMMAND_RESERVE_BYTES}"
         );
     }
 

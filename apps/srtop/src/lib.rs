@@ -592,6 +592,7 @@ pub fn initialize(session: &Session) -> Result<(), SessionError> {
     initialize_rows(
         session,
         vec![],
+        0,
         STATUS_TEXT,
         &summary,
         &owner::OwnerView::uncollected(),
@@ -781,11 +782,18 @@ fn plural(count: usize) -> &'static str {
 /// where the rows are chosen, by `refresh::ProcessView::start`, because only
 /// there can the status honestly say how many rows were left out.
 ///
+/// `collected` is how many rows were projected before that bound (PX-018),
+/// so the first filter status says how many of them are shown, worded exactly
+/// as the view states it later.
+///
 /// `sampling` is the collecting view's sampling state (PX-015), or `None` for
 /// the shell that collects nothing, whose sampling controls are disabled.
+// One commit's worth of shell state; each argument is a separate part of it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn initialize_rows(
     session: &Session,
     items: Vec<srui_semantic_tree::ModelItem>,
+    collected: usize,
     status: &str,
     summary: &summary::Properties,
     owner: &owner::OwnerView,
@@ -905,13 +913,16 @@ pub(crate) fn initialize_rows(
             .accessible_description(FILTER_DESCRIPTION)
             .create(ui)?;
         ui.set(FILTER_INPUT, ENABLED, sort_enabled)?;
+        // `collected` rows were projected and `items` are those the
+        // publishable ceiling kept, worded exactly as the view states it
+        // (PX-018).
         let initial_filter_status = if sort_enabled {
-            let shown = items.len();
-            if shown == 0 {
-                "Filter: none · 0 rows".to_string()
-            } else {
-                format!("Filter: none · showing all {shown} rows")
-            }
+            filter::FilterQuery::default().format_committed_status(
+                filter::FilterGeneration::INITIAL,
+                items.len(),
+                collected.max(items.len()),
+                collected.max(items.len()),
+            )
         } else {
             UNCOLLECTED_FILTER_STATUS.to_string()
         };

@@ -1178,3 +1178,151 @@ fn a_column_layout_change_re_lays_out_both_collections_and_keeps_the_tree() {
         "the hierarchy and every item ID are kept"
     );
 }
+
+/// `count` processes whose rows all cost the same bytes, in the table and in
+/// the tree: the widest name, the same cells, and every one a kernel root, so
+/// the publishable byte ceiling keeps a count that depends on the view alone.
+fn uniform(count: u32) -> Fixed {
+    let name = "\u{20000}".repeat(MAX_DISPLAY_NAME_CHARS);
+    Fixed::new(
+        (0..count)
+            .map(|offset| record(10_000 + offset, &name, Lineage::new(0, 1), 1))
+            .collect(),
+    )
+}
+
+/// The rows a fresh view of `count` uniform processes publishes in the table,
+/// and in the tree it switches to.
+fn capacity(count: u32) -> (usize, usize) {
+    let mut source = uniform(count);
+    let mut h = harness(&mut source);
+    let table = h.table().len();
+    h.show_tree(true);
+    (table, h.tree().len())
+}
+
+fn status(h: &Harness) -> String {
+    h.text(srui_process_explorer::STATUS)
+}
+
+fn filter_status(h: &Harness) -> String {
+    h.text(srui_process_explorer::FILTER_STATUS)
+}
+
+/// The statuses the switch commit itself set: only that one transaction.
+fn switch_statuses(h: &Harness, from: u64) -> Vec<(u64, String)> {
+    let transactions = h.session.collect_replayed_transactions(from).unwrap();
+    assert_eq!(transactions.len(), 1, "the switch is one transaction");
+    transactions[0]
+        .operations
+        .iter()
+        .filter_map(|op| match &op.op {
+            Some(operation::Op::SetProperty(set)) => {
+                let text = match set.value.as_ref()?.value.as_ref()? {
+                    srui_protocol::value::Value::StringValue(text) => text.clone(),
+                    _ => return None,
+                };
+                Some((set.node_id, text))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// F1 (PX-018 verification): a tree row costs more bytes than a table row
+/// (its Parent cell and two item properties), so a switch to the tree can
+/// leave rows out at the byte ceiling that the table showed. The switch
+/// commit itself counts them in the status line and the filter status, paused
+/// or not, and the switch back, a filter and its reset restate the count for
+/// the rows they publish. Exactly at the tree's ceiling nothing is left out.
+#[test]
+fn a_switch_to_the_tree_at_the_byte_ceiling_counts_the_rows_it_leaves_out() {
+    // Far more than the tree's ceiling and inside the table's: the probe finds
+    // the tree's ceiling for this row shape without restating the budget.
+    let (table, at) = capacity(22_000);
+    assert_eq!(table, 22_000, "the table shows every probe row");
+    assert!(at < 22_000, "the tree's rows cost more: {at}");
+    let at = u32::try_from(at).unwrap();
+    for paused in [false, true] {
+        // Exactly at the ceiling: the tree shows every row and says nothing.
+        let mut source = uniform(at);
+        let mut h = harness(&mut source);
+        if paused {
+            h.view().pause_view(&h.session).unwrap();
+            h.sync();
+        }
+        let clean = status(&h);
+        h.show_tree(true);
+        assert_eq!(h.tree().len(), at as usize, "paused={paused}");
+        assert_eq!(status(&h), clean, "nothing to count, paused={paused}");
+        assert!(!status(&h).contains("beyond the publishable size limit"));
+        assert_eq!(
+            filter_status(&h),
+            format!("Filter: none · showing all {at} rows")
+        );
+
+        // One row past it: the switch commit counts the one row it left out.
+        let mut source = uniform(at + 1);
+        let mut h = harness(&mut source);
+        assert_eq!(h.table().len(), at as usize + 1);
+        if paused {
+            h.view().pause_view(&h.session).unwrap();
+            h.sync();
+        }
+        let before = h.revision();
+        h.show_tree(true);
+        assert_eq!(h.tree().len(), at as usize, "paused={paused}");
+        let expected = format!("{clean} · 1 row beyond the publishable size limit");
+        let shown_of = format!(
+            "Filter: none · showing {at} of {} rows; 1 beyond the publishable size limit",
+            at + 1
+        );
+        assert_eq!(status(&h), expected, "paused={paused}");
+        assert_eq!(filter_status(&h), shown_of);
+        let set = switch_statuses(&h, before);
+        assert!(set.contains(&(srui_process_explorer::STATUS.get(), expected.clone())));
+        assert!(set.contains(&(srui_process_explorer::FILTER_STATUS.get(), shown_of)));
+        // A filter while in the tree publishes other rows, and recounts them.
+        h.view()
+            .set_filter(&h.session, "nothing-matches-this")
+            .unwrap();
+        h.sync();
+        assert_eq!(
+            status(&h),
+            clean,
+            "a filter that leaves out nothing, paused={paused}"
+        );
+        h.view().set_filter(&h.session, "").unwrap();
+        h.sync();
+        assert_eq!(
+            status(&h),
+            expected,
+            "the reset counts again, paused={paused}"
+        );
+        assert_eq!(h.tree().len(), at as usize);
+        // A sort republishes the same rows and keeps the count.
+        h.view().click_sort(&h.session, ProcessField::Cpu).unwrap();
+        h.sync();
+        assert_eq!(status(&h), expected);
+        // The switch back shows every row again, and says so in its commit.
+        let back = h.revision();
+        h.show_tree(false);
+        assert_eq!(h.table().len(), at as usize + 1);
+        assert_eq!(status(&h), clean, "paused={paused}");
+        let set = switch_statuses(&h, back);
+        assert!(set.contains(&(srui_process_explorer::STATUS.get(), clean.clone())));
+        assert_eq!(
+            filter_status(&h),
+            format!(
+                "Committed filter (gen 2): none · showing all {} rows",
+                at + 1
+            )
+        );
+        if !paused {
+            // A sample in the tree counts the same rows as the switch did.
+            h.show_tree(true);
+            h.sample(&mut source);
+            assert_eq!(status(&h), expected);
+        }
+    }
+}

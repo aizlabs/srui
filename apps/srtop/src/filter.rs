@@ -267,14 +267,25 @@ impl FilterQuery {
         total: usize,
     ) -> String {
         if self.terms.is_empty() {
+            // Every row matches, but the publishable ceiling may leave some
+            // out (PX-004, PX-018): then this says how many are shown, never
+            // "all".
+            let showing = if shown < matched {
+                format!(
+                    "showing {shown} of {matched} rows; {} beyond the publishable size limit",
+                    matched - shown
+                )
+            } else {
+                format!("showing all {shown} rows")
+            };
             if generation.get() == 0 {
-                if shown == 0 {
+                if shown == 0 && matched == 0 {
                     "Filter: none · 0 rows".to_string()
                 } else {
-                    format!("Filter: none · showing all {shown} rows")
+                    format!("Filter: none · {showing}")
                 }
             } else {
-                format!("Committed filter (gen {generation}): none · showing all {shown} rows")
+                format!("Committed filter (gen {generation}): none · {showing}")
             }
         } else {
             let terms_display = self

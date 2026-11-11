@@ -556,6 +556,15 @@ pub struct ProcessView {
     tree_levels: usize,
     /// The view status as the client holds it (PX-018).
     view_status: String,
+    /// What the status line is built from (PX-004, PX-018): the source's own
+    /// label and the last scan's report, and the counts last stated. A
+    /// republish that changes which rows are shown — a view switch, a sort, a
+    /// filter — restates the status from these with its own row counts, so a
+    /// row the ceiling newly leaves out is counted in that commit, not only at
+    /// the next sample.
+    status_source: String,
+    status_scan: ScanReport,
+    status_counts: RefreshCounts,
 }
 
 /// The rows every active filter keeps, and what the filters' controls say
@@ -691,14 +700,11 @@ impl ProcessView {
         // fit do not depend on what this tick's status happens to say.
         let mut rows = unfiltered_rows.clone();
         let truncated = bound_to_publishable_collection(&mut rows, published_limit);
-        let status = refresh_status(
-            &source_status,
-            &snapshot,
-            &RefreshCounts {
-                truncated,
-                ..RefreshCounts::default()
-            },
-        );
+        let status_counts = RefreshCounts {
+            truncated,
+            ..RefreshCounts::default()
+        };
+        let status = refresh_status(&source_status, &snapshot, &status_counts);
         debug_assert!(status.len() <= STATUS_RESERVE_BYTES);
         // The first sample is shown if it is one; a first scan that could not
         // list its processes publishes a collector error and no figure.
@@ -719,6 +725,7 @@ impl ProcessView {
         initialize_rows(
             session,
             rows.iter().map(Row::to_model_item).collect(),
+            unfiltered_rows.len(),
             &status,
             &summary,
             &owner_published,
@@ -773,6 +780,9 @@ impl ProcessView {
                         .min(DEFAULT_MAX_MODEL_TREE_DEPTH)
                 }),
                 view_status: TABLE_VIEW_STATUS.to_string(),
+                status_source: source_status,
+                status_scan: ScanReport::of(&snapshot),
+                status_counts,
             },
             snapshot,
         ))
@@ -936,17 +946,15 @@ impl ProcessView {
             .iter()
             .filter(|row| !confirmed_ids.contains(&row.item_id))
             .count();
-        let status = refresh_status(
-            source_status,
-            snapshot,
-            &RefreshCounts {
-                retained,
-                rejected,
-                evicted,
-                truncated,
-            },
-        );
+        let counts = RefreshCounts {
+            retained,
+            rejected,
+            evicted,
+            truncated,
+        };
+        let status = refresh_status(source_status, snapshot, &counts);
         debug_assert!(status.len() <= STATUS_RESERVE_BYTES);
+        self.remember_status(source_status, snapshot, counts);
         let filter_status =
             self.filter_status_for(target.len(), matched, unfiltered_target.len(), beyond_text);
 
@@ -1284,16 +1292,14 @@ impl ProcessView {
         summary: summary::Properties,
     ) -> Result<Refreshed, SessionError> {
         let retained = self.rows.len();
-        let status = refresh_status(
-            source_status,
-            snapshot,
-            &RefreshCounts {
-                retained,
-                rejected,
-                ..RefreshCounts::default()
-            },
-        );
+        let counts = RefreshCounts {
+            retained,
+            rejected,
+            ..RefreshCounts::default()
+        };
+        let status = refresh_status(source_status, snapshot, &counts);
         debug_assert!(status.len() <= STATUS_RESERVE_BYTES);
+        self.remember_status(source_status, snapshot, counts);
         let mut result = Refreshed {
             retained,
             ..Refreshed::default()
@@ -1427,6 +1433,38 @@ impl ProcessView {
         self.republish(session, plan)
     }
 
+    /// Keeps what a sample's status line was built from (PX-018), so a
+    /// republish can restate it with its own row counts.
+    fn remember_status(
+        &mut self,
+        source_status: &str,
+        snapshot: &ProcessSnapshot,
+        counts: RefreshCounts,
+    ) {
+        self.status_source = source_status.to_string();
+        self.status_scan = ScanReport::of(snapshot);
+        self.status_counts = counts;
+    }
+
+    /// The status line for a republish that shows `target`, of which the
+    /// ceiling left `truncated` matching rows out (PX-018): the last sample's
+    /// scan and counts, with the rows kept from an earlier scan and the rows
+    /// beyond the publishable size limit counted again for these rows. A
+    /// republish samples nothing, so its scan clauses are the last sample's.
+    fn republished_status(&self, target: &[Row], truncated: usize) -> (String, RefreshCounts) {
+        let counts = RefreshCounts {
+            retained: target
+                .iter()
+                .filter(|row| self.unconfirmed.contains(&row.item_id))
+                .count(),
+            truncated,
+            ..self.status_counts.clone()
+        };
+        let status = refresh_status_from(&self.status_source, &self.status_scan, &counts);
+        debug_assert!(status.len() <= STATUS_RESERVE_BYTES);
+        (status, counts)
+    }
+
     /// The rows every active filter keeps out of `unfiltered`, and the
     /// user-filter controls for them (PX-010, PX-012), as `mode` shows
     /// them (PX-018): the table's leading rows in the active order, or the
@@ -1439,7 +1477,10 @@ impl ProcessView {
     /// cell and item properties too. A prefix of a preorder is itself a
     /// forest, and every kept row's ancestors precede it, so the ceiling
     /// never orphans a shown process: a subtree it cuts is shown with the
-    /// descendants that fit, and the filter status counts the rest.
+    /// descendants that fit. `truncated` counts the rest, which the status
+    /// line states in the same commit on every path that publishes these rows
+    /// — a sample, a view switch either way, a sort, a filter — and the
+    /// filter status says how many of the matching rows are shown.
     fn visible_in(
         &self,
         mode: ViewMode,
@@ -1592,6 +1633,15 @@ impl ProcessView {
             visible.beyond_text,
         );
         let (batch, max_ops, max_bytes) = self.planning_limits(session);
+        // The rows this publishes may not be the ones the last sample's
+        // status counted: a switch to the tree, whose rows cost more bytes,
+        // or a sort or filter that brings other rows under the ceiling
+        // (PX-018). The status counts these rows, in this commit.
+        let (status, counts) = self.republished_status(&target, visible.truncated);
+        if status != self.status {
+            plan.push(Planned::new(Effect::Status(status)));
+        }
+        self.status_counts = counts;
         if filter_status != self.filter_status {
             plan.push(Planned::new(Effect::FilterStatus(filter_status)));
         }
@@ -5433,6 +5483,7 @@ mod tests {
         crate::initialize_rows(
             &session,
             Vec::new(),
+            0,
             &status,
             &widest_summary(),
             &owner,

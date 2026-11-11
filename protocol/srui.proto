@@ -89,6 +89,7 @@ enum StandardProperty {
   PROPERTY_SHORTCUT = 31;
   PROPERTY_TREE_DEPTH = 32;
   PROPERTY_DESCENDANT_COUNT = 33;
+  PROPERTY_KEEP_VISIBLE = 34;
 }
 
 enum TextRole {

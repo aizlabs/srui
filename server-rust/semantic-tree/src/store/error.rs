@@ -133,6 +133,9 @@ pub enum StoreError {
     /// A List/Table/Tree promoted selection (`value`) is not an `ItemId`, or is held while the
     /// node's `selection_mode` is absent or `none` (§6.3, §7.4, §8).
     InvalidCollectionSelection { node_id: NodeId, reason: String },
+    /// A `keep_visible` value is not an `ItemId`, or is held by a node that is not a model-backed
+    /// `List`, `Table` or `Tree` (§6.3, §8).
+    InvalidKeepVisible { node_id: NodeId, reason: String },
     /// A `shortcut` value is not in the closed canonical grammar (§4 inv. 13, §26).
     InvalidShortcut { node_id: NodeId, reason: String },
     /// A `shortcut` was set on a node type that does not admit one (§7.4).
@@ -264,6 +267,9 @@ impl fmt::Display for StoreError {
                 "invalid promoted selection on collection node {}: {}",
                 node_id, reason
             ),
+            Self::InvalidKeepVisible { node_id, reason } => {
+                write!(f, "invalid keep_visible on node {}: {}", node_id, reason)
+            }
             Self::InvalidShortcut { node_id, reason } => {
                 write!(f, "invalid shortcut on node {}: {}", node_id, reason)
             }
@@ -335,6 +341,7 @@ impl StoreError {
             Self::ModelIndexOutOfBounds { .. } => "model_index_out_of_bounds",
             Self::DuplicateItemId { .. } => "duplicate_item_id",
             Self::InvalidCollectionSelection { .. } => "invalid_collection_selection",
+            Self::InvalidKeepVisible { .. } => "invalid_keep_visible",
             Self::InvalidShortcut { .. } => "invalid_shortcut",
             Self::ShortcutNotAdmitted { .. } => "shortcut_not_admitted",
             Self::DuplicateShortcut { .. } => "duplicate_shortcut",

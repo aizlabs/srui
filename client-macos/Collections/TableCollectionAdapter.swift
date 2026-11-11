@@ -53,6 +53,9 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
     public private(set) var pendingPromotion: CollectionPromotion?
     /// The user changed the selection after the last promotion (§22.5).
     public private(set) var localSelectionSincePromotion = false
+    /// Server-hinted keep-in-view item and its displayed row as of the last reveal or
+    /// re-baseline, `nil` while hidden or not yet revealed (§6.3, §22.7).
+    public private(set) var keepVisible = CollectionKeepVisible()
 
     /// Nested-scroll chrome. Public so `ControlFactory` (RendererAppKit) can
     /// wire collections that now live in a separate module.
@@ -359,6 +362,19 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
         guard selectionMode != .none else { return }
         pendingPromotion = CollectionPromotion(itemID: itemID, reveal: reveal)
         resolvePendingPromotion(in: tableView)
+    }
+
+    // MARK: - Server-hinted keep-in-view (§6.3, §8, §22.5, §22.7)
+
+    /// Applies the collection's `keep_visible` after a commit (`CollectionKeepVisible`).
+    ///
+    /// Reveals the hinted row with the minimum scroll when the commit set the property or moved
+    /// the item to another row index. Never reads or changes the selection, never posts an
+    /// accessibility notification and never emits an event.
+    public func applyKeepVisible(_ itemID: ItemId?, explicit: Bool, tableView: NSTableView) {
+        if let row = keepVisible.apply(itemID, explicit: explicit, rowOf: row(of:)) {
+            CollectionPromotion.reveal(row: row, in: tableView)
+        }
     }
 
     /// Reselects a user's local selection by ItemId without revealing it (§22.5).

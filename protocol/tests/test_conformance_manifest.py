@@ -243,6 +243,14 @@ STATE_MACHINE_VECTORS_ADDED_AFTER_SPLIT = (
     "86_model_tree_unreachable_depth_across_gap_rejected.json",
     "87_model_tree_shape_gained_through_update_rejected.json",
     "88_model_tree_descendants_below_the_deepest_level_rejected.json",
+    # PX-017-G01: server-hinted keep-in-view item, standard `keep_visible` property (§6.3, §8, §22.7).
+    "89_keep_visible_success.json",
+    "90_keep_visible_non_collection_rejected.json",
+    "91_keep_visible_row_index_rejected.json",
+    "92_keep_visible_model_less_collection_rejected.json",
+    "93_keep_visible_clear_model_ref_while_held_rejected.json",
+    # PX-017-G01 verification O3: BATCH_PROPERTY_SET relies on the node's existing model_ref.
+    "94_keep_visible_batch_uses_existing_model_ref_success.json",
 )
 
 

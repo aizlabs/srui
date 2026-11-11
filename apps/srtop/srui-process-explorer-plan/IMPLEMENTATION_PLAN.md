@@ -813,10 +813,34 @@ Apply the standing completion contract. Record evidence in `docs/process-explore
 
 ---
 
+#### PX-017-G01 — Server-hinted keep-in-view for collection items
+
+**Phase:** B · **Scope size:** M · **Status:** planned · **Gate:** R1-prerequisite
+**Dependencies:** PX-016
+**Read:** D1 §§4 inv. 13, 6.3, 7.4, 8, 12.1, 22.5, 22.7, 26, 32; registry List (17), Table (18), Tree (19)
+
+##### Build
+
+Add one standard property `keep_visible` on model-backed List, Table and Tree nodes: an ItemId the client keeps in view. It is presentation guidance from the server (§6.3) and never selection state: setting, changing or clearing it never selects, deselects or replaces a local selection, never posts a selection notification and never emits an event. Whenever a commit sets the property, or changes the row index at which the named item is shown, the client scrolls the minimum needed to make that row visible (the same one-shot reveal as a promotion, without the selection); a commit that leaves the item's row index unchanged never scrolls, so a local pan persists until the item moves. If the item is not cached the client waits and reveals it when it arrives through range data, requesting nothing new. A local selection, scroll or keyboard navigation never clears or overrides the property. Store rules in Rust and Swift: the value is an ItemId only, admitted only on model-backed List, Table and Tree, otherwise the transaction is refused. Authoritative settlement mirrors PX-011-G01: a transaction that removes the named item from the collection's model (delete, reset, positional update, model_ref change) clears the property in the same commit; an authoritative set naming an item the model does not hold is refused with ItemNotFound; a pre-built commit that would leave it dangling is refused. SDK set and clear on the three widgets. Registry, spec/registries.md, build.rs count asserts and generated Swift tables updated through codegen. A client without support keeps its viewport where the user put it, documented as the fallback. No application-specific client path.
+
+##### Out of scope
+
+No change to `value` or promotion semantics, no Tree disclosure interaction beyond scrolling the row if it is visible (hierarchical disclosure is PX-018-G01's), no client-to-server viewport reporting, and no Process Explorer feature work (PX-017 adopts this separately).
+
+##### Verification / acceptance criteria
+
+Rust and Swift tests plus conformance vectors: store admission and value-type refusals with rollback in both languages; settlement clears on every removal path and refuses an unknown item; positive and negative suite 1 vectors and the manifest count updated exactly. Native AppKit tests on a 10,000-row table: setting the property reveals the row without changing an existing local selection or emitting SELECTION_CHANGED; a commit that moves the item's row reveals it again; a commit that does not move it leaves a local pan untouched; 20 rapid local selections while the item keeps moving end on the last selection with no backward jump and no selection change caused by the property; an uncached item is revealed when it arrives; clearing the property never moves the viewport or the selection.
+
+##### Handoff and completion
+
+Apply the standing completion contract. Record evidence in `docs/process-explorer/completions/PX-017-G01.md`, update the individual feature ledger, and commit only this bounded change after required checks pass. A gate remains open if a required behavior or native test is missing.
+
+---
+
 #### PX-017 — Add follow mode and stable viewport behavior
 
 **Phase:** B · **Scope size:** M · **Status:** planned · **Gate:** none
-**Dependencies:** PX-016
+**Dependencies:** PX-016, PX-017-G01
 **Read:** D1 §§6.2–6.3, 8, 22.7; D2 T28
 
 ##### Build

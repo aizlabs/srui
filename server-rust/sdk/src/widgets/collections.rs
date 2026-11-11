@@ -363,6 +363,31 @@ macro_rules! impl_promoted_selection {
             pub fn promoted_selection(&self, store: &SemanticStore) -> Option<ItemId> {
                 store.get_node(self.id())?.promoted_selection()
             }
+
+            /// Hints that the client keep `item` in view, never touching selection (§6.3, §8).
+            ///
+            /// See [`crate::UiTransaction::set_keep_visible`] for the recorded operations and
+            /// the explicit errors.
+            pub fn set_keep_visible(
+                &self,
+                ui: &mut crate::UiTransaction,
+                item: impl Into<ItemId>,
+            ) -> Result<(), StoreError> {
+                ui.set_keep_visible(self.id(), item)
+            }
+
+            /// Clears this collection's `keep_visible` hint, returning the item it named.
+            pub fn clear_keep_visible(
+                &self,
+                ui: &mut crate::UiTransaction,
+            ) -> Result<Option<ItemId>, StoreError> {
+                ui.clear_keep_visible(self.id())
+            }
+
+            /// Returns this collection's `keep_visible` hint, if any (§6.3).
+            pub fn keep_visible(&self, store: &SemanticStore) -> Option<ItemId> {
+                store.get_node(self.id())?.keep_visible()
+            }
         }
     };
 }

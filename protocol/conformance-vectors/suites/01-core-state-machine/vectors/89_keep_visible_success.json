@@ -1,0 +1,156 @@
+{
+  "name": "keep_visible_success",
+  "description": "A model-backed Table holds keep_visible as an ItemId (standard property 32). It is presentation guidance, not selection: it is admitted with selection_mode none and leaves value absent (§6.3, §8, §22.7).",
+  "spec_sections": [
+    "§4 inv. 13",
+    "§6.3",
+    "§8",
+    "§12.1"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Processes"
+          }
+        },
+        {
+          "type": "CREATE_MODEL",
+          "model_id": 10,
+          "model_type": "Table",
+          "item_count": 0
+        },
+        {
+          "type": "MODEL_INSERT",
+          "model_id": 10,
+          "index": 0,
+          "items": [
+            {
+              "item_id": 101,
+              "value": "Row A",
+              "properties": {}
+            },
+            {
+              "item_id": 102,
+              "value": "Row B",
+              "properties": {}
+            },
+            {
+              "item_id": 103,
+              "value": "Row C",
+              "properties": {}
+            }
+          ]
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Table",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "model_ref": 10,
+            "selection_mode": {
+              "enum": "SelectionMode",
+              "value": "none"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "SET_PROPERTY",
+        "node_id": 2,
+        "property": "keep_visible",
+        "value": {
+          "item_id": 102
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "success",
+    "committed_revision": 2,
+    "store_state": {
+      "node_count": 2,
+      "roots": [
+        1
+      ],
+      "nodes": {
+        "1": {
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "ordered_children": [
+            2
+          ],
+          "properties": {
+            "label": "Processes"
+          }
+        },
+        "2": {
+          "node_id": 2,
+          "node_type": "Table",
+          "parent_id": 1,
+          "ordered_children": [],
+          "properties": {
+            "model_ref": 10,
+            "selection_mode": {
+              "enum": "SelectionMode",
+              "value": "none"
+            },
+            "keep_visible": {
+              "item_id": 102
+            }
+          }
+        }
+      },
+      "model_count": 1,
+      "models": {
+        "10": {
+          "model_id": 10,
+          "model_type": "Table",
+          "item_count": 3,
+          "cached_item_count": 3,
+          "cached_ranges": [
+            {
+              "start": 0,
+              "length": 3
+            }
+          ],
+          "items": {
+            "0": {
+              "item_id": 101,
+              "value": "Row A",
+              "properties": {}
+            },
+            "1": {
+              "item_id": 102,
+              "value": "Row B",
+              "properties": {}
+            },
+            "2": {
+              "item_id": 103,
+              "value": "Row C",
+              "properties": {}
+            }
+          }
+        }
+      }
+    }
+  }
+}

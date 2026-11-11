@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-017-G01",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Generic server-hinted keep-in-view for collection items (§4 inv. 13, §6.3, §7.4, §8, §12.1, §22.5, §22.7, §26, §32): one standard registry property, Rust and Swift store rules, authoritative settlement alongside promoted selection, SDK set/clear, and a generic AppKit reveal path that never touches selection; no Process Explorer feature work and no application-specific client path",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX017G01-001",
+      "feature": "Standard registry property `keep_visible` (namespace 0, value type `value`, control_specific) added through protocol/registry.yaml and srui.proto with codegen: build.rs asserts the new property count, srui.pb.swift and RegistryTables.swift regenerated with no residual diff, spec/registries.md and CLAUDE.md updated; the fallback (a client without support keeps its viewport where the user put it) is documented",
+      "scope": "PX-017-G01/protocol registry.yaml, srui.proto, generate_proto.sh outputs; server-rust/semantic-tree/build.rs; spec/registries.md; CLAUDE.md",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX017G01-002",
+      "feature": "Both stores admit keep_visible only as an ItemId on a List, Table or Tree that has a model_ref, evaluated on the resulting property set of CREATE_NODE, SET_PROPERTY, CLEAR_PROPERTY and BATCH_PROPERTY_SET (clearing model_ref while it is held is refused); refusals use invalid_keep_visible and roll back the whole transaction; independent of value and selection_mode; suite 1 positive and negative vectors replay identically in Rust and Swift and the manifest count is exact",
+      "scope": "PX-017-G01/semantic-tree store/mod.rs validate_keep_visible, store/error.rs, store/node.rs; client-macos SemanticModel/SemanticStore.swift; protocol/conformance-vectors suite 1 keep_visible vectors and manifest.json",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX017G01-003",
+      "feature": "Authoritative settlement mirrors PX-011-G01: an assignment naming an item the model does not hold is refused with ItemNotFound; delete, range reset, positional update and model_ref change clear the hint in the same commit; a pre-built sessiond commit_transaction that would leave it dangling is refused; runs on SDK transaction/transaction_custom, sessiond transaction_with_result and range fulfilment; settling a hint never touches value and vice versa",
+      "scope": "PX-017-G01/server-rust sdk/src/selection.rs, sessiond/src/session.rs, sessiond/src/session/model_range.rs",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX017G01-004",
+      "feature": "SDK set and clear: UiTransaction::{set_keep_visible, clear_keep_visible, keep_visible} and List/Table/Tree::{set_keep_visible, clear_keep_visible, keep_visible}; set records the authoritative item as a one-item MODEL_RESET_RANGE before SET_PROPERTY(keep_visible)",
+      "scope": "PX-017-G01/server-rust sdk/src/keep_visible.rs, sdk/src/widgets/collections.rs, sdk/src/lib.rs",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX017G01-005",
+      "feature": "Generic AppKit reveal-without-selection for Table, List and Tree: a commit that sets the hint or changes the item's row index scrolls the minimum to show it; an unchanged row never scrolls; an uncached item waits and is revealed on arrival with nothing requested; clearing never scrolls; it never selects, deselects, posts a selection notification, emits SELECTION_CHANGED or touches promotion memory; 20 rapid keyboard selections while the item moves end on the last selection; on a hierarchical Tree (PX-018-G01) rows come from the hidden-interval mapping, an item under a collapsed ancestor scrolls nothing and expands nothing, and a local expand or collapse never scrolls for the hint, only re-baselining its last revealed row",
+      "scope": "PX-017-G01/client-macos Collections/CollectionKeepVisible.swift, TableCollectionAdapter.swift, OutlineCollectionAdapter.swift; RendererAppKit/CollectionKeepVisibleRendering.swift, LayoutRenderer.swift; Tests/RendererAppKitTests/KeepVisibleRenderingTests.swift",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017-G01.md"
+      ]
+    }
+  ]
+}

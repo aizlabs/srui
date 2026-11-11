@@ -27,6 +27,11 @@
 //!   [`UiTransaction::settle_promoted_selections`] runs on every SDK and sessiond commit path; a
 //!   pre-built wire commit (`commit_transaction`) cannot gain operations, so it is refused instead
 //!   (see [`dangling_promotions`]).
+//! - **keep_visible.** The same settlement covers the standard `keep_visible` property, the
+//!   server-hinted keep-in-view item (see [`crate::keep_visible`]): an assignment naming an item
+//!   the model does not hold is refused with [`StoreError::ItemNotFound`], and an earlier hint
+//!   whose item the transaction removed is cleared in the same commit. Settling a hint never
+//!   touches `value`, and settling a promotion never touches `keep_visible`.
 
 use std::collections::HashSet;
 
@@ -36,20 +41,26 @@ use srui_semantic_tree::{
     StandardSelectionMode, StoreError, Value,
 };
 
-/// Returns `true` when `op` can assign a promotion or remove a promoted item from its
-/// collection's model, so the transaction's promotions must be re-checked (§6.3, §8).
+/// The collection properties that name a model item and are settled against the authoritative
+/// model: `value` (promoted selection) and `keep_visible` (keep-in-view hint).
+fn names_an_item(p: &PropertyRef) -> bool {
+    *p == PropertyRef::VALUE || *p == PropertyRef::KEEP_VISIBLE
+}
+
+/// Returns `true` when `op` can assign a promotion or a `keep_visible` hint, or remove the item
+/// either names from its collection's model, so the transaction's promotions and hints must be
+/// re-checked (§6.3, §8).
 pub fn affects_promotions(op: &Operation) -> bool {
-    let promotion_or_model =
-        |p: &PropertyRef| *p == PropertyRef::VALUE || *p == PropertyRef::MODEL_REF;
+    let item_or_model = |p: &PropertyRef| names_an_item(p) || *p == PropertyRef::MODEL_REF;
     match op {
         Operation::SetProperty { property, .. } | Operation::ClearProperty { property, .. } => {
-            promotion_or_model(property)
+            item_or_model(property)
         }
         Operation::BatchPropertySet { properties, .. } => {
-            properties.iter().any(|(p, _)| promotion_or_model(p))
+            properties.iter().any(|(p, _)| item_or_model(p))
         }
         Operation::CreateNode { properties, .. } => {
-            properties.iter().any(|(p, _)| *p == PropertyRef::VALUE)
+            properties.iter().any(|(p, _)| names_an_item(p))
         }
         Operation::ModelDelete { .. }
         | Operation::ModelResetRange { .. }
@@ -78,14 +89,45 @@ pub fn dangling_promotions(store: &SemanticStore) -> Vec<(NodeId, ItemId)> {
         .collect()
 }
 
-/// Tracks, within one transaction, whether promotions must be re-checked at commit and which
-/// collections this transaction itself assigned a promotion to.
+/// `keep_visible` hints in `store` whose item the collection's model does not hold (§6.3, §8).
+///
+/// Meaningful for an authoritative store. A sparse replica may legitimately not cache the item.
+pub fn dangling_keep_visible(store: &SemanticStore) -> Vec<(NodeId, ItemId)> {
+    // lc-debt: O(nodes) scan per commit that touches a model or a hint, shared with
+    // dangling_promotions; a store-maintained index would make it O(hints).
+    store
+        .iter_nodes()
+        .filter_map(|node| {
+            let item = node.keep_visible()?;
+            let held = node
+                .model_ref()
+                .and_then(|model| store.get_model(model))
+                .is_some_and(|model| model.contains_item(item));
+            (!held).then_some((node.id, item))
+        })
+        .collect()
+}
+
+/// The first item named by a dangling promotion or `keep_visible` hint in `store`, if any.
+///
+/// A pre-built commit that cannot gain the settling `CLEAR_PROPERTY` is refused with
+/// [`StoreError::ItemNotFound`] for this item (§6.3, §8).
+pub fn first_dangling_item(store: &SemanticStore) -> Option<ItemId> {
+    dangling_promotions(store)
+        .into_iter()
+        .chain(dangling_keep_visible(store))
+        .map(|(_, item)| item)
+        .next()
+}
+
+/// Tracks, within one transaction, whether promotions and `keep_visible` hints must be re-checked
+/// at commit and which collections this transaction itself assigned one to.
 #[derive(Debug, Default)]
 pub(crate) struct PromotionTracker {
-    /// Some operation could have assigned a promotion or removed a promoted item.
+    /// Some operation could have assigned a promotion or hint, or removed the item one names.
     dirty: bool,
-    /// Nodes whose `value` this transaction assigned; a dangling one is refused, not cleared.
-    assigned: HashSet<NodeId>,
+    /// `(node, property)` pairs this transaction assigned; a dangling one is refused, not cleared.
+    assigned: HashSet<(NodeId, PropertyRef)>,
 }
 
 impl PromotionTracker {
@@ -95,20 +137,17 @@ impl PromotionTracker {
             return;
         }
         self.dirty = true;
-        let assigns = match op {
-            Operation::SetProperty { id, property, .. } if *property == PropertyRef::VALUE => {
-                Some(*id)
+        match op {
+            Operation::SetProperty { id, property, .. } if names_an_item(property) => {
+                self.assigned.insert((*id, *property));
             }
             Operation::CreateNode { id, properties, .. }
-            | Operation::BatchPropertySet { id, properties }
-                if properties.iter().any(|(p, _)| *p == PropertyRef::VALUE) =>
-            {
-                Some(*id)
+            | Operation::BatchPropertySet { id, properties } => {
+                for (property, _) in properties.iter().filter(|(p, _)| names_an_item(p)) {
+                    self.assigned.insert((*id, *property));
+                }
             }
-            _ => None,
-        };
-        if let Some(id) = assigns {
-            self.assigned.insert(id);
+            _ => {}
         }
     }
 }
@@ -216,9 +255,12 @@ impl UiTransaction {
         self.staged.get_node(node.into())?.promoted_selection()
     }
 
-    /// Settles this transaction's promoted selections before it commits (§6.3, §8).
+    /// Settles this transaction's promoted selections and `keep_visible` hints before it commits
+    /// (§6.3, §8).
     ///
-    /// Runs only when an operation could have assigned a promotion or removed a promoted item.
+    /// Runs only when an operation could have assigned a promotion or hint, or removed the item
+    /// one names. Hints follow exactly the rules below for promotions, independently: a hint is
+    /// refused or cleared through `keep_visible` only, a promotion through `value` only.
     /// Every collection whose promotion names an item its authoritative model does not hold is
     /// then either refused — when this transaction assigned that promotion, with
     /// [`StoreError::ItemNotFound`], so the whole transaction is discarded — or cleared in this
@@ -240,16 +282,24 @@ impl UiTransaction {
         if !self.promotions.dirty {
             return Ok(());
         }
-        let dangling = dangling_promotions(&self.staged);
-        if let Some(&(_, item)) = dangling
+        let dangling: Vec<(NodeId, PropertyRef, ItemId)> = dangling_promotions(&self.staged)
+            .into_iter()
+            .map(|(node, item)| (node, PropertyRef::VALUE, item))
+            .chain(
+                dangling_keep_visible(&self.staged)
+                    .into_iter()
+                    .map(|(node, item)| (node, PropertyRef::KEEP_VISIBLE, item)),
+            )
+            .collect();
+        if let Some(&(_, _, item)) = dangling
             .iter()
-            .find(|(node, _)| self.promotions.assigned.contains(node))
+            .find(|(node, property, _)| self.promotions.assigned.contains(&(*node, *property)))
         {
             return Err(StoreError::ItemNotFound(item));
         }
-        for (node_id, _) in dangling {
+        for (node_id, property, _) in dangling {
             // Recording the clear re-marks the tracker dirty; on error it stays dirty.
-            self.clear(node_id, PropertyRef::VALUE)?;
+            self.clear(node_id, property)?;
         }
         self.promotions = PromotionTracker::default();
         Ok(())

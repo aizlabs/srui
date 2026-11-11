@@ -154,6 +154,9 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
     public private(set) var pendingPromotion: CollectionPromotion?
     /// The user changed the selection after the last promotion (§22.5).
     public private(set) var localSelectionSincePromotion = false
+    /// Server-hinted keep-in-view item and its displayed row as of the last reveal or
+    /// re-baseline, `nil` while hidden or not yet revealed (§6.3, §22.7).
+    public private(set) var keepVisible = CollectionKeepVisible()
 
     /// Collapsed items of a hierarchical model, by identity (§22.5). Only cached items.
     public private(set) var collapsedItemIDs: Set<ItemId> = []
@@ -390,6 +393,7 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
         onCollapsedItemsChanged?(nodeID, modelID, collapsedItemIDs)
         onExpansionChanged?(nodeID, itemID, expanded)
         resolvePendingPromotion(in: outlineView)
+        rebaselineKeepVisibleAfterDisclosureChange()
         emitRequestsAfterDisclosureChange(in: outlineView)
         return true
     }
@@ -563,6 +567,28 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
         guard selectionMode != .none else { return }
         pendingPromotion = CollectionPromotion(itemID: itemID, reveal: reveal)
         resolvePendingPromotion(in: outlineView)
+    }
+
+    /// Applies the tree's `keep_visible` after a commit, with the same rules as
+    /// `TableCollectionAdapter.applyKeepVisible`: it scrolls the hinted row into view and never
+    /// touches the selection or the disclosure state. Rows come from the hidden-interval mapping
+    /// (`row(of:)`), so an item under a collapsed ancestor has no row: nothing is scrolled and no
+    /// ancestor is expanded for it (expanding for a reveal is a promotion's behaviour only).
+    public func applyKeepVisible(_ itemID: ItemId?, explicit: Bool, outlineView: NSOutlineView) {
+        if let row = keepVisible.apply(itemID, explicit: explicit, rowOf: row(of:)) {
+            CollectionPromotion.reveal(row: row, in: outlineView)
+        }
+    }
+
+    /// Re-baselines `keep_visible` after a local disclosure change (§22.5). Never scrolls.
+    ///
+    /// A collapse or expand is the user's own action and the item did not move in the model, so
+    /// it must not trigger a server-hinted scroll, even when it expands the hinted item's
+    /// ancestor or shifts its row. The last revealed row becomes the item's new displayed row,
+    /// or "not shown" when the change hides it; the next commit that sets the hint or moves the
+    /// item relative to that baseline reveals it.
+    private func rebaselineKeepVisibleAfterDisclosureChange() {
+        keepVisible.rebaseline(rowOf: row(of:))
     }
 
     /// Reselects a user's local selection by ItemId without revealing it (§22.5).

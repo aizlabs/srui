@@ -63,6 +63,19 @@ impl Node {
             .and_then(Value::as_item_id)
     }
 
+    /// Returns the server-hinted keep-in-view item of a `List`, `Table` or `Tree` (§6.3, §8).
+    ///
+    /// The standard `keep_visible` property, when present, names an [`ItemId`] the client keeps in
+    /// view. It is presentation guidance and never selection state. Other node types, and a
+    /// collection without it, return `None`.
+    pub fn keep_visible(&self) -> Option<ItemId> {
+        if !super::is_selectable_collection(self.node_type) {
+            return None;
+        }
+        self.get_property(PropertyRef::KEEP_VISIBLE)
+            .and_then(Value::as_item_id)
+    }
+
     /// Returns the referenced `ModelId` if this node has a `model_ref` property defined (§8).
     pub fn model_ref(&self) -> Option<ModelId> {
         self.get_property(PropertyRef::MODEL_REF)

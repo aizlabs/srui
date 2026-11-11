@@ -19,6 +19,12 @@
 // `validateModelTree(_:)` after the last operation of a transaction that touches the model, with
 // the same rules, order and error codes as the Rust store (`Model.validateTreeShape`).
 //
+// The standard `keep_visible` property (§4 inv. 13, §6.3, §8, §22.7) is the server-hinted
+// keep-in-view item: presentation guidance, never selection. Same rules, order and error code as
+// the Rust store, on the resulting property set: an ItemId only, held only by a List, Table or
+// Tree that has a model_ref (clearing model_ref while it is held is refused). Item presence is
+// not checked, because this sparse replica may not cache the item.
+//
 // Architectural Invariants (§4):
 // - Invariant 2: The client retains a non-authoritative replica of committed semantic UI state
 //   plus local presentation state. The replica exists only to render, interact, inspect, cache,
@@ -137,6 +143,16 @@ public struct Node: Equatable, Sendable, CustomStringConvertible {
     public var promotedSelection: ItemId? {
         guard isSelectableCollection(nodeType) else { return nil }
         return properties[.value]?.asItemID
+    }
+
+    /// Server-hinted keep-in-view item of a `List`, `Table` or `Tree` (§6.3, §8, §22.7).
+    ///
+    /// The standard `keep_visible` property, when present, names the `ItemId` the renderer keeps in
+    /// view. It is presentation guidance and never selection state. Other node types, and a
+    /// collection without it, return `nil`.
+    public var keepVisible: ItemId? {
+        guard isSelectableCollection(nodeType) else { return nil }
+        return properties[.keepVisible]?.asItemID
     }
 
     /// Returns the referenced `ModelId` if this node has a `model_ref` property defined (§8).
@@ -424,6 +440,9 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
     /// A List/Table/Tree promoted selection (`value`) is not an `ItemId`, or is held while the
     /// node's `selection_mode` is absent or `none` (§6.3, §7.4, §8).
     case invalidCollectionSelection(nodeID: NodeId, reason: String)
+    /// A `keep_visible` value is not an `ItemId`, or is held by a node that is not a model-backed
+    /// `List`, `Table` or `Tree` (§6.3, §8).
+    case invalidKeepVisible(nodeID: NodeId, reason: String)
     /// A `shortcut` value is not in the closed canonical grammar (§4 inv. 13, §26).
     case invalidShortcut(nodeID: NodeId, reason: String)
     /// A `shortcut` was set on a node type that does not admit one (§7.4).
@@ -489,6 +508,8 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
             return "duplicate item ID \(itemID) in model \(modelID)"
         case .invalidCollectionSelection(let nodeID, let reason):
             return "invalid promoted selection on collection node \(nodeID): \(reason)"
+        case .invalidKeepVisible(let nodeID, let reason):
+            return "invalid keep_visible on node \(nodeID): \(reason)"
         case .invalidShortcut(let nodeID, let reason):
             return "invalid shortcut on node \(nodeID): \(reason)"
         case .shortcutNotAdmitted(let nodeID, let nodeType):
@@ -531,6 +552,7 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
         case .modelIndexOutOfBounds: return "model_index_out_of_bounds"
         case .duplicateItemId: return "duplicate_item_id"
         case .invalidCollectionSelection: return "invalid_collection_selection"
+        case .invalidKeepVisible: return "invalid_keep_visible"
         case .invalidShortcut: return "invalid_shortcut"
         case .shortcutNotAdmitted: return "shortcut_not_admitted"
         case .duplicateShortcut: return "duplicate_shortcut"
@@ -1081,6 +1103,30 @@ public struct SemanticStore: Equatable, Sendable {
         }
     }
 
+    /// Validates the `keep_visible` invariant of one node's resulting properties (§6.3, §8).
+    ///
+    /// `keepVisible` and `modelRef` are what the node would hold after the mutation. Same rules,
+    /// order and messages as the Rust store, so both replicas reach the same verdict (§12.1).
+    private func validateKeepVisible(
+        nodeID: NodeId,
+        nodeType: TypeRef,
+        keepVisible: Value?,
+        modelRef: Value?
+    ) throws {
+        guard let keepVisible else { return }
+        let reason: String
+        if !isSelectableCollection(nodeType) {
+            reason = "keep_visible is admitted only on a model-backed List, Table or Tree"
+        } else if keepVisible.asItemID == nil {
+            reason = "keep_visible must be an ItemId, never a row index or other value"
+        } else if modelRef == nil {
+            reason = "keep_visible names a model item, but the node has no model_ref"
+        } else {
+            return
+        }
+        throw StoreError.invalidKeepVisible(nodeID: nodeID, reason: reason)
+    }
+
     /// The node that scopes shortcut uniqueness for `id`: the root of its tree. In the standard
     /// profile that root is the window-owning Surface; a nested Surface is rendered inline in the
     /// enclosing window, so it shares the root's scope (same rule as the Rust store).
@@ -1220,6 +1266,12 @@ public struct SemanticStore: Equatable, Sendable {
             nodeType: nodeType,
             value: properties.last(where: { $0.0 == .value })?.1,
             selectionMode: properties.last(where: { $0.0 == .selectionMode })?.1
+        )
+        try validateKeepVisible(
+            nodeID: id,
+            nodeType: nodeType,
+            keepVisible: properties.last(where: { $0.0 == .keepVisible })?.1,
+            modelRef: properties.last(where: { $0.0 == .modelRef })?.1
         )
         for (prop, val) in properties where prop == .shortcut {
             try validateShortcutValue(nodeID: id, nodeType: nodeType, value: val)
@@ -1365,6 +1417,13 @@ public struct SemanticStore: Equatable, Sendable {
                 value: node.properties[.value],
                 selectionMode: value
             )
+        } else if property == .keepVisible {
+            try validateKeepVisible(
+                nodeID: nodeID,
+                nodeType: node.nodeType,
+                keepVisible: value,
+                modelRef: node.properties[.modelRef]
+            )
         }
         let previous = nodes[nodeID]?.properties[property]
         nodes[nodeID]?.properties[property] = value
@@ -1386,6 +1445,13 @@ public struct SemanticStore: Equatable, Sendable {
                 nodeType: node.nodeType,
                 value: node.properties[.value],
                 selectionMode: nil
+            )
+        } else if property == .modelRef {
+            try validateKeepVisible(
+                nodeID: nodeID,
+                nodeType: node.nodeType,
+                keepVisible: node.properties[.keepVisible],
+                modelRef: nil
             )
         }
         return nodes[nodeID]?.properties.removeValue(forKey: property)
@@ -1410,6 +1476,13 @@ public struct SemanticStore: Equatable, Sendable {
             value: properties.last(where: { $0.0 == .value })?.1 ?? node.properties[.value],
             selectionMode: properties.last(where: { $0.0 == .selectionMode })?.1
                 ?? node.properties[.selectionMode]
+        )
+        try validateKeepVisible(
+            nodeID: nodeID,
+            nodeType: node.nodeType,
+            keepVisible: properties.last(where: { $0.0 == .keepVisible })?.1
+                ?? node.properties[.keepVisible],
+            modelRef: properties.last(where: { $0.0 == .modelRef })?.1 ?? node.properties[.modelRef]
         )
         for (prop, val) in properties where prop == .shortcut {
             try validateShortcutValue(nodeID: nodeID, nodeType: node.nodeType, value: val)

@@ -1,0 +1,96 @@
+{
+  "name": "keep_visible_row_index_rejected",
+  "description": "keep_visible names an ItemId, never a row index: an integer is refused and the whole transaction is discarded (§8, §12.1).",
+  "spec_sections": [
+    "§4 inv. 13",
+    "§6.3",
+    "§8",
+    "§12.1"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Processes"
+          }
+        },
+        {
+          "type": "CREATE_MODEL",
+          "model_id": 10,
+          "model_type": "Table",
+          "item_count": 0
+        },
+        {
+          "type": "MODEL_INSERT",
+          "model_id": 10,
+          "index": 0,
+          "items": [
+            {
+              "item_id": 101,
+              "value": "Row A",
+              "properties": {}
+            },
+            {
+              "item_id": 102,
+              "value": "Row B",
+              "properties": {}
+            },
+            {
+              "item_id": 103,
+              "value": "Row C",
+              "properties": {}
+            }
+          ]
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Table",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "model_ref": 10,
+            "selection_mode": {
+              "enum": "SelectionMode",
+              "value": "none"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "SET_PROPERTY",
+        "node_id": 2,
+        "property": "label",
+        "value": "Processes"
+      },
+      {
+        "type": "SET_PROPERTY",
+        "node_id": 2,
+        "property": "keep_visible",
+        "value": 1
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "invalid_keep_visible",
+    "failed_op_index": 1,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

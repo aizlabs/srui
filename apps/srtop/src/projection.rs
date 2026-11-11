@@ -47,6 +47,29 @@ impl Row {
         ModelItem::with_value(self.item_id, self.value.clone())
     }
 
+    /// Brings every scan-derived field of this row up to `latest`, the same
+    /// instance (same item ID) as the latest sample projected it: its cells,
+    /// order values, display name and owner (PX-011, PX-013 review round).
+    /// Search, sorting and the inspector read these from the published rows,
+    /// so every path that records a later sample goes through this one place.
+    /// The published `value` is not touched: it changes only when a commit
+    /// carrying it does. Identity (`key`, `item_id`) never changes.
+    pub(crate) fn adopt_sample(&mut self, latest: &Row) {
+        debug_assert_eq!(self.item_id, latest.item_id);
+        if self.sort != latest.sort {
+            self.sort = latest.sort.clone();
+        }
+        if self.cells != latest.cells {
+            self.cells = latest.cells.clone();
+        }
+        if self.display_name != latest.display_name {
+            self.display_name = latest.display_name.clone();
+        }
+        if self.owner != latest.owner {
+            self.owner = latest.owner.clone();
+        }
+    }
+
     /// This row with its published value projected onto `layout`.
     pub(crate) fn laid_out(&self, layout: &ColumnLayout) -> Self {
         Self {

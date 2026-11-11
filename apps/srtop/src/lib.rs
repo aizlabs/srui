@@ -9,6 +9,7 @@
 
 pub mod catalogue;
 pub mod filter;
+pub mod inspector;
 pub mod metric;
 pub mod on_demand;
 pub mod owner;
@@ -117,6 +118,18 @@ pub const PID_SET_PLACEHOLDER: &str = "PIDs, separated by commas or spaces";
 pub const PID_SET_DESCRIPTION: &str =
     "Shows only processes with one of these PIDs, at most 64; empty shows every PID. A PID no visible process has is named on the user filter status.";
 pub const OWNER_NODE_COUNT: usize = 6;
+/// The selected-process inspector (PX-013): a Column under the table holding
+/// four status lines — what is selected and whether its details are loaded,
+/// its name, PID and owner, its state, parent and start time, and its current
+/// CPU share and resident memory.
+pub const INSPECTOR: NodeId = NodeId::new(55);
+pub const INSPECTOR_STATUS: NodeId = NodeId::new(56);
+pub const INSPECTOR_PROCESS: NodeId = NodeId::new(57);
+pub const INSPECTOR_DETAILS: NodeId = NodeId::new(58);
+pub const INSPECTOR_METRICS: NodeId = NodeId::new(59);
+pub const INSPECTOR_DESCRIPTION: &str =
+    "Describes the process selected in the table: the server resolves the selected row, reads its state, parent and start time, and shows its current CPU share and resident memory.";
+pub const INSPECTOR_NODE_COUNT: usize = 5;
 
 /// What one column chooser button does (PX-068). Each is resolved against the
 /// layout the server holds when the click is applied, never against anything
@@ -201,8 +214,8 @@ pub const STATUS_TEXT: &str = "Read-only · Process collection not started";
 /// (PX-007), which sits between the status line and the filter controls, the three
 /// of the filter bar (PX-010), the sort row with its four buttons (PX-009),
 /// the column chooser's row with its buttons (PX-068), the seven search
-/// controls (PX-011) and the six user-filter controls (PX-012). Rows are model
-/// items, never nodes.
+/// controls (PX-011), the six user-filter controls (PX-012) and the five of
+/// the inspector (PX-013). Rows are model items, never nodes.
 pub const SHELL_NODE_COUNT: usize = 5
     + summary::NODE_COUNT
     + FILTER_NODE_COUNT
@@ -210,7 +223,8 @@ pub const SHELL_NODE_COUNT: usize = 5
     + SORT_BUTTONS.len()
     + COLUMN_CHOOSER_NODE_COUNT
     + SEARCH_NODE_COUNT
-    + OWNER_NODE_COUNT;
+    + OWNER_NODE_COUNT
+    + INSPECTOR_NODE_COUNT;
 
 /// The sort button that orders `field`.
 pub fn sort_button_of(field: catalogue::ProcessField) -> NodeId {
@@ -362,6 +376,27 @@ pub fn install_owner_handlers(session: &Session, view: &refresh::SharedView) {
     session.on(PID_SET_INPUT, TEXT_EDIT, move |session, event| {
         refresh::pid_set_edited(&pids, session, event);
     });
+}
+
+/// Starts the inspector (PX-013): the detail worker over `details`, when the
+/// source provides them, and the table's `SELECTION_CHANGED` handler.
+///
+/// The handler reads only the event's `ItemId` argument, resolves it against
+/// the rows the server publishes, and refuses any other item without reading
+/// anything (see [`inspector`]). It never selects a row: the native highlight
+/// stays local (§22.5). Returns an observer of the detail worker, for tests;
+/// `None` when the source provides no details.
+pub fn install_inspector(
+    session: &std::sync::Arc<Session>,
+    view: &refresh::SharedView,
+    details: Option<std::sync::Arc<dyn inspector::DetailSource>>,
+) -> Option<inspector::DetailReadsIdle> {
+    let idle = details.and_then(|details| refresh::start_inspector(session, view, details));
+    let selected = std::sync::Arc::clone(view);
+    session.on(TABLE, SELECTION_CHANGED, move |session, event| {
+        refresh::selection_changed(&selected, session, event);
+    });
+    idle
 }
 
 /// One click on `field`'s sort button.
@@ -802,15 +837,40 @@ pub(crate) fn initialize_rows(
             .columns(refresh::column_headings(&layout))
             // A native selection, local presentation state (§22.5) the client
             // anchors to item IDs, so it follows its process when the rows are
-            // reordered (PX-009). No handler acts on a user's selection. An
-            // explicit search promotes its match to the table's semantic
-            // selection (PX-011, PX-011-G01), which the client selects and
-            // reveals; a later user click stays local.
+            // reordered (PX-009). A user's selection is reported to the
+            // inspector (PX-013), which describes the row and never selects
+            // one. An explicit search promotes its match to the table's
+            // semantic selection (PX-011, PX-011-G01), which the client
+            // selects and reveals; a later user click stays local.
             .selection_mode(SelectionMode::Single)
             .label("Processes")
             .grow(1.0)
             .create(ui)?;
         ui.set(TABLE, READ_ONLY, true)?;
+        // The inspector: standard status Texts in a Column under the table
+        // (PX-013). It starts with nothing selected.
+        let inspector = inspector::InspectorView::initial(sort_enabled);
+        Column::builder(INSPECTOR)
+            .parent(COLUMN)
+            .spacing_role(SpacingRole::Tight)
+            .accessible_description(INSPECTOR_DESCRIPTION)
+            .create(ui)?;
+        for (node, text) in [
+            (INSPECTOR_STATUS, &inspector.status),
+            (INSPECTOR_PROCESS, &inspector.process),
+            (INSPECTOR_DETAILS, &inspector.details),
+            (INSPECTOR_METRICS, &inspector.metrics),
+        ] {
+            Text::builder(node)
+                .parent(INSPECTOR)
+                .text(text.as_str())
+                .role(if sort_enabled && node == INSPECTOR_STATUS {
+                    TextRole::Status
+                } else {
+                    TextRole::Caption
+                })
+                .create(ui)?;
+        }
         Ok(())
     })?;
     Ok(())
@@ -955,9 +1015,10 @@ mod tests {
             // (PX-007), the three of the filter bar (PX-010), the sort row
             // with its four buttons (PX-009), the column chooser's row with
             // its thirteen buttons (PX-068), the seven search controls
-            // (PX-011) and the six user-filter controls (PX-012).
-            assert_eq!(store.node_count(), 54);
-            assert_eq!(SHELL_NODE_COUNT, 54);
+            // (PX-011), the six user-filter controls (PX-012) and the five of
+            // the inspector (PX-013).
+            assert_eq!(store.node_count(), 59);
+            assert_eq!(SHELL_NODE_COUNT, 59);
             assert_eq!(store.root_ids(), &[SURFACE]);
             assert_eq!(store.children_of(SURFACE), Some([COLUMN].as_slice()));
             assert_eq!(
@@ -972,7 +1033,8 @@ mod tests {
                         SEARCH_ROW,
                         SORT_ROW,
                         COLUMN_CHOOSER_ROW,
-                        TABLE
+                        TABLE,
+                        INSPECTOR
                     ]
                     .as_slice()
                 )
@@ -1276,7 +1338,8 @@ mod tests {
                         SEARCH_ROW,
                         SORT_ROW,
                         COLUMN_CHOOSER_ROW,
-                        TABLE
+                        TABLE,
+                        INSPECTOR
                     ]
                     .as_slice()
                 )

@@ -13,7 +13,10 @@
 //! describes a different collection than the one published with it. Since
 //! PX-012 the rows shown are the ones the user filter, the PID set and the text
 //! filter all keep ([`crate::owner`]), and every publication that applies them
-//! also publishes the user filter's status in the same plan.
+//! also publishes the user filter's status in the same plan. Since PX-013
+//! every publication that changes the rows also re-plans the selected-process
+//! inspector ([`crate::inspector`]) against the rows it publishes, and the
+//! inspector's detail worker publishes each detail result it accepts.
 //!
 //! Four rules shape this module:
 //!
@@ -93,6 +96,9 @@
 
 use crate::catalogue::{ColumnLayout, LayoutError, ProcessField};
 use crate::filter::{FilterGeneration, FilterQuery, PendingFilter};
+use crate::inspector::{
+    DetailRead, DetailReads, DetailReadsIdle, DetailRequest, DetailSource, Inspector, InspectorView,
+};
 use crate::owner::{OwnerChoice, OwnerFilter, OwnerView, Scope};
 use crate::projection::{Row, SessionItemIds};
 use crate::search::{Search, SearchStep, SearchView};
@@ -101,9 +107,10 @@ use crate::source::{ProcessSnapshot, ProcessSource, Retention};
 use crate::summary::{self, CollectorError, Sample};
 use crate::{
     bounded, initialize_rows, published_status_from, sort_button_of, ColumnAction, ScanReport,
-    COLUMN_CHOOSER_BUTTONS, FILTER_INPUT, FILTER_STATUS, MAX_PUBLISHED_LABEL_BYTES, MODEL,
-    OWNER_ALL, OWNER_INPUT, OWNER_MINE, OWNER_STATUS, PID_GO, PID_INPUT, PID_SET_INPUT,
-    SEARCH_INPUT, SEARCH_NEXT, SEARCH_PREVIOUS, SEARCH_STATUS, STATUS, TABLE,
+    COLUMN_CHOOSER_BUTTONS, FILTER_INPUT, FILTER_STATUS, INSPECTOR_DETAILS, INSPECTOR_METRICS,
+    INSPECTOR_PROCESS, INSPECTOR_STATUS, MAX_PUBLISHED_LABEL_BYTES, MODEL, OWNER_ALL, OWNER_INPUT,
+    OWNER_MINE, OWNER_STATUS, PID_GO, PID_INPUT, PID_SET_INPUT, SEARCH_INPUT, SEARCH_NEXT,
+    SEARCH_PREVIOUS, SEARCH_STATUS, STATUS, TABLE,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
 use srui_sdk::{ItemId, NodeId, Operation, Value, COLUMNS, ENABLED, LABEL, TEXT, VALUE};
@@ -253,6 +260,15 @@ pub const SEARCH_RESERVE_BYTES: usize = 4096;
 /// with every value at its widest.
 pub const OWNER_RESERVE_BYTES: usize = 4096;
 
+/// Bytes reserved for the selected-process inspector in a catch-up snapshot
+/// (PX-013): its Column with its description, and four status `Text`s, each
+/// at [`crate::inspector::MAX_INSPECTOR_LINE_BYTES`] plus the cut mark.
+/// Charged at this fixed reserve, so a long name or a long line can never
+/// shrink the row budget;
+/// `the_shell_status_and_summary_fit_their_snapshot_allowances` measures it
+/// with every line at its widest.
+pub const INSPECTOR_RESERVE_BYTES: usize = 6144;
+
 /// Bytes the `CLEAR_PROPERTY` settlement adds when a commit removes the
 /// promoted row (PX-011-G01): a clear carries no value.
 const PROMOTION_CLEAR_BYTES: usize = OPERATION_FRAMING_BYTES + OPERATION_HEADER_BYTES;
@@ -396,6 +412,11 @@ pub struct ProcessView {
     owner: OwnerFilter,
     /// The user-filter controls as the client holds them (PX-012).
     owner_published: OwnerView,
+    /// The selected-process inspector's target, generation and details, and
+    /// its detail worker once installed (PX-013).
+    inspector: Inspector,
+    /// The inspector's lines as the client holds them (PX-013).
+    inspector_published: InspectorView,
 }
 
 /// The rows every active filter keeps, and what the filters' controls say
@@ -463,6 +484,7 @@ impl ProcessView {
             search: &mut self.search_published,
             promoted: &mut self.promoted,
             owner: &mut self.owner_published,
+            inspector: &mut self.inspector_published,
         }
     }
 
@@ -575,6 +597,8 @@ impl ProcessView {
                 promoted: None,
                 owner,
                 owner_published,
+                inspector: Inspector::default(),
+                inspector_published: InspectorView::initial(true),
             },
             snapshot,
         ))
@@ -648,8 +672,15 @@ impl ProcessView {
         // Retention is bounded by construction, whatever a scan can and cannot
         // enumerate: the rows carried forward are evicted down to what the
         // published-row ceiling leaves once this scan's own rows are counted.
-        let evicted =
+        let evicted_ids =
             evict_unconfirmed_beyond(&mut unfiltered_target, &confirmed_ids, self.published_limit);
+        let evicted = evicted_ids.len();
+        // The inspector learns what this scan established about its target
+        // before anything is planned (PX-013 review round): its latest row, or
+        // that retention dropped it unconfirmed, which is not an exit, or that
+        // a scan entitled to say so found it gone.
+        self.inspector
+            .observe_scan(&unfiltered_target, &evicted_ids, &retention);
         // Every filter is applied to the collection together (PX-012): the
         // user filter, the PID set and the text filter.
         let visible = self.visible(&unfiltered_target);
@@ -722,8 +753,10 @@ impl ProcessView {
         plan.extend(moved.plan);
         plan.extend(diff(&moved.rows, &target, batch, max_bytes));
         // Last, the search re-counted against the rows this plan publishes, so
-        // it commits with the final rows rather than ahead of them (PX-011).
+        // it commits with the final rows rather than ahead of them (PX-011),
+        // and the inspector, whose metrics and state follow them (PX-013).
         plan.extend(self.search_effects(&target, &unfiltered_target, &unconfirmed));
+        plan.extend(self.inspector_effects(&target, &unfiltered_target, &unconfirmed));
 
         let mut result = Refreshed {
             retained,
@@ -744,6 +777,7 @@ impl ProcessView {
             self.ids.retain(&self.unfiltered_rows);
             self.unconfirmed = unconfirmed;
             self.search.observe(&self.rows);
+            self.inspector.reread(&self.rows, &confirmed_ids);
             return Ok(result);
         }
 
@@ -759,6 +793,9 @@ impl ProcessView {
         self.ids.retain(&self.unfiltered_rows);
         self.unconfirmed = unconfirmed;
         self.search.observe(&self.rows);
+        // The selected process's state is read again for this sample, if the
+        // scan confirmed its row (PX-013).
+        self.inspector.reread(&self.rows, &confirmed_ids);
         outcome.map(|()| result)
     }
 
@@ -837,8 +874,10 @@ impl ProcessView {
         // and deletions for any whose membership changed since the last
         // publication — an account name resolved in between, or a different
         // leading window under the published-row ceiling — and the filters'
-        // statuses and the search re-counted against exactly those rows, in
-        // the same plan. Every row keeps its item ID.
+        // statuses, the search and the inspector (PX-013) re-planned against
+        // exactly those rows, in the same plan. Every row keeps its item ID,
+        // and the inspector follows its own wherever it moved, or reports it
+        // as not shown when the new order's row ceiling drops it.
         self.republish(session, plan)
     }
 
@@ -1037,6 +1076,10 @@ impl ProcessView {
         let search = self.search_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
         result.controls += search.len();
         plan.extend(search);
+        let inspector =
+            self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
+        result.controls += inspector.len();
+        plan.extend(inspector);
         if plan.is_empty() {
             // An identical failure republishes nothing at all.
             self.ids.retain(&self.unfiltered_rows);
@@ -1253,8 +1296,10 @@ impl ProcessView {
         plan.extend(moved.plan);
         plan.extend(diff(&moved.rows, &target, batch, max_bytes));
         // The search counts the newly filtered rows; a target a filter hid is
-        // reported as no longer shown, never replaced (PX-011).
+        // reported as no longer shown, never replaced (PX-011). So is the
+        // inspector's (PX-013).
         plan.extend(self.search_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
+        plan.extend(self.inspector_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
 
         let mut result = Refreshed::default();
         count(&plan, &mut result);
@@ -1522,7 +1567,27 @@ impl ProcessView {
         session: &Session,
         mut plan: Vec<Planned>,
     ) -> Result<Refreshed, SessionError> {
+        // A promotion is a selection too: the inspector follows it, under a
+        // new generation, exactly as it follows a click (PX-013).
+        let promoted = plan.iter().find_map(|planned| match &planned.effect {
+            Effect::Promote(row) => Some(row.as_ref().clone()),
+            _ => None,
+        });
+        if let Some(row) = promoted {
+            self.inspector.select(&row);
+        }
         plan.extend(self.search_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed));
+        plan.extend(self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed));
+        self.publish_controls(session, plan)
+    }
+
+    /// Commits `plan`, which changes controls only and no row, in bounded
+    /// transactions.
+    fn publish_controls(
+        &mut self,
+        session: &Session,
+        plan: Vec<Planned>,
+    ) -> Result<Refreshed, SessionError> {
         let mut result = Refreshed::default();
         if plan.is_empty() {
             return Ok(result);
@@ -1539,6 +1604,119 @@ impl ProcessView {
         result.transactions = transactions;
         outcome.map(|()| result)
     }
+
+    /// The inspector's changes when the client holds `rows` out of the
+    /// server-side collection `unfiltered` (PX-013).
+    fn inspector_effects(
+        &self,
+        rows: &[Row],
+        unfiltered: &[Row],
+        unconfirmed: &HashSet<ItemId>,
+    ) -> Vec<Planned> {
+        let target = self
+            .inspector
+            .view(rows, unfiltered, unconfirmed, self.owner.names());
+        let published = &self.inspector_published;
+        [
+            (INSPECTOR_STATUS, target.status, &published.status),
+            (INSPECTOR_PROCESS, target.process, &published.process),
+            (INSPECTOR_DETAILS, target.details, &published.details),
+            (INSPECTOR_METRICS, target.metrics, &published.metrics),
+        ]
+        .into_iter()
+        .filter(|(_, now, was)| now != *was)
+        .map(|(node, text, _)| Planned::new(Effect::InspectorText { node, text }))
+        .collect()
+    }
+
+    /// Applies one table selection (PX-013). `item` is the only thing the
+    /// server reads from a `SELECTION_CHANGED`, and it is untrusted: it is
+    /// resolved against the rows this view publishes, and only a published
+    /// row becomes the inspector's target, under a new generation, with its
+    /// details asked of the worker. Any other item — unknown, no longer
+    /// published, or no item at all — is refused under a new generation too,
+    /// so no earlier read can land on it, and nothing is read for it. The
+    /// native highlight is the client's; nothing here selects a row.
+    pub fn select_item(
+        &mut self,
+        session: &Session,
+        item: Option<ItemId>,
+    ) -> Result<Refreshed, SessionError> {
+        let row = item.and_then(|item| self.rows.iter().find(|row| row.item_id == item).cloned());
+        match row {
+            Some(row) => self.inspector.select(&row),
+            None => self.inspector.refuse(item),
+        }
+        let plan = self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
+        self.publish_controls(session, plan)
+    }
+
+    /// Publishes one detail result (PX-013), if it answers the inspector's
+    /// current target and generation; any other result is dropped.
+    pub fn details_read(
+        &mut self,
+        session: &Session,
+        request: &DetailRequest,
+        read: DetailRead,
+    ) -> Result<Refreshed, SessionError> {
+        if !self.inspector.completed(request, read) {
+            return Ok(Refreshed::default());
+        }
+        let plan = self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
+        self.publish_controls(session, plan)
+    }
+
+    /// The inspector's server-side state (PX-013).
+    pub fn inspector(&self) -> &Inspector {
+        &self.inspector
+    }
+
+    /// The inspector's lines as this view last published them (PX-013).
+    pub fn inspector_view(&self) -> &InspectorView {
+        &self.inspector_published
+    }
+}
+
+/// Dispatches one `SELECTION_CHANGED` on the table to the shared view
+/// (PX-013). Only the event's `ItemId` argument is read; an event without
+/// one, or with any other value, names no row.
+pub fn selection_changed(
+    view: &std::sync::Mutex<ProcessView>,
+    session: &Session,
+    event: &srui_protocol::Event,
+) {
+    let item = srui_semantic_tree::Event::try_from(event.clone())
+        .ok()
+        .and_then(|event| event.item_id_arg());
+    if let Err(error) = lock_view(view).select_item(session, item) {
+        eprintln!("srtop: inspector not published: {error}");
+    }
+}
+
+/// Starts the inspector's detail worker over `details` and installs it in
+/// `view` (PX-013). The worker holds the view and the session only weakly: it
+/// publishes while both exist, and ends once the view is dropped and its
+/// current read returns. `None` if no thread could be started; the inspector
+/// then shows selected processes without details.
+pub fn start_inspector(
+    session: &Arc<Session>,
+    view: &SharedView,
+    details: Arc<dyn DetailSource>,
+) -> Option<DetailReadsIdle> {
+    let weak_view = Arc::downgrade(view);
+    let weak_session = Arc::downgrade(session);
+    let reads = DetailReads::start(details, move |request, read| {
+        let (Some(view), Some(session)) = (weak_view.upgrade(), weak_session.upgrade()) else {
+            return;
+        };
+        let published = lock_view(&view).details_read(&session, &request, read);
+        if let Err(error) = published {
+            eprintln!("srtop: inspector details not published: {error}");
+        }
+    })?;
+    let idle = reads.idle();
+    lock_view(view).inspector.install(reads);
+    Some(idle)
 }
 
 /// The string `node` holds as its `VALUE`, or the empty string.
@@ -1692,7 +1870,8 @@ fn count(plan: &[Planned], result: &mut Refreshed) {
             Effect::SearchStatus(_)
             | Effect::SearchEnabled { .. }
             | Effect::SearchValue { .. }
-            | Effect::Promote(_) => result.controls += 1,
+            | Effect::Promote(_)
+            | Effect::InspectorText { .. } => result.controls += 1,
             Effect::OwnerStatus(_) | Effect::OwnerEnabled { .. } | Effect::OwnerValue { .. } => {
                 result.controls += 1
             }
@@ -1916,7 +2095,8 @@ fn rows_word(count: usize) -> &'static str {
 /// the system summary [`SUMMARY_RESERVE_BYTES`] rather than its own (PX-007), and
 /// the command filter controls [`FILTER_RESERVE_BYTES`] rather than their own (PX-010), and
 /// the search controls [`SEARCH_RESERVE_BYTES`] rather than their own (PX-011),
-/// and the user filter [`OWNER_RESERVE_BYTES`] rather than its own (PX-012), so
+/// and the user filter [`OWNER_RESERVE_BYTES`] rather than its own (PX-012),
+/// and the inspector [`INSPECTOR_RESERVE_BYTES`] rather than its own (PX-013), so
 /// the rows that fit are a function of the rows alone. A status or summary that
 /// grew because a scan or a collector failed therefore cannot shrink the row
 /// budget and delete a row no scan said had ended.
@@ -1934,7 +2114,8 @@ fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
             + SUMMARY_RESERVE_BYTES
             + FILTER_RESERVE_BYTES
             + SEARCH_RESERVE_BYTES
-            + OWNER_RESERVE_BYTES,
+            + OWNER_RESERVE_BYTES
+            + INSPECTOR_RESERVE_BYTES,
     );
     let mut spent = 0usize;
     let mut kept = 0usize;
@@ -1987,9 +2168,9 @@ fn evict_unconfirmed_beyond(
     rows: &mut Vec<Row>,
     confirmed: &HashSet<ItemId>,
     limit: usize,
-) -> usize {
+) -> HashSet<ItemId> {
     if rows.len() <= limit {
-        return 0;
+        return HashSet::new();
     }
     let mut excess = rows.len() - limit;
     let mut evicted: HashSet<ItemId> = HashSet::new();
@@ -2002,11 +2183,10 @@ fn evict_unconfirmed_beyond(
             excess -= 1;
         }
     }
-    if evicted.is_empty() {
-        return 0;
+    if !evicted.is_empty() {
+        rows.retain(|row| !evicted.contains(&row.item_id));
     }
-    rows.retain(|row| !evicted.contains(&row.item_id));
-    evicted.len()
+    evicted
 }
 
 /// Keeps rows the scan did not confirm and could not account for, in the
@@ -2132,6 +2312,11 @@ enum Effect {
         node: NodeId,
         value: String,
     },
+    /// One inspector line's text set (PX-013).
+    InspectorText {
+        node: NodeId,
+        text: String,
+    },
     Delete(Vec<ItemId>),
     Insert(u64, Vec<Row>),
     Update(Vec<Row>),
@@ -2154,6 +2339,8 @@ struct Published<'a> {
     promoted: &'a mut Option<ItemId>,
     /// The user-filter controls as announced (PX-012).
     owner: &'a mut OwnerView,
+    /// The inspector's lines as announced (PX-013).
+    inspector: &'a mut InspectorView,
 }
 
 /// The planned operations that turn the `published` summary into `target`:
@@ -2217,6 +2404,9 @@ impl Planned {
             Effect::OwnerValue { node, value } => {
                 Operation::set_property(*node, VALUE, Value::String(value.clone()))
             }
+            Effect::InspectorText { node, text } => {
+                Operation::set_property(*node, TEXT, Value::String(text.clone()))
+            }
             Effect::Delete(ids) => Operation::model_delete_items(MODEL, ids.iter().copied()),
             Effect::Insert(index, rows) => {
                 Operation::model_insert(MODEL, *index, rows.iter().map(Row::to_model_item))
@@ -2279,6 +2469,7 @@ impl Effect {
             | Self::OwnerEnabled { .. } => VALUE_FRAMING_BYTES + SCALAR_VALUE_BYTES,
             Self::OwnerStatus(text) => VALUE_FRAMING_BYTES + text.len(),
             Self::OwnerValue { value, .. } => VALUE_FRAMING_BYTES + value.len(),
+            Self::InspectorText { text, .. } => VALUE_FRAMING_BYTES + text.len(),
             Self::SearchStatus(text) => VALUE_FRAMING_BYTES + text.len(),
             Self::SearchValue { value, .. } => VALUE_FRAMING_BYTES + value.len(),
             // The `SET_PROPERTY` of the item ID, and a whole second operation:
@@ -2308,8 +2499,21 @@ impl Effect {
             search,
             promoted,
             owner,
+            inspector,
         } = published;
         match self {
+            Self::InspectorText { node, text } => {
+                let line = if *node == INSPECTOR_STATUS {
+                    &mut inspector.status
+                } else if *node == INSPECTOR_PROCESS {
+                    &mut inspector.process
+                } else if *node == INSPECTOR_DETAILS {
+                    &mut inspector.details
+                } else {
+                    &mut inspector.metrics
+                };
+                line.clone_from(text);
+            }
             Self::OwnerStatus(text) => owner.status.clone_from(text),
             Self::OwnerEnabled { node, enabled } => {
                 if *node == OWNER_MINE {
@@ -2367,9 +2571,7 @@ impl Effect {
                 for row in rows.iter_mut() {
                     if let Some(update) = values.get(&row.item_id) {
                         row.value = update.value.clone();
-                        row.cells = update.cells.clone();
-                        row.sort = update.sort.clone();
-                        row.display_name = update.display_name.clone();
+                        row.adopt_sample(update);
                     }
                 }
             }
@@ -2571,15 +2773,7 @@ fn refresh_sort_values(rows: &mut [Row], target: &[Row]) {
     let current: HashMap<ItemId, &Row> = target.iter().map(|row| (row.item_id, row)).collect();
     for row in rows.iter_mut() {
         if let Some(latest) = current.get(&row.item_id) {
-            if row.sort != latest.sort {
-                row.sort = latest.sort.clone();
-            }
-            if row.cells != latest.cells {
-                row.cells = latest.cells.clone();
-            }
-            if row.display_name != latest.display_name {
-                row.display_name = latest.display_name.clone();
-            }
+            row.adopt_sample(latest);
         }
     }
 }
@@ -3450,7 +3644,8 @@ mod tests {
                 + SUMMARY_RESERVE_BYTES
                 + FILTER_RESERVE_BYTES
                 + SEARCH_RESERVE_BYTES
-                + OWNER_RESERVE_BYTES);
+                + OWNER_RESERVE_BYTES
+                + INSPECTOR_RESERVE_BYTES);
         let mut published = Vec::new();
         for system in [
             SystemSample::not_provided(),
@@ -3717,9 +3912,66 @@ mod tests {
                     VALUE,
                     "9".repeat(crate::owner::MAX_PID_SET_INPUT_BYTES),
                 )?;
+                // PX-013: every inspector line at its widest, cut mark
+                // included.
+                let widest = crate::bounded(
+                    &"\u{20000}".repeat(crate::inspector::MAX_INSPECTOR_LINE_BYTES / 4 + 1),
+                    crate::inspector::MAX_INSPECTOR_LINE_BYTES,
+                );
+                for node in [
+                    INSPECTOR_STATUS,
+                    INSPECTOR_PROCESS,
+                    INSPECTOR_DETAILS,
+                    INSPECTOR_METRICS,
+                ] {
+                    ui.set(node, TEXT, widest.as_str())?;
+                }
                 Ok(())
             })
             .unwrap();
+        // PX-013: the inspector alone, measured on the encoder against its
+        // own reserve.
+        let inspector = session.with_store(|store| {
+            [
+                crate::INSPECTOR,
+                INSPECTOR_STATUS,
+                INSPECTOR_PROCESS,
+                INSPECTOR_DETAILS,
+                INSPECTOR_METRICS,
+            ]
+            .iter()
+            .map(|id| {
+                let node = store.get_node(*id).unwrap();
+                let operation = Operation::create_node(
+                    *id,
+                    node.node_type,
+                    node.parent_id,
+                    None,
+                    node.properties
+                        .iter()
+                        .map(|(property, value)| (*property, value.clone())),
+                );
+                srui_protocol::framed_payload_len(&srui_protocol::SruiMessage {
+                    msg: Some(srui_protocol::srui_message::Msg::Transaction(
+                        srui_protocol::Transaction {
+                            base_revision: 0,
+                            new_revision: 0,
+                            priority: 0,
+                            operations: vec![operation.to_wire()],
+                        },
+                    )),
+                })
+            })
+            .sum::<usize>()
+        });
+        assert!(
+            inspector <= INSPECTOR_RESERVE_BYTES,
+            "the widest inspector encodes to {inspector} bytes, above its {INSPECTOR_RESERVE_BYTES} byte reserve"
+        );
+        assert!(
+            inspector > INSPECTOR_RESERVE_BYTES / 2,
+            "the reserve must be measured against an inspector that really is wide: {inspector}"
+        );
         let hello = srui_protocol::ClientHello {
             core_version: "0.5.0".to_string(),
             profiles: vec!["org.srui.standard-widgets/1".to_string()],
@@ -3744,6 +3996,7 @@ mod tests {
                     + FILTER_RESERVE_BYTES
                     + SEARCH_RESERVE_BYTES
                     + OWNER_RESERVE_BYTES
+                    + INSPECTOR_RESERVE_BYTES
                     + TRANSACTION_ENVELOPE_BYTES,
             "a snapshot with no row is {frame} bytes, above the allowances the row budget \
              leaves for it"
@@ -3756,6 +4009,10 @@ mod tests {
                 + FILTER_RESERVE_BYTES
                 + SEARCH_RESERVE_BYTES
                 + OWNER_RESERVE_BYTES
+                + INSPECTOR_RESERVE_BYTES
+        );
+        println!(
+            "PX-013 inspector at its widest: encoded={inspector} reserve={INSPECTOR_RESERVE_BYTES}"
         );
     }
 
@@ -3796,7 +4053,10 @@ mod tests {
         let confirmed: HashSet<ItemId> = [rows[1].item_id, rows[8].item_id].into_iter().collect();
 
         let mut inside = rows.clone();
-        assert_eq!(evict_unconfirmed_beyond(&mut inside, &confirmed, 10), 0);
+        assert_eq!(
+            evict_unconfirmed_beyond(&mut inside, &confirmed, 10).len(),
+            0
+        );
         assert_eq!(
             ids(&inside),
             ids(&rows),
@@ -3805,7 +4065,7 @@ mod tests {
 
         let mut bounded_rows = rows.clone();
         assert_eq!(
-            evict_unconfirmed_beyond(&mut bounded_rows, &confirmed, 6),
+            evict_unconfirmed_beyond(&mut bounded_rows, &confirmed, 6).len(),
             4
         );
         assert_eq!(
@@ -3823,13 +4083,13 @@ mod tests {
         // Repeating the same eviction is the same eviction: nothing here depends
         // on iteration order or on when a row was last seen.
         let mut again = rows.clone();
-        assert_eq!(evict_unconfirmed_beyond(&mut again, &confirmed, 6), 4);
+        assert_eq!(evict_unconfirmed_beyond(&mut again, &confirmed, 6).len(), 4);
         assert_eq!(ids(&again), ids(&bounded_rows));
 
         let every: HashSet<ItemId> = rows.iter().map(|row| row.item_id).collect();
         let mut confirmed_only = rows.clone();
         assert_eq!(
-            evict_unconfirmed_beyond(&mut confirmed_only, &every, 3),
+            evict_unconfirmed_beyond(&mut confirmed_only, &every, 3).len(),
             0,
             "a row this scan confirmed is never evicted"
         );

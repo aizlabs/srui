@@ -32,8 +32,10 @@
 //!   sort-button node constants as its first argument and `ACTIVATE` as its
 //!   second (PX-009's standard semantic controls), or, in the same exact shape,
 //!   a column chooser button (PX-068), a search button with `ACTIVATE` or the
-//!   filter, search or PID field with `TEXT_EDIT` (PX-010, PX-011), or a user-filter
-//!   button with `ACTIVATE` or the user or PID-set field with `TEXT_EDIT` (PX-012); `on_result`, `on_text_edit`
+//!   filter, search or PID field with `TEXT_EDIT` (PX-010, PX-011), a user-filter
+//!   button with `ACTIVATE` or the user or PID-set field with `TEXT_EDIT` (PX-012), or
+//!   exactly `TABLE` with `SELECTION_CHANGED`, the inspector's one selection input
+//!   (PX-013); `on_result`, `on_text_edit`
 //!   and a model range provider unconditionally; `include`, called or
 //!   renamed; or a macro definition (`macro_rules!`), whose expansion can
 //!   assemble tokens this audit never sees together. Attributes come from an
@@ -637,17 +639,20 @@ fn scan(level: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
                     // (PX-009), the column chooser's (PX-068), the search
                     // buttons' (PX-011), the user-filter buttons' (PX-012),
                     // and the filter, search, PID, user and PID-set fields'
-                    // TEXT_EDIT registrations (PX-010, PX-011, PX-012) are
-                    // the allowances: the first argument must be one of
-                    // those button constants with `ACTIVATE`, or one of
-                    // those input constants with `TEXT_EDIT`, so a handler on any
-                    // other node, under any other event type, or through a
-                    // computed argument stays refused exactly as before.
+                    // TEXT_EDIT registrations (PX-010, PX-011, PX-012) and
+                    // the table's one SELECTION_CHANGED registration (PX-013)
+                    // are the allowances: the first argument must be one of
+                    // those button constants with `ACTIVATE`, one of those
+                    // input constants with `TEXT_EDIT`, or `TABLE` with
+                    // `SELECTION_CHANGED`, so a handler on any other node,
+                    // under any other event type, or through a computed
+                    // argument stays refused exactly as before.
                     "on" if is_punct(prev, '.') || is_path_sep(prev) => {
                         let allowed = match next {
                             Some(Tok::Group(Delimiter::Parenthesis, tokens, _)) => {
                                 is_sort_button_activation(tokens)
                                     || is_filter_input_text_edit(tokens)
+                                    || is_table_selection(tokens)
                             }
                             _ => false,
                         };
@@ -842,6 +847,37 @@ fn is_filter_input_text_edit(tokens: &[Tok]) -> bool {
     let event = bare(arguments.get(1));
     matches!(node.as_deref(), Some(name) if TEXT_INPUT_CONSTANTS.contains(&name))
         && event.as_deref() == Some("TEXT_EDIT")
+}
+
+/// The one selection input srtop handles (PX-013): the process table's
+/// `SELECTION_CHANGED`, whose handler resolves the event's `ItemId` against
+/// the published rows and describes that row in the inspector. It reads
+/// details and never signals, opens for control or reconfigures a process.
+const TABLE_SELECTION: (&str, &str) = ("TABLE", "SELECTION_CHANGED");
+
+/// Whether an `on(..)` argument list is exactly the table's
+/// `SELECTION_CHANGED` registration: the first argument the bare constant
+/// `TABLE`, the second the bare constant `SELECTION_CHANGED`. Any other node,
+/// any other event type, a path or a computed argument is not the allowance.
+fn is_table_selection(tokens: &[Tok]) -> bool {
+    let mut arguments: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    for token in tokens {
+        match token {
+            Tok::Punct(',', _) => arguments.push(std::mem::take(&mut current)),
+            Tok::Ident(name, _, _) => current.push(name.clone()),
+            _ => current.push('\u{0}'.to_string()),
+        }
+    }
+    arguments.push(current);
+    let bare = |argument: Option<&Vec<String>>| -> Option<String> {
+        match argument?.as_slice() {
+            [only] if !only.is_empty() => Some(only.clone()),
+            _ => None,
+        }
+    };
+    bare(arguments.first()).as_deref() == Some(TABLE_SELECTION.0)
+        && bare(arguments.get(1)).as_deref() == Some(TABLE_SELECTION.1)
 }
 
 /// Every violation in the production tokens of one source file.
@@ -1517,11 +1553,6 @@ fn the_source_audit_reports_every_known_bypass() {
             "handler",
         ),
         (
-            "a table selection handler",
-            "session.on(TABLE, SELECTION_CHANGED, |_, _| {});",
-            "handler",
-        ),
-        (
             "a computed search target",
             "session.on(search_buttons[i], ACTIVATE, |_, _| {});",
             "handler",
@@ -1551,6 +1582,53 @@ fn the_source_audit_reports_every_known_bypass() {
             "a computed user-filter target",
             "session.on(owner_controls[i], TEXT_EDIT, |_, _| {});",
             "handler",
+        ),
+        // PX-013: the table's SELECTION_CHANGED is allowed only in its exact
+        // shape: the bare `TABLE` and the bare `SELECTION_CHANGED`.
+        (
+            "the table under a text edit",
+            "session.on(TABLE, TEXT_EDIT, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the table under another collection event",
+            "session.on(TABLE, EXPANSION_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a selection handler on another node",
+            "session.on(MODEL, SELECTION_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a selection handler on a button",
+            "session.on(SEARCH_NEXT, SELECTION_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a computed selection target",
+            "session.on(tables[i], SELECTION_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a path-qualified table",
+            "session.on(crate::TABLE, SELECTION_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a computed selection event type",
+            "session.on(TABLE, events[i], |_, _| {});",
+            "handler",
+        ),
+        (
+            "the table selection by path with a receiver",
+            "Session::on(&session, TABLE, SELECTION_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a table selection through on_result",
+            "session.on_result(TABLE, SELECTION_CHANGED, |_, _| Ok(()));",
+            "ident",
         ),
         ("on_result", "session.on_result(TABLE, ACTIVATE, |_, _| Ok(()));", "ident"),
         ("model range provider", "impl ModelRangeProvider for Rows {}", "ident"),
@@ -1611,6 +1689,8 @@ fn the_source_audit_reports_every_known_bypass() {
         "session.on(OWNER_ALL, ACTIVATE, move |session, _| { refresh::owner_chosen(&all, session, owner::OwnerChoice::AllVisible); });",
         "session.on(OWNER_INPUT, TEXT_EDIT, move |session, event| { refresh::owner_edited(&user, session, event); });",
         "session.on(PID_SET_INPUT, TEXT_EDIT, move |session, event| { refresh::pid_set_edited(&pids, session, event); });",
+        // the inspector's one selection input, as PX-013 installs it
+        "session.on(TABLE, SELECTION_CHANGED, move |session, event| { refresh::selection_changed(&selected, session, event); });",
         "let kind = std::fs::symlink_metadata(&path)?;",
         "use std::fs::File;",
         "use std::os::unix::fs::MetadataExt;",

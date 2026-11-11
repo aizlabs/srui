@@ -1497,3 +1497,55 @@ fn a_selected_process_moved_under_a_collapsed_parent_clears_the_inspector() {
         .text(FOLLOW_STATUS)
         .starts_with("Following PID 13 · xray · item 4 of 4 in the tree"));
 }
+
+/// Verification of Codex review round 1 (F1): a search or a PID jump that
+/// promotes a row hidden under a collapsed parent reveals it on the client,
+/// which expands exactly those parents and selects the row at once, and only
+/// then reports each with `EXPANSION_CHANGED(true)`
+/// (`OutlineCollectionAdapter.expandCollapsedAncestors`). The server's mirror
+/// expands them when the promotion is planned, so a sample that lands before
+/// those reports keeps the inspector on the match, and the reports, when
+/// they come, change nothing.
+#[test]
+fn a_sample_between_a_search_reveal_and_its_expansion_report_keeps_the_match() {
+    let mut source = family(&[
+        (10, "alpha", 0, 10),
+        (11, "beta", 10, 11),
+        (30, "xray", 0, 60),
+    ]);
+    let mut h = harness(&mut source);
+    h.show_tree(true);
+    let alpha = h.item_of(10);
+    let beta = h.item_of(11);
+    h.disclose(alpha, false);
+    h.view().jump_to_pid(&h.session, "11").unwrap();
+    h.sync();
+    assert_eq!(h.item_property(TREE, VALUE), Some(beta), "promoted");
+    assert!(h.text(INSPECTOR_STATUS).contains("PID 11"));
+    assert!(
+        !h.view().collapsed().contains(&alpha),
+        "the reveal expanded alpha in the mirror"
+    );
+    // The client's `EXPANSION_CHANGED(true)` is still in flight.
+    h.sample(&mut source);
+    assert!(
+        h.text(INSPECTOR_STATUS).contains("PID 11"),
+        "{}",
+        h.text(INSPECTOR_STATUS)
+    );
+    let quiet = h.revision();
+    h.disclose(alpha, true);
+    assert_eq!(h.revision(), quiet, "the late report changes nothing");
+    assert!(h.text(INSPECTOR_STATUS).contains("PID 11"));
+    // The same for a search, with follow on: the followed match is shown.
+    h.disclose(alpha, false);
+    assert_eq!(h.text(INSPECTOR_STATUS), NO_SELECTION_STATUS);
+    h.view().set_search(&h.session, "beta").unwrap();
+    h.sync();
+    h.follow(true);
+    h.sample(&mut source);
+    assert!(h.text(INSPECTOR_STATUS).contains("PID 11"));
+    assert!(h
+        .text(FOLLOW_STATUS)
+        .starts_with("Following PID 11 · beta · item 2 of 3 in the tree"));
+}

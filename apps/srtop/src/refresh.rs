@@ -113,7 +113,8 @@ use crate::catalogue::{ColumnLayout, LayoutError, ProcessField};
 use crate::filter::{FilterGeneration, FilterQuery, PendingFilter};
 use crate::follow::{Follow, FollowView};
 use crate::inspector::{
-    DetailRead, DetailReads, DetailReadsIdle, DetailRequest, DetailSource, Inspector, InspectorView,
+    DetailRead, DetailReads, DetailReadsIdle, DetailRequest, DetailSource, HeldSelection,
+    Inspector, InspectorView,
 };
 use crate::owner::{OwnerChoice, OwnerFilter, OwnerView, Scope};
 use crate::projection::{Row, SessionItemIds};
@@ -985,7 +986,7 @@ impl ProcessView {
         plan.extend(self.search_effects(&target, &unfiltered_target, &unconfirmed));
         // A row this sample moved under a parent the client keeps collapsed is
         // no longer selected there (PX-018).
-        self.reconcile_disclosure(&target, false);
+        let held = self.reconcile_disclosure(&target, false);
         plan.extend(self.inspector_effects(&target, &unfiltered_target, &unconfirmed));
         // Follow last of all (PX-017): it stops when this plan hides or ends
         // the followed process, and a hint it sets names the row's final
@@ -1021,6 +1022,7 @@ impl ProcessView {
         let (transactions, outcome) =
             commit(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
+        self.settle_disclosure(&target, held);
         // Order values never reach the wire, so every published row takes this
         // sample's whatever committed: a later click sorts by current values,
         // never by the ones a row was first published with.
@@ -1667,7 +1669,7 @@ impl ProcessView {
         // inspector's (PX-013), and a row these rows put under a parent the
         // client keeps collapsed is no longer selected there (PX-018).
         plan.extend(self.search_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
-        self.reconcile_disclosure(&target, switched);
+        let held = self.reconcile_disclosure(&target, switched);
         plan.extend(self.inspector_effects(&target, &self.unfiltered_rows, &self.unconfirmed));
         if switched {
             // The selection survives the switch by item ID (PX-018): the
@@ -1686,6 +1688,9 @@ impl ProcessView {
                 })
                 .cloned();
             if let Some(row) = selected {
+                // A promotion reveals: in a freshly filled tree nothing is
+                // collapsed, so the mirror has nothing to expand (PX-018).
+                self.reveal_in_mirror(&target, row.item_id);
                 plan.push(Planned::new(Effect::Promote(mode.node(), Box::new(row))));
             }
         }
@@ -1723,6 +1728,7 @@ impl ProcessView {
         let (transactions, outcome) =
             commit(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
+        self.settle_disclosure(&target, held);
         refresh_sort_values(&mut self.rows, &target);
         self.ids.retain(&self.unfiltered_rows);
         self.prune_collapsed();
@@ -1989,18 +1995,32 @@ impl ProcessView {
             Effect::Promote(_, row) => Some(row.as_ref().clone()),
             _ => None,
         });
-        if let Some(row) = promoted {
-            self.inspector.select(&row);
+        // The promotion reveals its match: in the tree the client expands the
+        // collapsed parents above it before it reports them, so the mirror
+        // expands them now (PX-018).
+        let mut revealed = Vec::new();
+        if let Some(row) = &promoted {
+            self.inspector.select(row);
             // While follow is on, the match is the process followed next
             // (PX-017): the hint moves to it.
-            self.follow.selected(Some(&row));
+            self.follow.selected(Some(row));
+            let rows = std::mem::take(&mut self.rows);
+            revealed = self.reveal_in_mirror(&rows, row.item_id);
+            self.rows = rows;
         }
         plan.extend(self.search_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed));
         plan.extend(self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed));
         let follow = self.follow_table_effects(&plan);
         plan.extend(follow);
         plan.extend(self.follow_view_effects());
-        self.publish_controls(session, plan)
+        let published = self.publish_controls(session, plan);
+        if let Some(row) = &promoted {
+            // A promotion that never committed revealed nothing on a client.
+            if self.promoted != Some(row.item_id) {
+                self.collapsed.extend(revealed);
+            }
+        }
+        published
     }
 
     /// Commits `plan`, which changes controls only and no row, in bounded
@@ -2257,7 +2277,18 @@ impl ProcessView {
     /// ([`Self::expansion_changed`]). Follow is not a selection: it stays on
     /// its process, and its status says it is hidden under the collapsed
     /// parent.
-    fn reconcile_disclosure(&mut self, target: &[Row], fresh: bool) {
+    ///
+    /// The plan has not committed yet, so what this changes is held: if the
+    /// rows never reach the client ([`Self::settle_disclosure`]), the mirror
+    /// and the inspector are put back exactly as they were. Only a sample or
+    /// a filter (the text filter, the user filter, the PID set) can move a
+    /// row under a collapsed parent: a sort only reorders siblings, and a
+    /// switch fills a tree that starts expanded.
+    fn reconcile_disclosure(&mut self, target: &[Row], fresh: bool) -> HeldDisclosure {
+        let held = HeldDisclosure {
+            collapsed: self.collapsed.clone(),
+            inspector: self.inspector.hold(),
+        };
         if fresh {
             self.collapsed.clear();
         }
@@ -2270,6 +2301,56 @@ impl ProcessView {
         if hidden {
             self.inspector.clear();
         }
+        held
+    }
+
+    /// Keeps what [`Self::reconcile_disclosure`] changed when `target` is now
+    /// the published rows, and puts it back when the commit stopped before
+    /// they were (PX-018): the client then still shows the old rows, its
+    /// collapsed set and its selection.
+    fn settle_disclosure(&mut self, target: &[Row], held: HeldDisclosure) {
+        let landed = self.rows.len() == target.len()
+            && self
+                .rows
+                .iter()
+                .zip(target)
+                .all(|(row, wanted)| row.item_id == wanted.item_id);
+        if !landed {
+            self.collapsed = held.collapsed;
+            self.inspector.restore(held.inspector);
+        }
+    }
+
+    /// Mirrors a revealing promotion of `item` on the tree (PX-018): the
+    /// client expands exactly the collapsed items whose subtree holds it
+    /// (`OutlineCollectionAdapter.expandCollapsedAncestors`) and only then
+    /// reports each with `EXPANSION_CHANGED(true)`. The mirror expands them
+    /// when the promotion is planned, so a sample landing before those
+    /// reports sees the match shown, and the reports change nothing. Returns
+    /// the items it expanded.
+    fn reveal_in_mirror(&mut self, rows: &[Row], item: ItemId) -> Vec<ItemId> {
+        if self.mode != ViewMode::Tree || self.collapsed.is_empty() {
+            return Vec::new();
+        }
+        let Some(at) = rows.iter().position(|row| row.item_id == item) else {
+            return Vec::new();
+        };
+        let opened: Vec<ItemId> = rows[..at]
+            .iter()
+            .enumerate()
+            .filter(|(index, row)| {
+                self.collapsed.contains(&row.item_id)
+                    && row
+                        .tree
+                        .as_ref()
+                        .is_some_and(|place| at as u64 <= *index as u64 + place.descendants)
+            })
+            .map(|(_, row)| row.item_id)
+            .collect();
+        for opened in &opened {
+            self.collapsed.remove(opened);
+        }
+        opened
     }
 
     /// The row operations that turn the published rows into `target` in the
@@ -2711,6 +2792,13 @@ pub fn follow_toggled(
     if let Err(error) = lock_view(view).set_follow(session, on) {
         eprintln!("srtop: follow not published: {error}");
     }
+}
+
+/// What [`ProcessView::reconcile_disclosure`] changed, held until its plan
+/// commits (PX-018).
+struct HeldDisclosure {
+    collapsed: HashSet<ItemId>,
+    inspector: HeldSelection,
 }
 
 /// Keeps only the collapsed items `rows` still hold (PX-018).

@@ -30,7 +30,9 @@
 //!   handler for client input except the sort controls' — `on` in method or
 //!   path form is refused unless the call names exactly one of the four
 //!   sort-button node constants as its first argument and `ACTIVATE` as its
-//!   second (PX-009's standard semantic controls); `on_result`, `on_text_edit`
+//!   second (PX-009's standard semantic controls), or, in the same exact shape,
+//!   a column chooser button (PX-068), a search button with `ACTIVATE` or the
+//!   filter, search or PID field with `TEXT_EDIT` (PX-010, PX-011); `on_result`, `on_text_edit`
 //!   and a model range provider unconditionally; `include`, called or
 //!   renamed; or a macro definition (`macro_rules!`), whose expansion can
 //!   assemble tokens this audit never sees together. Attributes come from an
@@ -631,10 +633,12 @@ fn scan(level: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
                 match name.as_str() {
                     // `x.on(..)` and `Session::on(&session, ..)`: a client event
                     // handler. The sort controls' four ACTIVATE registrations
-                    // (PX-009) and the filter input's TEXT_EDIT registration
-                    // (PX-010) are the allowances: the first argument must
-                    // be a sort-button node constant with `ACTIVATE`, or
-                    // `FILTER_INPUT` with `TEXT_EDIT`, so a handler on any
+                    // (PX-009), the column chooser's (PX-068), the search
+                    // buttons' (PX-011), and the filter, search and PID
+                    // fields' TEXT_EDIT registrations (PX-010, PX-011) are
+                    // the allowances: the first argument must be one of
+                    // those button constants with `ACTIVATE`, or one of
+                    // those input constants with `TEXT_EDIT`, so a handler on any
                     // other node, under any other event type, or through a
                     // computed argument stays refused exactly as before.
                     "on" if is_punct(prev, '.') || is_path_sep(prev) => {
@@ -754,6 +758,15 @@ const COLUMN_CHOOSER_CONSTANTS: &[&str] = &[
     "COLUMNS_RESTORE",
 ];
 
+/// The search buttons (PX-011), whose `ACTIVATE` handlers move the server's
+/// current match or resolve the PID field the server kept, and touch no
+/// process.
+const SEARCH_BUTTON_CONSTANTS: &[&str] = &["SEARCH_PREVIOUS", "SEARCH_NEXT", "PID_GO"];
+
+/// The text inputs whose `TEXT_EDIT` handlers are allowed: the filter input
+/// (PX-010) and the search and PID fields (PX-011).
+const TEXT_INPUT_CONSTANTS: &[&str] = &["FILTER_INPUT", "SEARCH_INPUT", "PID_INPUT"];
+
 /// Whether an `on(..)` argument list is one of the sort buttons' `ACTIVATE`
 /// registrations: the first argument exactly a sort-button node constant, the
 /// second exactly `ACTIVATE` (PX-009). A column chooser button constant is
@@ -787,12 +800,13 @@ fn is_sort_button_activation(tokens: &[Tok]) -> bool {
         node.as_deref(),
         Some(name) if SORT_BUTTON_CONSTANTS.contains(&name)
             || COLUMN_CHOOSER_CONSTANTS.contains(&name)
+            || SEARCH_BUTTON_CONSTANTS.contains(&name)
     ) && event.as_deref() == Some("ACTIVATE")
 }
 
-/// Whether an `on(..)` argument list is the filter input's `TEXT_EDIT`
-/// registration: the first argument exactly `FILTER_INPUT`, the second
-/// exactly `TEXT_EDIT` (PX-010).
+/// Whether an `on(..)` argument list is a text input's `TEXT_EDIT`
+/// registration: the first argument exactly `FILTER_INPUT` (PX-010) or the
+/// search or PID field's constant (PX-011), the second exactly `TEXT_EDIT`.
 fn is_filter_input_text_edit(tokens: &[Tok]) -> bool {
     let mut arguments: Vec<Vec<String>> = Vec::new();
     let mut current: Vec<String> = Vec::new();
@@ -812,7 +826,8 @@ fn is_filter_input_text_edit(tokens: &[Tok]) -> bool {
     };
     let node = bare(arguments.first());
     let event = bare(arguments.get(1));
-    node.as_deref() == Some("FILTER_INPUT") && event.as_deref() == Some("TEXT_EDIT")
+    matches!(node.as_deref(), Some(name) if TEXT_INPUT_CONSTANTS.contains(&name))
+        && event.as_deref() == Some("TEXT_EDIT")
 }
 
 /// Every violation in the production tokens of one source file.
@@ -1466,6 +1481,37 @@ fn the_source_audit_reports_every_known_bypass() {
             "Session::on(&session, SORT_PID, ACTIVATE, |_, _| {});",
             "handler",
         ),
+        // PX-011: the search controls are allowed only in their exact shape.
+        (
+            "a search button under another event",
+            "session.on(SEARCH_NEXT, TEXT_EDIT, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the PID button under a selection event",
+            "session.on(PID_GO, SELECTION_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the PID field under ACTIVATE",
+            "session.on(PID_INPUT, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the search field under ACTIVATE",
+            "session.on(SEARCH_INPUT, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a table selection handler",
+            "session.on(TABLE, SELECTION_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a computed search target",
+            "session.on(search_buttons[i], ACTIVATE, |_, _| {});",
+            "handler",
+        ),
         ("on_result", "session.on_result(TABLE, ACTIVATE, |_, _| Ok(()));", "ident"),
         ("model range provider", "impl ModelRangeProvider for Rows {}", "ident"),
         // outbound connections
@@ -1514,6 +1560,12 @@ fn the_source_audit_reports_every_known_bypass() {
         "session.on(COLUMNS_RESTORE, ACTIVATE, handler(RestoreDefaults));",
         // the filter input's TEXT_EDIT registration (PX-010)
         "session.on(FILTER_INPUT, TEXT_EDIT, move |session, event| { refresh::filter_edited(&view, session, event); });",
+        // the search controls' registrations, as PX-011 installs them
+        "session.on(SEARCH_INPUT, TEXT_EDIT, move |session, event| { refresh::search_edited(&edited, session, event); });",
+        "session.on(SEARCH_PREVIOUS, ACTIVATE, move |session, _| { refresh::search_stepped(&previous, session, search::SearchStep::Previous); });",
+        "session.on(SEARCH_NEXT, ACTIVATE, move |session, _| { refresh::search_stepped(&next, session, search::SearchStep::Next); });",
+        "session.on(PID_INPUT, TEXT_EDIT, move |session, event| { refresh::pid_edited(&pid, session, event); });",
+        "session.on(PID_GO, ACTIVATE, move |session, _| { refresh::pid_requested(&go, session); });",
         "let kind = std::fs::symlink_metadata(&path)?;",
         "use std::fs::File;",
         "use std::os::unix::fs::MetadataExt;",

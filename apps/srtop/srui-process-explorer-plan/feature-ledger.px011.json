@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-011",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Server-authoritative find-next/find-previous and jump to PID over the published process collection through standard native TextInputs, Buttons and a status Text with standard TEXT_EDIT and ACTIVATE events; search locates rows and never hides, moves or changes one; the current match is held by ItemId, promoted to the table's semantic selection through the PX-011-G01 SDK API so the generic client selects and reveals it, and never retargeted automatically; no process action, no protocol, SDK or client change in this ticket",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX011-001",
+      "feature": "Search is distinct from filtering: a search query is parsed and matched by the filter's own rules (name and available command text, Unicode case folding, | OR terms, 512-byte and 16-term caps, inert sanitization, monotonic generation) and locates matching rows without hiding, moving or changing any row; matches are counted over the whole server-side collection in published order, and matches the committed filter or the published-row ceiling keep out of the model are counted and stated",
+      "scope": "PX-011/search (src/search.rs) Search::set_query, Search::view; refresh (src/refresh.rs) ProcessView::set_search",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-011",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-011.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX011-002",
+      "feature": "Next match and Previous match cycle predictably through the matches in published order and wrap in both directions without changing the row count, and each step selects and reveals the match in the native table; a new query selects the first match; no match publishes a visible explanation, disables both buttons so event validation refuses a click, and leaves the native selection unchanged",
+      "scope": "PX-011/search (src/search.rs) Search::step; refresh (src/refresh.rs) ProcessView::step_search and promotion; SEARCH_PREVIOUS and SEARCH_NEXT handlers (src/lib.rs install_search_handlers); RepeatedNamesSource fixture (src/source.rs, --fake-repeated-names)",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-011",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-011.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX011-003",
+      "feature": "Go to PID resolves a numeric PID (one to ten ASCII digits, read from the field the server kept) to the published row the latest scan confirmed with it, holds that row's ItemId and selects and reveals it in the native table; a missing, filtered-out, beyond-the-ceiling, retained-only or malformed PID is explained instead of selected and leaves the selection unchanged; when the target stops being shown the search says so and moves to no other process, and a reused PID selects the new live record only through an explicit new search, never by a refresh, and never inherits a promotion",
+      "scope": "PX-011/search (src/search.rs) Search::go_to_pid, Search::observe; refresh (src/refresh.rs) ProcessView unconfirmed set, search effects in apply, set_sort and commit_filter",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-011",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-011.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX011-004",
+      "feature": "Search state and controls are bounded: the status is at most 1024 bytes, the PID field keeps at most 32 bytes, the query is bounded by the filter's caps, and the seven new shell nodes and the table's promoted value are charged a fixed 4096-byte SEARCH_RESERVE_BYTES against the catch-up snapshot; while a promotion is held every row-removing plan leaves one operation and its bytes free for the settlement CLEAR_PROPERTY, and a promotion counts as its two operations; the PX-008 audit admits only the exact SEARCH_INPUT/PID_INPUT TEXT_EDIT and SEARCH_PREVIOUS/SEARCH_NEXT/PID_GO ACTIVATE registrations",
+      "scope": "PX-011/refresh (src/refresh.rs) SEARCH_RESERVE_BYTES, planning_limits, PROMOTION_CLEAR_BYTES, Planned::operations; tests/no_process_control_test.rs allowances",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-011",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-011.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX011-005",
+      "feature": "An explicit search that sets a current match promotes its ItemId to the process table's semantic selection through UiTransaction::promote_selection (PX-011-G01), so the generic client selects the row and scrolls it into view; a search that selects nothing leaves the promotion as it was; a sort or refresh that moves the row keeps it; the SDK's settlement clears it in the same commit that removes its row (process exit, filter, row limit) and srtop records that from the store; a row shown again is not re-promoted automatically; a user's click stays local and Next/Previous continue from the server's current match",
+      "scope": "PX-011/refresh (src/refresh.rs) Effect::Promote, ProcessView::promotion, promoted record, commit; native ProcessExplorerShellTests.searchSelectsAndRevealsMatchesWithoutHidingRowsAndJumpsToAPID",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-011",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-011.md"
+      ]
+    }
+  ]
+}

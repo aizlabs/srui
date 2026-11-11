@@ -147,11 +147,13 @@ fn a_snapshot_larger_than_one_model_batch_is_published_whole() {
             let template = snapshot.records[0].key.clone();
             snapshot.records = (0..self.0)
                 .map(|index| ProcessRecord {
+                    kind: srui_process_explorer::source::KIND_NOT_COLLECTED,
                     lineage: srui_process_explorer::source::Lineage::NOT_COLLECTED,
                     owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
                     key: ProcessKey {
                         pid: Observed::Known(index as u32 + 1),
                         creation: CreationToken::Opaque(format!("crowded-{index}")),
+                        thread: None,
                         ..template.clone()
                     },
                     display_name: DisplayName::sanitize(b"worker"),

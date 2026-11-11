@@ -56,6 +56,19 @@
 //! the key's start time, so what was read belongs to that instance and to no
 //! newcomer under its PID, whether the directory is pinned or read by name.
 //!
+//! User threads (PX-019) are read only while the view shows them
+//! ([`ProcessSource::collect_threads`]): after a record is read, its
+//! `task` directory is listed through the same handle and each thread's
+//! `task/<tid>/stat` is read, giving the thread's name, its own CPU counters
+//! and its start time, which is the thread's creation token. A thread is keyed
+//! by its process's key and its TID and start time, so a thread that ends and
+//! a newcomer under the same TID are different instances. A kernel thread's
+//! `task` directory is not listed: it is its own one task. One scan reads at
+//! most [`MAX_THREAD_RECORDS`] thread records; the processes whose threads it
+//! could not read, or never reached, are named, and their earlier thread rows
+//! are kept. Per-thread CPU baselines are kept apart from the processes', one
+//! per thread instance the previous scan published.
+//!
 //! Every published record also carries its parent PID and start time
 //! (PX-018), `stat` fields 4 and 22 of the very line that identified it, so
 //! the process tree resolves parents from one generation whose lineage no
@@ -78,7 +91,8 @@ use crate::source::{
     DisplayName, EnumerationIssue, Figure, FigureGap, HostId, IssueScope, Lineage, LoadAverages,
     MemoryFigures, MissingReason, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
     ProcessSnapshot, ProcessSource, SkippedRecords, SnapshotTime, SourceId, SwapFigures, SystemCpu,
-    SystemCpuInterval, SystemSample,
+    SystemCpuInterval, SystemSample, TaskKind, ThreadIdentity, ThreadRecords, ThreadScan,
+    MAX_THREAD_RECORDS,
 };
 use srui_semantic_tree::DEFAULT_MAX_CACHED_ITEMS_PER_MODEL;
 use std::collections::HashMap;
@@ -199,6 +213,9 @@ const PPID_FIELD_AFTER_COMM: usize = 1;
 /// `/proc/<pid>/stat` field 9 (`flags`, the kernel's `PF_*` word) is the
 /// seventh field after `comm` (`proc_pid_stat(5)`; PX-014).
 const FLAGS_FIELD_AFTER_COMM: usize = 6;
+/// `/proc/<pid>/stat` field 20, `num_threads` (PX-019): the threads of the
+/// thread group, as the kernel counts them.
+const THREADS_FIELD_AFTER_COMM: usize = 17;
 /// `PF_KTHREAD`: the `flags` bit of a kernel thread (include/linux/sched.h).
 const PF_KTHREAD: u32 = 0x0020_0000;
 
@@ -486,6 +503,18 @@ impl RecordDir {
         File::open(self.base.join(file))
     }
 
+    /// The entry names of one of the record's directories (PX-019: `task`),
+    /// listed through the same handle as its files.
+    fn list(
+        &self,
+        directory: &str,
+    ) -> io::Result<impl Iterator<Item = io::Result<std::ffi::OsString>>> {
+        #[cfg(test)]
+        fault::check(&self.record, directory)?;
+        Ok(std::fs::read_dir(self.base.join(directory))?
+            .map(|entry| entry.map(|entry| entry.file_name())))
+    }
+
     /// The target of one of the record's links (PX-014: `exe`, `cwd`), read
     /// with `readlink` and never followed. The kernel's own `readlink` of
     /// these links returns at most `PATH_MAX` bytes.
@@ -567,16 +596,39 @@ pub struct ProcFsSource {
     /// source, and nothing for any other tree, whose UIDs this host's database
     /// may not name.
     accounts: Accounts,
+    /// Whether scans read user threads (PX-019): only while the view shows
+    /// them.
+    collect_threads: bool,
+    /// Whether this source can read per-thread records at all (PX-019): a
+    /// tree given to [`Self::with_root`] states its own `task` directories,
+    /// and the host's own `/proc` has them only on Linux. Elsewhere the host
+    /// has no per-thread procfs, and threads are a capability limitation.
+    threads_supported: bool,
+    /// Bound on the thread records one scan reads (PX-019).
+    thread_limit: usize,
+    /// One CPU baseline per thread instance the previous scan published
+    /// (PX-019), keyed by its process instance and its own TID and start time.
+    /// Rebuilt on every scan that reads threads, so it is bounded by the
+    /// thread bound and forgets every thread that ended.
+    thread_baselines: HashMap<ThreadInstance, CpuBaseline>,
 }
+
+/// A thread instance, for its CPU baseline (PX-019): the process's PID and
+/// start time, then the thread's TID and start time.
+type ThreadInstance = (u32, u64, u32, u64);
 
 impl ProcFsSource {
     /// Reads the host's real process filesystem. Only this constructor may
     /// describe its data as live.
     pub fn live() -> Self {
-        Self::rooted(
-            PathBuf::from(DEFAULT_PROC_ROOT),
-            LIVE_STATUS_TEXT.to_string(),
-        )
+        Self {
+            // Only a Linux host's own `/proc` has per-thread records (PX-019).
+            threads_supported: cfg!(target_os = "linux"),
+            ..Self::rooted(
+                PathBuf::from(DEFAULT_PROC_ROOT),
+                LIVE_STATUS_TEXT.to_string(),
+            )
+        }
         .with_accounts(Accounts::system())
     }
 
@@ -620,6 +672,10 @@ impl ProcFsSource {
                 system_baseline: None,
                 wall_clock: Arc::new(SystemWallClock),
                 accounts: Accounts::not_provided(),
+                collect_threads: false,
+                threads_supported: true,
+                thread_limit: MAX_THREAD_RECORDS,
+                thread_baselines: HashMap::new(),
             };
         };
         let status = format!(
@@ -645,6 +701,10 @@ impl ProcFsSource {
             system_baseline: None,
             wall_clock: Arc::new(SystemWallClock),
             accounts: Accounts::not_provided(),
+            collect_threads: false,
+            threads_supported: true,
+            thread_limit: MAX_THREAD_RECORDS,
+            thread_baselines: HashMap::new(),
         }
     }
 
@@ -682,6 +742,35 @@ impl ProcFsSource {
     pub fn with_record_limit(mut self, limit: usize) -> Self {
         self.record_limit = limit;
         self
+    }
+
+    /// Bounds how many thread records one scan reads (PX-019). The processes
+    /// whose threads the bound leaves unread are named, not counted as
+    /// unreadable.
+    pub fn with_thread_limit(mut self, limit: usize) -> Self {
+        self.thread_limit = limit;
+        self
+    }
+
+    /// How many thread CPU baselines this source is holding for the next scan
+    /// (PX-019).
+    pub fn thread_baselines(&self) -> usize {
+        self.thread_baselines.len()
+    }
+
+    /// What a scan that read no record says about threads (PX-019): nothing
+    /// was read, and no process's threads can be named, so every earlier
+    /// thread row is kept.
+    fn threads_unread(&self) -> ThreadScan {
+        if !self.threads_supported {
+            return ThreadScan::NotProvided;
+        }
+        if !self.collect_threads {
+            return ThreadScan::NotRequested;
+        }
+        let mut read = ThreadRecords::with_limit(0);
+        read.unreadable.mark_unenumerable();
+        ThreadScan::Read(read)
     }
 
     /// Bounds how many identities one scan may name in each of its two ledgers.
@@ -892,6 +981,13 @@ impl ProcessSource for ProcFsSource {
         Some(Arc::new(self.details_reader()))
     }
 
+    fn collect_threads(&mut self, on: bool) {
+        self.collect_threads = on;
+        if !on {
+            self.thread_baselines.clear();
+        }
+    }
+
     fn snapshot(&mut self) -> ProcessSnapshot {
         let sampled_at = SnapshotTime(self.wall_clock.now());
         let mut issues = Vec::new();
@@ -912,6 +1008,7 @@ impl ProcessSource for ProcFsSource {
                 sampled_at,
                 records: Vec::new(),
                 vanished: 0,
+                threads: self.threads_unread(),
                 capped: CappedRecords::none(),
                 // Nothing was enumerated at all: no absence can be attributed.
                 completeness: Completeness::from_scan(SkippedRecords::unenumerable(), issues),
@@ -1006,6 +1103,11 @@ impl ProcessSource for ProcFsSource {
         // a scan-start-to-scan-start interval it was never measured over.
         let mut baselines = HashMap::with_capacity(self.cpu_baselines.len());
         let mut records = Vec::new();
+        // User threads (PX-019), read only while asked for, under their own
+        // bound and with their own baselines.
+        let mut threads = (self.collect_threads && self.threads_supported)
+            .then(|| ThreadRecords::with_limit(self.uncertain_limit));
+        let mut thread_baselines = HashMap::new();
         let entries = match std::fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(error) => {
@@ -1025,6 +1127,7 @@ impl ProcessSource for ProcFsSource {
                     sampled_at,
                     records,
                     vanished,
+                    threads: self.threads_unread(),
                     capped,
                     completeness: Completeness::from_scan(skipped, issues),
                     system,
@@ -1194,7 +1297,20 @@ impl ProcessSource for ProcFsSource {
                             // of this instance warms up again.
                             None => CpuUsage::Missing(MissingReason::Unavailable),
                         };
-                        records.push(ProcessRecord {
+                        // A kernel thread says so in its flags; a user
+                        // process carries the thread count of the same line
+                        // (PX-019).
+                        let kind = match stat.flags {
+                            Observed::Known(flags) if flags & PF_KTHREAD != 0 => {
+                                Observed::Known(TaskKind::KernelThread)
+                            }
+                            Observed::Known(_) => Observed::Known(TaskKind::Process {
+                                threads: stat.threads.clone(),
+                            }),
+                            Observed::Missing(reason) => Observed::Missing(reason),
+                        };
+                        let record = ProcessRecord {
+                            kind,
                             // The parent and the start time come from the
                             // same `stat` read as the identity (PX-018), so
                             // a recycled PID never lends its parent to the
@@ -1211,11 +1327,33 @@ impl ProcessSource for ProcFsSource {
                                 pid_namespace: pid_namespace.clone(),
                                 pid: Observed::Known(pid),
                                 creation: CreationToken::LinuxBootTicks(stat.start_ticks),
+                                thread: None,
                             },
-                            display_name: stat.display_name,
+                            display_name: stat.display_name.clone(),
                             resident: resident_bytes(resident_pages, &page_size),
                             cpu,
-                        });
+                        };
+                        // A kernel thread is its own one task; any other
+                        // record's threads are listed through the same
+                        // handle (PX-019).
+                        if let Some(read) = threads.as_mut() {
+                            if record.kind != Observed::Known(TaskKind::KernelThread) {
+                                read_threads(
+                                    &directory,
+                                    &record,
+                                    stat.start_ticks,
+                                    &ThreadReader {
+                                        limit: self.thread_limit,
+                                        clock: self.clock.as_ref(),
+                                        ticks_per_second: &ticks_per_second,
+                                        previous: &self.thread_baselines,
+                                    },
+                                    &mut thread_baselines,
+                                    read,
+                                );
+                            }
+                        }
+                        records.push(record);
                     }
                 },
             }
@@ -1228,11 +1366,38 @@ impl ProcessSource for ProcFsSource {
         // Only what this scan published is kept for the next one, so the map is
         // bounded by the record bound and a process that ended is forgotten.
         self.cpu_baselines = baselines;
+        let threads = match threads {
+            Some(mut read) => {
+                // Grouped by process in the records' order, ascending TID
+                // within each, as the projection expects.
+                let order: HashMap<u32, usize> = records
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, record)| match record.key.pid {
+                        Observed::Known(pid) => Some((pid, index)),
+                        Observed::Missing(_) => None,
+                    })
+                    .collect();
+                read.records.sort_by_key(|thread| {
+                    let pid = match thread.key.pid {
+                        Observed::Known(pid) => pid,
+                        Observed::Missing(_) => u32::MAX,
+                    };
+                    let tid = thread.key.thread.as_ref().map_or(u32::MAX, |t| t.tid);
+                    (order.get(&pid).copied().unwrap_or(usize::MAX), tid)
+                });
+                self.thread_baselines = thread_baselines;
+                ThreadScan::Read(read)
+            }
+            None if !self.threads_supported => ThreadScan::NotProvided,
+            None => ThreadScan::NotRequested,
+        };
         ProcessSnapshot {
             source: self.source.clone(),
             sampled_at,
             records,
             vanished,
+            threads,
             capped,
             completeness: Completeness::from_scan(skipped, issues),
             system,
@@ -1341,6 +1506,28 @@ impl DetailSource for ProcFsDetails {
         if stat.start_ticks != *start_ticks {
             return DetailRead::Ended;
         }
+        // A thread's own state and start time come from its own task record,
+        // which must still carry the thread's start time; its command line is
+        // its process's (PX-019).
+        let own = match &target.thread {
+            None => None,
+            Some(ThreadIdentity {
+                tid,
+                creation: CreationToken::LinuxBootTicks(thread_ticks),
+            }) => {
+                let bytes = match directory.read(&format!("task/{tid}/stat")) {
+                    Ok(bytes) => bytes,
+                    Err(error) if ended(&error) => return DetailRead::Ended,
+                    Err(error) => return DetailRead::Unreadable(reason_for(&error)),
+                };
+                match parse_stat(*tid, &bytes) {
+                    Some(thread) if thread.start_ticks == *thread_ticks => Some(thread),
+                    Some(_) => return DetailRead::Ended,
+                    None => return DetailRead::Unreadable(MissingReason::Unavailable),
+                }
+            }
+            Some(_) => return DetailRead::Unreadable(MissingReason::Unavailable),
+        };
         let mut command = read_command(&directory, &stat);
         // Read the record again: what was read is this instance's only if the
         // record still is. A kernel procfs binds a pinned directory to its
@@ -1356,20 +1543,141 @@ impl DetailSource for ProcFsDetails {
             Err(error) if ended(&error) => return DetailRead::Ended,
             Err(error) => command = CommandContext::missing(reason_for(&error)),
         }
+        let described = own.unwrap_or(stat);
         let started = match read_auxv_entry(&self.root, parse_clock_ticks) {
             Observed::Known(rate) => Observed::Known(StartTime::from_ticks(
-                stat.start_ticks,
+                described.start_ticks,
                 rate,
                 read_boot_time(&self.root.join("stat")),
             )),
             Observed::Missing(reason) => Observed::Missing(reason),
         };
         DetailRead::Read(ProcessDetails {
-            state: stat.state,
-            parent: stat.parent,
+            state: described.state,
+            parent: described.parent,
             started,
             command,
         })
+    }
+}
+
+/// What [`read_threads`] reads with (PX-019): the scan's thread bound, the
+/// clock and tick rate CPU intervals are measured with, and the previous
+/// scan's thread baselines.
+struct ThreadReader<'a> {
+    limit: usize,
+    clock: &'a dyn MonotonicClock,
+    ticks_per_second: &'a Observed<u64>,
+    previous: &'a HashMap<ThreadInstance, CpuBaseline>,
+}
+
+/// Reads the threads of `process`, whose record directory is `directory` and
+/// whose start time is `started`, into `read` (PX-019).
+///
+/// The `task` directory is listed through the record's own handle, and each
+/// thread's `task/<tid>/stat` is read through it too: the thread's name, its
+/// own CPU counters (fields 14 and 15 of a task's line count that thread
+/// alone), and its start time, the thread's creation token. Each thread record
+/// is keyed by `process`'s key and the thread's TID and start time, carries
+/// `process`'s owner, and states no resident memory of its own: a thread
+/// shares its process's address space, so its process's figure is the only
+/// one, and repeating it per thread would count it once per thread.
+///
+/// A thread that ended between the listing and its read is churn. A listing,
+/// or a thread, that could not be read names the process in `read.unreadable`
+/// once, so its earlier thread rows are kept rather than deleted; a listing
+/// that is gone because the process itself has since ended names nothing. Once
+/// `read` holds `reader.limit` records, the rest of the process's threads are
+/// not read and the process is named in `read.capped`.
+fn read_threads(
+    directory: &RecordDir,
+    process: &ProcessRecord,
+    started: u64,
+    reader: &ThreadReader<'_>,
+    baselines: &mut HashMap<ThreadInstance, CpuBaseline>,
+    read: &mut ThreadRecords,
+) {
+    let Observed::Known(pid) = process.key.pid else {
+        return;
+    };
+    let unreadable = |read: &mut ThreadRecords, reason: MissingReason| {
+        if !read.unreadable.pids().contains(&pid) {
+            read.unreadable.record(pid);
+            if reason == MissingReason::Denied {
+                read.denied += 1;
+            }
+        }
+    };
+    let entries = match directory.list("task") {
+        Ok(entries) => entries,
+        // The process ended after its own reads: its threads went with it.
+        Err(error) if ended(&error) && directory.confirms_exit(pid, started) => return,
+        Err(error) => return unreadable(read, reason_for(&error)),
+    };
+    for entry in entries {
+        let name = match entry {
+            Ok(name) => name,
+            Err(error) => {
+                unreadable(read, reason_for(&error));
+                continue;
+            }
+        };
+        let Some(tid) = parse_pid(name.as_encoded_bytes()) else {
+            continue;
+        };
+        if read.records.len() >= reader.limit {
+            read.capped.record(pid);
+            return;
+        }
+        let bytes = match directory.read(&format!("task/{tid}/stat")) {
+            Ok(bytes) => bytes,
+            Err(error) if ended(&error) => {
+                read.vanished += 1;
+                continue;
+            }
+            Err(error) => {
+                unreadable(read, reason_for(&error));
+                continue;
+            }
+        };
+        let read_at = reader.clock.now();
+        let Some(stat) = parse_stat(tid, &bytes) else {
+            unreadable(read, MissingReason::Unavailable);
+            continue;
+        };
+        let instance = (pid, started, tid, stat.start_ticks);
+        let cpu = match stat.cpu_ticks {
+            Some(ticks) => {
+                let (usage, keep) = sample_cpu(
+                    reader.previous.get(&instance),
+                    CpuBaseline { ticks, at: read_at },
+                    reader.ticks_per_second,
+                );
+                baselines.insert(instance, keep);
+                usage
+            }
+            None => CpuUsage::Missing(MissingReason::Unavailable),
+        };
+        read.records.push(ProcessRecord {
+            key: ProcessKey {
+                thread: Some(ThreadIdentity {
+                    tid,
+                    creation: CreationToken::LinuxBootTicks(stat.start_ticks),
+                }),
+                ..process.key.clone()
+            },
+            display_name: stat.display_name,
+            // Per process, never per thread: see above.
+            resident: Observed::Missing(MissingReason::Unavailable),
+            cpu,
+            owner: process.owner.clone(),
+            // A thread's parent is its process; its own start time is read.
+            lineage: Lineage {
+                parent: Observed::Known(pid),
+                started: Observed::Known(stat.start_ticks),
+            },
+            kind: Observed::Known(TaskKind::Thread),
+        });
     }
 }
 
@@ -1703,6 +2011,9 @@ pub struct StatFields {
     /// Field 9: the kernel's `PF_*` flags (PX-014), read only to recognise a
     /// kernel thread. A field that is not a plain count within `u32` is unread.
     pub flags: Observed<u32>,
+    /// Field 20: the thread group's thread count (PX-019). A field that is not
+    /// a plain count within `u32` is unread, never 0.
+    pub threads: Observed<u32>,
 }
 
 /// Parses `comm`, the creation token, the CPU counters, the state and the
@@ -1759,21 +2070,24 @@ pub fn parse_stat(pid: u32, bytes: &[u8]) -> Option<StatFields> {
             Observed::Missing(MissingReason::Unavailable),
             Observed::Known,
         );
-    let flags = fields
-        .get(FLAGS_FIELD_AFTER_COMM)
-        .and_then(|field| parse_count(field))
-        .and_then(|flags| u32::try_from(flags).ok())
-        .map_or(
-            Observed::Missing(MissingReason::Unavailable),
-            Observed::Known,
-        );
+    let unsigned = |index: usize| {
+        fields
+            .get(index)
+            .and_then(|field| parse_count(field))
+            .and_then(|value| u32::try_from(value).ok())
+            .map_or(
+                Observed::Missing(MissingReason::Unavailable),
+                Observed::Known,
+            )
+    };
     Some(StatFields {
         display_name: DisplayName::sanitize(&bytes[open + 1..close]),
         start_ticks,
         cpu_ticks,
         state,
         parent,
-        flags,
+        flags: unsigned(FLAGS_FIELD_AFTER_COMM),
+        threads: unsigned(THREADS_FIELD_AFTER_COMM),
     })
 }
 

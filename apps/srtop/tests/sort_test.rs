@@ -44,6 +44,7 @@ fn key(pid: Option<u32>, token: &str) -> ProcessKey {
             Observed::Known,
         ),
         creation: CreationToken::Opaque(token.into()),
+        thread: None,
     }
 }
 
@@ -64,6 +65,7 @@ fn record(
     cpu: CpuUsage,
 ) -> ProcessRecord {
     ProcessRecord {
+        kind: srui_process_explorer::source::KIND_NOT_COLLECTED,
         lineage: srui_process_explorer::source::Lineage::NOT_COLLECTED,
         owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
         key: key(pid, token),
@@ -121,6 +123,7 @@ fn snapshot(records: Vec<ProcessRecord>, second: u64) -> ProcessSnapshot {
         ),
         records,
         vanished: 0,
+        threads: srui_process_explorer::source::ThreadScan::NotProvided,
         capped: CappedRecords::none(),
         completeness: Completeness::Complete,
         system: SystemSample::not_provided(),

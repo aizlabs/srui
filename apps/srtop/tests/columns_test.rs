@@ -107,6 +107,7 @@ fn key(pid: u32, token: &str) -> ProcessKey {
         pid_namespace: Observed::Known(PidNamespaceId(4_026_531_836)),
         pid: Observed::Known(pid),
         creation: CreationToken::Opaque(token.into()),
+        thread: None,
     }
 }
 
@@ -121,6 +122,7 @@ fn cpu(percent: u64) -> CpuUsage {
 
 fn record(pid: u32, name: &str, resident: u64, cpu: CpuUsage) -> ProcessRecord {
     ProcessRecord {
+        kind: srui_process_explorer::source::KIND_NOT_COLLECTED,
         lineage: srui_process_explorer::source::Lineage::NOT_COLLECTED,
         owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
         key: key(pid, name),
@@ -178,6 +180,7 @@ fn snapshot(records: Vec<ProcessRecord>, second: u64) -> ProcessSnapshot {
         ),
         records,
         vanished: 0,
+        threads: srui_process_explorer::source::ThreadScan::NotProvided,
         capped: CappedRecords::none(),
         completeness: Completeness::Complete,
         system: SystemSample::not_provided(),

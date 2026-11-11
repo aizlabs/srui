@@ -107,7 +107,8 @@ fn pid_text(pid: &Observed<u32>) -> String {
 fn who(row: &Row) -> String {
     format!(
         "{} · {}",
-        pid_text(&row.key.pid),
+        // A thread is named by its TID and its process's PID (PX-019).
+        crate::threads::thread_subject(row).unwrap_or_else(|| pid_text(&row.key.pid)),
         bounded(row.display_name.as_str(), MAX_NAME_ECHO_BYTES)
     )
 }

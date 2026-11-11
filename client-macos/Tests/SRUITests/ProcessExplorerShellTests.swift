@@ -1,4 +1,4 @@
-// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012/PX-013/PX-014/PX-015/PX-016/PX-017/PX-018: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
+// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012/PX-013/PX-014/PX-015/PX-016/PX-017/PX-018/PX-019: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
 import Testing
 import Foundation
 import AppKit
@@ -1505,6 +1505,138 @@ struct ProcessExplorerShellTests {
         print("PX-017 rapid arrows native SSH evidence: \(results)")
         await controller.stop()
     }
+
+    /// PX-019: user threads and kernel threads over real SSH. "Show user threads" adds one row
+    /// per thread right after its process, each under its own item ID, with its own CPU and no
+    /// memory figure of its own; "Show kernel threads" hides the kernel's tasks independently; the
+    /// inspector names a selected thread; the tree places threads under their process; and a
+    /// thread that ends, and a TID that is reused, get new item IDs while every other row keeps
+    /// its own. Checkboxes are driven as a click drives them: the state flips, then the action.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func userAndKernelThreadsAreShownUnderTheirProcessWithTheirOwnIdentities() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-threads", "--refresh-interval-ms", "300000"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer with its thread controls") {
+            applier.lastAppliedRevision.value >= 1
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(Self.userThreadsID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        SurfacePresentation.forHostApplication().present(window)
+        window.contentView?.layoutSubtreeIfNeeded()
+        func view<T>(_ id: UInt64, as _: T.Type = T.self) throws -> T {
+            try #require(renderer.registry.handle(for: NodeId(id))?.view as? T, "node \(id)")
+        }
+        let table = try #require((renderer.registry.handle(for: NodeId(5))?.view as? NSScrollView)?.documentView as? NSTableView)
+        let userThreads: NSButton = try view(Self.userThreadsID)
+        let kernelThreads: NSButton = try view(Self.kernelThreadsID)
+        let threadsStatus: NSTextField = try view(Self.threadsStatusID)
+        let inspectorStatus: NSTextField = try view(Self.inspectorLineIDs[0])
+        let refresh: NSButton = try view(63)
+        let viewToggle: NSButton = try view(Self.viewToggleID)
+        func pids() -> [String] { Self.nativeRows(table).map { $0[0] } }
+        func check(_ box: NSButton) { box.setNextState(); NativeActivation.click(box) }
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "five process rows") {
+            pids() == ["1", "2", "3", "200", "300"] && userThreads.isEnabled
+        }
+        #expect(userThreads.title == "Show user threads" && userThreads.state == .off)
+        #expect(kernelThreads.title == "Show kernel threads" && kernelThreads.state == .on)
+        #expect(threadsStatus.stringValue.hasPrefix("User threads hidden · 6 threads in 3 user processes by the kernel's count"))
+
+        // Show user threads: the server samples at once and the threads follow their process.
+        let processIDs = Dictionary(uniqueKeysWithValues: zip(pids(), Self.modelItemIDs(applier)))
+        check(userThreads)
+        let withThreads = ["1", "2", "3", "200", "200 (thread of 200)", "201 (thread of 200)", "202 (thread of 200)", "300"]
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the server's threads") {
+            pids() == withThreads && threadsStatus.stringValue.hasPrefix("User threads: 3 thread rows under 1 process")
+        }
+        let rows = Self.nativeRows(table)
+        #expect(rows[5] == ["201 (thread of 200)", "worker-1", "See process", "60.0%"])
+        #expect(rows[3] == ["200", "server", "800.0 KiB", "100.0%"], "the process row is the whole process")
+        #expect(threadsStatus.stringValue.contains("threads of 1 process unreadable (1 permission denied)"))
+        func itemIDs() -> [String: UInt64] {
+            guard let model = applier.store.getModel(ModelId(1)) else { return [:] }
+            return Dictionary(uniqueKeysWithValues: (0..<Int(model.itemCount)).compactMap { index -> (String, UInt64)? in
+                guard let item = model.getItemByIndex(UInt64(index)), case .list(let cells) = item.value else { return nil }
+                let pid: String
+                switch cells[0] {
+                case .unsignedInt(let value): pid = String(value)
+                case .string(let text): pid = text
+                default: return nil
+                }
+                return (pid, item.itemID.value)
+            })
+        }
+        let before = itemIDs()
+        for pid in ["1", "2", "3", "200", "300"] { #expect(before[pid] == processIDs[pid], "\(pid) kept its item ID") }
+        #expect(Set(before.values).count == 8, "every row has its own item ID")
+
+        // Select a thread: the inspector names it as a thread.
+        table.selectRowIndexes(IndexSet(integer: 5), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on worker-1") {
+            inspectorStatus.stringValue.hasPrefix("Selected thread: TID 201 of PID 200 · worker-1")
+        }
+
+        // Hide kernel threads, independently: the user threads stay.
+        check(kernelThreads)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "kernel threads hidden") {
+            pids() == ["1", "200", "200 (thread of 200)", "201 (thread of 200)", "202 (thread of 200)", "300"]
+                && threadsStatus.stringValue.hasSuffix("Kernel threads hidden (2)")
+        }
+
+        // The tree: each thread under its process, as its first children.
+        check(viewToggle)
+        let outline = try #require((renderer.registry.handle(for: NodeId(Self.treeID))?.view as? NSScrollView)?.documentView as? NSOutlineView)
+        func treeRows() -> [[String]] {
+            (0..<outline.numberOfRows).map { row in
+                let first = (outline.view(atColumn: 0, row: row, makeIfNecessary: true) as? OutlineCollectionAdapter.TreeCellView)?.label.stringValue ?? ""
+                let last = (outline.view(atColumn: outline.tableColumns.count - 1, row: row, makeIfNecessary: true) as? NSTextField)?.stringValue ?? ""
+                let level = (outline.view(atColumn: 0, row: row, makeIfNecessary: true) as? OutlineCollectionAdapter.TreeCellView)?.level ?? -1
+                return [first, String(level), last]
+            }
+        }
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the tree with threads") {
+            treeRows().count == 6
+        }
+        #expect(treeRows() == [
+            ["1", "0", "none: started by the kernel"],
+            ["200", "1", "1"],
+            ["200 (thread of 200)", "2", "thread of 200"],
+            ["201 (thread of 200)", "2", "thread of 200"],
+            ["202 (thread of 200)", "2", "thread of 200"],
+            ["300", "1", "1"],
+        ])
+        check(viewToggle)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the table again") {
+            table.numberOfRows == 6 && outline.numberOfRows == 0
+        }
+
+        // Refresh now: worker-1 ended, worker-3 started and TID 202 is a new thread.
+        NativeActivation.click(refresh)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the churned threads") {
+            pids() == ["1", "200", "200 (thread of 200)", "202 (thread of 200)", "203 (thread of 200)", "300"]
+        }
+        let after = itemIDs()
+        for pid in ["1", "200", "300", "200 (thread of 200)"] { #expect(after[pid] == before[pid], "\(pid) kept its item ID") }
+        #expect(after["202 (thread of 200)"] != before["202 (thread of 200)"], "a reused TID is a new thread")
+        #expect(!Set(before.values).contains(after["203 (thread of 200)"] ?? 0), "a new thread has a new item ID")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector says the thread ended") {
+            inspectorStatus.stringValue.contains("this thread has ended")
+        }
+        print("PX-019 native SSH evidence: window \(window.windowNumber); rows=\(Self.nativeRows(table)); threads status=\(threadsStatus.stringValue); item IDs before=\(before) after=\(after); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
+    // PX-019: the thread controls.
+    fileprivate static let userThreadsID: UInt64 = 75
+    fileprivate static let kernelThreadsID: UInt64 = 76
+    fileprivate static let threadsStatusID: UInt64 = 77
 
     // PX-018: the view switch and the process tree.
     fileprivate static let viewToggleID: UInt64 = 71

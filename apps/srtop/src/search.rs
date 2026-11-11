@@ -81,9 +81,9 @@ enum Origin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
     item_id: ItemId,
-    /// The row's PID and bounded name when it was last published, so a target
-    /// that is no longer shown can still be named.
-    pid: Option<u32>,
+    /// How the row was named and its bounded name when it was last published,
+    /// so a target that is no longer shown can still be named.
+    subject: String,
     name: String,
     /// The row index it last held, where Next/Previous continue from once it
     /// is no longer shown.
@@ -144,11 +144,24 @@ pub fn parse_pid(text: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// The PID of a process row. A thread row (PX-019) carries its process's
+/// PID but is not that process: Go to PID never selects it.
 fn known_pid(row: &Row) -> Option<u32> {
+    if row.key.is_thread() {
+        return None;
+    }
     match row.key.pid {
         Observed::Known(pid) => Some(pid),
         Observed::Missing(_) => None,
     }
+}
+
+/// How a status names `row`: `PID p`, or a thread's `TID t of PID p`
+/// (PX-019), or `PID unavailable`.
+fn subject(row: &Row) -> String {
+    crate::threads::thread_subject(row).unwrap_or_else(|| {
+        known_pid(row).map_or_else(|| "PID unavailable".to_string(), |pid| format!("PID {pid}"))
+    })
 }
 
 fn plural<'a>(count: usize, one: &'a str, many: &'a str) -> &'a str {
@@ -164,7 +177,7 @@ impl Target {
         let row = &rows[index];
         Self {
             item_id: row.item_id,
-            pid: known_pid(row),
+            subject: subject(row),
             name: crate::bounded(row.display_name.as_str(), MAX_NAME_ECHO_BYTES),
             anchor: index,
             origin,
@@ -172,9 +185,10 @@ impl Target {
     }
 
     fn describe(&self) -> String {
-        match self.pid {
-            Some(pid) => format!("PID {pid} · {}", self.name),
-            None => format!("{} (PID unavailable)", self.name),
+        if self.subject == "PID unavailable" {
+            format!("{} (PID unavailable)", self.name)
+        } else {
+            format!("{} · {}", self.subject, self.name)
         }
     }
 }
@@ -404,22 +418,21 @@ impl Search {
                 Some(index) => {
                     let row = &rows[index];
                     let name = crate::bounded(row.display_name.as_str(), MAX_NAME_ECHO_BYTES);
-                    let pid = known_pid(row)
-                        .map_or_else(|| "unavailable".to_string(), |pid| pid.to_string());
+                    let who = subject(row);
                     let at = index + 1;
                     clauses.push(
                         match (matches.iter().position(|&m| m == index), target.origin) {
                             (Some(nth), _) => format!(
-                                "match {} of {} at row {at} of {shown} · PID {pid} · {name}",
+                                "match {} of {} at row {at} of {shown} · {who} · {name}",
                                 nth + 1,
                                 matches.len()
                             ),
                             (None, Origin::Pid(_)) => {
-                                format!("PID {pid} found at row {at} of {shown} · {name}")
+                                format!("{who} found at row {at} of {shown} · {name}")
                             }
-                            (None, Origin::Query) => format!(
-                                "row {at} of {shown} no longer matches · PID {pid} · {name}"
-                            ),
+                            (None, Origin::Query) => {
+                                format!("row {at} of {shown} no longer matches · {who} · {name}")
+                            }
                         },
                     );
                 }

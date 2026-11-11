@@ -50,6 +50,7 @@ const SETTLE: Duration = Duration::from_secs(10);
 
 fn record(pid: u32, name: &str, owner: Observed<u32>) -> ProcessRecord {
     ProcessRecord {
+        kind: srui_process_explorer::source::KIND_NOT_COLLECTED,
         lineage: srui_process_explorer::source::Lineage::NOT_COLLECTED,
         key: ProcessKey {
             source: SourceId(SOURCE.into()),
@@ -58,6 +59,7 @@ fn record(pid: u32, name: &str, owner: Observed<u32>) -> ProcessRecord {
             pid_namespace: Observed::Known(PidNamespaceId(4_026_531_836)),
             pid: Observed::Known(pid),
             creation: CreationToken::Opaque(format!("{name}-{pid}")),
+            thread: None,
         },
         display_name: DisplayName::from(name),
         resident: Observed::Known(4096),
@@ -109,6 +111,7 @@ impl ProcessSource for Fixture {
             source: SourceId(SOURCE.into()),
             records: self.records.clone(),
             vanished: 0,
+            threads: srui_process_explorer::source::ThreadScan::NotProvided,
             capped: CappedRecords::none(),
             system: SystemSample::not_provided(),
             completeness: Completeness::Complete,

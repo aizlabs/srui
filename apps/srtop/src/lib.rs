@@ -31,6 +31,7 @@ pub mod search;
 pub mod sort;
 pub mod source;
 pub mod summary;
+pub mod threads;
 pub mod tree;
 
 use srui_sdk::*;
@@ -181,6 +182,15 @@ pub const VIEW_STATUS: NodeId = NodeId::new(72);
 /// created, so the generic client mounts it with its columns.
 pub const TREE: NodeId = NodeId::new(73);
 pub const VIEW_NODE_COUNT: usize = 4;
+/// The thread controls (PX-019): a Row between the view switch and the
+/// collections holding the "Show user threads" and "Show kernel threads"
+/// checkbox `Toggle`s and the threads status, which says what each shows, how
+/// many threads there are, and every way they could not be read.
+pub const THREADS_ROW: NodeId = NodeId::new(74);
+pub const USER_THREADS_TOGGLE: NodeId = NodeId::new(75);
+pub const KERNEL_THREADS_TOGGLE: NodeId = NodeId::new(76);
+pub const THREADS_STATUS: NodeId = NodeId::new(77);
+pub const THREADS_NODE_COUNT: usize = 4;
 pub const VIEW_LABEL: &str = "Show process tree";
 pub const VIEW_DESCRIPTION: &str =
     "When on, the same processes are shown as a tree under their parents instead of the table. The server resolves each parent from the latest scan and never guesses one: a process whose parent is not in the scan, unreadable, a newer process reusing its PID, hidden by the filters, or caught in a cycle is shown at the top, and its Parent column says why. Expanding and collapsing are local; sorting orders each parent's children. The selection and follow carry over.";
@@ -318,7 +328,8 @@ pub const STATUS_TEXT: &str = "Read-only · Process collection not started";
 /// the column chooser's row with its buttons (PX-068), the seven search
 /// controls (PX-011), the six user-filter controls (PX-012), the six of
 /// the inspector (PX-013, PX-014), the six sampling controls (PX-015) and the
-/// three follow controls (PX-017). Rows are model items, never nodes.
+/// three follow controls (PX-017), the view switch and tree (PX-018) and the
+/// four thread controls (PX-019). Rows are model items, never nodes.
 pub const SHELL_NODE_COUNT: usize = 5
     + summary::NODE_COUNT
     + SAMPLING_NODE_COUNT
@@ -330,7 +341,8 @@ pub const SHELL_NODE_COUNT: usize = 5
     + OWNER_NODE_COUNT
     + INSPECTOR_NODE_COUNT
     + FOLLOW_NODE_COUNT
-    + VIEW_NODE_COUNT;
+    + VIEW_NODE_COUNT
+    + THREADS_NODE_COUNT;
 
 /// The sort button that orders `field`.
 pub fn sort_button_of(field: catalogue::ProcessField) -> NodeId {
@@ -529,6 +541,26 @@ pub fn install_view_handlers(session: &Session, view: &refresh::SharedView) {
     });
 }
 
+/// Installs the thread controls' handlers (§7.6, PX-019): each checkbox's
+/// `VALUE_CHANGED`, whose boolean says whether that kind of task is shown.
+/// Only that boolean is read. Neither touches a process: showing user threads
+/// asks the next sample to read them, and the checkboxes choose which rows
+/// the collection holds.
+pub fn install_thread_handlers(session: &Session, view: &refresh::SharedView) {
+    let user = std::sync::Arc::clone(view);
+    session.on(USER_THREADS_TOGGLE, VALUE_CHANGED, move |session, event| {
+        refresh::user_threads_toggled(&user, session, event);
+    });
+    let kernel = std::sync::Arc::clone(view);
+    session.on(
+        KERNEL_THREADS_TOGGLE,
+        VALUE_CHANGED,
+        move |session, event| {
+            refresh::kernel_threads_toggled(&kernel, session, event);
+        },
+    );
+}
+
 /// Installs the sampling controls' handlers (§7.6, §22.6, PX-015): the Pause
 /// view/Resume view, Refresh now and Apply interval buttons' `ACTIVATE`, and
 /// the interval field's `TEXT_EDIT`. Each is applied before the event is
@@ -598,6 +630,7 @@ pub fn initialize(session: &Session) -> Result<(), SessionError> {
         &owner::OwnerView::uncollected(),
         false,
         None,
+        threads::UNCOLLECTED_STATUS,
     )
 }
 
@@ -788,6 +821,8 @@ fn plural(count: usize) -> &'static str {
 ///
 /// `sampling` is the collecting view's sampling state (PX-015), or `None` for
 /// the shell that collects nothing, whose sampling controls are disabled.
+///
+/// `threads_status` is the threads status (PX-019) for `items`.
 // One commit's worth of shell state; each argument is a separate part of it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn initialize_rows(
@@ -799,6 +834,7 @@ pub(crate) fn initialize_rows(
     owner: &owner::OwnerView,
     sort_enabled: bool,
     sampling: Option<&sampling::Sampling>,
+    threads_status: &str,
 ) -> Result<(), SessionError> {
     let (sampling_view, interval_text) = match sampling {
         Some(sampling) => (sampling.view(), sampling.input().to_string()),
@@ -1116,6 +1152,45 @@ pub(crate) fn initialize_rows(
                 TextRole::Caption
             })
             .create(ui)?;
+        // The thread controls (PX-019): two standard checkbox Toggles and a
+        // status Text in a Row above the collections. User threads start
+        // hidden and kernel threads shown, the collection as it was before.
+        let settings = threads::ThreadSettings::default();
+        Row::builder(THREADS_ROW)
+            .parent(COLUMN)
+            .spacing_role(SpacingRole::Normal)
+            .create(ui)?;
+        for (toggle, label, description, value) in [
+            (
+                USER_THREADS_TOGGLE,
+                threads::USER_THREADS_LABEL,
+                threads::USER_THREADS_DESCRIPTION,
+                settings.user,
+            ),
+            (
+                KERNEL_THREADS_TOGGLE,
+                threads::KERNEL_THREADS_LABEL,
+                threads::KERNEL_THREADS_DESCRIPTION,
+                settings.kernel,
+            ),
+        ] {
+            Toggle::checkbox(toggle)
+                .parent(THREADS_ROW)
+                .label(label)
+                .value(value)
+                .accessible_description(description)
+                .create(ui)?;
+            ui.set(toggle, ENABLED, sort_enabled)?;
+        }
+        Text::builder(THREADS_STATUS)
+            .parent(THREADS_ROW)
+            .text(threads_status)
+            .role(if sort_enabled {
+                TextRole::Status
+            } else {
+                TextRole::Caption
+            })
+            .create(ui)?;
         Table::builder(TABLE)
             .parent(COLUMN)
             .model_ref(MODEL)
@@ -1339,9 +1414,29 @@ mod tests {
             // the inspector (PX-013, and its command line since PX-014) and
             // the six sampling controls (PX-015) and the three follow
             // controls (PX-017) and the view switch's row, toggle and
-            // status and the process tree (PX-018).
-            assert_eq!(store.node_count(), 73);
-            assert_eq!(SHELL_NODE_COUNT, 73);
+            // status and the process tree (PX-018) and the thread controls'
+            // row, two toggles and status (PX-019).
+            assert_eq!(store.node_count(), 77);
+            assert_eq!(SHELL_NODE_COUNT, 77);
+            // A shell that samples nothing has no tasks to choose, and says
+            // so (PX-019).
+            assert_eq!(
+                store.children_of(THREADS_ROW),
+                Some([USER_THREADS_TOGGLE, KERNEL_THREADS_TOGGLE, THREADS_STATUS].as_slice())
+            );
+            for (toggle, label, value) in [
+                (USER_THREADS_TOGGLE, threads::USER_THREADS_LABEL, false),
+                (KERNEL_THREADS_TOGGLE, threads::KERNEL_THREADS_LABEL, true),
+            ] {
+                let node = store.get_node(toggle).unwrap();
+                assert_eq!(node.get_property(LABEL), Some(&Value::String(label.into())));
+                assert_eq!(node.get_property(VALUE), Some(&Value::Bool(value)));
+                assert_eq!(node.get_property(ENABLED), Some(&Value::Bool(false)));
+            }
+            assert_eq!(
+                store.get_node(THREADS_STATUS).unwrap().get_property(TEXT),
+                Some(&Value::String(threads::UNCOLLECTED_STATUS.into()))
+            );
             // A shell that samples nothing has nothing to follow, and says so
             // (PX-017).
             assert_eq!(
@@ -1422,6 +1517,7 @@ mod tests {
                         COLUMN_CHOOSER_ROW,
                         FOLLOW_ROW,
                         VIEW_ROW,
+                        THREADS_ROW,
                         TABLE,
                         TREE,
                         INSPECTOR
@@ -1740,6 +1836,7 @@ mod tests {
                         COLUMN_CHOOSER_ROW,
                         FOLLOW_ROW,
                         VIEW_ROW,
+                        THREADS_ROW,
                         TABLE,
                         TREE,
                         INSPECTOR

@@ -217,7 +217,12 @@ impl FixtureDetails {
 
 impl DetailSource for FixtureDetails {
     fn read_details(&self, target: &ProcessKey) -> DetailRead {
-        let CreationToken::Opaque(token) = &target.creation else {
+        // A thread's details are its own (PX-019): keyed by its own token.
+        let creation = target
+            .thread
+            .as_ref()
+            .map_or(&target.creation, |thread| &thread.creation);
+        let CreationToken::Opaque(token) = creation else {
             return DetailRead::Unreadable(MissingReason::Unavailable);
         };
         if target.source != self.source {
@@ -736,25 +741,26 @@ impl Inspector {
         let shown = rows.iter().find(|row| row.item_id == item);
         let kept = shown.or_else(|| unfiltered.iter().find(|row| row.item_id == item));
         let row = kept.unwrap_or(&selected.row);
-        let head = format!(
-            "Selected process: {} · {}",
-            pid_text(&row.key.pid),
-            row.display_name.as_str()
-        );
+        // A thread row is described as the thread it is (PX-019): its TID and
+        // its process's PID, and its own state and start time.
+        let (noun, subject) = match crate::threads::thread_subject(row) {
+            Some(subject) => ("thread", subject),
+            None => ("process", pid_text(&row.key.pid)),
+        };
+        let head = format!("Selected {noun}: {subject} · {}", row.display_name.as_str());
         let process = format!(
-            "Name: {} · {} · Owner: {}",
+            "Name: {} · {subject} · Owner: {}",
             row.display_name.as_str(),
-            pid_text(&row.key.pid),
             owner_text(&row.owner, names)
         );
         let ended = kept.is_none() || selected.details == Details::Ended;
         if ended {
             return InspectorView::bounded(
-                format!("{head} · this process has ended; select another row"),
+                format!("{head} · this {noun} has ended; select another row"),
                 process,
-                format!("{DETAILS_HEAD}: none: the process has ended"),
-                format!("{METRICS_HEAD}: none: the process has ended"),
-                format!("{COMMAND_HEAD}: none: the process has ended"),
+                format!("{DETAILS_HEAD}: none: the {noun} has ended"),
+                format!("{METRICS_HEAD}: none: the {noun} has ended"),
+                format!("{COMMAND_HEAD}: none: the {noun} has ended"),
             );
         }
         let Some(shown) = shown else {

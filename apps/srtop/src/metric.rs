@@ -52,7 +52,8 @@ pub const PROCESS_ID: MetricDefinition = MetricDefinition {
     interpretation: "The process (thread group) ID in the PID namespace the scanned procfs \
                      was mounted for. Reused after a process ends, so it identifies nothing \
                      on its own; a PID the scan could not read is published as a word, never \
-                     as 0.",
+                     as 0. A thread row (PX-019) shows its own thread ID and its process's \
+                     PID, as \"TID (thread of PID)\", in fixed wording no name can imitate.",
 };
 
 /// The process name (PX-002, catalogued by PX-042).
@@ -90,7 +91,11 @@ pub const RESIDENT_MEMORY: MetricDefinition = MetricDefinition {
                      kernel since 6.2 and is not used. Before 6.2 statm and stat read one counter \
                      that is approximate too: each thread adds its cached changes in only after \
                      more than 64 page-fault events (SPLIT_RSS_COUNTING). Proportional and \
-                     shared-page accounting is PX-046, not this metric.",
+                     shared-page accounting is PX-046, not this metric. A thread row \
+                     (PX-019) shows no figure of its own: every thread of a process shares \
+                     its one address space, so the process row's figure is the only one, and \
+                     the thread row says \"See process\" instead of repeating it once per \
+                     thread.",
 };
 
 /// CPU time a process used over one sampling interval, as a share of **one**
@@ -115,8 +120,28 @@ pub const CPU_USAGE: MetricDefinition = MetricDefinition {
                      replacement under a reused PID, after a counter went backwards, or across \
                      an interval that did not advance is published as warming up or unavailable, \
                      never as zero and never as a spike. The interval is measured on a monotonic \
-                     clock, so a wall-clock change cannot stretch or shrink it.",
+                     clock, so a wall-clock change cannot stretch or shrink it. A process row is \
+                     the whole process: every thread it has, plus the time of its threads that \
+                     ended. A thread row (PX-019) is that one thread alone, from \
+                     /proc/<pid>/task/<tid>/stat fields 14 and 15, so a process's thread rows \
+                     split its own figure between them: never add a process row to its thread \
+                     rows, which would count the same time twice.",
 };
+
+/// A thread row's resident memory cell (PX-019): a thread has no memory of
+/// its own, and its process row states the process's figure once.
+pub const THREAD_RESIDENT_TEXT: &str = "See process";
+
+/// A thread row's PID cell (PX-019): its own thread ID and its process's PID,
+/// in fixed wording and numbers only, so no process name can imitate it.
+pub fn thread_pid_cell(tid: u32, pid: &crate::source::Observed<u32>) -> String {
+    match pid {
+        crate::source::Observed::Known(pid) => format!("{tid} (thread of {pid})"),
+        crate::source::Observed::Missing(reason) => {
+            format!("{tid} (thread of PID {})", reason.describe())
+        }
+    }
+}
 
 /// Published while a process instance has only one sample: there is no interval
 /// yet to divide by. It is a state, not a quantity, so it carries no digit.

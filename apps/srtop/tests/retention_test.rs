@@ -61,11 +61,13 @@ fn key(pid: u32) -> ProcessKey {
         pid_namespace: Observed::Known(PidNamespaceId(4_026_531_836)),
         pid: Observed::Known(pid),
         creation: CreationToken::Opaque(format!("instance-{pid}")),
+        thread: None,
     }
 }
 
 fn record(pid: u32) -> ProcessRecord {
     ProcessRecord {
+        kind: srui_process_explorer::source::KIND_NOT_COLLECTED,
         lineage: srui_process_explorer::source::Lineage::NOT_COLLECTED,
         owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
         key: key(pid),
@@ -84,6 +86,7 @@ fn scan(pids: &[u32]) -> ProcessSnapshot {
         sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
         records: pids.iter().copied().map(record).collect(),
         vanished: 0,
+        threads: srui_process_explorer::source::ThreadScan::NotProvided,
         capped: CappedRecords::none(),
         completeness: Completeness::Complete,
         // Retention is about rows; this fixture states no system figure.

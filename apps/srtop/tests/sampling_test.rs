@@ -53,11 +53,13 @@ fn key(pid: u32) -> ProcessKey {
         pid_namespace: Observed::Known(PidNamespaceId(4_026_531_836)),
         pid: Observed::Known(pid),
         creation: CreationToken::Opaque(format!("token-{pid}")),
+        thread: None,
     }
 }
 
 fn record(pid: u32, name: &str, resident: u64) -> ProcessRecord {
     ProcessRecord {
+        kind: srui_process_explorer::source::KIND_NOT_COLLECTED,
         lineage: srui_process_explorer::source::Lineage::NOT_COLLECTED,
         owner: OWNER_NOT_COLLECTED,
         key: key(pid),
@@ -127,6 +129,7 @@ impl ProcessSource for Live {
             ),
             records,
             vanished: 0,
+            threads: srui_process_explorer::source::ThreadScan::NotProvided,
             capped: CappedRecords::none(),
             completeness: Completeness::Complete,
             system: SystemSample::not_provided(),

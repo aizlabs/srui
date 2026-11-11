@@ -1505,9 +1505,13 @@ fn a_reused_pid_whose_new_threads_are_unreadable_keeps_no_row_of_the_ended_insta
     h.toggle(USER_THREADS_TOGGLE, true);
     h.sample(&mut source);
     let init_thread = h.item("1 (thread of 1)");
+    let clean = h.text(srui_process_explorer::STATUS);
     fs::remove_dir_all(tree.0.join("100")).unwrap();
     tree.process(100, "server2", 0, 2, 900, 0).deny_threads(100);
     h.sample(&mut source);
+    // Nothing was kept and then dropped: no thread of the ended instance
+    // was ever carried forward, so the status has no clause at all.
+    assert_eq!(h.text(srui_process_explorer::STATUS), clean);
     assert_eq!(
         named(&h),
         pairs(&[
@@ -1552,6 +1556,7 @@ fn a_reused_pid_past_the_thread_bound_keeps_no_row_of_the_ended_instance_over_sc
     h.toggle(USER_THREADS_TOGGLE, true);
     h.sample(&mut full);
     let init_thread = h.item("1 (thread of 1)");
+    let clean = h.text(srui_process_explorer::STATUS);
     fs::remove_dir_all(tree.0.join("100")).unwrap();
     tree.process(100, "server2", 0, 1, 900, 0)
         .thread(100, 100, "server2", 900, 0);
@@ -1571,6 +1576,13 @@ fn a_reused_pid_past_the_thread_bound_keeps_no_row_of_the_ended_instance_over_sc
             "scan {scan}"
         );
         assert_eq!(h.item("1 (thread of 1)"), init_thread, "scan {scan}");
+        // Only init's own thread row, of the instance this scan read, is
+        // carried forward; nothing is carried and then dropped.
+        assert_eq!(
+            h.text(srui_process_explorer::STATUS),
+            format!("{clean} · 1 row retained from an earlier scan"),
+            "scan {scan}"
+        );
         assert!(
             h.text(OWNER_STATUS).contains("showing all 5 processes"),
             "scan {scan}"
@@ -1856,4 +1868,268 @@ fn follow_on_a_thread_says_user_threads_were_hidden() {
         "{}",
         h.text(FOLLOW_STATUS)
     );
+}
+
+// ---- rebase onto PX-018's disclosure mirror, and round-2 notes --------------
+
+impl Harness {
+    /// The client expands or collapses `item` in the tree and reports it.
+    fn disclose(&mut self, item: ItemId, expanded: bool) {
+        self.seq += 1;
+        let wire = DomainEvent::expansion_changed(
+            self.seq,
+            format!("threads-disclosure-{}", self.seq),
+            self.session.current_revision(),
+            srui_process_explorer::TREE,
+            item,
+            expanded,
+        )
+        .with_client_instance_id(CLIENT.to_vec())
+        .to_wire();
+        let outcome = self.session.process_event(&wire).expect("event admitted");
+        assert!(matches!(outcome, EventOutcome::Processed { .. }));
+        self.sync();
+    }
+}
+
+/// N4: a thread ledger that cannot name every process it missed keeps the
+/// earlier thread rows of every process the scan confirmed, and says the
+/// listing is incomplete.
+#[test]
+fn a_thread_ledger_past_its_bound_keeps_the_threads_of_every_confirmed_process() {
+    let tree = Tree::usual();
+    let mut source = ProcFsSource::with_root(&tree.0);
+    let mut h = harness(&mut source);
+    h.toggle(USER_THREADS_TOGGLE, true);
+    h.sample(&mut source);
+    let before: Vec<(String, ItemId)> = h
+        .table()
+        .into_iter()
+        .map(|row| (row.pid, row.item))
+        .collect();
+    tree.deny_threads(100).deny_threads(1);
+    // Three processes now miss their threads, and the ledger names none.
+    let mut bounded = ProcFsSource::with_root(&tree.0).with_uncertain_limit(0);
+    bounded.collect_threads(true);
+    assert_eq!(
+        bounded.snapshot().thread_retention(),
+        ThreadRetention::Every
+    );
+    h.sample(&mut bounded);
+    let after: Vec<(String, ItemId)> = h
+        .table()
+        .into_iter()
+        .map(|row| (row.pid, row.item))
+        .collect();
+    assert_eq!(
+        after, before,
+        "every earlier thread row of a confirmed process is kept"
+    );
+    assert!(
+        h.text(THREADS_STATUS).contains("thread listing incomplete"),
+        "{}",
+        h.text(THREADS_STATUS)
+    );
+    // The kept thread rows are not counted as anything the scan read.
+    assert!(
+        h.text(THREADS_STATUS)
+            .contains("threads of 4 processes unreadable (3 permission denied)"),
+        "{}",
+        h.text(THREADS_STATUS)
+    );
+}
+
+/// Round-2 note 2: past the ledger's bound a process whose threads are
+/// unreadable is still counted once, not once per thread.
+#[test]
+fn a_process_with_several_unreadable_threads_is_counted_once_past_the_ledger_bound() {
+    let tree = Tree::usual();
+    for tid in [101, 102] {
+        fs::set_permissions(
+            tree.0.join(format!("100/task/{tid}/stat")),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+    }
+    for limit in [0usize, 16] {
+        let mut source = ProcFsSource::with_root(&tree.0).with_uncertain_limit(limit);
+        source.collect_threads(true);
+        let snapshot = source.snapshot();
+        let threads = snapshot.threads.read().unwrap();
+        // 100 (two threads denied), 200 (no `task`) and 300 (refused).
+        assert_eq!(threads.unreadable.count(), 3, "limit {limit}");
+        assert_eq!(threads.denied, 2, "limit {limit}");
+        assert_eq!(
+            threads.unreadable.is_enumerable(),
+            limit > 0,
+            "limit {limit}"
+        );
+    }
+}
+
+/// A source whose `p` (with two threads) a later sample moves under `q`.
+struct Movable {
+    moved: bool,
+    collect: bool,
+}
+
+impl Movable {
+    fn key(pid: u32) -> ProcessKey {
+        TwoInstances::key(pid, &format!("movable-{pid}"))
+    }
+
+    fn process(pid: u32, name: &str, parent: u32) -> ProcessRecord {
+        ProcessRecord {
+            key: ProcessKey {
+                source: SourceId(TwoInstances::SOURCE.into()),
+                ..Self::key(pid)
+            },
+            ..TwoInstances::process(pid, &format!("movable-{pid}"), name, parent, u64::from(pid))
+        }
+    }
+}
+
+impl ProcessSource for Movable {
+    fn status_text(&self) -> &str {
+        "Read-only · Movable fixture"
+    }
+
+    fn collect_threads(&mut self, on: bool) {
+        self.collect = on;
+    }
+
+    fn snapshot(&mut self) -> ProcessSnapshot {
+        let p = Self::process(20, "p", if self.moved { 10 } else { 1 });
+        let mut read = ThreadRecords::with_limit(16);
+        read.records = vec![
+            TwoInstances::thread(&p, 20, "p"),
+            TwoInstances::thread(&p, 21, "p-worker"),
+        ];
+        ProcessSnapshot {
+            source: SourceId(TwoInstances::SOURCE.into()),
+            sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
+            records: vec![
+                Self::process(1, "init", 0),
+                Self::process(10, "q", 1),
+                Self::process(11, "q-child", 10),
+                p,
+            ],
+            vanished: 0,
+            capped: CappedRecords::none(),
+            completeness: Completeness::Complete,
+            system: FakeProcessSource::system(),
+            threads: if self.collect {
+                ThreadScan::Read(read)
+            } else {
+                ThreadScan::NotRequested
+            },
+        }
+    }
+}
+
+fn movable() -> (Movable, Harness) {
+    let mut source = Movable {
+        moved: false,
+        collect: false,
+    };
+    let mut h = harness(&mut source);
+    h.toggle(USER_THREADS_TOGGLE, true);
+    h.sample(&mut source);
+    h.toggle(VIEW_TOGGLE, true);
+    assert_eq!(
+        h.tree()
+            .iter()
+            .map(|row| (row.name.as_str(), row.depth.unwrap()))
+            .collect::<Vec<_>>(),
+        [
+            ("init", 0),
+            ("q", 1),
+            ("q-child", 2),
+            ("p", 1),
+            ("p", 2),
+            ("p-worker", 2)
+        ]
+    );
+    (source, h)
+}
+
+/// PX-018's mirror with threads: a selected thread that a sample moves,
+/// with its process, under a parent the client keeps collapsed has no row
+/// on that client any more, so the inspector clears; follow stays on it.
+#[test]
+fn a_selected_thread_a_sample_hides_under_a_collapsed_parent_clears_the_inspector() {
+    let (mut source, mut h) = movable();
+    let worker = h.item("21 (thread of 20)");
+    h.select(srui_process_explorer::TREE, worker);
+    assert!(h
+        .text(INSPECTOR_STATUS)
+        .starts_with("Selected thread: TID 21 of PID 20 · p-worker"));
+    let q = h.item("10");
+    h.disclose(q, false);
+    assert!(h.view().collapsed().contains(&q));
+    assert!(
+        h.text(INSPECTOR_STATUS)
+            .starts_with("Selected thread: TID 21"),
+        "q's collapse hides nothing selected"
+    );
+    source.moved = true;
+    h.sample(&mut source);
+    assert_eq!(
+        h.tree()
+            .iter()
+            .map(|row| (row.name.as_str(), row.depth.unwrap()))
+            .collect::<Vec<_>>(),
+        [
+            ("init", 0),
+            ("q", 1),
+            ("q-child", 2),
+            ("p", 2),
+            ("p", 3),
+            ("p-worker", 3)
+        ]
+    );
+    assert_eq!(
+        h.text(INSPECTOR_STATUS),
+        srui_process_explorer::inspector::NO_SELECTION_STATUS
+    );
+    assert!(
+        h.view().collapsed().contains(&q),
+        "the client keeps q collapsed"
+    );
+    // Collapsing the thread's own process hides it too, and expanding both
+    // shows it again without selecting it.
+    h.disclose(q, true);
+    let p = h.item("20");
+    h.select(srui_process_explorer::TREE, worker);
+    h.disclose(p, false);
+    assert_eq!(
+        h.text(INSPECTOR_STATUS),
+        srui_process_explorer::inspector::NO_SELECTION_STATUS
+    );
+}
+
+/// A search that matches a thread hidden under collapsed parents reveals it:
+/// the mirror opens exactly its process and the ancestors above it.
+#[test]
+fn a_search_that_matches_a_hidden_thread_opens_its_process_and_ancestors() {
+    let (_source, mut h) = movable();
+    let init = h.item("1");
+    let q = h.item("10");
+    let p = h.item("20");
+    let worker = h.item("21 (thread of 20)");
+    for item in [p, q, init] {
+        h.disclose(item, false);
+    }
+    h.view().set_search(&h.session, "p-worker").unwrap();
+    h.sync();
+    assert_eq!(h.view().promoted_selection(), Some(worker));
+    let collapsed: BTreeSet<u64> = h.view().collapsed().iter().map(|item| item.get()).collect();
+    assert_eq!(
+        collapsed,
+        BTreeSet::from([q.get()]),
+        "only q, not above the match, stays collapsed"
+    );
+    assert!(h
+        .text(INSPECTOR_STATUS)
+        .starts_with("Selected thread: TID 21 of PID 20 · p-worker"));
 }

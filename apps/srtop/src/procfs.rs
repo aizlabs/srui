@@ -1600,8 +1600,13 @@ fn read_threads(
     let Observed::Known(pid) = process.key.pid else {
         return;
     };
-    let unreadable = |read: &mut ThreadRecords, reason: MissingReason| {
-        if !read.unreadable.pids().contains(&pid) {
+    // Once per process, whether or not the ledger can still name it: a
+    // ledger past its bound names nothing, and this process must still be
+    // counted once, not once per thread it could not read.
+    let mut counted = false;
+    let mut unreadable = |read: &mut ThreadRecords, reason: MissingReason| {
+        if !counted {
+            counted = true;
             read.unreadable.record(pid);
             if reason == MissingReason::Denied {
                 read.denied += 1;

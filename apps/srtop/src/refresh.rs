@@ -2682,17 +2682,56 @@ impl ProcessView {
             })];
             return self.publish_controls(session, plan);
         };
+        let before = self.threads;
+        let held = self.inspector.hold();
+        let selected_thread = self
+            .inspector
+            .selected_row()
+            .filter(|row| row.key.is_thread())
+            .map(|row| row.item_id);
         self.threads.user = on;
         if on {
             self.sampling.refresh_now();
-        } else if self
-            .inspector
-            .selected_row()
-            .is_some_and(|row| row.key.is_thread())
-        {
+        } else if selected_thread.is_some() {
             self.inspector.clear();
         }
-        self.republish(session, Vec::new())
+        let published = self.republish(session, Vec::new());
+        self.settle_thread_request(before, held, selected_thread);
+        published
+    }
+
+    /// Puts back what a thread checkbox request changed ahead of its plan
+    /// when the plan did not reach the client (PX-019, on PX-018's rule): the
+    /// setting, when the checkbox's own value never committed, and the
+    /// inspector on a thread, when that thread's row is still published —
+    /// the client then still shows it, selected.
+    fn settle_thread_request(
+        &mut self,
+        before: ThreadSettings,
+        held: crate::inspector::HeldSelection,
+        selected_thread: Option<ItemId>,
+    ) {
+        if self.threads_published.user != self.threads.user
+            || self.threads_published.kernel != self.threads.kernel
+        {
+            self.threads = ThreadSettings {
+                user: if self.threads_published.user == self.threads.user {
+                    self.threads.user
+                } else {
+                    before.user
+                },
+                kernel: if self.threads_published.kernel == self.threads.kernel {
+                    self.threads.kernel
+                } else {
+                    before.kernel
+                },
+            };
+        }
+        if selected_thread.is_some_and(|item| self.rows.iter().any(|row| row.item_id == item))
+            && self.inspector.selected() != selected_thread
+        {
+            self.inspector.restore(held);
+        }
     }
 
     /// Applies one "Show kernel threads" request (PX-019), like
@@ -2711,8 +2750,12 @@ impl ProcessView {
             })];
             return self.publish_controls(session, plan);
         };
+        let before = self.threads;
+        let held = self.inspector.hold();
         self.threads.kernel = on;
-        self.republish(session, Vec::new())
+        let published = self.republish(session, Vec::new());
+        self.settle_thread_request(before, held, None);
+        published
     }
 
     /// Applies one `EXPANSION_CHANGED` report from the tree (PX-018): the
@@ -7133,5 +7176,193 @@ mod disclosure_commit_tests {
         view.jump_to_pid(&session, "4").unwrap();
         let open: HashSet<ItemId> = [item(&view, 5), item(&view, 7)].into_iter().collect();
         assert_eq!(view.collapsed, open, "only the match's ancestors opened");
+    }
+}
+
+/// PX-019 on PX-018's disclosure mirror: what a thread request, or a sample
+/// that hides a selected thread, leaves behind when its plan does not
+/// commit, through the test-only [`commit_fault`] seam.
+#[cfg(test)]
+mod thread_commit_tests {
+    use super::*;
+    use crate::source::{
+        BootId, CappedRecords, Completeness, CpuUsage, CreationToken, DisplayName,
+        FakeProcessSource, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+        SnapshotTime, SourceId, TaskKind, ThreadIdentity, ThreadRecords, ThreadScan, ThreadsSource,
+        OWNER_NOT_COLLECTED,
+    };
+
+    fn item(view: &ProcessView, pid: u32, tid: Option<u32>) -> ItemId {
+        view.rows
+            .iter()
+            .find(|row| {
+                row.key.pid == Observed::Known(pid)
+                    && row.key.thread.as_ref().map(|thread| thread.tid) == tid
+            })
+            .map(|row| row.item_id)
+            .unwrap_or_else(|| panic!("{pid}/{tid:?} is shown"))
+    }
+
+    fn threads_shown() -> (Session, ThreadsSource, ProcessView) {
+        let session = Session::mint();
+        let mut source = ThreadsSource::default();
+        let (mut view, _) = ProcessView::start(&session, &mut source).unwrap();
+        view.set_user_threads(&session, Some(true)).unwrap();
+        view.refresh(&session, &mut source).unwrap();
+        (session, source, view)
+    }
+
+    #[test]
+    fn a_failed_hide_of_user_threads_keeps_the_setting_and_the_inspector() {
+        let (session, _source, mut view) = threads_shown();
+        let worker = item(&view, 200, Some(201));
+        view.select_item_in(&session, TABLE, Some(worker)).unwrap();
+        assert_eq!(view.inspector().selected(), Some(worker));
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.set_user_threads(&session, Some(false)).is_err());
+        }
+        assert!(
+            view.threads_requested(),
+            "the checkbox never changed on the client"
+        );
+        assert_eq!(
+            view.inspector().selected(),
+            Some(worker),
+            "still selected there"
+        );
+        assert!(view.rows.iter().any(|row| row.item_id == worker));
+        view.set_user_threads(&session, Some(false)).unwrap();
+        assert!(!view.threads_requested());
+        assert_eq!(view.inspector().selected(), None);
+        assert!(view.rows.iter().all(|row| !row.key.is_thread()));
+    }
+
+    #[test]
+    fn a_failed_hide_of_kernel_threads_keeps_the_setting() {
+        let (session, _source, mut view) = threads_shown();
+        let shown = view.item_ids();
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.set_kernel_threads(&session, Some(false)).is_err());
+        }
+        assert!(view.thread_settings().kernel);
+        assert_eq!(view.item_ids(), shown);
+        view.set_kernel_threads(&session, Some(false)).unwrap();
+        assert!(!view.thread_settings().kernel);
+        assert_eq!(view.item_ids().len(), shown.len() - 2);
+    }
+
+    /// `p` with two threads, which a later sample moves under `q`.
+    struct Movable {
+        moved: bool,
+    }
+
+    impl Movable {
+        fn process(pid: u32, name: &str, parent: u32) -> ProcessRecord {
+            ProcessRecord {
+                lineage: Lineage::new(parent, u64::from(pid)),
+                owner: OWNER_NOT_COLLECTED,
+                key: ProcessKey {
+                    source: SourceId("movable-threads".into()),
+                    host: Observed::Known(HostId("h".into())),
+                    boot: Observed::Known(BootId("b".into())),
+                    pid_namespace: Observed::Known(PidNamespaceId(1)),
+                    pid: Observed::Known(pid),
+                    creation: CreationToken::Opaque(format!("{name}-{pid}")),
+                    thread: None,
+                },
+                display_name: DisplayName::from(name),
+                resident: Observed::Known(4096),
+                cpu: CpuUsage::WarmingUp,
+                kind: Observed::Known(TaskKind::Process {
+                    threads: Observed::Known(2),
+                }),
+            }
+        }
+    }
+
+    impl ProcessSource for Movable {
+        fn status_text(&self) -> &str {
+            "Read-only · Movable thread fixture"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            let p = Self::process(20, "p", if self.moved { 10 } else { 1 });
+            let mut read = ThreadRecords::with_limit(16);
+            read.records = [(20, "p"), (21, "p-worker")]
+                .into_iter()
+                .map(|(tid, name)| ProcessRecord {
+                    key: ProcessKey {
+                        thread: Some(ThreadIdentity {
+                            tid,
+                            creation: CreationToken::Opaque(format!("t{tid}")),
+                        }),
+                        ..p.key.clone()
+                    },
+                    display_name: DisplayName::from(name),
+                    resident: Observed::Missing(crate::source::MissingReason::Unavailable),
+                    kind: Observed::Known(TaskKind::Thread),
+                    ..p.clone()
+                })
+                .collect();
+            ProcessSnapshot {
+                source: SourceId("movable-threads".into()),
+                sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH),
+                records: vec![
+                    Self::process(1, "init", 0),
+                    Self::process(10, "q", 1),
+                    Self::process(11, "q-child", 10),
+                    p,
+                ],
+                vanished: 0,
+                capped: CappedRecords::none(),
+                completeness: Completeness::Complete,
+                system: FakeProcessSource::system(),
+                threads: ThreadScan::Read(read),
+            }
+        }
+    }
+
+    /// A sample that would move a selected thread, with its process, under a
+    /// parent the client keeps collapsed and does not commit leaves the
+    /// mirror and the inspector as they were; the one that commits clears
+    /// the inspector. The thread rows are part of the rows the plan's
+    /// `rows_end` waits for.
+    #[test]
+    fn a_failed_sample_that_would_hide_a_selected_thread_restores_the_inspector() {
+        let session = Session::mint();
+        let mut source = Movable { moved: false };
+        let (mut view, _) = ProcessView::start(&session, &mut source).unwrap();
+        view.set_user_threads(&session, Some(true)).unwrap();
+        view.refresh(&session, &mut source).unwrap();
+        view.set_view(&session, Some(true)).unwrap();
+        let worker = item(&view, 20, Some(21));
+        let q = item(&view, 10, None);
+        view.select_item_in(&session, TREE, Some(worker)).unwrap();
+        view.expansion_changed(&session, TREE, q, false).unwrap();
+        assert_eq!(view.inspector().selected(), Some(worker));
+        source.moved = true;
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.refresh(&session, &mut source).is_err());
+        }
+        assert_eq!(
+            view.inspector().selected(),
+            Some(worker),
+            "still shown there"
+        );
+        assert!(view.collapsed.contains(&q));
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.inspector().selected(), None, "hidden under q now");
+        assert!(view.collapsed.contains(&q));
+        let depth = |row_item: ItemId| {
+            view.rows
+                .iter()
+                .find(|row| row.item_id == row_item)
+                .and_then(|row| row.tree.as_ref())
+                .map(|place| place.depth)
+        };
+        assert_eq!(depth(worker), Some(3), "under p, under q");
     }
 }

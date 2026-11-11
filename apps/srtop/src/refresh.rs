@@ -979,6 +979,8 @@ impl ProcessView {
         // (PX-009), and only then what really appeared, ended or changed; in
         // the tree, one index-range unit (PX-018).
         plan.extend(self.plan_rows(&target, batch, max_ops, max_bytes));
+        // The rows reach the client once every entry before this one has.
+        let rows_end = plan.len();
         plan.extend(self.view_effects(self.mode, forest.as_ref()));
         // Last, the search re-counted against the rows this plan publishes, so
         // it commits with the final rows rather than ahead of them (PX-011),
@@ -1019,10 +1021,10 @@ impl ProcessView {
             return Ok(result);
         }
 
-        let (transactions, outcome) =
-            commit(session, &plan, max_ops, max_bytes, &mut self.published());
+        let (transactions, reached, outcome) =
+            commit_reaching(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
-        self.settle_disclosure(&target, held);
+        self.settle_disclosure(held, reached >= rows_end);
         // Order values never reach the wire, so every published row takes this
         // sample's whatever committed: a later click sorts by current values,
         // never by the ones a row was first published with.
@@ -1663,6 +1665,8 @@ impl ProcessView {
                 false
             }
         };
+        // The rows reach the client once every entry before this one has.
+        let rows_end = plan.len();
         plan.extend(self.view_effects(mode, forest.as_ref()));
         // The search counts the newly filtered rows; a target a filter hid is
         // reported as no longer shown, never replaced (PX-011). So is the
@@ -1725,10 +1729,10 @@ impl ProcessView {
             return Ok(result);
         }
 
-        let (transactions, outcome) =
-            commit(session, &plan, max_ops, max_bytes, &mut self.published());
+        let (transactions, reached, outcome) =
+            commit_reaching(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
-        self.settle_disclosure(&target, held);
+        self.settle_disclosure(held, reached >= rows_end);
         refresh_sort_values(&mut self.rows, &target);
         self.ids.retain(&self.unfiltered_rows);
         self.prune_collapsed();
@@ -2013,12 +2017,15 @@ impl ProcessView {
         let follow = self.follow_table_effects(&plan);
         plan.extend(follow);
         plan.extend(self.follow_view_effects());
-        let published = self.publish_controls(session, plan);
-        if let Some(row) = &promoted {
-            // A promotion that never committed revealed nothing on a client.
-            if self.promoted != Some(row.item_id) {
-                self.collapsed.extend(revealed);
-            }
+        let promotion_at = plan
+            .iter()
+            .position(|planned| matches!(planned.effect, Effect::Promote(..)));
+        let (published, reached) = self.publish_controls_reaching(session, plan);
+        // A promotion that never committed revealed nothing on a client, even
+        // when the same item was already promoted before: the mirror keeps
+        // the parents the client keeps collapsed.
+        if promotion_at.is_some_and(|at| reached <= at) {
+            self.collapsed.extend(revealed);
         }
         published
     }
@@ -2030,13 +2037,23 @@ impl ProcessView {
         session: &Session,
         plan: Vec<Planned>,
     ) -> Result<Refreshed, SessionError> {
+        self.publish_controls_reaching(session, plan).0
+    }
+
+    /// [`Self::publish_controls`], and how many of `plan`'s entries
+    /// committed ([`commit_reaching`]).
+    fn publish_controls_reaching(
+        &mut self,
+        session: &Session,
+        plan: Vec<Planned>,
+    ) -> (Result<Refreshed, SessionError>, usize) {
         let mut result = Refreshed::default();
         if plan.is_empty() {
-            return Ok(result);
+            return (Ok(result), 0);
         }
         count(&plan, &mut result);
         let max_ops = session.with_store(|store| store.limits().max_transaction_operations.max(1));
-        let (transactions, outcome) = commit(
+        let (transactions, reached, outcome) = commit_reaching(
             session,
             &plan,
             max_ops,
@@ -2044,7 +2061,7 @@ impl ProcessView {
             &mut self.published(),
         );
         result.transactions = transactions;
-        outcome.map(|()| result)
+        (outcome.map(|()| result), reached)
     }
 
     /// The inspector's changes when the client holds `rows` out of the
@@ -2304,17 +2321,13 @@ impl ProcessView {
         held
     }
 
-    /// Keeps what [`Self::reconcile_disclosure`] changed when `target` is now
-    /// the published rows, and puts it back when the commit stopped before
-    /// they were (PX-018): the client then still shows the old rows, its
-    /// collapsed set and its selection.
-    fn settle_disclosure(&mut self, target: &[Row], held: HeldDisclosure) {
-        let landed = self.rows.len() == target.len()
-            && self
-                .rows
-                .iter()
-                .zip(target)
-                .all(|(row, wanted)| row.item_id == wanted.item_id);
+    /// Keeps what [`Self::reconcile_disclosure`] changed when the plan's rows
+    /// `landed` — every row entry of the plan committed, as the commit itself
+    /// reports ([`commit_reaching`]) — and puts it back when the commit
+    /// stopped before them (PX-018): the client then still shows the old
+    /// rows, its collapsed set and its selection. Comparing the rows instead
+    /// would miss a reparent that keeps the preorder's item IDs in place.
+    fn settle_disclosure(&mut self, held: HeldDisclosure, landed: bool) {
         if !landed {
             self.collapsed = held.collapsed;
             self.inspector.restore(held.inspector);
@@ -3184,6 +3197,21 @@ fn commit(
     max_bytes: usize,
     published: &mut Published<'_>,
 ) -> (usize, Result<(), SessionError>) {
+    let (transactions, _, outcome) = commit_reaching(session, plan, max_ops, max_bytes, published);
+    (transactions, outcome)
+}
+
+/// [`commit`], also returning how many of `plan`'s entries committed: every
+/// entry before that index reached the store and every later one did not
+/// (PX-018). A caller that changed server-side state ahead of a plan entry
+/// keeps the change exactly when that entry committed.
+fn commit_reaching(
+    session: &Session,
+    plan: &[Planned],
+    max_ops: usize,
+    max_bytes: usize,
+    published: &mut Published<'_>,
+) -> (usize, usize, Result<(), SessionError>) {
     let mut committed = 0;
     let mut start = 0;
     while start < plan.len() {
@@ -3223,6 +3251,14 @@ fn commit(
         }
         let chunk = &plan[start..end];
         match session.transaction(|ui| {
+            // Test-only: a failed session commit, injected here so tests can
+            // exercise what a plan that stops partway leaves behind. A
+            // property of a node that cannot exist is refused and the whole
+            // transaction rolls back, exactly as any refused operation does.
+            #[cfg(test)]
+            if commit_fault::fires() {
+                ui.apply_op(&Operation::clear_property(NodeId::new(u64::MAX), TEXT))?;
+            }
             for planned in chunk {
                 match &planned.effect {
                     // Through the SDK, which sends the item with the promotion
@@ -3258,11 +3294,58 @@ fn commit(
                 *published.keep_visible = keep_visible;
                 committed += 1;
             }
-            Err(error) => return (committed, Err(error)),
+            Err(error) => return (committed, start, Err(error)),
         }
         start = end;
     }
-    (committed, Ok(()))
+    (committed, start, Ok(()))
+}
+
+/// Test-only fault injection into [`commit_reaching`] (PX-018), on the
+/// pattern of `procfs`'s: an armed counter fails one later transaction of
+/// this thread, through a refused operation, until the guard is dropped.
+/// Every caller that commits a plan does so on its own thread, so a
+/// thread-local reaches exactly the plan one test publishes. Compiled only
+/// under `cfg(test)`: no release or integration-test build contains it.
+#[cfg(test)]
+mod commit_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_IN: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Disarms the fault when dropped, even when the test panics.
+    #[must_use = "the fault is disarmed as soon as this guard is dropped"]
+    pub(super) struct Armed;
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            FAIL_IN.with(|slot| slot.set(None));
+        }
+    }
+
+    /// Fails the transaction attempted `after` attempts from now: 0 fails the
+    /// next one.
+    pub(super) fn arm(after: usize) -> Armed {
+        FAIL_IN.with(|slot| slot.set(Some(after)));
+        Armed
+    }
+
+    /// Whether this transaction attempt must fail.
+    pub(super) fn fires() -> bool {
+        FAIL_IN.with(|slot| match slot.get() {
+            Some(0) => {
+                slot.set(None);
+                true
+            }
+            Some(left) => {
+                slot.set(Some(left - 1));
+                false
+            }
+            None => false,
+        })
+    }
 }
 
 /// The published status: what the source says it read, what the scan could not
@@ -6427,5 +6510,203 @@ mod tests {
         )
         .plan
         .is_empty());
+    }
+}
+
+/// PX-018, verification of Codex review round 1: what a plan that does not
+/// commit leaves of the server's disclosure mirror and inspector, through
+/// the test-only [`commit_fault`] seam, and the reveal rule's exact scope.
+#[cfg(test)]
+mod disclosure_commit_tests {
+    use super::*;
+    use crate::source::{
+        BootId, CappedRecords, Completeness, CpuInterval, CpuUsage, CreationToken, DisplayName,
+        FakeProcessSource, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+        SnapshotTime, SourceId, OWNER_NOT_COLLECTED,
+    };
+
+    struct Family(Vec<ProcessRecord>);
+
+    impl Family {
+        fn new(records: &[(u32, &str, u32, u64)]) -> Self {
+            Self(
+                records
+                    .iter()
+                    .map(|&(pid, name, parent, started)| ProcessRecord {
+                        lineage: Lineage::new(parent, started),
+                        owner: OWNER_NOT_COLLECTED,
+                        key: ProcessKey {
+                            source: SourceId("disclosure-fixture".into()),
+                            host: Observed::Known(HostId("h".into())),
+                            boot: Observed::Known(BootId("b".into())),
+                            pid_namespace: Observed::Known(PidNamespaceId(1)),
+                            pid: Observed::Known(pid),
+                            creation: CreationToken::Opaque(format!("{name}-{pid}")),
+                        },
+                        display_name: DisplayName::from(name),
+                        resident: Observed::Known(4096),
+                        cpu: CpuUsage::Measured(CpuInterval {
+                            ticks: u64::from(pid),
+                            ticks_per_second: 100,
+                            elapsed: Duration::from_secs(1),
+                        }),
+                    })
+                    .collect(),
+            )
+        }
+
+        fn reparent(&mut self, pid: u32, parent: u32) {
+            for record in &mut self.0 {
+                if record.key.pid == Observed::Known(pid) {
+                    if let Observed::Known(started) = record.lineage.started {
+                        record.lineage = Lineage::new(parent, started);
+                    }
+                }
+            }
+        }
+    }
+
+    impl ProcessSource for Family {
+        fn status_text(&self) -> &str {
+            "Read-only · Disclosure fixture"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            ProcessSnapshot {
+                source: SourceId("disclosure-fixture".into()),
+                sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH),
+                records: self.0.clone(),
+                vanished: 0,
+                capped: CappedRecords::none(),
+                completeness: Completeness::Complete,
+                system: FakeProcessSource::system(),
+            }
+        }
+    }
+
+    fn tree(source: &mut Family) -> (Session, ProcessView) {
+        let session = Session::mint();
+        let (mut view, _) = ProcessView::start(&session, source).unwrap();
+        view.set_view(&session, Some(true)).unwrap();
+        (session, view)
+    }
+
+    fn item(view: &ProcessView, pid: u32) -> ItemId {
+        view.rows
+            .iter()
+            .find(|row| row.key.pid == Observed::Known(pid))
+            .map(|row| row.item_id)
+            .unwrap_or_else(|| panic!("PID {pid} is shown"))
+    }
+
+    fn collapse(session: &Session, view: &mut ProcessView, pid: u32) {
+        let item = item(view, pid);
+        view.expansion_changed(session, TREE, item, false).unwrap();
+        assert!(view.collapsed.contains(&item), "PID {pid} collapsed");
+    }
+
+    #[test]
+    fn the_fault_seam_fails_exactly_the_armed_transaction() {
+        let mut source = Family::new(&[(10, "alpha", 0, 10), (11, "beta", 10, 11)]);
+        let (session, mut view) = tree(&mut source);
+        let revision = session.current_revision();
+        let armed = commit_fault::arm(0);
+        assert!(view.set_view(&session, Some(false)).is_err());
+        assert_eq!(session.current_revision(), revision, "nothing committed");
+        assert_eq!(view.view_mode(), ViewMode::Tree);
+        drop(armed);
+        view.set_view(&session, Some(false)).unwrap();
+        assert_eq!(view.view_mode(), ViewMode::Table);
+    }
+
+    /// F1: a reparent that keeps the preorder's item IDs in place
+    /// (`[alpha, beta, xray]` both before and after `xray` moves under the
+    /// collapsed `alpha`) and does not commit leaves the mirror and the
+    /// inspector as they were: the client still shows `xray` selected.
+    #[test]
+    fn a_failed_reparent_that_keeps_the_preorder_ids_restores_the_inspector() {
+        let mut source = Family::new(&[
+            (10, "alpha", 0, 10),
+            (11, "beta", 10, 11),
+            (30, "xray", 0, 60),
+        ]);
+        let (session, mut view) = tree(&mut source);
+        let xray = item(&view, 30);
+        view.select_item_in(&session, TREE, Some(xray)).unwrap();
+        collapse(&session, &mut view, 10);
+        assert_eq!(view.inspector().selected(), Some(xray));
+        let before: Vec<ItemId> = view.item_ids();
+        source.reparent(30, 10);
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.refresh(&session, &mut source).is_err());
+        }
+        assert_eq!(view.item_ids(), before, "the preorder's IDs are the same");
+        assert_eq!(
+            view.inspector().selected(),
+            Some(xray),
+            "the client still shows xray selected"
+        );
+        assert!(view.collapsed.contains(&item(&view, 10)));
+        // The next sample commits, and hides xray then.
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.inspector().selected(), None);
+    }
+
+    /// F2: re-promoting the match already promoted (Go to PID again, after
+    /// the user collapsed its parent) that does not commit leaves the parent
+    /// collapsed in the mirror, as on the client.
+    #[test]
+    fn a_failed_repromotion_of_the_same_match_keeps_its_parent_collapsed() {
+        let mut source = Family::new(&[
+            (10, "alpha", 0, 10),
+            (11, "beta", 10, 11),
+            (30, "xray", 0, 60),
+        ]);
+        let (session, mut view) = tree(&mut source);
+        let alpha = item(&view, 10);
+        let beta = item(&view, 11);
+        view.jump_to_pid(&session, "11").unwrap();
+        assert_eq!(view.promoted_selection(), Some(beta));
+        collapse(&session, &mut view, 10);
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.go_to_pid(&session).is_err());
+        }
+        assert_eq!(
+            view.promoted_selection(),
+            Some(beta),
+            "still the old promotion"
+        );
+        assert!(
+            view.collapsed.contains(&alpha),
+            "the client keeps alpha collapsed"
+        );
+        // When the promotion commits, alpha is revealed.
+        view.go_to_pid(&session).unwrap();
+        assert!(!view.collapsed.contains(&alpha));
+    }
+
+    /// The reveal opens exactly the collapsed items whose subtree holds the
+    /// match, at every level, and no collapsed sibling or other root.
+    #[test]
+    fn a_reveal_opens_only_the_collapsed_ancestors_of_its_match() {
+        let mut source = Family::new(&[
+            (1, "a", 0, 1),
+            (2, "b", 1, 2),
+            (3, "c", 2, 3),
+            (4, "match", 3, 4),
+            (5, "s", 1, 5),
+            (6, "t", 5, 6),
+            (7, "r", 0, 7),
+            (8, "u", 7, 8),
+        ]);
+        let (session, mut view) = tree(&mut source);
+        for pid in [3, 2, 5, 1, 7] {
+            collapse(&session, &mut view, pid);
+        }
+        view.jump_to_pid(&session, "4").unwrap();
+        let open: HashSet<ItemId> = [item(&view, 5), item(&view, 7)].into_iter().collect();
+        assert_eq!(view.collapsed, open, "only the match's ancestors opened");
     }
 }

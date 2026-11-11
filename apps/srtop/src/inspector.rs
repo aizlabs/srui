@@ -27,6 +27,11 @@
 //!   sort, filter or refresh moves its row. A process that ended, a row a
 //!   filter hides, and a record whose PID now names another instance each
 //!   publish their own state; a reused PID's new record is never shown.
+//!   "Ended" is said only on evidence of an exit: the detail reader found the
+//!   instance gone, or a scan entitled to account for it no longer listed it.
+//!   A row that retention dropped unconfirmed under the published-row ceiling
+//!   is not shown, and why, never ended. Every field the inspector shows is
+//!   the latest scan's (PX-013 review round).
 //! * **Unavailable is not zero.** A field that could not be read says why; a
 //!   parent PID 0 is the kernel's "no parent", never "root"; a state the
 //!   kernel did not document is shown as an unrecognized code.
@@ -51,7 +56,7 @@ use crate::command::{CommandContext, COMMAND_HEAD, NO_SELECTION_COMMAND, UNCOLLE
 use crate::metric::format_utc;
 use crate::owner::{AccountName, AccountNames};
 use crate::projection::Row;
-use crate::source::{CreationToken, MissingReason, Observed, ProcessKey, SourceId};
+use crate::source::{CreationToken, MissingReason, Observed, ProcessKey, Retention, SourceId};
 use srui_sdk::{ItemId, Value};
 use std::collections::HashSet;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -398,10 +403,15 @@ enum Details {
 
 #[derive(Debug, Clone)]
 struct Selected {
-    /// The row as it was when selected, shown once the row is gone.
+    /// The row as the latest scan that listed it projected it: shown once the
+    /// row is gone, so it never reverts to an older sample.
     row: Row,
     generation: SelectionGeneration,
     details: Details,
+    /// Retention dropped the row unconfirmed under the published-row ceiling
+    /// (`evict_unconfirmed_beyond`): no scan has said the process ended, and
+    /// the row's item ID is gone, so it is not shown, never called ended.
+    evicted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -585,6 +595,7 @@ impl Inspector {
             row: row.clone(),
             generation: self.generation,
             details,
+            evicted: false,
         }));
         self.ask();
     }
@@ -597,9 +608,12 @@ impl Inspector {
     }
 
     /// The view is paused (PX-015): a read still loading is deferred, and
-    /// its result is dropped when it returns.
+    /// the current target moves to a new generation, so the result of any
+    /// read asked for before the pause is dropped whenever it returns —
+    /// during the pause or after a resume (PR #95 review, F1).
     pub(crate) fn pause(&mut self) {
         self.paused = true;
+        self.renew();
         if let Selection::Process(selected) = &mut self.selection {
             if selected.details == Details::Loading {
                 selected.details = Details::Deferred;
@@ -607,14 +621,26 @@ impl Inspector {
         }
     }
 
-    /// The view is live again (PX-015): a deferred read is asked for now.
+    /// The view is live again (PX-015): the current target moves to another
+    /// new generation, and a deferred read is asked for under it. Only a
+    /// read asked for from here on can land.
     pub(crate) fn resume(&mut self) {
         self.paused = false;
+        self.renew();
         if let Selection::Process(selected) = &mut self.selection {
             if selected.details == Details::Deferred {
                 selected.details = Details::Loading;
                 self.ask();
             }
+        }
+    }
+
+    /// Moves the current target to a new generation, keeping its row and
+    /// details: every read asked for under an earlier one is stale.
+    fn renew(&mut self) {
+        if let Selection::Process(selected) = &mut self.selection {
+            self.generation = self.generation.next();
+            selected.generation = self.generation;
         }
     }
 
@@ -644,6 +670,39 @@ impl Inspector {
             return;
         }
         self.ask();
+    }
+
+    /// Records what one accepted scan established about the target (PX-013
+    /// review round), before its publication is planned: `latest` is the
+    /// server-side collection the scan leaves, `evicted` the unconfirmed rows
+    /// retention dropped under the published-row ceiling, and `retention` the
+    /// absences the scan could not account for.
+    ///
+    /// * Listed: the stored row takes the latest projection, so a row shown
+    ///   after it is gone carries the newest owner and name, never an older one.
+    /// * Evicted: marked, not ended. Nothing established an exit.
+    /// * Previously evicted and now absent from a scan entitled to account for
+    ///   its instance: that is a confirmed exit, and the target has ended.
+    pub(crate) fn observe_scan(
+        &mut self,
+        latest: &[Row],
+        evicted: &HashSet<ItemId>,
+        retention: &Retention,
+    ) {
+        let Selection::Process(selected) = &mut self.selection else {
+            return;
+        };
+        let item = selected.row.item_id;
+        if let Some(row) = latest.iter().find(|row| row.item_id == item) {
+            selected.row.adopt_sample(row);
+        } else if evicted.contains(&item) {
+            selected.evicted = true;
+        } else if selected.evicted
+            && !retention.keeps(&selected.row.key)
+            && !latest.iter().any(|row| row.key == selected.row.key)
+        {
+            selected.details = Details::Ended;
+        }
     }
 
     /// Accepts `read` if it answers the current target's key and generation,
@@ -715,6 +774,24 @@ impl Inspector {
             pid_text(&row.key.pid),
             owner_text(&row.owner, names)
         );
+        if kept.is_none() && selected.evicted && selected.details != Details::Ended {
+            // Dropped unconfirmed under the row ceiling: not evidence of an
+            // exit. If a later scan lists the same instance again, it does so
+            // under a new item ID, which this target does not adopt.
+            let listed_again = unfiltered.iter().any(|row| row.key == selected.row.key);
+            let why = if listed_again {
+                "listed again as a new row after the row limit dropped it unconfirmed; select it again"
+            } else {
+                "not confirmed by the latest scan; not shown (dropped under the row limit)"
+            };
+            return InspectorView::bounded(
+                format!("{head} · {why}"),
+                process,
+                format!("{DETAILS_HEAD}: not shown"),
+                format!("{METRICS_HEAD}: not shown"),
+                format!("{COMMAND_HEAD}: not shown"),
+            );
+        }
         let ended = kept.is_none() || selected.details == Details::Ended;
         if ended {
             return InspectorView::bounded(

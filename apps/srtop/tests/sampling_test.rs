@@ -18,7 +18,7 @@
 //!   while paused. Every timer ends with the loop on shutdown.
 
 use srui_process_explorer::catalogue::ProcessField;
-use srui_process_explorer::inspector::{DetailReadsIdle, DetailSource};
+use srui_process_explorer::inspector::{DetailRead, DetailReadsIdle, DetailSource};
 use srui_process_explorer::refresh::{lock_view, poll, ProcessView, SharedView};
 use srui_process_explorer::sampling::{
     PAUSED_FRESHNESS, PAUSE_LABEL, RESUME_LABEL, RESUMING_FRESHNESS,
@@ -158,7 +158,58 @@ fn three() -> Vec<ProcessRecord> {
     ]
 }
 
+/// A detail source whose every read waits for one release, and says it
+/// started. Its first read answers "permission denied", every later one
+/// "unavailable", so a test can tell which read a published line came from.
+struct GatedDetails {
+    reads: Mutex<u64>,
+    entered: Mutex<std::sync::mpsc::Sender<u64>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl DetailSource for GatedDetails {
+    fn read_details(&self, _target: &ProcessKey) -> DetailRead {
+        let read = {
+            let mut reads = self.reads.lock().unwrap();
+            *reads += 1;
+            *reads
+        };
+        let _ = self.entered.lock().unwrap().send(read);
+        let _ = self
+            .release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30));
+        if read == 1 {
+            DetailRead::Unreadable(MissingReason::Denied)
+        } else {
+            DetailRead::Unreadable(MissingReason::Unavailable)
+        }
+    }
+}
+
+/// A [`GatedDetails`], the receiver of its read numbers, and its release.
+fn gated_details() -> (
+    Arc<dyn DetailSource>,
+    std::sync::mpsc::Receiver<u64>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (entered, reads) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let details = GatedDetails {
+        reads: Mutex::new(0),
+        entered: Mutex::new(entered),
+        release: Mutex::new(released),
+    };
+    (Arc::new(details), reads, release)
+}
+
 fn start(interval: Duration) -> Harness {
+    start_with(interval, None)
+}
+
+/// [`start`], with the inspector reading `details` instead of the source's.
+fn start_with(interval: Duration, details: Option<Arc<dyn DetailSource>>) -> Harness {
     let session = Arc::new(Session::mint());
     let host = Host::default();
     host.set(three());
@@ -176,7 +227,7 @@ fn start(interval: Duration) -> Harness {
     install_sort_handlers(&session, &view);
     install_filter_handlers(&session, &view);
     install_sampling_handlers(&session, &view);
-    let idle = install_inspector(&session, &view, source.details());
+    let idle = install_inspector(&session, &view, details.or_else(|| source.details()));
     let mut harness = Harness {
         session,
         view,
@@ -802,4 +853,138 @@ async fn the_loop_ends_on_shutdown_in_every_sampling_state_and_releases_the_view
             "nothing outlives the view ({state})"
         );
     }
+}
+
+const DETAILS_LOADING: &str = "State, parent and start time: loading";
+const DETAILS_DEFERRED: &str =
+    "State, parent and start time: not read while the view is paused; Resume view reads them";
+const DETAILS_FIRST_READ: &str = "State, parent and start time: permission denied";
+const DETAILS_LATER_READ: &str = "State, parent and start time: unavailable";
+
+/// PR #95 review, F1: a detail read asked for before Pause view and returning
+/// after Resume view is from an earlier generation, and is never shown; the
+/// read the resume asked for is.
+#[test]
+fn a_detail_read_from_before_a_pause_and_resume_is_never_shown() {
+    let (details, entered, release) = gated_details();
+    let harness = start_with(Duration::from_secs(1), Some(details));
+    let ids = harness.identities();
+    harness.select(ids["beta"]);
+    assert_eq!(
+        entered.recv_timeout(WAIT),
+        Ok(1),
+        "the first read is running"
+    );
+    let before = lock_view(&harness.view).inspector().stale_results();
+    harness.click(SAMPLING_PAUSE);
+    harness.click(SAMPLING_PAUSE);
+    assert_eq!(harness.text(INSPECTOR_DETAILS), DETAILS_LOADING);
+    // The first read returns; the worker delivers it before it starts the
+    // resume's read, so once that one has started the first is settled.
+    release.send(()).unwrap();
+    assert_eq!(entered.recv_timeout(WAIT), Ok(2), "the resume asked again");
+    assert_eq!(
+        harness.text(INSPECTOR_DETAILS),
+        DETAILS_LOADING,
+        "the pre-pause read was dropped, not published into the resumed view"
+    );
+    assert_eq!(
+        lock_view(&harness.view).inspector().stale_results(),
+        before + 1
+    );
+    release.send(()).unwrap();
+    let idle = harness.idle.clone().expect("a detail worker");
+    assert!(idle.wait_idle(WAIT));
+    assert_eq!(harness.text(INSPECTOR_DETAILS), DETAILS_LATER_READ);
+    assert_ne!(harness.text(INSPECTOR_DETAILS), DETAILS_FIRST_READ);
+}
+
+/// A detail read in flight across Pause view alone is dropped when it
+/// returns: the paused inspector keeps saying nothing was read.
+#[test]
+fn a_detail_read_in_flight_across_a_pause_is_dropped() {
+    let (details, entered, release) = gated_details();
+    let harness = start_with(Duration::from_secs(1), Some(details));
+    let ids = harness.identities();
+    harness.select(ids["beta"]);
+    assert_eq!(entered.recv_timeout(WAIT), Ok(1));
+    let before = lock_view(&harness.view).inspector().stale_results();
+    harness.click(SAMPLING_PAUSE);
+    assert_eq!(harness.text(INSPECTOR_DETAILS), DETAILS_DEFERRED);
+    release.send(()).unwrap();
+    let idle = harness.idle.clone().expect("a detail worker");
+    assert!(idle.wait_idle(WAIT));
+    assert_eq!(harness.text(INSPECTOR_DETAILS), DETAILS_DEFERRED);
+    assert_eq!(
+        lock_view(&harness.view).inspector().stale_results(),
+        before + 1
+    );
+    // Resume reads again, and that read is shown.
+    harness.click(SAMPLING_PAUSE);
+    assert_eq!(entered.recv_timeout(WAIT), Ok(2));
+    release.send(()).unwrap();
+    assert!(idle.wait_idle(WAIT));
+    assert_eq!(harness.text(INSPECTOR_DETAILS), DETAILS_LATER_READ);
+}
+
+/// PR #95 review, F2: an interval change during a scan that outlasts the old
+/// interval leaves the old ticker's tick and the wake both ready. Whichever the
+/// loop takes, no scan starts before one new interval. Each round makes both
+/// ready; code that honoured the retired tick would start an extra scan in
+/// about half of the rounds, so eight clean rounds leave it a 1-in-256 chance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tick_of_the_retired_ticker_never_starts_an_extra_scan() {
+    let mut harness = start(Duration::from_millis(50));
+    let shutdown = CancellationToken::new();
+    let polling = harness.poll(&shutdown);
+    for round in 0..8 {
+        harness.next_scan().await;
+        // Hold the next scan inside the source.
+        harness.gate.close();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        harness.drain();
+        harness.type_into(INTERVAL_INPUT, "300000");
+        harness.click(INTERVAL_APPLY);
+        // Well past the old interval: its tick is due, and the wake is stored.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        harness.gate.open();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            harness.drain(),
+            0,
+            "round {round}: a retired tick started a scan after the interval became 300000 ms"
+        );
+        // Back to 50 ms for the next round.
+        harness.type_into(INTERVAL_INPUT, "50");
+        harness.click(INTERVAL_APPLY);
+    }
+    shutdown.cancel();
+    tokio::time::timeout(WAIT, polling).await.unwrap().unwrap();
+}
+
+/// Refresh now restarts the ticker: the next periodic sample is one interval
+/// after the manual one, not the old schedule's next tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_now_restarts_the_ticker() {
+    let interval = Duration::from_millis(600);
+    let mut harness = start(interval);
+    let shutdown = CancellationToken::new();
+    let polling = harness.poll(&shutdown);
+    // A periodic scan, then a manual one half an interval later.
+    harness.next_scan().await;
+    tokio::time::sleep(interval / 2).await;
+    assert_eq!(harness.drain(), 0);
+    harness.click(SAMPLING_REFRESH);
+    harness.next_scan().await;
+    let manual = std::time::Instant::now();
+    // The old schedule would tick half an interval after the manual scan.
+    tokio::time::sleep(interval * 3 / 4).await;
+    assert_eq!(harness.drain(), 0, "the old schedule's tick was not kept");
+    harness.next_scan().await;
+    assert!(
+        manual.elapsed() >= interval * 3 / 4,
+        "the next periodic scan follows one interval after the manual one"
+    );
+    shutdown.cancel();
+    tokio::time::timeout(WAIT, polling).await.unwrap().unwrap();
 }

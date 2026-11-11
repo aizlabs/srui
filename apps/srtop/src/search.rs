@@ -99,6 +99,10 @@ pub struct Search {
     query: FilterQuery,
     generation: FilterGeneration,
     pid_input: String,
+    /// Whether the PID field's text was longer than [`MAX_PID_INPUT_BYTES`]:
+    /// it then names no PID, whatever its first bytes say (PX-012 review
+    /// round, F2).
+    pid_input_overlong: bool,
     target: Option<Target>,
     /// The PID of the last Go to PID that selected nothing.
     unresolved_pid: Option<u32>,
@@ -259,15 +263,25 @@ impl Search {
         self.target()
     }
 
-    /// Keeps the PID field's text, bounded to [`MAX_PID_INPUT_BYTES`] on a
-    /// character boundary. Typing never moves the target.
+    /// Keeps the PID field's text, bounded to [`MAX_PID_INPUT_BYTES`]. Typing
+    /// never moves the target. Text past the bound names no PID: it is not cut
+    /// into a shorter one (30 spaces and `4102` are not PID 41), and the field
+    /// keeps it only up to the last whole entry (PX-012 review round, F2).
     pub(crate) fn set_pid_input(&mut self, text: &str) -> &str {
-        let mut end = text.len().min(MAX_PID_INPUT_BYTES);
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        self.pid_input = text[..end].to_string();
+        let (kept, overlong) =
+            crate::owner::whole_entries(text, MAX_PID_INPUT_BYTES, char::is_whitespace);
+        self.pid_input = kept.to_string();
+        self.pid_input_overlong = overlong;
         &self.pid_input
+    }
+
+    /// The PID the field names, if it names one.
+    fn field_pid(&self) -> Option<u32> {
+        if self.pid_input_overlong {
+            None
+        } else {
+            parse_pid(&self.pid_input)
+        }
     }
 
     /// Resolves the PID field to the published row the latest scan confirmed
@@ -281,7 +295,7 @@ impl Search {
         rows: &[Row],
         unconfirmed: &HashSet<ItemId>,
     ) -> Option<ItemId> {
-        let pid = parse_pid(&self.pid_input)?;
+        let pid = self.field_pid()?;
         match rows
             .iter()
             .position(|row| known_pid(row) == Some(pid) && !unconfirmed.contains(&row.item_id))
@@ -315,6 +329,7 @@ impl Search {
             && self.target.is_none()
             && self.unresolved_pid.is_none()
             && self.pid_input.trim().is_empty()
+            && !self.pid_input_overlong
     }
 
     /// What the search controls publish when the client holds `rows`, out of
@@ -327,7 +342,7 @@ impl Search {
         unfiltered: &[Row],
         unconfirmed: &HashSet<ItemId>,
     ) -> SearchView {
-        let go = parse_pid(&self.pid_input).is_some();
+        let go = self.field_pid().is_some();
         if self.is_idle() {
             return SearchView {
                 status: IDLE_STATUS.to_string(),
@@ -442,7 +457,11 @@ impl Search {
                 }
             }
         }
-        if !self.pid_input.trim().is_empty() && !go {
+        if self.pid_input_overlong {
+            clauses.push(format!(
+                "PID field: longer than {MAX_PID_INPUT_BYTES} bytes, not a PID"
+            ));
+        } else if !self.pid_input.trim().is_empty() && !go {
             clauses.push("PID field: digits only".to_string());
         }
         let status = if clauses.is_empty() {
@@ -498,5 +517,25 @@ mod tests {
         assert!(kept.len() <= MAX_PID_INPUT_BYTES);
         assert!(long.starts_with(&kept));
         assert_eq!(search.pid_input(), kept);
+        assert_eq!(search.field_pid(), None);
+    }
+
+    /// PX-012 review round, F2: a PID the bound cuts through is never read as a
+    /// shorter PID. At the bound the field is read whole; past it, it names no
+    /// PID and keeps only whole entries.
+    #[test]
+    fn a_pid_the_bound_cuts_through_is_not_read_as_a_shorter_one() {
+        let mut search = Search::default();
+        let at = format!("{}4102", " ".repeat(MAX_PID_INPUT_BYTES - 4));
+        assert_eq!(search.set_pid_input(&at), at);
+        assert_eq!(search.field_pid(), Some(4102));
+        let past = format!("{}4102", " ".repeat(MAX_PID_INPUT_BYTES - 2));
+        let kept = search.set_pid_input(&past).to_string();
+        assert_eq!(
+            kept,
+            " ".repeat(MAX_PID_INPUT_BYTES - 2),
+            "the cut entry is dropped"
+        );
+        assert_eq!(search.field_pid(), None, "not PID 41");
     }
 }

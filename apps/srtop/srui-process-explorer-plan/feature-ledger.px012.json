@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-012",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Server-authoritative filtering of the published process collection by owner (all users visible to the daemon's OS account, the daemon's own account, a numeric UID, or an exactly matching resolved account name) and by an explicit, bounded PID set, through standard native Buttons, TextInputs and a status Text with standard ACTIVATE and TEXT_EDIT events; the UID is authoritative and read from /proc/<pid>/status through the pinned record directory; account names come from a bounded, non-blocking cache with one worker thread; user filter, PID set and text filter combine by conjunction; no process action, no protocol, SDK, renderer or client source change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX012-001",
+      "feature": "Each Linux record carries its owner as the effective UID on /proc/<pid>/status's Uid: line, read through the same pinned /proc/<pid> directory handle as stat and statm so a recycled PID cannot lend its owner to the instance stat identified; the directory's own owner is not used; an owner that is missing, refused or not the kernel's line is published as unread (Observed::Missing), never UID 0 or root, without degrading the scan, and a status gone with its stat is an exit",
+      "scope": "PX-012/procfs (src/procfs.rs) ProcFsSource::snapshot owner read, parse_status_uid; source (src/source.rs) ProcessRecord::owner, OWNER_NOT_COLLECTED",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-012",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-012.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX012-002",
+      "feature": "User filter: All visible users (default; every process the daemon's OS account can enumerate, not a promise to bypass host permissions), Only my processes (the daemon's effective UID as the source states it), a numeric UID typed into the user field (selectable whether or not an account names it; digits beyond u32 refused, and a field longer than 64 bytes refused whole rather than cut into another UID or name), or an account name matched exactly against the resolved names of the collection's owners, keeping every UID that shares the name; an unreadable owner is hidden by any specific filter and counted; a source that states no accounts is explained, never guessed",
+      "scope": "PX-012/owner (src/owner.rs) OwnerChoice, OwnerFilter::scope, OwnerFilter::by_name, OwnerFilter::view, Accounts; refresh (src/refresh.rs) ProcessView::choose_owner, set_owner_input; ProcessSource::accounts",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-012",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-012.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX012-003",
+      "feature": "Account-name resolution is bounded, cached and never blocks sampling or publication: getpwuid_r(3) (srui_unix_security::account_name) runs only on one worker thread; the cache answers at once (named, no account, pending, timed out, failed, not provided), holds at most 1024 UIDs with least-recently-used eviction, queues at most 64 lookups, publishes a lookup unanswered after 2 s as timed out, records a late answer, re-asks after 10 minutes (measured on an injectable monotonic clock), and sanitizes and bounds each name to 64 bytes; a deliberately delayed resolver leaves every edit and refresh immediate",
+      "scope": "PX-012/owner (src/owner.rs) AccountNames, AccountLookup, SystemAccountLookup, FixedAccountLookup; server-rust/unix-security (src/lib.rs) account_name",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-012",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-012.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX012-004",
+      "feature": "Optional PID-set filter: PIDs separated by commas or white space, at most 64 distinct PIDs from at most 512 bytes of text (text past the bound dropped with any entry it cuts through, never read as a shorter PID; such a set keeps only its whole PIDs and says so), duplicates collapsed, further PIDs counted and ignored, entries that are not PIDs named and a set of only such entries keeping nothing; PIDs no visible process has are listed on the status; a PID set selects by number on every scan, identity stays the row's ItemId",
+      "scope": "PX-012/owner (src/owner.rs) PidSet; refresh (src/refresh.rs) ProcessView::set_pid_set",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-012",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-012.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX012-005",
+      "feature": "The user filter, PID set and text filter combine by conjunction before the published-row ceiling; the user-filter status counts what all of them keep and an empty result states what each active filter keeps alone; the text filter's counts say when they are counted after the other two; a sort publishes through the same full path, so membership changed by a name resolved since the last publication is inserted or deleted with matching statuses; search still counts over the whole collection and reports hidden matches as not shown; a filter that hides the promoted search match lets PX-011-G01 settlement clear it in the same commit that removes the row; changing any filter never creates a process identity and clearing them restores every row under its original ItemId",
+      "scope": "PX-012/owner (src/owner.rs) Scope; refresh (src/refresh.rs) ProcessView::visible, republish, filter_status_for, project_visible_rows; tests/owner_test.rs; native ProcessExplorerShellTests.userFilterAndPIDSetFilterTheNativeTableAndKeepItemIDs",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-012",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-012.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX012-006",
+      "feature": "The six new shell nodes (OWNER_ROW 49, OWNER_MINE 50, OWNER_ALL 51, OWNER_INPUT 52, PID_SET_INPUT 53, OWNER_STATUS 54) are standard Row, Button, TextInput and Text nodes charged a fixed 4096-byte OWNER_RESERVE_BYTES against the catch-up snapshot with every value at its widest; the status is at most 1024 bytes and the user field 64 bytes; the PX-008 audit admits only the exact OWNER_MINE/OWNER_ALL ACTIVATE and OWNER_INPUT/PID_SET_INPUT TEXT_EDIT registrations",
+      "scope": "PX-012/lib (src/lib.rs) shell nodes, install_owner_handlers; refresh (src/refresh.rs) OWNER_RESERVE_BYTES; tests/no_process_control_test.rs allowances",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-012",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-012.md"
+      ]
+    }
+  ]
+}

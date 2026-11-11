@@ -7,7 +7,7 @@ use srui_process_explorer::source::*;
 use srui_process_explorer::summary::{FRESHNESS_TEXT, LAYOUT, SUMMARY};
 use srui_process_explorer::{
     start_from_source, COLUMN, COLUMN_CHOOSER_ROW, FILTER_ROW, FILTER_STATUS, HEADING, MODEL,
-    SEARCH_ROW, SHELL_NODE_COUNT, SORT_ROW, STATUS, SURFACE, TABLE,
+    OWNER_ROW, OWNER_STATUS, SEARCH_ROW, SHELL_NODE_COUNT, SORT_ROW, STATUS, SURFACE, TABLE,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
 use srui_sdk::{EnumToken, ItemId, NodeId, Operation, TextRole, Value, ROLE, TEXT};
@@ -95,6 +95,7 @@ fn is_scalar_shell_property(op: &Operation) -> bool {
         Operation::SetProperty { id, property, .. } => {
             (*id == STATUS && *property == TEXT)
                 || (*id == FILTER_STATUS && *property == TEXT)
+                || (*id == OWNER_STATUS && *property == TEXT)
                 || summary(id)
         }
         Operation::ClearProperty { id, .. } => summary(id),
@@ -117,6 +118,7 @@ fn assert_shell_intact(session: &Session) {
                     STATUS,
                     SUMMARY,
                     FILTER_ROW,
+                    OWNER_ROW,
                     SEARCH_ROW,
                     SORT_ROW,
                     COLUMN_CHOOSER_ROW,
@@ -498,6 +500,7 @@ impl ProcessSource for Widest {
             .map(|index| {
                 let pid = self.first_pid + index;
                 ProcessRecord {
+                    owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
                     key: ProcessKey {
                         pid: Observed::Known(pid),
                         creation: CreationToken::Opaque(format!("widest-{pid}")),
@@ -1011,6 +1014,7 @@ fn a_refresh_beyond_the_transaction_bound_is_published_whole() {
             let records = (0..self.rows)
                 .filter(|index| index % self.stride == 0)
                 .map(|index| ProcessRecord {
+                    owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
                     key: ProcessKey {
                         pid: Observed::Known(index + 1),
                         creation: CreationToken::Opaque(format!("interleaved-{index}")),

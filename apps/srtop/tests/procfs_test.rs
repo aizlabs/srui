@@ -122,6 +122,18 @@ impl ProcFixture {
         self
     }
 
+    /// A record's `status`, verbatim (PX-012).
+    fn status(&self, pid: u32, status: &[u8]) -> &Self {
+        fs::write(self.0.join(pid.to_string()).join("status"), status).unwrap();
+        self
+    }
+
+    /// A record whose `status` names real UID `real` and effective UID
+    /// `effective`, laid out as the kernel writes it (PX-012).
+    fn owned(&self, pid: u32, real: u32, effective: u32) -> &Self {
+        self.status(pid, status_lines(real, effective).as_bytes())
+    }
+
     /// A record's `statm`, verbatim (PX-005-G01).
     fn statm(&self, pid: u32, statm: &[u8]) -> &Self {
         fs::write(self.0.join(pid.to_string()).join("statm"), statm).unwrap();
@@ -321,6 +333,16 @@ fn stat_line_with_cpu(pid: u32, comm: &[u8], ticks: u64, utime: &str, stime: &st
 /// single spaces and ended by one newline (`proc_pid_statm`, fs/proc/array.c) —
 /// with `resident` pages as its second field. For any non-zero count the fields
 /// beside it are other numbers, so a parser that read the wrong field fails.
+/// A `status` as the kernel lays it out, with the real UID `real` and the
+/// effective, saved and filesystem UIDs `effective` (PX-012).
+fn status_lines(real: u32, effective: u32) -> String {
+    format!(
+        "Name:\tfixture\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t1\nPid:\t1\n\
+         Uid:\t{real}\t{effective}\t{effective}\t{effective}\n\
+         Gid:\t100\t100\t100\t100\nThreads:\t1\n"
+    )
+}
+
 fn statm_line(resident: u64) -> Vec<u8> {
     format!(
         "{} {resident} {} 8 0 88 0\n",
@@ -1440,6 +1462,97 @@ fn an_exit_confirmed_by_name_is_not_undone_by_a_newcomer_under_the_same_pid() {
     );
     assert_eq!(snapshot.vanished, 1);
     assert_eq!(snapshot.completeness, Completeness::Complete);
+}
+
+/// PX-012: a record's owner is the effective UID on its `status`'s `Uid:`
+/// line. A record whose `status` is missing, refused or not the kernel's is
+/// still published, with its owner unread — never UID 0 — and the scan stays
+/// complete; a real UID 0 is published as UID 0.
+#[test]
+fn the_owner_is_the_effective_uid_of_status_and_an_unread_one_is_never_uid_zero() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .process(700, b"setuid", 10)
+        .owned(700, 1000, 2000)
+        .process(701, b"nostatus", 11)
+        .process(702, b"refused", 12)
+        .owned(702, 1000, 1000)
+        .process(703, b"malformed", 13)
+        .status(703, b"Name:\tx\nUid:\t1000\n")
+        .process(704, b"root", 14)
+        .owned(704, 0, 0);
+    let refused = fixture.0.join("702/status");
+    fs::set_permissions(&refused, fs::Permissions::from_mode(0o000)).unwrap();
+    let snapshot = fixture.source().snapshot();
+    fs::set_permissions(&refused, fs::Permissions::from_mode(0o600)).unwrap();
+    let owners: Vec<(Observed<u32>, Observed<u32>)> = snapshot
+        .records
+        .iter()
+        .map(|record| (record.key.pid.clone(), record.owner.clone()))
+        .collect();
+    assert_eq!(
+        owners,
+        vec![
+            (Observed::Known(700), Observed::Known(2000)),
+            (
+                Observed::Known(701),
+                Observed::Missing(MissingReason::Unavailable)
+            ),
+            (
+                Observed::Known(702),
+                Observed::Missing(MissingReason::Denied)
+            ),
+            (
+                Observed::Known(703),
+                Observed::Missing(MissingReason::Unavailable)
+            ),
+            (Observed::Known(704), Observed::Known(0)),
+        ]
+    );
+    assert_eq!(snapshot.completeness, Completeness::Complete);
+    // A tree that is not this host names no account and no daemon.
+    let accounts = fixture.source().accounts();
+    assert!(accounts.lookup.is_none());
+    assert_eq!(
+        accounts.current,
+        Observed::Missing(MissingReason::Unavailable)
+    );
+}
+
+/// PX-012: the owner, like `statm`, is read through the directory `stat` was
+/// read from, so a PID reused between the two reads cannot lend its owner to
+/// the instance `stat` identified (PX-005-G01's pinned handle).
+#[cfg(target_os = "linux")]
+#[test]
+fn status_is_read_from_the_directory_its_stat_was_read_from() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .resident(700, b"first", 10_000, 3)
+        .owned(700, 1000, 1000);
+    let root = fixture.0.clone();
+    let clock = BetweenReads::new(move || {
+        fs::rename(root.join("700"), root.join("reaped-700")).unwrap();
+        fs::create_dir(root.join("700")).unwrap();
+        fs::write(root.join("700/stat"), stat_line(700, b"newcomer", 10_500)).unwrap();
+        fs::write(root.join("700/statm"), statm_line(5)).unwrap();
+        fs::write(root.join("700/status"), status_lines(0, 0)).unwrap();
+    });
+    let snapshot = fixture.source().with_clock(clock.clone()).snapshot();
+    assert!(clock.fired(), "the first instance's stat was read");
+    let first = snapshot
+        .records
+        .iter()
+        .find(|record| record.key.creation == CreationToken::LinuxBootTicks(10_000))
+        .expect("the instance whose stat was read is published");
+    assert_eq!(
+        first.owner,
+        Observed::Known(1000),
+        "the newcomer's owner was attributed to the instance stat identified"
+    );
+    let later = fixture.source().snapshot();
+    assert_eq!(later.records[0].owner, Observed::Known(0));
 }
 
 /// A record whose directory this scan may not open — what `hidepid=1` does to
@@ -3483,6 +3596,104 @@ mod live {
 
     /// `utime + stime` of `pid`, fields 14 and 15 of `/proc/<pid>/stat`, read
     /// here rather than through the collector this checks.
+    /// The effective UID on this process's own `status`, read with no help
+    /// from the collector.
+    fn own_effective_uid() -> u32 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = status
+            .lines()
+            .find(|line| line.starts_with("Uid:"))
+            .expect("a status names its UIDs");
+        line.split_whitespace().nth(2).unwrap().parse().unwrap()
+    }
+
+    /// PX-012 on a real host: a test-owned worker's owner is this test's
+    /// effective UID; "my processes" keeps it, another UID hides it, and a PID
+    /// set with the worker's PID and an absent one keeps only the worker,
+    /// naming the absent PID. No filter changes the worker's item ID. The
+    /// daemon's own name is resolved by the system database on the cache's
+    /// worker, never on the publishing path.
+    #[test]
+    fn a_test_owned_worker_is_filtered_by_its_real_owner_and_by_pid() {
+        use srui_process_explorer::owner::{AccountName, OwnerChoice};
+        let worker = Worker::start();
+        let pid = worker.pid();
+        let me = own_effective_uid();
+        assert_eq!(me, srui_unix_security::effective_uid());
+        let mut source = ProcFsSource::live();
+        assert_eq!(source.accounts().current, Observed::Known(me));
+        let snapshot = source.snapshot();
+        let record = snapshot
+            .records
+            .iter()
+            .find(|record| record.key.pid == Observed::Known(pid))
+            .expect("the owned worker is listed");
+        assert_eq!(record.owner, Observed::Known(me));
+        // Every readable record has an owner, and none is guessed.
+        let read = snapshot
+            .records
+            .iter()
+            .filter(|record| matches!(record.owner, Observed::Known(_)))
+            .count();
+        assert!(read > 0);
+
+        let session = Session::mint();
+        let (mut view, _) = start_from_source(&session, &mut source).unwrap();
+        let worker_item = row_for(&session, pid).expect("the worker is published").0;
+        view.choose_owner(&session, OwnerChoice::Current).unwrap();
+        assert_eq!(row_for(&session, pid).map(|(id, _)| id), Some(worker_item));
+        let other = if me == u32::MAX { me - 1 } else { me + 1 };
+        view.set_owner_input(&session, &other.to_string()).unwrap();
+        assert!(
+            row_for(&session, pid).is_none(),
+            "another UID hides the worker"
+        );
+        view.set_owner_input(&session, "").unwrap();
+        // An absent PID: one past the kernel's own maximum, which no process
+        // can hold.
+        let pid_max: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let absent = pid_max + 1;
+        view.set_pid_set(&session, &format!("{pid} {absent}"))
+            .unwrap();
+        let shown: Vec<ItemId> = session.with_store(|store| {
+            store
+                .get_model(MODEL)
+                .unwrap()
+                .items
+                .values()
+                .map(|item| item.item_id)
+                .collect()
+        });
+        assert_eq!(shown, vec![worker_item]);
+        let status = view.owner_status().to_string();
+        assert!(
+            status.contains(&format!("no visible process has PID {absent}")),
+            "{status}"
+        );
+        view.set_pid_set(&session, "").unwrap();
+        assert_eq!(row_for(&session, pid).map(|(id, _)| id), Some(worker_item));
+        // The system database names the daemon's account off the publishing
+        // path; this host's answer is whatever its database says, and it is
+        // never a guess.
+        let names = view.owner_filter().names();
+        let _ = names.name(me);
+        assert!(names.wait_idle(Duration::from_secs(30)));
+        let name = names.name(me);
+        assert!(
+            matches!(name, AccountName::Named(_) | AccountName::NoEntry),
+            "{name:?}"
+        );
+        println!(
+            "PX-012 live evidence: worker_pid={pid} owner_uid={me} name={name:?} \
+             absent_pid={absent} status={status:?} records={} with_owner={read}",
+            snapshot.records.len()
+        );
+    }
+
     fn cpu_ticks(pid: u32) -> u64 {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .expect("a test's own worker has a stat file");

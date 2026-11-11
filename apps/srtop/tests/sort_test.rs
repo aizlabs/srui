@@ -64,6 +64,7 @@ fn record(
     cpu: CpuUsage,
 ) -> ProcessRecord {
     ProcessRecord {
+        owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
         key: key(pid, token),
         display_name: name.into(),
         resident,

@@ -48,6 +48,7 @@ fn key(pid: u32, token: &str) -> ProcessKey {
 
 fn record(pid: u32, token: &str, name: &str, cmd: &[u8]) -> ProcessRecord {
     ProcessRecord {
+        owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
         key: key(pid, token),
         display_name: DisplayName::from(name).with_command(cmd),
         resident: Observed::Known(4096),

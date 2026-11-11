@@ -1,4 +1,4 @@
-// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
+// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
 import Testing
 import Foundation
 import AppKit
@@ -765,6 +765,123 @@ struct ProcessExplorerShellTests {
         print("PX-011 native SSH evidence: window \(window.windowNumber); rows=\(table.numberOfRows); initially visible=\(initiallyVisible); selections=\(selections); final selection=\(table.selectedRow) visible=\(table.rows(in: table.visibleRect)); itemIDs unchanged=\(Self.modelItemIDs(applier) == identities); statuses=\(trace); revision=\(applier.lastAppliedRevision.value)")
         await controller.stop()
     }
+
+    /// PX-012: the user filter and PID set are two standard native buttons, two standard native
+    /// text fields and a status line. Every one sends a standard `ACTIVATE` or `TEXT_EDIT`; the
+    /// server resolves owners by UID, names them through its own bounded cache, filters the rows
+    /// and explains an empty result. The fixture's PID 4101 belongs to its own account (UID
+    /// 1000, `alice`), PID 4102 to UID 1001 (`bob`), and the helper's owner is unreadable. The
+    /// native table shows exactly the kept rows, each under the item ID it had before, and
+    /// clearing the filters restores every row and identity.
+    @Test(.timeLimit(.minutes(1)))
+    @MainActor
+    func userFilterAndPIDSetFilterTheNativeTableAndKeepItemIDs() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-source"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        renderer.textEditingSession.debounceNanoseconds = 0
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer over SSH with user-filter controls") {
+            applier.lastAppliedRevision == Revision(1)
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(Self.ownerStatusID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
+        let table = try #require((tableHandle.view as? NSScrollView)?.documentView as? NSTableView)
+        let mine = try #require(renderer.registry.handle(for: NodeId(Self.ownerMineID))?.view as? NSButton)
+        let all = try #require(renderer.registry.handle(for: NodeId(Self.ownerAllID))?.view as? NSButton)
+        let userHandle = try #require(renderer.registry.handle(for: NodeId(Self.ownerInputID)))
+        let userField = try #require(userHandle.view as? NSTextField)
+        let userAdapter = try #require(userHandle.textAdapter)
+        let pidSetHandle = try #require(renderer.registry.handle(for: NodeId(Self.pidSetInputID)))
+        let pidSetField = try #require(pidSetHandle.view as? NSTextField)
+        let pidSetAdapter = try #require(pidSetHandle.textAdapter)
+        let statusHandle = try #require(renderer.registry.handle(for: NodeId(Self.ownerStatusID)))
+        let statusField = try #require(statusHandle.view as? NSTextField)
+
+        #expect(Self.nativeRows(table) == Self.fakeRows)
+        let identities = Self.modelItemIDs(applier)
+        #expect(identities.count == 3)
+        #expect(mine.title == "Only my processes" && all.title == "All visible users")
+        #expect(mine.isEnabled && !all.isEnabled, "every visible user is the starting choice")
+        #expect(userField.isEditable && pidSetField.isEditable)
+        #expect(userField.placeholderString == "UID or account name")
+        #expect(pidSetField.placeholderString == "PIDs, separated by commas or spaces")
+        #expect(statusField.stringValue == "User: all users visible to this daemon's account · showing all 3 processes")
+
+        func type(_ text: String, into field: NSTextField, _ adapter: NativeTextEditorAdapter) {
+            field.stringValue = text
+            adapter.notifyTextDidChangeForTests()
+            adapter.notifyEndEditingForTests()
+        }
+        var trace: [String] = []
+        /// Waits until the native table shows exactly `rows` (indices into the fixture), under
+        /// their original item IDs, and the status says `fragment`.
+        func waitFor(_ fragment: String, rows: [Int]) async throws {
+            let expected = rows.map { Self.fakeRows[$0] }
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "\(fragment) with rows \(rows)") {
+                Self.nativeRows(table) == expected && statusField.stringValue.contains(fragment)
+            }
+            #expect(Self.modelItemIDs(applier) == rows.map { identities[$0] }, "\(fragment): no new identity")
+            trace.append(statusField.stringValue)
+        }
+
+        // Only my processes: the fixture's own account owns PID 4101; the unreadable owner is
+        // hidden and counted, never taken for root.
+        NativeActivation.click(mine)
+        try await waitFor("User: mine, UID 1000 (alice) · 1 of 3 processes match · 1 process with an unreadable owner hidden", rows: [0])
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "buttons follow the choice") {
+            !mine.isEnabled && all.isEnabled
+        }
+
+        // A name typed into the user field: resolved on the server's own cache, then filtered.
+        type("bob", into: userField, userAdapter)
+        try await waitFor("User: name \"bob\", UID 1001 · 1 of 3 processes match", rows: [1])
+        #expect(mine.isEnabled && all.isEnabled)
+
+        // A UID no account names, which no process has: an explained empty result.
+        type("4242", into: userField, userAdapter)
+        try await waitFor("User: UID 4242 (no account name) · no process of 3 matches every filter: the user filter alone keeps 0", rows: [])
+        #expect(table.numberOfRows == 0)
+
+        // All visible users again: the button empties the user field.
+        NativeActivation.click(all)
+        try await waitFor("showing all 3 processes", rows: [0, 1, 2])
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the user field emptied") {
+            userField.stringValue == "" && !all.isEnabled && mine.isEnabled
+        }
+
+        // A PID set with one PID no visible process has.
+        type("4102 9999", into: pidSetField, pidSetAdapter)
+        try await waitFor("PID set: 2 PIDs · no visible process has PID 9999 · 1 of 3 processes match", rows: [1])
+        // Combined with the user filter: nothing matches both, and each filter's count is stated.
+        NativeActivation.click(mine)
+        try await waitFor("no process of 3 matches every filter: the user filter alone keeps 1, the PID set alone keeps 1", rows: [])
+
+        // Cleared: every row back, every identity unchanged, every native handle the same.
+        NativeActivation.click(all)
+        type("", into: pidSetField, pidSetAdapter)
+        try await waitFor("showing all 3 processes", rows: [0, 1, 2])
+        #expect(Self.nativeRows(table) == Self.fakeRows)
+        #expect(Self.modelItemIDs(applier) == identities)
+        #expect(renderer.registry.handle(for: NodeId(5)) === tableHandle)
+        #expect(renderer.registry.handle(for: NodeId(Self.ownerInputID)) === userHandle)
+        #expect(renderer.registry.handle(for: NodeId(Self.pidSetInputID)) === pidSetHandle)
+        #expect(renderer.registry.handle(for: NodeId(Self.ownerStatusID)) === statusHandle)
+        print("PX-012 native SSH evidence: window \(window.windowNumber); itemIDs=\(identities) unchanged=\(Self.modelItemIDs(applier) == identities); rows=\(Self.nativeRows(table)); statuses=\(trace); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
+    // PX-012: the user-filter controls.
+    fileprivate static let ownerMineID: UInt64 = 50
+    fileprivate static let ownerAllID: UInt64 = 51
+    fileprivate static let ownerInputID: UInt64 = 52
+    fileprivate static let pidSetInputID: UInt64 = 53
+    fileprivate static let ownerStatusID: UInt64 = 54
 
     // PX-011: the search controls.
     fileprivate static let searchInputID: UInt64 = 43

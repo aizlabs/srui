@@ -286,6 +286,7 @@ mod tests {
     ) -> Row {
         let key = key(pid, token);
         let record = ProcessRecord {
+            owner: crate::source::OWNER_NOT_COLLECTED,
             key: key.clone(),
             display_name: name.into(),
             resident: resident.map_or(
@@ -295,6 +296,7 @@ mod tests {
             cpu,
         };
         Row {
+            owner: crate::source::OWNER_NOT_COLLECTED,
             sort: SortValues::of_record(&key, &record),
             key,
             item_id: srui_sdk::ItemId::new(id),
@@ -341,6 +343,7 @@ mod tests {
         // present.
         let missing = row(2, None, "u", "name", None, CpuUsage::WarmingUp);
         let record = ProcessRecord {
+            owner: crate::source::OWNER_NOT_COLLECTED,
             key: missing.key.clone(),
             display_name: "name".into(),
             resident: Observed::Missing(MissingReason::Unavailable),

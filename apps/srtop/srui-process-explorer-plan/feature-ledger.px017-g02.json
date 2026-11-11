@@ -41,7 +41,7 @@
     },
     {
       "feature_id": "SRUI-PX017G02-003",
-      "feature": "TableCollectionAdapter and OutlineCollectionAdapter report one cleared selection when a user action empties the selection (and a Tree when a user collapse hides every selected row); commits, promotions, withdrawals, pending promotions and restores stay suppressed; PX-011-G01 withdrawal unchanged; multiple selection unchanged",
+      "feature": "TableCollectionAdapter and OutlineCollectionAdapter report one cleared selection when a user deselect empties the selection; a Tree collapse that hides the selection sends only EXPANSION_CHANGED, never a clear; commits, promotions, withdrawals, pending promotions and restores stay suppressed; PX-011-G01 withdrawal unchanged; multiple selection unchanged",
       "scope": "PX-017-G02/client-macos Collections/TableCollectionAdapter.swift, Collections/OutlineCollectionAdapter.swift, RendererAppKit/ControlFactory.swift, RendererAppKit/SemanticInteraction.swift; RendererAppKitTests CollectionAdaptersTests, HierarchicalTreeTests, WidgetSemanticsConformanceTests",
       "source_refs": [
         "D1",

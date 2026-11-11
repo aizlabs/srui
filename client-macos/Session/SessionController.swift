@@ -1358,18 +1358,27 @@ public final class SessionController: @unchecked Sendable {
                 eventType: request.action.eventType
             )
         }
-        if request.action.eventType == .EVENT_SELECTION_CHANGED,
-           node.nodeType == .list || node.nodeType == .table || node.nodeType == .tree {
-            let modeToken = node.getProperty(.selectionMode)?.asEnumToken
-            let selectionMode = modeToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
-            guard selectionMode != .none else {
-                throw SemanticAutomationError.unsupportedAction(
-                    nodeID: request.nodeID,
-                    eventType: request.action.eventType
-                )
-            }
+        if Self.selectionActionIsRefused(request.action, on: node) {
+            throw SemanticAutomationError.unsupportedAction(
+                nodeID: request.nodeID,
+                eventType: request.action.eventType
+            )
         }
         return ownership
+    }
+
+    /// `SELECTION_CHANGED` rules beyond the registry's emits matrix (§7.6;
+    /// `spec/registries.md` §4.4): a List, Table or Tree whose `selection_mode` is none sends
+    /// neither form, and the cleared form exists only on a List, Table or Tree.
+    static func selectionActionIsRefused(_ action: SemanticAction, on node: Node) -> Bool {
+        let isCollection = node.nodeType == .list || node.nodeType == .table || node.nodeType == .tree
+        if case .selectionCleared = action, !isCollection {
+            return true
+        }
+        guard action.eventType == .EVENT_SELECTION_CHANGED, isCollection else { return false }
+        let modeToken = node.getProperty(.selectionMode)?.asEnumToken
+        let selectionMode = modeToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
+        return selectionMode == .none
     }
     private func revalidateSemanticActionForOutbox(
         _ request: SemanticActionRequest?,

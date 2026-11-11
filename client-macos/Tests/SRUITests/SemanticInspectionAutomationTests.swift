@@ -418,6 +418,28 @@ struct SemanticInspectionAutomationTests {
         }
     }
 
+    @Test("A cleared selection is admitted only on a List, Table or Tree that can select")
+    func clearedSelectionIsRefusedOutsideSelectableCollections() {
+        // PX-017-G02 (spec/registries.md §4.4): Select, ChoiceGroup and Tabs emit
+        // SELECTION_CHANGED with an item, but the argumentless form is defined only for
+        // List, Table and Tree, and never for selection_mode none.
+        let single: [PropertyRef: Value] = [.selectionMode: .enumToken(.selectionModeSingle)]
+        for nodeType in [TypeRef.select, .choiceGroup, .tabs] {
+            let node = Node(id: 9, nodeType: nodeType, properties: single)
+            #expect(SessionController.selectionActionIsRefused(.selectionCleared, on: node), "\(nodeType)")
+            #expect(!SessionController.selectionActionIsRefused(.selectionChanged(ItemId(1)), on: node), "\(nodeType)")
+        }
+        for nodeType in [TypeRef.list, .table, .tree] {
+            let selectable = Node(id: 9, nodeType: nodeType, properties: single)
+            #expect(!SessionController.selectionActionIsRefused(.selectionCleared, on: selectable))
+            #expect(!SessionController.selectionActionIsRefused(.selectionChanged(ItemId(1)), on: selectable))
+            let none = Node(id: 9, nodeType: nodeType)
+            #expect(SessionController.selectionActionIsRefused(.selectionCleared, on: none))
+            #expect(SessionController.selectionActionIsRefused(.selectionChanged(ItemId(1)), on: none))
+        }
+        #expect(!SessionController.selectionActionIsRefused(.activate, on: Node(id: 9, nodeType: .button)))
+    }
+
     @Test("Native and inspected Tree disclosure each send one EXPANSION_CHANGED without a reply")
     @MainActor
     func treeDisclosureSendsOneExpansionChangedWithoutAwaitingAReply() async throws {

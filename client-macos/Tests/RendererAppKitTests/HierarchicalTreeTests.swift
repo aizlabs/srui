@@ -329,12 +329,13 @@ struct HierarchicalTreeTests {
 
     // MARK: - Cleared selection (PX-017-G02)
 
-    /// A user deselect, or a user collapse that hides every selected row, leaves the tree with
-    /// nothing selected and is reported once with no item (spec/registries.md §4.4). A promotion,
-    /// its withdrawal and a commit removing the selected item are server-driven and never
-    /// reported, and a collapse that keeps the selection shown reports no clear.
+    /// A user deselect leaves the tree with nothing selected and is reported once with no item
+    /// (spec/registries.md §4.4). A promotion, its withdrawal and a commit removing the selected
+    /// item are server-driven and never reported. A user collapse that hides the selection is a
+    /// disclosure change: it reports EXPANSION_CHANGED only, never a clear, and the server learns
+    /// of it from that event (PX-018 mirrors the collapsed set).
     @Test
-    func aUserDeselectOrHidingCollapseReportsOneClearAndServerDeselectionsNone() throws {
+    func aUserDeselectReportsOneClearAndCollapsesAndServerDeselectionsNone() throws {
         var store = try Self.store(Self.forest)
         let recorder = Recorder()
         let (adapter, outlineView) = try Self.outline(for: store, selectionMode: .single, recorder: recorder)
@@ -352,18 +353,18 @@ struct HierarchicalTreeTests {
         #expect(outlineView.selectedRowIndexes.isEmpty)
         #expect(recorder.cleared == 1, "a promotion withdrawal is server-driven")
 
-        // Collapsing B hides the selected D (row 3): EXPANSION_CHANGED, then one clear.
+        // Collapsing B hides the selected D (row 3): EXPANSION_CHANGED only, no clear.
         outlineView.selectRowIndexes(IndexSet(integer: 3), byExtendingSelection: false)
         #expect(adapter.setExpanded(false, itemID: Self.b, outlineView: outlineView))
         #expect(outlineView.selectedRowIndexes.isEmpty)
         #expect(recorder.expansions == [Expansion(itemID: Self.b, expanded: false)])
-        #expect(recorder.cleared == 2)
+        #expect(recorder.cleared == 1, "a collapse that hides the selection is not a deselection")
 
         // Rows are now A B E F G. Collapsing F keeps the selected A shown: no clear.
         outlineView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         #expect(adapter.setExpanded(false, itemID: Self.f, outlineView: outlineView))
         #expect(outlineView.selectedRowIndexes == IndexSet(integer: 0))
-        #expect(recorder.cleared == 2)
+        #expect(recorder.cleared == 1)
 
         // A commit that removes the selected E deselects it without a report.
         outlineView.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
@@ -374,7 +375,7 @@ struct HierarchicalTreeTests {
         ])
         adapter.update(model: store.getModel(Self.modelID), modelID: Self.modelID, outlineView: outlineView)
         #expect(outlineView.selectedRowIndexes.isEmpty)
-        #expect(recorder.cleared == 2, "a commit's deselection is server-driven")
+        #expect(recorder.cleared == 1, "a commit's deselection is server-driven")
     }
 
     // MARK: - Model updates keep disclosure by ItemId (§22.5)

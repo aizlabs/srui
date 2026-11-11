@@ -392,15 +392,11 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
         } else {
             collapsedItemIDs.insert(itemID)
         }
-        let hadSelection = !outlineView.selectedRowIndexes.isEmpty
+        // A collapse that hides the selected rows is a disclosure change, not a deselection: it
+        // sends EXPANSION_CHANGED only, never SELECTION_CHANGED (spec/registries.md §4.4).
         applyDisclosureChange(in: outlineView)
         onCollapsedItemsChanged?(nodeID, modelID, collapsedItemIDs)
         onExpansionChanged?(nodeID, itemID, expanded)
-        if hadSelection, outlineView.selectedRowIndexes.isEmpty {
-            // The user's collapse hid every selected row, which leaves the tree with nothing
-            // selected: reported like any user deselection (spec/registries.md §4.4).
-            noteUserClearedSelection()
-        }
         resolvePendingPromotion(in: outlineView)
         rebaselineKeepVisibleAfterDisclosureChange()
         emitRequestsAfterDisclosureChange(in: outlineView)
@@ -836,7 +832,7 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
         }
     }
 
-    /// A user action left the tree with nothing selected: kept locally and reported once as
+    /// A user deselect left the tree with nothing selected: kept locally and reported once as
     /// `SELECTION_CHANGED` with no `value` (§7.6, §22.5; `spec/registries.md` §4.4).
     private func noteUserClearedSelection() {
         guard selectionMode != .none else { return }

@@ -37,7 +37,11 @@
 //! thread controls decide which tasks the collection holds before any filter
 //! applies. The refresh loop asks the source for threads only while they are
 //! shown, and every publication that applies the controls also publishes the
-//! threads status in the same plan.
+//! threads status in the same plan. Since PX-020 rows can be tagged
+//! ([`crate::tags`]): every publication marks the tag cell of each row it
+//! publishes from the view's tag set, kept by process instance, and publishes
+//! the tags status after the rows, carrying the set's generation; a request
+//! or a sample whose tags status never committed puts the previous set back.
 //!
 //! Four rules shape this module:
 //!
@@ -129,6 +133,7 @@ use crate::search::{Search, SearchStep, SearchView};
 use crate::sort::{self, SortOrder};
 use crate::source::{ProcessSnapshot, ProcessSource, Retention};
 use crate::summary::{self, CollectorError, Sample};
+use crate::tags::{TagCounts, Tags, TagsView};
 use crate::threads::{self, ThreadCounts, ThreadReport, ThreadSettings, ThreadsView};
 use crate::tree::{self, ForestSummary, Generation, ScanGaps};
 use crate::KERNEL_THREADS_TOGGLE;
@@ -139,7 +144,7 @@ use crate::{
     INTERVAL_INPUT, LIST_SHORTCUT, MAX_PUBLISHED_LABEL_BYTES, MODEL, OWNER_ALL, OWNER_INPUT,
     OWNER_MINE, OWNER_STATUS, PID_GO, PID_INPUT, PID_SET_INPUT, SAMPLING_PAUSE, SAMPLING_REFRESH,
     SAMPLING_STATUS, SEARCH_INPUT, SEARCH_NEXT, SEARCH_PREVIOUS, SEARCH_STATUS, STATUS, TABLE,
-    THREADS_STATUS, TREE, TREE_MODEL, USER_THREADS_TOGGLE, VIEW_STATUS, VIEW_TOGGLE,
+    TAGS_STATUS, THREADS_STATUS, TREE, TREE_MODEL, USER_THREADS_TOGGLE, VIEW_STATUS, VIEW_TOGGLE,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
 use srui_sdk::{
@@ -347,6 +352,22 @@ pub const MAX_VIEW_STATUS_BYTES: usize = 512;
 /// threads status at its widest. Charged at this fixed reserve, never at the
 /// status's current length.
 pub const THREADS_RESERVE_BYTES: usize = 4096;
+/// The tag controls' allowance in the catch-up snapshot (PX-020): the row,
+/// the three buttons with their fixed labels, descriptions and shortcuts,
+/// and the tags status at [`crate::tags::MAX_TAGS_STATUS_BYTES`] plus the
+/// cut mark. Charged at this fixed reserve, never at the status's current
+/// length.
+pub const TAGS_RESERVE_BYTES: usize = 4096;
+
+/// What every row's tag cell is charged in the row ceiling (PX-020): an
+/// untagged, empty cell, whether the row is tagged or not, so tagging or
+/// untagging a row never changes which rows fit.
+const TAG_CELL_BYTES: usize = VALUE_FRAMING_BYTES;
+
+/// What the tagged cells add beyond [`TAG_CELL_BYTES`] at most, reserved once
+/// in the catch-up snapshot (PX-020): at most [`crate::tags::MAX_TAGGED`]
+/// rows are tagged, each tag cell that many bytes longer than an empty one.
+pub const TAG_CELLS_RESERVE_BYTES: usize = crate::tags::MAX_TAGGED * crate::tags::TAGGED_CELL.len();
 
 /// What a model item of the process tree carries beyond a table row's: the
 /// two standard item properties `tree_depth` and `descendant_count`, each a
@@ -587,6 +608,12 @@ pub struct ProcessView {
     /// What the last accepted sample said about user threads (PX-019).
     /// Replaced, never grown, by every sample.
     thread_report: ThreadReport,
+    /// The tagged process instances and the historical tags (PX-020).
+    /// Bounded by the collection and [`crate::tags::MAX_HISTORICAL_TAGS`].
+    tags: Tags,
+    /// The tags status as the client holds it, with the generation it states
+    /// (PX-020).
+    tags_published: TagsView,
 }
 
 /// The rows every active filter keeps, and what the filters' controls say
@@ -611,6 +638,8 @@ struct Visible {
     owner: OwnerView,
     /// What the published forest holds, in the tree view (PX-018).
     forest: Option<ForestSummary>,
+    /// Where the tagged processes the rows do not show are (PX-020).
+    tags: TagCounts,
 }
 
 /// Why a column layout request was not published (PX-068).
@@ -647,6 +676,10 @@ pub fn column_headings(layout: &ColumnLayout) -> Vec<Value> {
         .fields()
         .iter()
         .map(|field| Value::String(field.heading().into()))
+        // The tag column follows the chosen columns (PX-020).
+        .chain(std::iter::once(Value::String(
+            crate::tags::TAG_HEADING.into(),
+        )))
         .collect()
 }
 
@@ -669,6 +702,7 @@ impl ProcessView {
             mode: &mut self.mode,
             view_status: &mut self.view_status,
             threads: &mut self.threads_published,
+            tags: &mut self.tags_published,
         }
     }
 
@@ -770,6 +804,12 @@ impl ProcessView {
             user: threads.user,
             kernel: threads.kernel,
         };
+        // Nothing starts tagged (PX-020).
+        let tags = Tags::default();
+        let tags_published = TagsView {
+            status: tags.status(TagCounts::default()),
+            generation: tags.generation(),
+        };
         initialize_rows(
             session,
             rows.iter().map(Row::to_model_item).collect(),
@@ -780,6 +820,7 @@ impl ProcessView {
             true,
             Some(&sampling),
             &threads_published.status,
+            &tags_published.status,
         )?;
         let sampling_published = sampling.view();
         ids.retain(&unfiltered_rows);
@@ -835,6 +876,8 @@ impl ProcessView {
                 threads,
                 threads_published,
                 thread_report,
+                tags,
+                tags_published,
             },
             snapshot,
         ))
@@ -989,6 +1032,14 @@ impl ProcessView {
         let (grouped, evicted_threads) = threads::group(unfiltered_target);
         let unfiltered_target = grouped;
         let evicted = evicted + orphaned + evicted_threads;
+        // A tagged process this generation no longer holds — it ended, or no
+        // scan lists it any more — keeps a historical tag (PX-020). The set
+        // before is held until the tags status commits.
+        let departed = self
+            .tags
+            .departed(&self.unfiltered_rows, &unfiltered_target);
+        let held_tags = (!departed.is_empty()).then(|| self.tags.clone());
+        self.tags.retire(departed);
         // The rows this scan did not confirm, which a PID jump never selects
         // (PX-011) and the tree never takes a parent from (PX-018): bounded by
         // the collection, and replaced on every refresh.
@@ -1014,6 +1065,7 @@ impl ProcessView {
         let visible = self.visible_in(self.mode, &unfiltered_target, &unconfirmed, &gaps);
         let forest = visible.forest;
         let total = visible.total;
+        let tag_counts = visible.tags;
         let (target, matched, filter_truncated) =
             (visible.rows, visible.matched, visible.truncated);
         let filter_matches = visible.restricted.then_some(visible.matched_processes);
@@ -1029,6 +1081,11 @@ impl ProcessView {
         // this app emits cannot cost a row — there is no row budget, no diff and
         // no eviction on this path to cost one.
         if confirmed_empty && retention.is_global() {
+            // Every row is kept on this path, so no tag has departed; a held
+            // set is put back all the same rather than run ahead (PX-020).
+            if let Some(held) = held_tags {
+                self.tags = held;
+            }
             return self.publish_status_only(session, source_status, snapshot, rejected, summary);
         }
         // A client receives the status and the rows in the same catch-up
@@ -1076,6 +1133,9 @@ impl ProcessView {
         // The rows reach the client once every entry before this one has.
         let rows_end = plan.len();
         plan.extend(self.view_effects(self.mode, forest.as_ref()));
+        // The tags status after the rows whose tag cells it describes
+        // (PX-020).
+        plan.extend(self.tags_effects(tag_counts));
         // Last, the search re-counted against the rows this plan publishes, so
         // it commits with the final rows rather than ahead of them (PX-011),
         // and the inspector, whose metrics and state follow them (PX-013).
@@ -1113,6 +1173,7 @@ impl ProcessView {
             self.gaps = gaps;
             self.search.observe(&self.rows);
             self.inspector.reread(&self.rows, &confirmed_ids);
+            self.settle_tags(held_tags);
             return Ok(result);
         }
 
@@ -1120,6 +1181,7 @@ impl ProcessView {
             commit_reaching(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
         self.settle_disclosure(held, reached >= rows_end);
+        self.settle_tags(held_tags);
         // Order values never reach the wire, so every published row takes this
         // sample's whatever committed: a later click sorts by current values,
         // never by the ones a row was first published with.
@@ -1613,7 +1675,33 @@ impl ProcessView {
                 )
             };
         let scope = self.owner.scope(&admitted, &self.committed_filter);
-        let kept = threads::kept_with_processes(&admitted, |row| scope.keeps(row));
+        let mut kept = threads::kept_with_processes(&admitted, |row| scope.keeps(row));
+        // Every kept row's tag cell says whether its process instance is
+        // tagged (PX-020), and every tagged process not kept is counted where
+        // it is hidden.
+        let mut tags = TagCounts::default();
+        let mut tagged_kept = 0usize;
+        if self.tags.tagged() > 0 {
+            let mut kept_ids: HashSet<ItemId> = HashSet::new();
+            for row in &mut kept {
+                let tagged = self.tags.is_tagged(&row.key);
+                row.set_tagged(tagged, &self.columns);
+                if tagged {
+                    kept_ids.insert(row.item_id);
+                }
+            }
+            tagged_kept = kept_ids.len();
+            for row in unfiltered {
+                if !self.tags.is_tagged(&row.key) || kept_ids.contains(&row.item_id) {
+                    continue;
+                }
+                if threads::admits(settings, row) {
+                    tags.filtered += 1;
+                } else {
+                    tags.kernel_hidden += 1;
+                }
+            }
+        }
         let matched = kept.len();
         let matched_processes = kept.iter().filter(|row| !row.key.is_thread()).count();
         let (rows, truncated, forest) = match mode {
@@ -1648,7 +1736,11 @@ impl ProcessView {
         let owner = self
             .owner
             .view(&scope, &admitted, shown_processes, matched_processes);
+        if tagged_kept > 0 {
+            tags.beyond_limit = tagged_kept - rows.iter().filter(|row| row.tagged).count();
+        }
         Visible {
+            tags,
             restricted: scope.is_restricted(),
             beyond_text: scope.restricts_beyond_text(),
             total: admitted.len(),
@@ -1747,6 +1839,7 @@ impl ProcessView {
         let mode = switch.unwrap_or(self.mode);
         let visible = self.visible_in(mode, &self.unfiltered_rows, &self.unconfirmed, &self.gaps);
         let forest = visible.forest;
+        let tag_counts = visible.tags;
         let target = visible.rows;
         let filter_matches = visible.restricted.then_some(visible.matched_processes);
         // A paused view re-projects its frozen rows, and its freshness line
@@ -1788,6 +1881,9 @@ impl ProcessView {
         // The rows reach the client once every entry before this one has.
         let rows_end = plan.len();
         plan.extend(self.view_effects(mode, forest.as_ref()));
+        // The tags status after the rows whose tag cells it describes
+        // (PX-020).
+        plan.extend(self.tags_effects(tag_counts));
         // The search counts the newly filtered rows; a target a filter hid is
         // reported as no longer shown, never replaced (PX-011). So is the
         // inspector's (PX-013), and a row these rows put under a parent the
@@ -2758,6 +2854,110 @@ impl ProcessView {
         published
     }
 
+    /// The tag set (PX-020).
+    pub fn tags(&self) -> &Tags {
+        &self.tags
+    }
+
+    /// The tags status this view last published (PX-020).
+    pub fn tags_status(&self) -> &str {
+        &self.tags_published.status
+    }
+
+    /// The tags status's change for tag counts `counts` (PX-020): planned
+    /// when its text or the set's generation changed, so a change that keeps
+    /// the same words still records the generation the client now holds.
+    fn tags_effects(&self, counts: TagCounts) -> Vec<Planned> {
+        let status = self.tags.status(counts);
+        if status == self.tags_published.status
+            && self.tags.generation() == self.tags_published.generation
+        {
+            return Vec::new();
+        }
+        vec![Planned::new(Effect::TagsStatus {
+            text: status,
+            generation: self.tags.generation(),
+        })]
+    }
+
+    /// Puts back `held`, the tag set before a request or a sample changed it,
+    /// when the tags status stating the change never committed (PX-020): the
+    /// client then still shows the rows and status of the set before, and the
+    /// set may not run ahead of them. A plan that committed its rows in part
+    /// leaves cells the next publication restates from the set put back.
+    fn settle_tags(&mut self, held: Option<Tags>) {
+        if let Some(held) = held {
+            if self.tags_published.generation != self.tags.generation() {
+                self.tags = held;
+            }
+        }
+    }
+
+    /// The published process row a tag request acts on (PX-020): the row
+    /// the inspector describes, the user's own resolved selection, while this
+    /// view still publishes it; otherwise why nothing can be tagged.
+    fn tag_target(&self) -> Result<Row, String> {
+        let Some(selected) = self.inspector.selected_row() else {
+            return Err("Nothing tagged: select a process row first".to_string());
+        };
+        match self.rows.iter().find(|row| row.item_id == selected.item_id) {
+            Some(row) => Ok(row.clone()),
+            None => Err(format!(
+                "Nothing tagged: {} is no longer shown",
+                crate::tags::who(selected)
+            )),
+        }
+    }
+
+    /// Applies one tag request (PX-020) and republishes: the rows whose tag
+    /// cells changed, under their own item IDs and in their places, and the
+    /// tags status. The selection, the promoted `value`, follow and every
+    /// filter are untouched; no process is.
+    ///
+    /// - [`TagRequest::Toggle`] tags the process the inspector describes,
+    ///   or untags it when it is tagged.
+    /// - [`TagRequest::Descendants`] tags it and the descendants the latest
+    ///   sample shows under it ([`tree::descendants`]), each by its own
+    ///   process instance, frozen now: a child started later is not added.
+    /// - [`TagRequest::Clear`] removes every tag, live and historical.
+    ///
+    /// A request with no shown process row selected, or on a thread row,
+    /// says why in the tags status and tags nothing. The set before is put
+    /// back when the tags status stating the change never committed.
+    pub fn request_tags(
+        &mut self,
+        session: &Session,
+        request: TagRequest,
+    ) -> Result<Refreshed, SessionError> {
+        let held = self.tags.clone();
+        match request {
+            TagRequest::Clear => self.tags.clear(),
+            TagRequest::Toggle => match self.tag_target() {
+                Ok(row) => self.tags.toggle(&row),
+                Err(why) => self.tags.refuse(why),
+            },
+            TagRequest::Descendants => match self.tag_target() {
+                Ok(row) if !row.key.is_thread() => {
+                    let generation = Generation {
+                        unfiltered: &self.unfiltered_rows,
+                        unconfirmed: &self.unconfirmed,
+                        gaps: &self.gaps,
+                    };
+                    let found: Vec<&Row> = tree::descendants(&generation, row.item_id)
+                        .into_iter()
+                        .map(|index| &self.unfiltered_rows[index])
+                        .collect();
+                    self.tags.tag_with_descendants(&row, &found);
+                }
+                Ok(row) => self.tags.tag_with_descendants(&row, &[]),
+                Err(why) => self.tags.refuse(why),
+            },
+        }
+        let published = self.republish(session, Vec::new());
+        self.settle_tags(Some(held));
+        published
+    }
+
     /// Applies one `EXPANSION_CHANGED` report from the tree (PX-018): the
     /// client has already expanded or collapsed `item` locally, and the
     /// server only records what it was told. Nothing about the rows is
@@ -3094,6 +3294,27 @@ pub fn kernel_threads_toggled(
         .and_then(|event| event.bool_arg());
     if let Err(error) = lock_view(view).set_kernel_threads(session, on) {
         eprintln!("srtop: kernel threads not published: {error}");
+    }
+}
+
+/// One tag button's request (PX-020): which button was clicked, fixed when
+/// its handler is installed. It names no process: the target is the view's
+/// own resolved selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagRequest {
+    /// "Tag or untag selected".
+    Toggle,
+    /// "Tag selected and descendants".
+    Descendants,
+    /// "Clear tags".
+    Clear,
+}
+
+/// Dispatches one tag button's `ACTIVATE` to the shared view (PX-020).
+/// Nothing the event carries is read.
+pub fn tag_requested(view: &std::sync::Mutex<ProcessView>, session: &Session, request: TagRequest) {
+    if let Err(error) = lock_view(view).request_tags(session, request) {
+        eprintln!("srtop: tags not published: {error}");
     }
 }
 
@@ -3477,6 +3698,7 @@ fn count(plan: &[Planned], result: &mut Refreshed) {
             | Effect::SamplingValue(_) => result.controls += 1,
             Effect::FollowValue(_) | Effect::FollowStatus(_) => result.controls += 1,
             Effect::ThreadsStatus(_) | Effect::ThreadToggle { .. } => result.controls += 1,
+            Effect::TagsStatus { .. } => result.controls += 1,
             Effect::Delete(_) if planned.moving => {}
             Effect::Insert(_, rows) if planned.moving => result.moved += rows.len(),
             Effect::Delete(ids) => result.deleted += ids.len(),
@@ -3807,7 +4029,9 @@ fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
             + SAMPLING_RESERVE_BYTES
             + FOLLOW_RESERVE_BYTES
             + VIEW_RESERVE_BYTES
-            + THREADS_RESERVE_BYTES,
+            + THREADS_RESERVE_BYTES
+            + TAGS_RESERVE_BYTES
+            + TAG_CELLS_RESERVE_BYTES,
     );
     let mut spent = 0usize;
     let mut kept = 0usize;
@@ -3819,10 +4043,13 @@ fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
         // hiding a wide field admits extra rows that cannot fit when restored,
         // and the following refresh evicts them despite an unchanged source.
         // A tree row also carries its parent cell and its two item
-        // properties (PX-018).
+        // properties (PX-018). Every row carries its tag cell, charged empty
+        // whether it is tagged or not; the tagged cells' extra bytes are one
+        // fixed reserve (PX-020).
         let mut cost = MODEL_ITEM_FRAMING_BYTES
             + VALUE_FRAMING_BYTES
             + row.cells.iter().map(value_wire_bytes).sum::<usize>()
+            + TAG_CELL_BYTES
             + row.tree.as_ref().map_or(0, |place| {
                 value_wire_bytes(&place.parent_cell()) + TREE_ITEM_PROPERTIES_BYTES
             });
@@ -4087,6 +4314,12 @@ enum Effect {
         node: NodeId,
         on: bool,
     },
+    /// The tags status text set, and the tag set's generation it states
+    /// recorded as it commits (PX-020).
+    TagsStatus {
+        text: String,
+        generation: u64,
+    },
     Delete(Vec<ItemId>),
     Insert(u64, Vec<Row>),
     Update(Vec<Row>),
@@ -4123,6 +4356,8 @@ struct Published<'a> {
     view_status: &'a mut String,
     /// The thread controls as announced (PX-019).
     threads: &'a mut ThreadsView,
+    /// The tags status as announced, and its generation (PX-020).
+    tags: &'a mut TagsView,
 }
 
 /// The planned operations that turn the `published` summary into `target`:
@@ -4256,6 +4491,9 @@ impl Planned {
             Effect::ThreadToggle { node, on } => {
                 Operation::set_property(*node, VALUE, Value::Bool(*on))
             }
+            Effect::TagsStatus { text, .. } => {
+                Operation::set_property(TAGS_STATUS, TEXT, Value::String(text.clone()))
+            }
             Effect::Delete(ids) => Operation::model_delete_items(MODEL, ids.iter().copied()),
             Effect::Insert(index, rows) => {
                 Operation::model_insert(MODEL, *index, rows.iter().map(Row::to_model_item))
@@ -4330,6 +4568,7 @@ impl Effect {
                 VALUE_FRAMING_BYTES + text.len()
             }
             Self::ThreadToggle { .. } => VALUE_FRAMING_BYTES + SCALAR_VALUE_BYTES,
+            Self::TagsStatus { text, .. } => VALUE_FRAMING_BYTES + text.len(),
             Self::SearchStatus(text) => VALUE_FRAMING_BYTES + text.len(),
             Self::SearchValue { value, .. } => VALUE_FRAMING_BYTES + value.len(),
             // The `SET_PROPERTY` of the item ID, and a whole second operation:
@@ -4383,6 +4622,7 @@ impl Effect {
             mode,
             view_status,
             threads,
+            tags,
         } = published;
         match self {
             Self::ViewMode(shown) => **mode = *shown,
@@ -4432,6 +4672,10 @@ impl Effect {
             Self::FollowValue(checked) => follow.checked = *checked,
             Self::FollowStatus(text) => follow.status.clone_from(text),
             Self::ThreadsStatus(text) => threads.status.clone_from(text),
+            Self::TagsStatus { text, generation } => {
+                tags.status.clone_from(text);
+                tags.generation = *generation;
+            }
             Self::ThreadToggle { node, on } => {
                 if *node == USER_THREADS_TOGGLE {
                     threads.user = *on;
@@ -4493,6 +4737,9 @@ impl Effect {
                         row.cells = update.cells.clone();
                         row.sort = update.sort.clone();
                         row.display_name = update.display_name.clone();
+                        // The tag cell is in the value; the flag says so
+                        // (PX-020), for a later re-layout of this row.
+                        row.tagged = update.tagged;
                     }
                 }
             }
@@ -5374,7 +5621,10 @@ mod tests {
                         // (PX-005), in both metric columns (PX-006).
                         Value::String(widest_metric_cell()),
                         Value::String(widest_metric_cell()),
+                        // Tagged, the wider tag cell (PX-020).
+                        Value::String(crate::tags::TAGGED_CELL.into()),
                     ]),
+                    tagged: true,
                 }
             })
             .collect()
@@ -5815,7 +6065,9 @@ mod tests {
                 + SAMPLING_RESERVE_BYTES
                 + FOLLOW_RESERVE_BYTES
                 + VIEW_RESERVE_BYTES
-                + THREADS_RESERVE_BYTES);
+                + THREADS_RESERVE_BYTES
+                + TAGS_RESERVE_BYTES
+                + TAG_CELLS_RESERVE_BYTES);
         let mut published = Vec::new();
         for system in [
             SystemSample::not_provided(),
@@ -5879,6 +6131,82 @@ mod tests {
         assert!(
             published.windows(2).all(|pair| pair[0] == pair[1]),
             "{published:?}: the summary's length moved the row budget"
+        );
+    }
+
+    /// PX-020: tagging never changes which rows fit, and the most tagged
+    /// rows a view can hold add exactly their tagged cells' bytes to the
+    /// catch-up snapshot, inside the one reserve the row ceiling sets aside
+    /// for them. Every row's tag cell is charged empty in the ceiling.
+    #[test]
+    fn tagging_the_most_rows_at_the_ceiling_keeps_every_row_inside_its_reserve() {
+        let session = srui_sessiond::Session::mint();
+        let mut source = Host::new(58_000, 48);
+        let (mut view, snapshot) = ProcessView::start(&session, &mut source).unwrap();
+        let before = view.item_ids();
+        assert!(
+            before.len() < snapshot.records.len(),
+            "the ceiling must bind here"
+        );
+        let hello = srui_protocol::ClientHello {
+            core_version: "0.5.0".to_string(),
+            profiles: vec!["org.srui.standard-widgets/1".to_string()],
+            limits: None,
+            client_instance_id: vec![1, 2, 3],
+            client_metadata: Default::default(),
+            known_resource_hashes: vec![],
+        };
+        let frame = |session: &srui_sessiond::Session| {
+            let snapshot = session
+                .bootstrap_fresh_client(&hello)
+                .expect("a fresh client attaches")
+                .snapshot
+                .expect("a populated session sends a catch-up snapshot");
+            srui_protocol::framed_payload_len(&srui_protocol::SruiMessage {
+                msg: Some(srui_protocol::srui_message::Msg::Transaction(snapshot)),
+            })
+        };
+        let untagged = frame(&session);
+        let status_before = view.tags_status().len();
+        // The last rows the ceiling keeps, as many as may be tagged.
+        let keys: Vec<ProcessKey> = view.rows[view.rows.len() - crate::tags::MAX_TAGGED..]
+            .iter()
+            .map(|row| row.key.clone())
+            .collect();
+        view.tags.tag_for_test(keys);
+        view.republish(&session, Vec::new()).unwrap();
+        assert_eq!(view.item_ids(), before, "tagging moved the row ceiling");
+        assert_eq!(
+            view.rows.iter().filter(|row| row.tagged).count(),
+            crate::tags::MAX_TAGGED
+        );
+        // A sample keeps the same rows and their tags.
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.item_ids(), before, "a sample moved the row ceiling");
+        assert_eq!(
+            view.rows.iter().filter(|row| row.tagged).count(),
+            crate::tags::MAX_TAGGED
+        );
+        let tagged = frame(&session);
+        // The tags status changed length too; its bytes are the tag
+        // controls' reserve, not the cells'.
+        let cells = (tagged as isize
+            - untagged as isize
+            - (view.tags_status().len() as isize - status_before as isize))
+            as usize;
+        assert!(
+            cells >= crate::tags::MAX_TAGGED * crate::tags::TAGGED_CELL.len(),
+            "{cells} bytes for {} tagged cells",
+            crate::tags::MAX_TAGGED
+        );
+        assert!(
+            cells <= TAG_CELLS_RESERVE_BYTES,
+            "the tagged cells take {cells} bytes, above their {TAG_CELLS_RESERVE_BYTES} byte reserve"
+        );
+        assert!(tagged <= DEFAULT_MAX_FRAME_SIZE, "{tagged}");
+        println!(
+            "PX-020 tagged cells at the ceiling: {} rows, {cells} bytes, reserve {TAG_CELLS_RESERVE_BYTES}",
+            view.rows.len()
         );
     }
 
@@ -6055,6 +6383,11 @@ mod tests {
             false,
             Some(&sampling),
             &"t".repeat(crate::threads::MAX_THREADS_STATUS_BYTES),
+            // PX-020: the tags status at its widest, cut mark included.
+            &crate::bounded(
+                &"\u{20000}".repeat(crate::tags::MAX_TAGS_STATUS_BYTES),
+                crate::tags::MAX_TAGS_STATUS_BYTES,
+            ),
         )
         .unwrap();
         // PX-011: every search value at its widest — the status at its bound,
@@ -6255,6 +6588,22 @@ mod tests {
             threads > THREADS_RESERVE_BYTES / 4,
             "the reserve must be measured against thread controls that really are wide: {threads}"
         );
+        // PX-020: the tag controls, their status at its bound.
+        let tags = encoded(&[
+            crate::TAGS_ROW,
+            crate::TAG_TOGGLE,
+            crate::TAG_DESCENDANTS,
+            crate::TAGS_CLEAR,
+            crate::TAGS_STATUS,
+        ]);
+        assert!(
+            tags <= TAGS_RESERVE_BYTES,
+            "the widest tag controls encode to {tags} bytes, above their {TAGS_RESERVE_BYTES} byte reserve"
+        );
+        assert!(
+            tags > TAGS_RESERVE_BYTES / 4,
+            "the reserve must be measured against tag controls that really are wide: {tags}"
+        );
         let sampling = encoded(&[
             crate::SAMPLING_ROW,
             SAMPLING_PAUSE,
@@ -6417,6 +6766,7 @@ mod tests {
                     + FOLLOW_RESERVE_BYTES
                     + VIEW_RESERVE_BYTES
                     + THREADS_RESERVE_BYTES
+                    + TAGS_RESERVE_BYTES
                     + TRANSACTION_ENVELOPE_BYTES,
             "a snapshot with no row is {frame} bytes, above the allowances the row budget \
              leaves for it"
@@ -6435,12 +6785,16 @@ mod tests {
                 + FOLLOW_RESERVE_BYTES
                 + VIEW_RESERVE_BYTES
                 + THREADS_RESERVE_BYTES
+                + TAGS_RESERVE_BYTES
         );
         println!(
             "PX-018 view switch and tree at their widest: encoded={view} reserve={VIEW_RESERVE_BYTES}"
         );
         println!(
             "PX-019 thread controls at their widest: encoded={threads} reserve={THREADS_RESERVE_BYTES}"
+        );
+        println!(
+            "PX-020 tag controls at their widest: encoded={tags} reserve={TAGS_RESERVE_BYTES}"
         );
         println!(
             "PX-013 inspector at its widest: encoded={inspector} reserve={INSPECTOR_RESERVE_BYTES}"
@@ -6614,6 +6968,7 @@ mod tests {
                         Value::String("0 B".into()),
                     ]),
                     sort: template.sort.clone(),
+                    tagged: false,
                 }],
             ))
         };
@@ -7364,5 +7719,193 @@ mod thread_commit_tests {
                 .map(|place| place.depth)
         };
         assert_eq!(depth(worker), Some(3), "under p, under q");
+    }
+}
+
+/// PX-020: the tag set never runs ahead of a commit. A tag request or a
+/// sample whose tags status did not commit puts the set before back, through
+/// the test-only [`commit_fault`] seam.
+#[cfg(test)]
+mod tag_commit_tests {
+    use super::*;
+    use crate::source::{
+        BootId, CappedRecords, Completeness, CpuInterval, CpuUsage, CreationToken, DisplayName,
+        FakeProcessSource, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+        SnapshotTime, SourceId, OWNER_NOT_COLLECTED,
+    };
+
+    /// Records of (PID, name, parent PID, start tick); a name is part of the
+    /// creation token, so a new name under an old PID is a new instance.
+    struct Family(Vec<ProcessRecord>);
+
+    impl Family {
+        fn new(records: &[(u32, &str, u32, u64)]) -> Self {
+            Self(
+                records
+                    .iter()
+                    .map(|&(pid, name, parent, started)| ProcessRecord {
+                        lineage: Lineage::new(parent, started),
+                        owner: OWNER_NOT_COLLECTED,
+                        key: ProcessKey {
+                            source: SourceId("tag-fixture".into()),
+                            host: Observed::Known(HostId("h".into())),
+                            boot: Observed::Known(BootId("b".into())),
+                            pid_namespace: Observed::Known(PidNamespaceId(1)),
+                            pid: Observed::Known(pid),
+                            creation: CreationToken::Opaque(format!("{name}-{started}")),
+                            thread: None,
+                        },
+                        kind: crate::source::KIND_NOT_COLLECTED,
+                        display_name: DisplayName::from(name),
+                        resident: Observed::Known(4096),
+                        cpu: CpuUsage::Measured(CpuInterval {
+                            ticks: u64::from(pid),
+                            ticks_per_second: 100,
+                            elapsed: Duration::from_secs(1),
+                        }),
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    impl ProcessSource for Family {
+        fn status_text(&self) -> &str {
+            "Read-only · Tag fixture"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            ProcessSnapshot {
+                source: SourceId("tag-fixture".into()),
+                sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH),
+                records: self.0.clone(),
+                vanished: 0,
+                capped: CappedRecords::none(),
+                completeness: Completeness::Complete,
+                system: FakeProcessSource::system(),
+                threads: crate::source::ThreadScan::NotProvided,
+            }
+        }
+    }
+
+    fn item(view: &ProcessView, pid: u32) -> ItemId {
+        view.rows
+            .iter()
+            .find(|row| row.key.pid == Observed::Known(pid))
+            .map(|row| row.item_id)
+            .unwrap_or_else(|| panic!("PID {pid} is shown"))
+    }
+
+    fn select(session: &Session, view: &mut ProcessView, pid: u32) {
+        let item = item(view, pid);
+        view.select_item(session, Some(item)).unwrap();
+    }
+
+    fn tagged_pids(view: &ProcessView) -> Vec<u32> {
+        let mut pids: Vec<u32> = view
+            .rows
+            .iter()
+            .filter(|row| row.tagged)
+            .filter_map(|row| match row.key.pid {
+                Observed::Known(pid) => Some(pid),
+                Observed::Missing(_) => None,
+            })
+            .collect();
+        pids.sort_unstable();
+        pids
+    }
+
+    fn family() -> Family {
+        Family::new(&[(1, "init", 0, 1), (10, "build", 1, 10), (11, "cc", 10, 11)])
+    }
+
+    #[test]
+    fn a_failed_tag_request_keeps_the_set_and_the_status() {
+        let mut source = family();
+        let session = Session::mint();
+        let (mut view, _) = ProcessView::start(&session, &mut source).unwrap();
+        select(&session, &mut view, 10);
+        let status = view.tags_status().to_string();
+        let revision = session.current_revision();
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.request_tags(&session, TagRequest::Toggle).is_err());
+        }
+        assert_eq!(session.current_revision(), revision, "nothing committed");
+        assert_eq!(view.tags().tagged(), 0, "the set did not run ahead");
+        assert_eq!(view.tags_status(), status);
+        assert!(tagged_pids(&view).is_empty());
+        // The same request, committed, tags; a failed descendants request
+        // then leaves exactly that.
+        view.request_tags(&session, TagRequest::Toggle).unwrap();
+        assert_eq!(tagged_pids(&view), [10]);
+        let generation = view.tags().generation();
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view
+                .request_tags(&session, TagRequest::Descendants)
+                .is_err());
+        }
+        assert_eq!(view.tags().tagged(), 1);
+        assert_eq!(view.tags().generation(), generation);
+        assert_eq!(tagged_pids(&view), [10]);
+        view.request_tags(&session, TagRequest::Descendants)
+            .unwrap();
+        assert_eq!(tagged_pids(&view), [10, 11]);
+    }
+
+    #[test]
+    fn a_failed_clear_keeps_every_tag() {
+        let mut source = family();
+        let session = Session::mint();
+        let (mut view, _) = ProcessView::start(&session, &mut source).unwrap();
+        select(&session, &mut view, 1);
+        view.request_tags(&session, TagRequest::Descendants)
+            .unwrap();
+        assert_eq!(tagged_pids(&view), [1, 10, 11]);
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.request_tags(&session, TagRequest::Clear).is_err());
+        }
+        assert_eq!(view.tags().tagged(), 3);
+        assert_eq!(tagged_pids(&view), [1, 10, 11]);
+        assert!(view.tags_status().starts_with("Tags: 3 tagged"));
+        view.request_tags(&session, TagRequest::Clear).unwrap();
+        assert_eq!(view.tags().tagged(), 0);
+        assert!(tagged_pids(&view).is_empty());
+    }
+
+    /// A sample in which a tagged process ended and that did not commit
+    /// leaves the tag live: the client still shows the row, tagged. The next
+    /// sample that commits makes it historical.
+    #[test]
+    fn a_failed_sample_keeps_an_ended_process_tagged_until_one_commits() {
+        let mut source = family();
+        let session = Session::mint();
+        let (mut view, _) = ProcessView::start(&session, &mut source).unwrap();
+        select(&session, &mut view, 11);
+        view.request_tags(&session, TagRequest::Toggle).unwrap();
+        let status = view.tags_status().to_string();
+        source
+            .0
+            .retain(|record| record.key.pid != Observed::Known(11));
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.refresh(&session, &mut source).is_err());
+        }
+        assert_eq!(view.tags().tagged(), 1, "the set did not run ahead");
+        assert_eq!(view.tags().historical(), 0);
+        assert_eq!(view.tags_status(), status);
+        assert_eq!(tagged_pids(&view), [11], "the client still shows it tagged");
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.tags().tagged(), 0);
+        assert_eq!(view.tags().history().collect::<Vec<_>>(), ["PID 11 · cc"]);
+        assert!(
+            view.tags_status()
+                .starts_with("Tags: 0 tagged · 1 no longer listed: PID 11 · cc"),
+            "{}",
+            view.tags_status()
+        );
+        assert!(tagged_pids(&view).is_empty());
     }
 }

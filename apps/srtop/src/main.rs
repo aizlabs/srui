@@ -2,7 +2,7 @@
 use srui_process_explorer::{
     initialize, install_column_handlers, install_filter_handlers, install_follow_handlers,
     install_inspector, install_owner_handlers, install_sampling_handlers, install_search_handlers,
-    install_sort_handlers, install_thread_handlers, install_view_handlers,
+    install_sort_handlers, install_tag_handlers, install_thread_handlers, install_view_handlers,
     procfs::ProcFsSource,
     refresh::{poll, ProcessView, DEFAULT_REFRESH_INTERVAL},
     sampling::parse_interval,
@@ -82,6 +82,9 @@ where
     // The thread controls choose which tasks the collection holds, and the
     // loop reads user threads only while they are shown (PX-019).
     install_thread_handlers(session, &view);
+    // The tag buttons mark the selected process, or it and its sampled
+    // descendants, by process instance; they touch no process (PX-020).
+    install_tag_handlers(session, &view);
     // The inspector reads details through its own reader of the source's
     // records, on its own bounded worker (PX-013).
     install_inspector(session, &view, source.details());

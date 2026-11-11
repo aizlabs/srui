@@ -4997,6 +4997,126 @@ mod live {
         );
     }
 
+    /// The PIDs of the published rows whose tag cell says tagged (PX-020), in
+    /// the default layout, whose tag cell follows its four columns.
+    fn tagged_pids(session: &Session) -> BTreeSet<u32> {
+        session.with_store(|store| {
+            store
+                .get_model(MODEL)
+                .unwrap()
+                .items
+                .values()
+                .filter_map(|item| match &item.value {
+                    Value::List(cells)
+                        if cells[4]
+                            == Value::String(srui_process_explorer::tags::TAGGED_CELL.into()) =>
+                    {
+                        match cells[0] {
+                            Value::UnsignedInt(pid) => u32::try_from(pid).ok(),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+    }
+
+    /// PX-020: this test process and its descendants, tagged from a real
+    /// `/proc` sample: a test-owned parent worker and the child it started
+    /// are tagged with it, as individual process instances. A worker started
+    /// after the request is not added. When the parent ends, its tag turns
+    /// historical; its child, reparented by the kernel, keeps its own tag,
+    /// because a tag follows the process instance and not its place.
+    #[test]
+    fn a_live_tagged_family_keeps_its_frozen_membership_and_an_ended_worker_turns_historical() {
+        use srui_process_explorer::refresh::TagRequest;
+        let (parent, child) = Worker::family();
+        let parent_pid = parent.pid();
+        let me = std::process::id();
+        let session = Session::mint();
+        let mut source = ProcFsSource::live();
+        let (mut view, _) = start_from_source(&session, &mut source).unwrap();
+        let (item, _) = row_for(&session, me).expect("this test process is shown");
+        view.select_item(&session, Some(item)).unwrap();
+        view.request_tags(&session, TagRequest::Descendants)
+            .unwrap();
+        let tagged = tagged_pids(&session);
+        assert!(
+            [me, parent_pid, child]
+                .iter()
+                .all(|pid| tagged.contains(pid)),
+            "{tagged:?}"
+        );
+        let status = view.tags_status().to_string();
+        assert!(status.contains(&format!("Tagged PID {me} · ")), "{status}");
+        assert!(
+            status.contains("processes started later are not added"),
+            "{status}"
+        );
+
+        // A worker started after the request is a descendant of this process
+        // too, and is not added.
+        let late = Worker::start();
+        let snapshot = source.snapshot();
+        view.apply(&session, LIVE_STATUS_TEXT, &snapshot).unwrap();
+        assert!(
+            row_for(&session, late.pid()).is_some(),
+            "the late worker is shown"
+        );
+        let tagged = tagged_pids(&session);
+        assert!(!tagged.contains(&late.pid()), "{tagged:?}");
+        assert!(
+            [me, parent_pid, child]
+                .iter()
+                .all(|pid| tagged.contains(pid)),
+            "{tagged:?}"
+        );
+
+        // The parent ends; the kernel reparents its child.
+        drop(parent);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let adopted = loop {
+            match kernel_parent(child) {
+                Some(adopter) if adopter != parent_pid => break adopter,
+                _ if Instant::now() > deadline => panic!("PID {child} was never reparented"),
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        let snapshot = source.snapshot();
+        view.apply(&session, LIVE_STATUS_TEXT, &snapshot).unwrap();
+        let tagged = tagged_pids(&session);
+        assert!(!tagged.contains(&parent_pid), "{tagged:?}");
+        assert!(
+            tagged.contains(&child),
+            "the reparented child keeps its tag"
+        );
+        assert!(!tagged.contains(&late.pid()));
+        let history: Vec<String> = view.tags().history().map(str::to_string).collect();
+        assert!(
+            history.contains(&format!("PID {parent_pid} · srtop-worker")),
+            "{history:?}"
+        );
+        let status = view.tags_status().to_string();
+        assert!(
+            status.contains(&format!("PID {parent_pid} · srtop-worker")),
+            "{status}"
+        );
+        // The child ends with this test; it is not this test's child to reap.
+        let _ = Command::new("kill")
+            .arg(child.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        println!(
+            "PX-020 live evidence: me={me} parent={parent_pid} child={child} adopted_by={adopted} \
+             late={} tagged={} historical={history:?} status={status:?}",
+            late.pid(),
+            tagged.len()
+        );
+    }
+
     fn row_for(session: &Session, pid: u32) -> Option<(ItemId, Value)> {
         session.with_store(|store| {
             store

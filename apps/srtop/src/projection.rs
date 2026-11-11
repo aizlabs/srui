@@ -1,7 +1,8 @@
 //! Server-side row projection and session-local item allocation
 //! (§§6.2, 8; PX-002 rows, PX-003 process-instance keys, PX-004 refresh,
 //! PX-005 and PX-006 metric cells, PX-042 catalogued columns, PX-068 chosen
-//! columns, PX-018 lineage and tree places, PX-019 thread rows).
+//! columns, PX-018 lineage and tree places, PX-019 thread rows, PX-020 the tag
+//! cell).
 use crate::catalogue::{ColumnLayout, PROCESS_LIST};
 use crate::sort::SortValues;
 use crate::source::{
@@ -31,6 +32,11 @@ use std::io;
 /// from `cells` without resampling, so a retained row is re-laid out under the
 /// cells it was published with, and identity and order values never depend on
 /// which columns are visible.
+///
+/// After the chosen columns `value` always holds the tag cell (PX-020):
+/// [`crate::tags::TAGGED_CELL`] while `tagged`, and empty otherwise. It is not
+/// a catalogued column: no sort, filter or chooser reads it, and only the
+/// view's tag set decides it, never anything a scan read.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Row {
     pub(crate) key: ProcessKey,
@@ -52,6 +58,10 @@ pub(crate) struct Row {
     /// a table row. A tree row's `value` ends with its parent cell, and its
     /// model item carries the standard `tree_depth` and `descendant_count`.
     pub(crate) tree: Option<TreePlace>,
+    /// Whether the published value's tag cell says tagged (PX-020). Set only
+    /// on the rows a publication chooses, from the view's tag set; a
+    /// projected row starts untagged.
+    pub(crate) tagged: bool,
 }
 
 impl Row {
@@ -67,10 +77,11 @@ impl Row {
         item
     }
 
-    /// This row with its published value projected onto `layout`: a tree row
-    /// keeps its parent cell last (PX-018).
+    /// This row with its published value projected onto `layout`: its tag
+    /// cell after the chosen columns (PX-020), and a tree row's parent cell
+    /// last (PX-018).
     pub(crate) fn laid_out(&self, layout: &ColumnLayout) -> Self {
-        let value = match (&self.tree, lay_out(&self.cells, layout)) {
+        let value = match (&self.tree, lay_out(&self.cells, layout, self.tagged)) {
             (Some(place), Value::List(mut cells)) => {
                 cells.push(place.parent_cell());
                 Value::List(cells)
@@ -86,21 +97,42 @@ impl Row {
     /// This row as a table row: no tree place, and no parent cell (PX-018).
     pub(crate) fn flat(&self, layout: &ColumnLayout) -> Self {
         Self {
-            value: lay_out(&self.cells, layout),
+            value: lay_out(&self.cells, layout, self.tagged),
             tree: None,
             ..self.clone()
         }
     }
+
+    /// Marks this row tagged or untagged (PX-020), rewriting only its tag
+    /// cell, which sits right after the `layout` columns of its value.
+    pub(crate) fn set_tagged(&mut self, tagged: bool, layout: &ColumnLayout) {
+        if self.tagged == tagged {
+            return;
+        }
+        self.tagged = tagged;
+        if let Value::List(cells) = &mut self.value {
+            if let Some(cell) = cells.get_mut(layout.fields().len()) {
+                *cell = tag_cell(tagged);
+            }
+        }
+    }
+}
+
+/// The tag cell of a row that is `tagged` or not (PX-020).
+pub(crate) fn tag_cell(tagged: bool) -> Value {
+    Value::String(if tagged { crate::tags::TAGGED_CELL } else { "" }.into())
 }
 
 /// The published value of a row whose catalogued cells are `cells`: one cell
-/// per visible column, in the layout's order (PX-068).
-pub(crate) fn lay_out(cells: &[Value], layout: &ColumnLayout) -> Value {
+/// per visible column, in the layout's order (PX-068), then the tag cell
+/// (PX-020).
+pub(crate) fn lay_out(cells: &[Value], layout: &ColumnLayout, tagged: bool) -> Value {
     Value::List(
         layout
             .fields()
             .iter()
             .map(|field| cells[field.index()].clone())
+            .chain(std::iter::once(tag_cell(tagged)))
             .collect(),
     )
 }
@@ -289,7 +321,7 @@ impl SessionItemIds {
                 Ok(Row {
                     key,
                     item_id,
-                    value: lay_out(&cells, layout),
+                    value: lay_out(&cells, layout, false),
                     cells,
                     sort,
                     display_name: record.display_name.clone(),
@@ -297,6 +329,7 @@ impl SessionItemIds {
                     lineage: record.lineage.clone(),
                     kind: record.kind.clone(),
                     tree: None,
+                    tagged: false,
                 })
             })
             .collect()

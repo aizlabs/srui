@@ -40,7 +40,8 @@
 //!   (PX-017), or exactly `VIEW_TOGGLE` with `VALUE_CHANGED`, `TREE` with
 //!   `SELECTION_CHANGED` or `TREE` with `EXPANSION_CHANGED` (PX-018), or
 //!   exactly `USER_THREADS_TOGGLE` or `KERNEL_THREADS_TOGGLE` with
-//!   `VALUE_CHANGED` (PX-019);
+//!   `VALUE_CHANGED` (PX-019), or a tag button (`TAG_TOGGLE`,
+//!   `TAG_DESCENDANTS`, `TAGS_CLEAR`) with `ACTIVATE` (PX-020);
 //!   `on_result`, `on_text_edit`, `on_expansion_changed`
 //!   and a model range provider unconditionally; `include`, called or
 //!   renamed; or a macro definition (`macro_rules!`), whose expansion can
@@ -788,6 +789,13 @@ const OWNER_BUTTON_CONSTANTS: &[&str] = &["OWNER_MINE", "OWNER_ALL"];
 /// The sampling buttons (PX-015), whose `ACTIVATE` handlers pause or resume
 /// this app's published view, ask the refresh loop for one read-only sample,
 /// or apply the interval field the server kept, and touch no process.
+/// The tag buttons (PX-020), whose `ACTIVATE` handlers tag or untag the
+/// process the server already resolved as selected, tag it and the
+/// descendants the latest sample shows under it, or clear every tag. A tag
+/// only marks published rows: none signals, opens for control or
+/// reconfigures a process.
+const TAG_BUTTON_CONSTANTS: &[&str] = &["TAG_TOGGLE", "TAG_DESCENDANTS", "TAGS_CLEAR"];
+
 const SAMPLING_BUTTON_CONSTANTS: &[&str] =
     &["SAMPLING_PAUSE", "SAMPLING_REFRESH", "INTERVAL_APPLY"];
 
@@ -839,6 +847,7 @@ fn is_sort_button_activation(tokens: &[Tok]) -> bool {
             || SEARCH_BUTTON_CONSTANTS.contains(&name)
             || OWNER_BUTTON_CONSTANTS.contains(&name)
             || SAMPLING_BUTTON_CONSTANTS.contains(&name)
+            || TAG_BUTTON_CONSTANTS.contains(&name)
     ) && event.as_deref() == Some("ACTIVATE")
 }
 
@@ -1804,6 +1813,47 @@ fn the_source_audit_reports_every_known_bypass() {
             "session.on(VIEW_TOGGLE, events[i], |_, _| {});",
             "handler",
         ),
+        // PX-020: the tag buttons are allowed only in their exact shape.
+        (
+            "a tag button under a value change",
+            "session.on(TAG_TOGGLE, VALUE_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the descendants button under a selection event",
+            "session.on(TAG_DESCENDANTS, SELECTION_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the clear button under a text edit",
+            "session.on(TAGS_CLEAR, TEXT_EDIT, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the tags status as a button",
+            "session.on(TAGS_STATUS, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the tags row as a button",
+            "session.on(TAGS_ROW, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a computed tag target",
+            "session.on(tag_buttons[i], ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a tag button by path",
+            "session.on(crate::TAG_TOGGLE, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a tag button under a computed event",
+            "session.on(TAGS_CLEAR, events[i], |_, _| {});",
+            "handler",
+        ),
         (
             "the SDK's disclosure handler",
             "tree.on_expansion_changed(&session, |_, _| {});",
@@ -1880,6 +1930,10 @@ fn the_source_audit_reports_every_known_bypass() {
         "session.on(SAMPLING_REFRESH, ACTIVATE, move |session, _| { refresh::refresh_requested(&now, session); });",
         "session.on(INTERVAL_INPUT, TEXT_EDIT, move |session, event| { refresh::interval_edited(&interval, session, event); });",
         "session.on(INTERVAL_APPLY, ACTIVATE, move |session, _| { refresh::interval_requested(&apply, session); });",
+        // the tag buttons' registrations, as PX-020 installs them
+        "session.on(TAG_TOGGLE, ACTIVATE, move |session, _| { refresh::tag_requested(&toggle, session, refresh::TagRequest::Toggle); });",
+        "session.on(TAG_DESCENDANTS, ACTIVATE, move |session, _| { refresh::tag_requested(&descendants, session, refresh::TagRequest::Descendants); });",
+        "session.on(TAGS_CLEAR, ACTIVATE, move |session, _| { refresh::tag_requested(&clear, session, refresh::TagRequest::Clear); });",
         "let kind = std::fs::symlink_metadata(&path)?;",
         "use std::fs::File;",
         "use std::os::unix::fs::MetadataExt;",

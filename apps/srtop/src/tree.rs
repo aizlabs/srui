@@ -45,6 +45,10 @@
 //! The forest is flattened, and every item stamped, by the SDK's
 //! [`srui_sdk::TreeModel`] ([`stamp`]), so the published shape is the one the
 //! runtime validates and refuses beyond its depth limit.
+//!
+//! The same parent rule finds a process's sampled descendants for tagging
+//! (PX-020, [`descendants`]), over every process of the generation whatever
+//! the filters hide.
 
 use crate::catalogue::ColumnLayout;
 use crate::projection::Row;
@@ -338,6 +342,52 @@ fn break_cycles(visible: &[Row], links: &mut [Result<usize, RootReason>]) {
             state[member] = 2;
         }
     }
+}
+
+/// The sampled descendants of the process row `root` (PX-020): the process
+/// rows of `generation.unfiltered` whose chain of parents reaches `root`
+/// under exactly the rules the tree attaches a child by — each link a parent
+/// PID read by this generation's scan, held by exactly one confirmed record
+/// that started no later than the child — with cycles broken as the tree
+/// breaks them, in preorder. The filters play no part: a descendant the
+/// filters hide is a descendant still. Threads are never descendants, and a
+/// row kept from an earlier scan has no parent in this generation, so none
+/// is below it. Returns indexes into `generation.unfiltered`, `root`
+/// excluded; empty when `root` is not one of its process rows.
+pub(crate) fn descendants(generation: &Generation<'_>, root: ItemId) -> Vec<usize> {
+    let processes: Vec<usize> = generation
+        .unfiltered
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| !row.key.is_thread())
+        .map(|(index, _)| index)
+        .collect();
+    let Some(start) = processes
+        .iter()
+        .position(|&index| generation.unfiltered[index].item_id == root)
+    else {
+        return Vec::new();
+    };
+    let visible: Vec<Row> = processes
+        .iter()
+        .map(|&index| generation.unfiltered[index].clone())
+        .collect();
+    let mut links = resolve(&visible, generation);
+    break_cycles(&visible, &mut links);
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); visible.len()];
+    for (index, link) in links.iter().enumerate() {
+        if let Ok(parent) = link {
+            children[*parent].push(index);
+        }
+    }
+    // Cycles are broken above, so every row is reached at most once.
+    let mut found = Vec::new();
+    let mut stack: Vec<usize> = children[start].iter().rev().copied().collect();
+    while let Some(index) = stack.pop() {
+        found.push(processes[index]);
+        stack.extend(children[index].iter().rev());
+    }
+    found
 }
 
 /// Arranges `visible` — the shown rows, in the active order — into the

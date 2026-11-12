@@ -3183,20 +3183,18 @@ impl ProcessView {
     /// therefore leaves the mirror and the inspector as they are, so the
     /// newer selection the promotion made is kept.
     ///
-    /// The converse does not hold (verification V6-F1, a known limitation):
-    /// a report stamped at the promotion's revision or later was not
-    /// necessarily made after the outline applied the promotion. The client
-    /// stamps it with the applier's published snapshot
-    /// (`SessionController.enqueueNativeSemanticAction`,
-    /// `client-macos/Session/SessionController.swift:1201-1206`, through
-    /// `semanticInspectionSourceSnapshot`), which advances before the
-    /// main-actor render that calls `applyPromotion`. A collapse made in that
-    /// gap carries the promotion's own revision, is taken as fresh and clears
-    /// the inspector, while the render then expands the parent and selects
-    /// the match. No server-side boundary separates it from a collapse made
-    /// after the render, which does deselect the row; closing the gap needs
-    /// the client to stamp disclosure and selection events with the revision
-    /// its renderer has applied.
+    /// The generic client stamps a disclosure or selection report with the
+    /// revision its outline showed when the user acted, not the one its
+    /// store had received (PX-018-G02,
+    /// `SessionController.enqueueNativeSemanticAction`). So a collapse made
+    /// after the promotion reached the client but before the outline applied
+    /// it is stamped `before` or earlier and is undone here too, and one made
+    /// after the render carries the promotion's revision or later and is
+    /// applied. A client without PX-018-G02 stamps the received revision: a
+    /// collapse in that gap then carries the promotion's own revision and
+    /// clears the inspector while the render selects the match (verification
+    /// V6-F1). No server-side boundary separates that report from a collapse
+    /// made after the render, so nothing here guesses.
     pub fn expansion_changed_at(
         &mut self,
         session: &Session,

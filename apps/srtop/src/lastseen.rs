@@ -221,9 +221,10 @@ impl<'a> Evidence<'a> {
         if self.snapshot.threads.read().is_none() {
             return Departure::NotObserved(Unobserved::ThreadsNotRead);
         }
-        if self.thread_retention.covers(&key.pid) {
-            return Departure::NotObserved(Unobserved::Evicted);
-        }
+        // A TID this scan read under the same process instance names a newer
+        // thread: the earlier one is gone, whatever else of that process's
+        // threads the scan could not read (merge with main: PX-019's
+        // superseded-TID rule, which never retains such a row).
         let replaced = self.snapshot.threads.records().iter().any(|record| {
             record.key.is_thread_of(&process)
                 && record
@@ -232,11 +233,13 @@ impl<'a> Evidence<'a> {
                     .as_ref()
                     .is_some_and(|other| other.tid == thread.tid)
         });
-        Departure::Exited(if replaced {
-            Exit::Replaced
-        } else {
-            Exit::Unlisted
-        })
+        if replaced {
+            return Departure::Exited(Exit::Replaced);
+        }
+        if self.thread_retention.covers(&key.pid) {
+            return Departure::NotObserved(Unobserved::Evicted);
+        }
+        Departure::Exited(Exit::Unlisted)
     }
 
     fn process(&self, key: &ProcessKey) -> Departure {
@@ -499,6 +502,27 @@ impl LastSeen {
         }
         self.entries = kept;
         dropped
+    }
+
+    /// Upgrades to `exited` every record that says only "no longer observed"
+    /// of an instance whose exit a later scan establishes: `exit(key)` is that
+    /// scan's verdict on the absent instance, or `None` when the scan cannot
+    /// account for it (merge with main: PX-013's review round ends a row the
+    /// row limit dropped once a scan entitled to account for it no longer
+    /// lists it). The record keeps its row, details and last-observed time:
+    /// only the verdict was unknown. The caller has already dropped the
+    /// records of instances this scan lists again ([`Self::drop_relisted`]),
+    /// so every record asked about is absent from it. An established exit is
+    /// final and is never asked about again.
+    pub(crate) fn establish_exits(&mut self, exit: impl Fn(&ProcessKey) -> Option<Exit>) {
+        for tombstone in &mut self.entries {
+            if tombstone.departure.exited() {
+                continue;
+            }
+            if let Some(exit) = exit(tombstone.key()) {
+                tombstone.departure = Departure::Exited(exit);
+            }
+        }
     }
 
     /// Counts `count` historical tags forgotten without a bound dropping

@@ -3275,12 +3275,20 @@ fn procfs_absences_establish_exits_and_inaccessible_records_never_do() {
         ..base.clone()
     };
     for pid in [301, 302, 303] {
-        view.select_item(&session, shown_item(&session, pid))
-            .unwrap();
+        view.select_item(
+            &session,
+            b"lastseen-fixture-client",
+            shown_item(&session, pid),
+        )
+        .unwrap();
         view.request_tags(&session, TagRequest::Toggle).unwrap();
     }
-    view.select_item(&session, shown_item(&session, 300))
-        .unwrap();
+    view.select_item(
+        &session,
+        b"lastseen-fixture-client",
+        shown_item(&session, 300),
+    )
+    .unwrap();
     assert_eq!(view.tags().tagged(), 3);
 
     // 302's record is denied: kept, and nothing is recorded.
@@ -5133,7 +5141,8 @@ mod live {
         let mut source = ProcFsSource::live();
         let (mut view, _) = start_from_source(&session, &mut source).unwrap();
         let (item, _) = row_for(&session, me).expect("this test process is shown");
-        view.select_item(&session, Some(item)).unwrap();
+        view.select_item(&session, b"live-tags-client", Some(item))
+            .unwrap();
         view.request_tags(&session, TagRequest::Descendants)
             .unwrap();
         let tagged = tagged_pids(&session);
@@ -5230,7 +5239,8 @@ mod live {
         let mut source = ProcFsSource::live();
         let (mut view, _) = start_from_source(&session, &mut source).unwrap();
         let (item, _) = row_for(&session, pid).expect("the worker is shown");
-        view.select_item(&session, Some(item)).unwrap();
+        view.select_item(&session, b"live-lastseen-client", Some(item))
+            .unwrap();
         let live = view.inspector_view().clone();
         assert!(
             live.status
@@ -5288,7 +5298,8 @@ mod live {
         // A degraded real sample: the host identity unread, and the second
         // worker not listed. Nothing establishes that it exited.
         let (item, _) = row_for(&session, other_pid).expect("the second worker is shown");
-        view.select_item(&session, Some(item)).unwrap();
+        view.select_item(&session, b"live-lastseen-client", Some(item))
+            .unwrap();
         let mut degraded = source.snapshot();
         degraded
             .records

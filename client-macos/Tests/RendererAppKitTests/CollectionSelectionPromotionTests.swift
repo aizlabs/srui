@@ -181,9 +181,11 @@ struct CollectionSelectionPromotionTests {
         #expect(harness.visibleRows.contains(8_000))
         #expect(harness.adapter.pendingPromotion == nil)
 
-        // The revealed viewport's neighbours are requested through ordinary range requests.
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
-        harness.adapter.reissueVisibleRangeRequests()
+        // The revealed viewport's neighbours are requested through ordinary range requests. The
+        // reveal scrolls the clip view, whose bounds-change notification is delivered
+        // synchronously to the adapter's viewport observer; force layout so the visible rows are
+        // final instead of servicing the main run loop (scripts/check-test-main-runloop-nesting.sh).
+        harness.tableView.window?.layoutIfNeeded()
         let covered = harness.rangeRequests.contains { request in
             request.nodeID == Self.tableID && request.modelID == Self.modelID
                 && (request.startIndex..<(request.startIndex + request.count)).overlaps(

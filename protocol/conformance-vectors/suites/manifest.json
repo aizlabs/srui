@@ -139,7 +139,7 @@
       "gaps": [
         {
           "scenario": "Surface VIEWPORT_CHANGED is declared in \u00a77.6 but the renderer has no interaction path that can originate it.",
-          "reason": "RendererAppKit/SemanticInteraction.swift models activate, valueChanged, selectionChanged, expansionChanged (Tree disclosure, PX-018-G01) and textEdit, but no window-viewport case. A required-tier Surface can therefore never emit the viewport event the registry declares for it.",
+          "reason": "RendererAppKit/SemanticInteraction.swift models activate, valueChanged, selectionChanged, selectionCleared (PX-017-G02), expansionChanged (Tree disclosure, PX-018-G01) and textEdit, but no window-viewport case. A required-tier Surface can therefore never emit the viewport event the registry declares for it.",
           "future_task": "unowned \u2014 needs a SemanticInteraction case plus the AppKit window wiring (Tree EXPANSION_CHANGED was closed by PX-018-G01)",
           "gap_probe": {
             "file": "client-macos/RendererAppKit/SemanticInteraction.swift",

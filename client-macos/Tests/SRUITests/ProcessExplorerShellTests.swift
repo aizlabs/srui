@@ -1,4 +1,4 @@
-// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012/PX-013/PX-014/PX-015/PX-016/PX-017/PX-018/PX-019: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
+// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012/PX-013/PX-014/PX-015/PX-016/PX-017/PX-018/PX-018-G02/PX-019: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
 import Testing
 import Foundation
 import AppKit
@@ -1197,6 +1197,97 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
+    /// PX-017-G02 (Codex review of PR #101): a user deselect is reported as `SELECTION_CHANGED`
+    /// with no `value`. `deselectAll(nil)` goes through the table's delegate exactly as a click in
+    /// empty space does. While following, the deselect stops follow with its reason and clears the
+    /// hint, and the inspector says the selection was cleared; turning follow on afterwards is
+    /// refused rather than following the deselected process. The same holds for select, deselect,
+    /// then follow on, with follow never on before.
+    @Test(.timeLimit(.minutes(1)))
+    @MainActor
+    func deselectingStopsFollowClearsTheInspectorAndFollowOnIsRefused() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-follow", "--refresh-interval-ms", "300000"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer over SSH with its follow controls") {
+            applier.lastAppliedRevision.value >= 1
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(Self.followStatusID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        SurfacePresentation.forHostApplication().present(window)
+        window.contentView?.layoutSubtreeIfNeeded()
+        let router = renderer.layoutRenderer.shortcutRouter
+        router.isWindowKey = { $0 === window }
+        func view<T>(_ id: UInt64, as _: T.Type = T.self) throws -> T {
+            try #require(renderer.registry.handle(for: NodeId(id))?.view as? T, "node \(id)")
+        }
+        let table = try #require((renderer.registry.handle(for: NodeId(5))?.view as? NSScrollView)?.documentView as? NSTableView)
+        let toggle: NSButton = try view(Self.followToggleID)
+        let status: NSTextField = try view(Self.followStatusID)
+        let inspectorStatus: NSTextField = try view(Self.inspectorLineIDs[0])
+        let followKey = try Self.keyEvent("f", [.command, .shift], keyCode: 3, in: window)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "all 60 rows") {
+            table.numberOfRows == 60
+        }
+        let cleared = "Selected process: none · the selection was cleared; select a row to inspect it"
+        let refused = "Follow: off · nothing is selected; select a row, then turn follow on"
+
+        // Follow on, then deselect: follow stops with its reason and its hint is cleared.
+        table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        let first = Self.nativeRows(table)[0][0]
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on row 1") {
+            inspectorStatus.stringValue.hasPrefix("Selected process: PID \(first) · ")
+        }
+        #expect(window.performKeyEquivalent(with: followKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "following row 1") {
+            toggle.state == .on && status.stringValue.hasPrefix("Following PID \(first) · ")
+                && applier.store.getNode(NodeId(5))?.keepVisible != nil
+        }
+        table.deselectAll(nil)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "follow stopped by the deselect") {
+            status.stringValue == "Follow stopped: the selection was cleared; select a row and turn follow on again"
+                && toggle.state == .off
+                && applier.store.getNode(NodeId(5))?.keepVisible == nil
+                && inspectorStatus.stringValue == cleared
+        }
+        #expect(table.selectedRowIndexes.isEmpty, "the server selected nothing back")
+        #expect(applier.store.getNode(NodeId(5))?.promotedSelection == nil)
+
+        // Turning follow on now is refused: nothing is selected.
+        #expect(window.performKeyEquivalent(with: followKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "follow on refused after the clear") {
+            status.stringValue == refused && toggle.state == .off
+        }
+        #expect(applier.store.getNode(NodeId(5))?.keepVisible == nil)
+
+        // Select, deselect, then follow on, with follow off throughout: refused, never the old row.
+        table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        let second = Self.nativeRows(table)[1][0]
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on row 2") {
+            inspectorStatus.stringValue.hasPrefix("Selected process: PID \(second) · ")
+        }
+        table.deselectAll(nil)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector cleared") {
+            inspectorStatus.stringValue == cleared
+        }
+        let beforeToggle = applier.lastAppliedRevision.value
+        #expect(window.performKeyEquivalent(with: followKey))
+        // The refusal text is already shown, so wait for the server's answer to this press: it
+        // always states the toggle's value, in a new revision.
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "follow on refused again") {
+            applier.lastAppliedRevision.value > beforeToggle && status.stringValue == refused && toggle.state == .off
+        }
+        #expect(applier.store.getNode(NodeId(5))?.keepVisible == nil, "the deselected process is not followed")
+        #expect(table.selectedRowIndexes.isEmpty)
+        print("PX-017-G02 native SSH evidence: window \(window.windowNumber); first=\(first); second=\(second); follow=\(status.stringValue); inspector=\(inspectorStatus.stringValue); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
     /// PX-018: the process tree over real SSH. Switching from the table to the tree with ⌘T keeps
     /// the selection by item ID and carries follow over; the tree is one native `NSOutlineView`
     /// whose rows are indented from the server's `tree_depth`, under a visible header with the
@@ -1390,6 +1481,305 @@ struct ProcessExplorerShellTests {
         #expect(renderer.registry.handle(for: NodeId(5)) === tableHandle, "the table was never rebuilt")
         #expect(renderer.registry.handle(for: NodeId(Self.treeID)) === treeHandle, "the tree was never rebuilt")
         print("PX-018 native SSH evidence: window \(window.windowNumber); tree rows=\(rows.map(\.cells)); levels=\(rows.map(\.level)); indentation=\(rows.map(\.indentation)); disclosure commits=\(disclosureRevisions); tree range requests=\(treeRangeRequests.count); follow=\(followStatus.stringValue); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
+    /// PX-018, Codex review round 5: the user clicks Go to PID and collapses the match's parent in
+    /// the same turn, before the promotion reaches the client, so the collapse report is made at
+    /// the earlier revision and reaches the server after it selected the match. The client then
+    /// applies the promotion: it expands the parent, selects the match with selection events
+    /// suppressed and reports the expand. The inspector keeps describing the match, which the
+    /// outline shows selected, after every report has been processed.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func aCollapseBeforeTheGoToPIDPromotionArrivesKeepsTheInspectorOnTheMatch() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-tree", "--refresh-interval-ms", "300000"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer with its view switch") {
+            applier.lastAppliedRevision.value >= 1
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(Self.treeID)) != nil
+                && renderer.registry.handle(for: NodeId(Self.viewToggleID)) != nil
+                && renderer.registry.handle(for: NodeId(Self.pidGoID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        SurfacePresentation.forHostApplication().present(window)
+        window.contentView?.layoutSubtreeIfNeeded()
+        renderer.layoutRenderer.shortcutRouter.isWindowKey = { $0 === window }
+        let treeHandle = try #require(renderer.registry.handle(for: NodeId(Self.treeID)))
+        let outline = try #require((treeHandle.view as? NSScrollView)?.documentView as? NSOutlineView)
+        let adapter = try #require(treeHandle.modelAdapter as? OutlineCollectionAdapter)
+        let inspector = try #require(renderer.registry.handle(for: NodeId(Self.inspectorLineIDs[0]))?.view as? NSTextField)
+        let pidHandle = try #require(renderer.registry.handle(for: NodeId(Self.pidInputID)))
+        let pidField = try #require(pidHandle.view as? NSTextField)
+        let pidAdapter = try #require(pidHandle.textAdapter)
+        let go = try #require(renderer.registry.handle(for: NodeId(Self.pidGoID))?.view as? NSButton)
+        let viewToggle = try #require(renderer.registry.handle(for: NodeId(Self.viewToggleID))?.view as? NSButton)
+        func pids() -> [String] {
+            (0..<outline.numberOfRows).map { row in
+                (outline.view(atColumn: 0, row: row, makeIfNecessary: true)
+                    as? OutlineCollectionAdapter.TreeCellView)?.label.stringValue ?? ""
+            }
+        }
+        func type(_ text: String) {
+            pidField.stringValue = text
+            pidAdapter.notifyTextDidChangeForTests()
+            pidAdapter.notifyEndEditingForTests()
+        }
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the switch enabled") { viewToggle.isEnabled }
+        #expect(window.performKeyEquivalent(with: try Self.keyEvent("t", [.command], keyCode: 17, in: window)))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the tree") { outline.numberOfRows == 12 }
+        type("311")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the PID field held") {
+            applier.store.getNode(NodeId(Self.pidInputID))?.getProperty(.value) == .string("311") && go.isEnabled
+        }
+        let makeRow = try #require(pids().firstIndex(of: "300"))
+        let make = try #require(applier.store.getModel(ModelId(2))?.getItemByIndex(adapter.modelIndex(forRow: makeRow))).itemID
+        let observed = applier.lastAppliedRevision.value
+        // One main-actor turn: the click, then the collapse, both at `observed`.
+        NativeActivation.click(go)
+        #expect(adapter.setExpanded(false, itemID: make, outlineView: outline))
+        #expect(applier.lastAppliedRevision.value == observed, "the promotion has not arrived yet")
+        #expect(!pids().contains("311"), "ld hidden locally")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the promotion applied") {
+            adapter.isExpanded(make) && outline.selectedRowIndexes == IndexSet(integer: pids().firstIndex(of: "311") ?? -1)
+        }
+        // A later round trip: once the server holds the new PID text, it has processed the
+        // collapse and the client's expand report, which the client sent before it.
+        type("1")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "every report processed") {
+            applier.store.getNode(NodeId(Self.pidInputID))?.getProperty(.value) == .string("1")
+        }
+        #expect(inspector.stringValue.hasPrefix("Selected process: PID 311 · ld"), "\(inspector.stringValue)")
+        #expect(outline.selectedRowIndexes == IndexSet(integer: try #require(pids().firstIndex(of: "311"))))
+        print("PX-018 Codex round 5 native SSH evidence: window \(window.windowNumber); observed=\(observed); revision=\(applier.lastAppliedRevision.value); rows=\(pids()); inspector=\(inspector.stringValue)")
+        await controller.stop()
+    }
+
+    /// PX-018-G02 (PX-018 verification V6-F1): the collapse is made after the client's store has
+    /// applied the Go to PID promotion and before the outline has rendered it, on the main actor
+    /// through `liveTransactionPublishedInterceptorForTesting`. The client stamps the
+    /// `EXPANSION_CHANGED` with the revision its outline showed, the one before the promotion, so
+    /// srtop takes it for the collapse the promotion undoes. The render then expands the parent
+    /// and selects the match, and after a later round trip the inspector still describes it.
+    /// Stamped with the applier's published snapshot, the report carried the promotion's own
+    /// revision and srtop cleared the inspector.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func aCollapseBetweenTheGoToPIDCommitAndItsRenderKeepsTheInspectorOnTheMatch() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-tree", "--refresh-interval-ms", "300000"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let transport = OutboundEventRecorder(inner: SSHTransport(configuration: harness.configuration))
+        let (controller, applier, renderer) = Self.genericClient(transport)
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer with its view switch") {
+            applier.lastAppliedRevision.value >= 1
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(Self.treeID)) != nil
+                && renderer.registry.handle(for: NodeId(Self.viewToggleID)) != nil
+                && renderer.registry.handle(for: NodeId(Self.pidGoID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        SurfacePresentation.forHostApplication().present(window)
+        window.contentView?.layoutSubtreeIfNeeded()
+        renderer.layoutRenderer.shortcutRouter.isWindowKey = { $0 === window }
+        let treeHandle = try #require(renderer.registry.handle(for: NodeId(Self.treeID)))
+        let outline = try #require((treeHandle.view as? NSScrollView)?.documentView as? NSOutlineView)
+        let adapter = try #require(treeHandle.modelAdapter as? OutlineCollectionAdapter)
+        let inspector = try #require(renderer.registry.handle(for: NodeId(Self.inspectorLineIDs[0]))?.view as? NSTextField)
+        let pidHandle = try #require(renderer.registry.handle(for: NodeId(Self.pidInputID)))
+        let pidField = try #require(pidHandle.view as? NSTextField)
+        let pidAdapter = try #require(pidHandle.textAdapter)
+        let go = try #require(renderer.registry.handle(for: NodeId(Self.pidGoID))?.view as? NSButton)
+        let viewToggle = try #require(renderer.registry.handle(for: NodeId(Self.viewToggleID))?.view as? NSButton)
+        func pids() -> [String] {
+            (0..<outline.numberOfRows).map { row in
+                (outline.view(atColumn: 0, row: row, makeIfNecessary: true)
+                    as? OutlineCollectionAdapter.TreeCellView)?.label.stringValue ?? ""
+            }
+        }
+        func item(_ pid: String) throws -> ItemId {
+            let row = try #require(pids().firstIndex(of: pid), "PID \(pid) is shown")
+            return try #require(applier.store.getModel(ModelId(2))?.getItemByIndex(adapter.modelIndex(forRow: row))).itemID
+        }
+        func type(_ text: String) {
+            pidField.stringValue = text
+            pidAdapter.notifyTextDidChangeForTests()
+            pidAdapter.notifyEndEditingForTests()
+        }
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the switch enabled") { viewToggle.isEnabled }
+        #expect(window.performKeyEquivalent(with: try Self.keyEvent("t", [.command], keyCode: 17, in: window)))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the tree") { outline.numberOfRows == 12 }
+        type("311")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the PID field held") {
+            applier.store.getNode(NodeId(Self.pidInputID))?.getProperty(.value) == .string("311") && go.isEnabled
+        }
+        let make = try item("300")
+        let ld = try item("311")
+        let observed = applier.lastAppliedRevision
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the outline showing the PID text") {
+            controller.nativeRenderedRevisionForTesting == observed
+        }
+        let gap = GoToPIDRenderGap()
+        let onPublished: @MainActor @Sendable () -> Void = {
+            // The promotion's commit: the store holds it, the outline does not yet.
+            guard !gap.fired,
+                  applier.store.getNode(NodeId(Self.treeID))?.getProperty(.value) == .itemID(ld) else { return }
+            gap.fired = true
+            gap.promotion = applier.lastAppliedRevision
+            gap.rendered = controller.nativeRenderedRevisionForTesting
+            gap.outlinePromotion = adapter.promotedItemID
+            gap.collapsed = adapter.setExpanded(false, itemID: make, outlineView: outline)
+            gap.rowsAtCollapse = pids()
+        }
+        controller.liveTransactionPublishedInterceptorForTesting = { await onPublished() }
+        NativeActivation.click(go)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the collapse made and the promotion rendered") {
+            gap.fired && adapter.isExpanded(make)
+                && outline.selectedRowIndexes == IndexSet(integer: pids().firstIndex(of: "311") ?? -1)
+        }
+        controller.liveTransactionPublishedInterceptorForTesting = nil
+        #expect(gap.collapsed, "the collapse was local and immediate")
+        #expect(gap.outlinePromotion == nil, "the outline had not applied the promotion")
+        #expect(!gap.rowsAtCollapse.contains("311"), "ld hidden locally")
+        #expect(gap.rendered == observed && gap.promotion > observed, "the store was ahead of the outline")
+        // A later round trip: once the server holds the new PID text it has processed the
+        // collapse and the client's expand report, which the client sent before it.
+        type("1")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "every report processed") {
+            applier.store.getNode(NodeId(Self.pidInputID))?.getProperty(.value) == .string("1")
+        }
+        let disclosure = transport.events.filter {
+            $0.eventType == .EVENT_EXPANSION_CHANGED && $0.nodeId == NodeId(Self.treeID)
+        }
+        let collapse = try #require(disclosure.first { $0.arguments[.VALUE] == .bool(false) })
+        #expect(collapse.arguments[.ITEMS] == .list([.itemID(make)]))
+        #expect(collapse.observedRevision == observed, "stamped with what the outline showed, before the promotion")
+        let reveal = try #require(disclosure.first { $0.arguments[.VALUE] == .bool(true) })
+        #expect(reveal.arguments[.ITEMS] == .list([.itemID(make)]))
+        #expect(reveal.observedRevision == gap.promotion, "the render's own expand report describes the promotion")
+        #expect(disclosure.allSatisfy { $0.observedRevision <= applier.lastAppliedRevision })
+        #expect(inspector.stringValue.hasPrefix("Selected process: PID 311 · ld"), "\(inspector.stringValue)")
+        #expect(outline.selectedRowIndexes == IndexSet(integer: try #require(pids().firstIndex(of: "311"))))
+        print("PX-018-G02 native SSH evidence: window \(window.windowNumber); observed=\(observed); promotion=\(gap.promotion); renderedAtCollapse=\(gap.rendered); disclosure=\(disclosure.map { "\($0.arguments[.VALUE].map(String.init(describing:)) ?? "?")@\($0.observedRevision)" }); revision=\(applier.lastAppliedRevision.value); rows=\(pids()); inspector=\(inspector.stringValue)")
+        await controller.stop()
+    }
+
+    /// PX-018, Codex review round 4: disclosure is each client's own. The first client selects and
+    /// follows `cc`, then collapses its parent `make`, which hides it there. A second client that
+    /// attaches to the same running srtop starts with every item expanded and inherits nothing of
+    /// that collapse; selecting `ld`, a child of `make` it shows, is its own selection: the
+    /// inspector describes it and follow retargets to it, in the tree and not hidden.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func aFreshClientDoesNotInheritAnotherClientsCollapsedParent() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-tree", "--refresh-interval-ms", "300000"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the first client with its view switch") {
+            applier.lastAppliedRevision.value >= 1
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(Self.treeID)) != nil
+                && renderer.registry.handle(for: NodeId(Self.viewToggleID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        SurfacePresentation.forHostApplication().present(window)
+        window.contentView?.layoutSubtreeIfNeeded()
+        renderer.layoutRenderer.shortcutRouter.isWindowKey = { $0 === window }
+        /// One client's tree: its outline, its adapter, and the shared status lines it shows.
+        @MainActor
+        struct Client {
+            let applier: TransactionApplier
+            let outline: NSOutlineView
+            let adapter: OutlineCollectionAdapter
+            let inspector: NSTextField
+            let follow: NSTextField
+            func pids() -> [String] {
+                (0..<outline.numberOfRows).map { row in
+                    (outline.view(atColumn: 0, row: row, makeIfNecessary: true)
+                        as? OutlineCollectionAdapter.TreeCellView)?.label.stringValue ?? ""
+                }
+            }
+            func row(_ pid: String) throws -> Int { try #require(pids().firstIndex(of: pid), "PID \(pid) is shown") }
+            func item(_ pid: String) throws -> ItemId {
+                let model = try #require(applier.store.getModel(ModelId(2)))
+                return try #require(model.getItemByIndex(adapter.modelIndex(forRow: try row(pid)))).itemID
+            }
+        }
+        func client(_ renderer: AppKitRenderer, _ applier: TransactionApplier) throws -> Client {
+            let tree = try #require(renderer.registry.handle(for: NodeId(Self.treeID)))
+            return Client(
+                applier: applier,
+                outline: try #require((tree.view as? NSScrollView)?.documentView as? NSOutlineView),
+                adapter: try #require(tree.modelAdapter as? OutlineCollectionAdapter),
+                inspector: try #require(renderer.registry.handle(for: NodeId(Self.inspectorLineIDs[0]))?.view as? NSTextField),
+                follow: try #require(renderer.registry.handle(for: NodeId(Self.followStatusID))?.view as? NSTextField))
+        }
+        let first = try client(renderer, applier)
+        let treeKey = try Self.keyEvent("t", [.command], keyCode: 17, in: window)
+        let followKey = try Self.keyEvent("f", [.command, .shift], keyCode: 3, in: window)
+        let viewToggle = try #require(renderer.registry.handle(for: NodeId(Self.viewToggleID))?.view as? NSButton)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the switch enabled") { viewToggle.isEnabled }
+        #expect(window.performKeyEquivalent(with: treeKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the first client's tree") {
+            first.outline.numberOfRows == 12
+        }
+        first.outline.selectRowIndexes(IndexSet(integer: try first.row("310")), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on cc") {
+            first.inspector.stringValue.hasPrefix("Selected process: PID 310 · cc")
+        }
+        #expect(window.performKeyEquivalent(with: followKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "following cc in the tree") {
+            first.follow.stringValue.hasPrefix("Following PID 310 · cc · item 5 of 12 in the tree")
+        }
+        // The first client collapses `make`: `cc` is hidden there, so its selection is gone.
+        let make = try first.item("300")
+        #expect(first.adapter.setExpanded(false, itemID: make, outlineView: first.outline))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the server told of the collapse") {
+            first.inspector.stringValue == "Selected process: none · select a row to inspect it"
+                && first.follow.stringValue.hasPrefix("Following PID 310 · cc · hidden under collapsed PID 300 · make")
+        }
+
+        // A second client attaches to the same srtop: every item is expanded there.
+        let (secondController, secondApplier, secondRenderer) =
+            Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await secondController.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "a second client's tree") {
+            secondController.isEventDispatchEnabled
+                && secondRenderer.registry.handle(for: NodeId(Self.treeID)) != nil
+                && secondApplier.lastAppliedRevision == applier.lastAppliedRevision
+                && ((secondRenderer.registry.handle(for: NodeId(Self.treeID))?.view as? NSScrollView)?
+                    .documentView as? NSOutlineView)?.numberOfRows == 12
+        }
+        let secondWindow = try #require(secondRenderer.registry.handle(for: NodeId(1))?.window)
+        defer { secondWindow.orderOut(nil); secondWindow.close() }
+        SurfacePresentation.forHostApplication().present(secondWindow)
+        secondWindow.contentView?.layoutSubtreeIfNeeded()
+        let second = try client(secondRenderer, secondApplier)
+        #expect(second.adapter.isExpanded(make) && second.adapter.collapsedItemIDs.isEmpty, "nothing inherited")
+        #expect(second.pids() == ["1", "100", "200", "300", "310", "311", "301", "700", "500", "600", "800", "801"])
+        #expect(first.pids().count == 10, "still collapsed on the first client")
+        // Selecting `ld`, which it shows, is the second client's selection.
+        second.outline.selectRowIndexes(IndexSet(integer: try second.row("311")), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the second client's selection described") {
+            second.inspector.stringValue.hasPrefix("Selected process: PID 311 · ld")
+                && second.follow.stringValue.hasPrefix("Following PID 311 · ld · item 6 of 12 in the tree")
+                && first.follow.stringValue.hasPrefix("Following PID 311 · ld · item 6 of 12 in the tree")
+        }
+        #expect(!second.follow.stringValue.contains("hidden"))
+        #expect(second.outline.selectedRowIndexes == IndexSet(integer: try second.row("311")))
+        print("PX-018 Codex round 4 native SSH evidence: first window \(window.windowNumber) rows=\(first.pids()); second window \(secondWindow.windowNumber) rows=\(second.pids()); inspector=\(second.inspector.stringValue); follow=\(second.follow.stringValue); revision=\(secondApplier.lastAppliedRevision.value)")
+        await secondController.stop()
         await controller.stop()
     }
 
@@ -3115,6 +3505,57 @@ private final class PublishedStateRecorder {
         guard states.last != observation else { return }
         states.append(observation)
         stamps.append(start.duration(to: clock.now))
+    }
+}
+
+/// PX-018-G02: what the main actor saw when the collapse was made inside a promotion's
+/// publish-to-render gap.
+@MainActor
+fileprivate final class GoToPIDRenderGap {
+    var fired = false
+    var promotion = Revision.initial
+    var rendered = Revision.initial
+    var outlinePromotion: ItemId?
+    var collapsed = false
+    var rowsAtCollapse: [String] = []
+}
+
+/// PX-018-G02: a pass-through transport that also decodes every `Event` the client sends, so a
+/// test can read the `observed_revision` it was stamped with. Inbound chunks and their
+/// acknowledgements are forwarded unchanged, so flow control stays the inner transport's own.
+fileprivate final class OutboundEventRecorder: Transport, @unchecked Sendable {
+    private let inner: any Transport
+    private let lock = NSLock()
+    private var recorded: [Event] = []
+
+    init(inner: any Transport) {
+        self.inner = inner
+    }
+
+    var events: [Event] {
+        lock.withLock { recorded }
+    }
+
+    func send(data: Data, logicalClass: LogicalChannelClass) async throws {
+        try await inner.send(data: data, logicalClass: logicalClass)
+        guard let message = try? decodeFramedMessage(from: data),
+              case .event(let wire) = message.msg,
+              let event = try? ProtocolDecoder().validateAndConvertEvent(wire: wire) else {
+            return
+        }
+        lock.withLock { recorded.append(event) }
+    }
+
+    func receiveStream() -> AsyncThrowingStream<Data, Error> {
+        inner.receiveStream()
+    }
+
+    func close() async {
+        await inner.close()
+    }
+
+    func acknowledgeReceived(byteCount: Int) async {
+        await inner.acknowledgeReceived(byteCount: byteCount)
     }
 }
 

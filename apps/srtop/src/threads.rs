@@ -33,6 +33,7 @@
 
 use crate::projection::Row;
 use crate::source::{Observed, ProcessKey, TaskKind, ThreadScan};
+use srui_sdk::ItemId;
 use std::collections::{HashMap, HashSet};
 
 /// The user-thread checkbox's label.
@@ -159,8 +160,14 @@ pub(crate) fn kept_with_processes(rows: &[Row], keeps: impl Fn(&Row) -> bool) ->
 /// in `rows` is dropped: a thread is never shown without its process. Returns
 /// the rows and how many were dropped.
 pub(crate) fn group(rows: Vec<Row>) -> (Vec<Row>, usize) {
+    let (grouped, dropped) = group_dropping(rows);
+    (grouped, dropped.len())
+}
+
+/// [`group`], returning the item IDs of the thread rows it dropped.
+pub(crate) fn group_dropping(rows: Vec<Row>) -> (Vec<Row>, Vec<ItemId>) {
     if !rows.iter().any(|row| row.key.is_thread()) {
-        return (rows, 0);
+        return (rows, Vec::new());
     }
     let mut threads: HashMap<ProcessKey, Vec<Row>> = HashMap::new();
     let mut processes = Vec::with_capacity(rows.len());
@@ -178,7 +185,11 @@ pub(crate) fn group(rows: Vec<Row>) -> (Vec<Row>, usize) {
         grouped.push(process);
         grouped.extend(own.into_iter().flatten());
     }
-    let dropped = threads.values().map(Vec::len).sum();
+    let dropped = threads
+        .into_values()
+        .flatten()
+        .map(|row| row.item_id)
+        .collect();
     (grouped, dropped)
 }
 

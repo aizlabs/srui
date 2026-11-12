@@ -21,7 +21,7 @@
 use srui_process_explorer::catalogue::ProcessField;
 use srui_process_explorer::inspector::DetailRead;
 use srui_process_explorer::procfs::ProcFsSource;
-use srui_process_explorer::refresh::{lock_view, ProcessView, SharedView};
+use srui_process_explorer::refresh::{lock_view, ProcessView, Refreshed, SharedView};
 use srui_process_explorer::source::*;
 use srui_process_explorer::summary::PROCESSES_TEXT;
 use srui_process_explorer::{
@@ -2067,7 +2067,7 @@ fn a_selected_thread_a_sample_hides_under_a_collapsed_parent_clears_the_inspecto
         .starts_with("Selected thread: TID 21 of PID 20 · p-worker"));
     let q = h.item("10");
     h.disclose(q, false);
-    assert!(h.view().collapsed().contains(&q));
+    assert!(h.view().collapsed_by(CLIENT).contains(&q));
     assert!(
         h.text(INSPECTOR_STATUS)
             .starts_with("Selected thread: TID 21"),
@@ -2094,7 +2094,7 @@ fn a_selected_thread_a_sample_hides_under_a_collapsed_parent_clears_the_inspecto
         srui_process_explorer::inspector::NO_SELECTION_STATUS
     );
     assert!(
-        h.view().collapsed().contains(&q),
+        h.view().collapsed_by(CLIENT).contains(&q),
         "the client keeps q collapsed"
     );
     // Collapsing the thread's own process hides it too, and expanding both
@@ -2124,7 +2124,12 @@ fn a_search_that_matches_a_hidden_thread_opens_its_process_and_ancestors() {
     h.view().set_search(&h.session, "p-worker").unwrap();
     h.sync();
     assert_eq!(h.view().promoted_selection(), Some(worker));
-    let collapsed: BTreeSet<u64> = h.view().collapsed().iter().map(|item| item.get()).collect();
+    let collapsed: BTreeSet<u64> = h
+        .view()
+        .collapsed_by(CLIENT)
+        .iter()
+        .map(|item| item.get())
+        .collect();
     assert_eq!(
         collapsed,
         BTreeSet::from([q.get()]),
@@ -2133,4 +2138,663 @@ fn a_search_that_matches_a_hidden_thread_opens_its_process_and_ancestors() {
     assert!(h
         .text(INSPECTOR_STATUS)
         .starts_with("Selected thread: TID 21 of PID 20 · p-worker"));
+}
+
+/// One fixed snapshot, published on every sample.
+struct Fixed(ProcessSnapshot);
+
+impl ProcessSource for Fixed {
+    fn status_text(&self) -> &str {
+        THREADS_STATUS_TEXT
+    }
+
+    fn snapshot(&mut self) -> ProcessSnapshot {
+        self.0.clone()
+    }
+}
+
+/// Merge with main (PX-013 review round, on PX-019): a selected thread row
+/// that retention drops unconfirmed under the row ceiling is not shown and
+/// never called ended, and a later scan ends it only when it is entitled to
+/// account for that thread. A scan that read no threads, or could not read
+/// that process's threads, is not; one that read them and did not list it is.
+#[test]
+fn an_evicted_thread_is_ended_only_by_a_scan_that_could_read_its_threads() {
+    let mut source = ThreadsSource::default();
+    let mut h = harness_with(&mut source, |view| view.with_published_limit(8));
+    h.toggle(USER_THREADS_TOGGLE, true);
+    h.sample(&mut source);
+    assert_eq!(h.pids().len(), 8);
+    h.select(TABLE, h.item(SERVER_THREADS[2]));
+    let head = "Selected thread: TID 202 of PID 200 · worker-2";
+    assert_eq!(
+        h.text(INSPECTOR_STATUS),
+        format!("{head} · this source provides no details")
+    );
+    // PX-021 (merge with main): the inspector shows the thread's
+    // last-observed record, `no longer observed`, never exited, until a scan
+    // entitled to account for it establishes the exit.
+    let not_shown = format!(
+        "{head} · no longer observed: kept while scans could not account for it, then left out at the row limit; whether it exited is unknown · last observed "
+    );
+
+    // A process the scan confirms takes the eighth place; `server` and its
+    // threads are retained unconfirmed, and the ceiling drops the last of them.
+    let mut newcomer = ThreadsSource::records(0)[4].clone();
+    newcomer.key.pid = Observed::Known(400);
+    newcomer.key.creation = CreationToken::Opaque("newcomer-400".into());
+    newcomer.display_name = DisplayName::from("newcomer");
+    let with_newcomer = |mut records: Vec<ProcessRecord>| {
+        records.push(newcomer.clone());
+        records
+    };
+    let mut without_server = threads_snapshot(
+        with_newcomer(
+            ThreadsSource::records(0)
+                .into_iter()
+                .filter(|record| record.key.pid != Observed::Known(200))
+                .collect(),
+        ),
+        {
+            let mut threads = ThreadsSource::threads(0);
+            threads.records.clear();
+            threads
+        },
+    );
+    without_server.completeness = Completeness::from_scan(
+        SkippedRecords::unenumerable(),
+        vec![EnumerationIssue {
+            scope: IssueScope::Entry,
+            reason: MissingReason::Denied,
+            detail: "scripted unreadable entry".into(),
+        }],
+    );
+    h.sample(&mut Fixed(without_server));
+    assert!(!h.pids().iter().any(|pid| pid == SERVER_THREADS[2]));
+    assert!(
+        h.text(INSPECTOR_STATUS).starts_with(&not_shown),
+        "{}",
+        h.text(INSPECTOR_STATUS)
+    );
+
+    // A scan that read no threads says nothing about any thread.
+    let mut no_threads = threads_snapshot(
+        with_newcomer(ThreadsSource::records(0)),
+        ThreadsSource::threads(0),
+    );
+    no_threads.threads = ThreadScan::NotRequested;
+    h.sample(&mut Fixed(no_threads));
+    assert!(h.pids().iter().all(|pid| !pid.contains("thread")));
+    assert!(
+        h.text(INSPECTOR_STATUS).starts_with(&not_shown),
+        "{}",
+        h.text(INSPECTOR_STATUS)
+    );
+
+    // Neither does one that could not read `server`'s threads.
+    let mut unreadable = ThreadsSource::threads(0);
+    unreadable.records.clear();
+    unreadable.unreadable.record(200);
+    unreadable.denied = 2;
+    h.sample(&mut Fixed(threads_snapshot(
+        with_newcomer(ThreadsSource::records(0)),
+        unreadable,
+    )));
+    assert!(
+        h.text(INSPECTOR_STATUS).starts_with(&not_shown),
+        "{}",
+        h.text(INSPECTOR_STATUS)
+    );
+
+    // One that read them and no longer lists TID 202's instance ends it.
+    h.sample(&mut Fixed(threads_snapshot(
+        with_newcomer(ThreadsSource::records(0)),
+        ThreadsSource::threads(ThreadsSource::CHURN_STEP),
+    )));
+    assert!(
+        h.text(INSPECTOR_STATUS).starts_with(&format!(
+            "{head} · exited: its TID now names a newer thread · last observed "
+        )),
+        "{}",
+        h.text(INSPECTOR_STATUS)
+    );
+}
+
+/// `ThreadsSource`'s step-0 records with one more confirmed process, PID 400.
+fn records_with_newcomer(keep: impl Fn(&ProcessRecord) -> bool) -> Vec<ProcessRecord> {
+    let mut newcomer = ThreadsSource::records(0)[4].clone();
+    newcomer.key.pid = Observed::Known(400);
+    newcomer.key.creation = CreationToken::Opaque("newcomer-400".into());
+    newcomer.display_name = DisplayName::from("newcomer");
+    let mut records: Vec<ProcessRecord> = ThreadsSource::records(0)
+        .into_iter()
+        .filter(|record| keep(record))
+        .collect();
+    records.push(newcomer);
+    records
+}
+
+fn is_server(record: &ProcessRecord) -> bool {
+    record.key.pid == Observed::Known(200)
+}
+
+/// A scan that read threads but not PID 200's record, under `skipped`.
+fn server_record_unread(skipped: SkippedRecords) -> ProcessSnapshot {
+    let mut threads = ThreadsSource::threads(0);
+    threads.records.retain(|record| !is_server(record));
+    let mut snapshot =
+        threads_snapshot(records_with_newcomer(|record| !is_server(record)), threads);
+    snapshot.completeness = Completeness::from_scan(
+        skipped,
+        vec![EnumerationIssue {
+            scope: IssueScope::Entry,
+            reason: MissingReason::Denied,
+            detail: "scripted unreadable entry".into(),
+        }],
+    );
+    snapshot
+}
+
+const EVICTED_HEAD: &str = "Selected thread: TID 202 of PID 200 · worker-2";
+
+/// The start of the inspector's status for the evicted thread's
+/// last-observed record (PX-021): no longer observed, never exited.
+fn evicted_not_shown() -> String {
+    format!("{EVICTED_HEAD} · no longer observed: kept while scans could not account for it, then left out at the row limit; whether it exited is unknown · last observed ")
+}
+
+/// The start of that status once a later scan established the exit.
+fn evicted_ended() -> String {
+    format!("{EVICTED_HEAD} · exited: ")
+}
+
+/// Asserts the inspector's status starts with `expected`.
+fn assert_status_starts(h: &Harness, expected: &str, case: &str) {
+    let status = h.text(INSPECTOR_STATUS);
+    assert!(status.starts_with(expected), "{case}: {status}");
+}
+
+/// TID 202 of `server` selected, then dropped unconfirmed under the row
+/// ceiling by a scan that could not read `server`'s record.
+fn evicted_thread() -> Harness {
+    let mut source = ThreadsSource::default();
+    let mut h = harness_with(&mut source, |view| view.with_published_limit(8));
+    h.toggle(USER_THREADS_TOGGLE, true);
+    h.sample(&mut source);
+    h.select(TABLE, h.item(SERVER_THREADS[2]));
+    h.sample(&mut Fixed(server_record_unread(
+        SkippedRecords::unenumerable(),
+    )));
+    assert_status_starts(&h, &evicted_not_shown(), "evicted");
+    h
+}
+
+/// Merge verification F1: an evicted thread whose process record a scan
+/// that read threads could not read is not ended. Neither a scan that cannot
+/// enumerate what it missed nor one that names PID 200 accounts for it; a
+/// complete one does.
+#[test]
+fn an_evicted_thread_is_not_ended_by_a_scan_that_could_not_read_its_process() {
+    let mut h = evicted_thread();
+    h.sample(&mut Fixed(server_record_unread(
+        SkippedRecords::unenumerable(),
+    )));
+    assert_status_starts(&h, &evicted_not_shown(), "unenumerable");
+    let mut named = SkippedRecords::with_limit(8);
+    named.record(200);
+    h.sample(&mut Fixed(server_record_unread(named)));
+    assert_status_starts(&h, &evicted_not_shown(), "PID 200 named");
+    h.sample(&mut Fixed(server_record_unread(SkippedRecords::none())));
+    assert_status_starts(
+        &h,
+        &format!("{}its process exited", evicted_ended()),
+        "complete",
+    );
+}
+
+/// Merge verification F2: the thread retention protects an evicted thread
+/// only beside its own process instance. A complete scan that no longer
+/// lists `server` ends it even though it read no threads, and so does one
+/// whose PID 200 is a new instance with unreadable threads.
+#[test]
+fn an_evicted_thread_of_an_ended_process_instance_is_ended() {
+    let mut h = evicted_thread();
+    let mut gone = threads_snapshot(
+        records_with_newcomer(|record| !is_server(record)),
+        ThreadsSource::threads(0),
+    );
+    gone.threads = ThreadScan::NotRequested;
+    h.sample(&mut Fixed(gone));
+    assert_status_starts(
+        &h,
+        &format!("{}its process exited", evicted_ended()),
+        "no threads read",
+    );
+
+    let mut h = evicted_thread();
+    let records = records_with_newcomer(|_| true)
+        .into_iter()
+        .map(|mut record| {
+            if is_server(&record) {
+                record.key.creation = CreationToken::Opaque("server-200-reused".into());
+            }
+            record
+        })
+        .collect();
+    let mut unreadable = ThreadsSource::threads(0);
+    unreadable.records.clear();
+    unreadable.unreadable.record(200);
+    unreadable.denied = 2;
+    h.sample(&mut Fixed(threads_snapshot(records, unreadable)));
+    assert_status_starts(
+        &h,
+        &format!("{}its process exited", evicted_ended()),
+        "PID 200 reused",
+    );
+}
+
+/// Merge verification F3: a sample taken while user threads were hidden
+/// that returns after they are shown again, and a thread selected, is
+/// discarded: it would drop every thread row and call a live thread ended.
+/// A sample under the current setting is applied, and the thread keeps its
+/// row and item ID.
+#[test]
+fn a_sample_taken_under_the_other_thread_setting_is_discarded() {
+    let mut source = ThreadsSource::default();
+    let mut h = harness(&mut source);
+    h.toggle(USER_THREADS_TOGGLE, true);
+    h.sample(&mut source);
+    let full = || threads_snapshot(ThreadsSource::records(0), ThreadsSource::threads(0));
+    h.toggle(USER_THREADS_TOGGLE, false);
+    let hidden = h.view().sampling().epoch();
+    h.toggle(USER_THREADS_TOGGLE, true);
+    let shown = h.view().sampling().epoch();
+    assert_ne!(hidden, shown);
+    // The view republished the thread rows it holds; select one.
+    let worker = h.item(SERVER_THREADS[1]);
+    h.select(TABLE, worker);
+    let selected = h.text(INSPECTOR_STATUS);
+    assert!(
+        selected.starts_with("Selected thread: TID 201 of PID 200"),
+        "{selected}"
+    );
+    let discarded = h.view().sampling().discarded();
+    let mut stale = full();
+    stale.threads = ThreadScan::NotRequested;
+    let refreshed = h
+        .view()
+        .apply_sampled(&h.session, hidden, THREADS_STATUS_TEXT, &stale)
+        .unwrap();
+    h.sync();
+    assert_eq!(refreshed, Refreshed::default(), "nothing published");
+    assert_eq!(h.view().sampling().discarded(), discarded + 1);
+    assert_eq!(h.item(SERVER_THREADS[1]), worker);
+    assert_eq!(h.text(INSPECTOR_STATUS), selected);
+    // A sample under the current setting lands, and keeps the thread's row.
+    h.view()
+        .apply_sampled(&h.session, shown, THREADS_STATUS_TEXT, &full())
+        .unwrap();
+    h.sync();
+    assert_eq!(h.item(SERVER_THREADS[1]), worker);
+    assert!(
+        !h.text(INSPECTOR_STATUS).contains("has ended"),
+        "{}",
+        h.text(INSPECTOR_STATUS)
+    );
+}
+
+// ---- the refresh loop and the user-thread setting (merge verification N1, N2)
+
+/// A gate a scan waits at while it is closed.
+#[derive(Clone, Default)]
+struct Gate(Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+impl Gate {
+    fn close(&self) {
+        *self.0 .0.lock().unwrap() = true;
+    }
+
+    fn open(&self) {
+        *self.0 .0.lock().unwrap() = false;
+        self.0 .1.notify_all();
+    }
+
+    fn pass(&self) {
+        let (closed, changed) = &*self.0;
+        let mut closed = closed.lock().unwrap();
+        while *closed {
+            closed = changed.wait(closed).unwrap();
+        }
+    }
+}
+
+/// Opens the gate when dropped, so a failing test never leaves the loop's
+/// scan held, which would wedge the runtime's shutdown.
+struct OpenOnDrop(Gate);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+/// `ThreadsSource`'s step-0 sample plus one process, PID `1000 + n`, where
+/// `n` counts this source's scans, so the published rows say which scan was
+/// applied last. Reports `(n, threads asked)` as each scan starts, then
+/// waits at the gate.
+struct Held {
+    asked: bool,
+    scans: u32,
+    entered: std::sync::mpsc::Sender<(u32, bool)>,
+    gate: Gate,
+}
+
+impl ProcessSource for Held {
+    fn status_text(&self) -> &str {
+        THREADS_STATUS_TEXT
+    }
+
+    fn collect_threads(&mut self, on: bool) {
+        self.asked = on;
+    }
+
+    fn snapshot(&mut self) -> ProcessSnapshot {
+        let n = self.scans;
+        self.scans += 1;
+        let _ = self.entered.send((n, self.asked));
+        self.gate.pass();
+        let mut marker = ThreadsSource::records(0)[4].clone();
+        marker.key.pid = Observed::Known(1000 + n);
+        marker.key.creation = CreationToken::Opaque(format!("marker-{n}"));
+        marker.display_name = DisplayName::from("marker");
+        let mut records = ThreadsSource::records(0);
+        records.push(marker);
+        let mut snapshot = threads_snapshot(records, ThreadsSource::threads(0));
+        if !self.asked {
+            snapshot.threads = ThreadScan::NotRequested;
+        }
+        snapshot
+    }
+}
+
+const LOOP_WAIT: Duration = Duration::from_secs(10);
+
+/// The refresh loop over a [`Held`] source with a 300 s interval, so no tick
+/// samples during a test; user threads shown, and that request's own
+/// sample (scan 0) taken and published.
+async fn held_loop() -> (
+    Harness,
+    std::sync::mpsc::Receiver<(u32, bool)>,
+    Gate,
+    tokio_util::sync::CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
+    let mut source = ThreadsSource::default();
+    let mut h = harness(&mut source);
+    h.toggle(USER_THREADS_TOGGLE, true);
+    let (entered, scans) = std::sync::mpsc::channel();
+    let gate = Gate::default();
+    let held = Held {
+        asked: false,
+        scans: 0,
+        entered,
+        gate: gate.clone(),
+    };
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let polling = tokio::spawn(srui_process_explorer::refresh::poll(
+        Arc::clone(&h.view),
+        held,
+        Arc::clone(&h.session),
+        Duration::from_secs(300),
+        shutdown.clone(),
+    ));
+    assert_eq!(scans.recv_timeout(LOOP_WAIT).unwrap(), (0, true));
+    published(&mut h, "1000").await;
+    (h, scans, gate, shutdown, polling)
+}
+
+/// Waits until the table shows `pid`.
+async fn published(h: &mut Harness, pid: &str) {
+    let deadline = std::time::Instant::now() + LOOP_WAIT;
+    loop {
+        h.sync();
+        if h.pids().iter().any(|shown| shown == pid) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{pid} never published: {:?}",
+            h.pids()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// N1: hiding user threads while Resume view's own sample is being taken
+/// retires that sample, which was taken with threads, and takes another at
+/// once, without them: the resume is completed, not left saying "sampling
+/// now" for a whole interval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hiding_user_threads_during_resume_views_sample_takes_another_at_once() {
+    let (mut h, scans, gate, shutdown, polling) = held_loop().await;
+    let _open = OpenOnDrop(gate.clone());
+    lock_view(&h.view).pause_view(&h.session).unwrap();
+    gate.close();
+    lock_view(&h.view).resume_view(&h.session).unwrap();
+    assert_eq!(scans.recv_timeout(LOOP_WAIT).unwrap(), (1, true));
+    assert!(h
+        .view()
+        .sampling()
+        .status()
+        .starts_with("Resuming · sampling now"));
+    let discarded = h.view().sampling().discarded();
+    h.toggle(USER_THREADS_TOGGLE, false);
+    gate.open();
+    assert_eq!(
+        scans.recv_timeout(LOOP_WAIT).unwrap(),
+        (2, false),
+        "a new sample at once, without threads"
+    );
+    published(&mut h, "1002").await;
+    assert!(!h.pids().iter().any(|pid| pid == "1001"), "{:?}", h.pids());
+    assert!(h.pids().iter().all(|pid| !pid.contains("thread")));
+    assert_eq!(h.view().sampling().discarded(), discarded + 1);
+    let status = h.view().sampling().status();
+    assert!(status.starts_with("Live · sampling every"), "{status}");
+    shutdown.cancel();
+    tokio::time::timeout(LOOP_WAIT, polling)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// N1: the same for a Refresh now press: the sample it asked for is
+/// replaced, never silently lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hiding_user_threads_during_a_refresh_now_sample_takes_another_at_once() {
+    let (mut h, scans, gate, shutdown, polling) = held_loop().await;
+    let _open = OpenOnDrop(gate.clone());
+    gate.close();
+    assert!(lock_view(&h.view).refresh_now());
+    assert_eq!(scans.recv_timeout(LOOP_WAIT).unwrap(), (1, true));
+    let discarded = h.view().sampling().discarded();
+    h.toggle(USER_THREADS_TOGGLE, false);
+    gate.open();
+    assert_eq!(
+        scans.recv_timeout(LOOP_WAIT).unwrap(),
+        (2, false),
+        "a new sample at once, without threads"
+    );
+    published(&mut h, "1002").await;
+    assert!(!h.pids().iter().any(|pid| pid == "1001"), "{:?}", h.pids());
+    assert_eq!(h.view().sampling().discarded(), discarded + 1);
+    shutdown.cancel();
+    tokio::time::timeout(LOOP_WAIT, polling)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// N2: only a real change of "Show user threads" advances the sampling
+/// epoch, once per change, live or paused; a request that changes nothing
+/// (the same value, or no boolean) and the kernel-thread checkbox never do.
+#[test]
+fn only_a_real_user_thread_change_advances_the_sampling_epoch() {
+    let mut source = ThreadsSource::default();
+    let h = harness(&mut source);
+    let epoch = || h.view().sampling().epoch();
+    let start = epoch();
+    let mut on = false;
+    for change in 1..=6u64 {
+        on = !on;
+        h.view().set_user_threads(&h.session, Some(on)).unwrap();
+        assert_eq!(epoch(), start + change, "change {change}");
+        h.view().set_user_threads(&h.session, Some(on)).unwrap();
+        h.view().set_user_threads(&h.session, None).unwrap();
+        h.view()
+            .set_kernel_threads(&h.session, Some(false))
+            .unwrap();
+        h.view().set_kernel_threads(&h.session, Some(true)).unwrap();
+        h.view().set_kernel_threads(&h.session, None).unwrap();
+        assert_eq!(
+            epoch(),
+            start + change,
+            "no-op requests after change {change}"
+        );
+    }
+    // Paused: a real change still retires a sample in flight; pause and
+    // resume advance it once each, as since PX-015.
+    h.view().pause_view(&h.session).unwrap();
+    assert_eq!(epoch(), start + 7);
+    h.view().set_user_threads(&h.session, Some(!on)).unwrap();
+    h.view().set_user_threads(&h.session, Some(!on)).unwrap();
+    h.view()
+        .set_kernel_threads(&h.session, Some(false))
+        .unwrap();
+    assert_eq!(epoch(), start + 8);
+    h.view().resume_view(&h.session).unwrap();
+    assert_eq!(epoch(), start + 9);
+}
+
+// ---- Codex review round (PR #103) ----------------------------------------
+
+/// Thread `PRRT_kwDOUG_6uM62WAQG`: a scan that reads a new thread under a
+/// reused TID while another thread of the same process is unreadable keeps
+/// the unreadable thread's row, but never the replaced instance beside its
+/// successor: it read that TID, so the earlier instance has ended.
+#[test]
+fn a_reused_tid_beside_an_unreadable_thread_keeps_only_the_new_instance() {
+    let tree = Tree::usual();
+    let mut source = ProcFsSource::with_root(&tree.0);
+    let mut h = harness(&mut source);
+    h.toggle(USER_THREADS_TOGGLE, true);
+    h.sample(&mut source);
+    let worker_1 = h.item("101 (thread of 100)");
+    let old = h.item("102 (thread of 100)");
+    tree.remove_thread(100, 102)
+        .thread(100, 102, "worker-2b", 150, 200);
+    let stat = tree.0.join("100/task/101/stat");
+    fs::set_permissions(&stat, fs::Permissions::from_mode(0o000)).unwrap();
+    h.sample(&mut source);
+    fs::set_permissions(&stat, fs::Permissions::from_mode(0o644)).unwrap();
+    // The kept row is anchored behind the rows this scan confirmed, as every
+    // retained row is (PX-004).
+    assert_eq!(
+        named(&h),
+        pairs(&[
+            ("1", "init"),
+            ("1 (thread of 1)", "init"),
+            ("2", "kthreadd"),
+            ("100", "server"),
+            ("100 (thread of 100)", "server"),
+            ("102 (thread of 100)", "worker-2b"),
+            ("101 (thread of 100)", "worker-1"),
+            ("200", "bare"),
+            ("300", "locked"),
+        ])
+    );
+    assert_eq!(h.item("101 (thread of 100)"), worker_1, "kept, unread");
+    assert_ne!(h.item("102 (thread of 100)"), old, "the new instance");
+    assert!(
+        h.text(THREADS_STATUS)
+            .starts_with("User threads: 4 thread rows under 2 processes"),
+        "{}",
+        h.text(THREADS_STATUS)
+    );
+    // The tree holds each TID once too.
+    h.toggle(VIEW_TOGGLE, true);
+    let tids: Vec<String> = h.tree().into_iter().map(|row| row.pid).collect();
+    assert_eq!(
+        tids.iter()
+            .filter(|pid| *pid == "102 (thread of 100)")
+            .count(),
+        1,
+        "{tids:?}"
+    );
+}
+
+/// The same rule for an inspector on a thread the row ceiling dropped: a
+/// scan that read its TID under a new instance ends it, even while that
+/// process's threads are otherwise unreadable.
+#[test]
+fn an_evicted_thread_whose_tid_a_new_instance_took_is_ended() {
+    let mut h = evicted_thread();
+    let mut threads = ThreadsSource::threads(ThreadsSource::CHURN_STEP);
+    threads.unreadable.record(200);
+    threads.denied = 2;
+    h.sample(&mut Fixed(threads_snapshot(
+        records_with_newcomer(|_| true),
+        threads,
+    )));
+    assert_status_starts(
+        &h,
+        &format!("{}its TID now names a newer thread", evicted_ended()),
+        "TID reused",
+    );
+}
+
+/// Thread `PRRT_kwDOUG_6uM62joAd`: thread CPU baselines taken under another
+/// boot or PID namespace are dropped with the process baselines, so a thread
+/// with the same PID, start times and TID there warms up rather than being
+/// measured against the other source's counter.
+#[test]
+fn thread_baselines_are_dropped_when_the_boot_or_pid_namespace_changes() {
+    let tree = Tree::usual();
+    let mut source = ProcFsSource::with_root(&tree.0);
+    source.collect_threads(true);
+    let measured = |snapshot: &ProcessSnapshot| -> Vec<(u32, bool)> {
+        tids(&snapshot.threads.read().unwrap().records)
+            .into_iter()
+            .zip(snapshot.threads.records())
+            .map(|((_, tid), record)| (tid, matches!(record.cpu, CpuUsage::Measured(_))))
+            .collect()
+    };
+    source.snapshot();
+    tree.thread(100, 101, "worker-1", 110, 80);
+    assert!(
+        measured(&source.snapshot()).contains(&(101, true)),
+        "same source"
+    );
+    for change in ["boot", "namespace"] {
+        match change {
+            "boot" => fs::write(tree.0.join("sys/kernel/random/boot_id"), "other-boot\n").unwrap(),
+            _ => {
+                fs::remove_file(tree.0.join("self/ns/pid")).unwrap();
+                std::os::unix::fs::symlink("pid:[4026599999]", tree.0.join("self/ns/pid")).unwrap();
+            }
+        }
+        tree.thread(100, 101, "worker-1", 110, 120);
+        let snapshot = source.snapshot();
+        assert!(
+            measured(&snapshot).iter().all(|(_, measured)| !measured),
+            "{change}: {:?}",
+            measured(&snapshot)
+        );
+        // The next scan of the same source measures again.
+        tree.thread(100, 101, "worker-1", 110, 150);
+        assert!(
+            measured(&source.snapshot()).contains(&(101, true)),
+            "{change}"
+        );
+    }
 }

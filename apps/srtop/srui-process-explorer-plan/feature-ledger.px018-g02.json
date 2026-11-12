@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-018-G02",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Generic macOS client: a List/Table/Tree SELECTION_CHANGED (item and cleared forms) and a Tree EXPANSION_CHANGED carry the revision the native tree showed when the event was made, not the applier's published snapshot (§4 inv. 13, §6.3, §7.6, §7.7, §12.1, §12.2, §18.2, §22.5, §22.7, §32); retires the PX-018 V6-F1 limitation; no protocol, registry, proto or framing change, no server heuristic and no application-specific client path",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX018G02-001",
+      "feature": "SessionController keeps the revision the native tree shows on the main actor (nativeRenderedRevision): it moves to a commit inside the synchronous main-actor turn that mounts or applies it in updateRenderer (live commits, the catch-up or resync snapshot, a resume remount), goes back if that render throws, returns to .initial with the replica reset, and only takes revisions the applier published",
+      "scope": "PX-018-G02/client-macos Session/SessionController.swift updateRenderer, resetSharedStateForReplacement, the abandoned-session discard; SRUITests RenderedRevisionStampTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018-G02",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018-G02.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX018G02-002",
+      "feature": "enqueueNativeSemanticAction stamps observed_revision with min(rendered, published) for SELECTION_CHANGED (both forms) on a List, Table or Tree and EXPANSION_CHANGED on a Tree; ACTIVATE, VALUE_CHANGED, TEXT_EDIT and Select/ChoiceGroup/Tabs selection keep the published revision; event_seq, event IDs, outbox retention, acknowledgement and replay are unchanged and a retained event replays with its original revision",
+      "scope": "PX-018-G02/client-macos Session/SessionController.swift enqueueNativeSemanticAction, stampsRenderedRevision, renderedObservedRevision; SRUITests RenderedRevisionStampTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018-G02",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018-G02.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX018G02-003",
+      "feature": "Native SSH against srtop --fake-tree: a collapse of the Go to PID match's parent made after the store applied the promotion and before the outline rendered it carries the pre-promotion revision, the render expands the parent (its expand report carries the promotion's revision) and selects the match, and after a later round trip the inspector still describes the match; the PX-018 V6-F1 limitation is retired in the srtop README, the expansion_changed_at doc comment and the PX-018 completion note",
+      "scope": "PX-018-G02/client-macos SRUITests ProcessExplorerShellTests aCollapseBetweenTheGoToPIDCommitAndItsRenderKeepsTheInspectorOnTheMatch, OutboundEventRecorder; apps/srtop README.md, src/refresh.rs doc comment; docs/process-explorer/completions/PX-018.md",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-018-G02",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-018-G02.md"
+      ]
+    }
+  ]
+}

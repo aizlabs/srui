@@ -1,7 +1,37 @@
 use srui_semantic_tree::{
     resolve_standard_event, ClientInstanceId, EditSeq, Event, EventId, EventValidationError,
-    ItemId, NodeId, PropertyRef, Revision, SemanticStore, Size, TypeRef, Value,
+    ItemId, NodeId, PropertyRef, Revision, SelectionChange, SemanticStore, Size, TypeRef, Value,
 };
+
+/// A malformed `SELECTION_CHANGED` is never read as a clear, and no other event type is a
+/// selection change (§7.6; `spec/registries.md` §4.4).
+#[test]
+fn selection_change_tells_an_item_a_clear_and_a_malformed_value_apart() {
+    let malformed = [
+        Value::UnsignedInt(500),
+        Value::String("500".to_string()),
+        Value::List(vec![Value::ItemId(ItemId::new(500))]),
+    ];
+    for value in malformed {
+        let event =
+            Event::selection_cleared(1, "sel", 1, 2).with_argument(PropertyRef::VALUE, value);
+        assert_eq!(event.selection_change(), None, "{event}");
+    }
+    // An unrelated argument does not turn a clear into anything else.
+    let labelled = Event::selection_cleared(1, "sel", 1, 2)
+        .with_argument(PropertyRef::LABEL, Value::String("x".to_string()));
+    assert_eq!(labelled.selection_change(), Some(SelectionChange::Cleared));
+
+    assert_eq!(Event::activate(1, "act", 1, 2).selection_change(), None);
+    assert_eq!(
+        Event::value_changed(1, "val", 1, 2, ItemId::new(5)).selection_change(),
+        None
+    );
+    assert_eq!(
+        Event::expansion_changed(1, "exp", 1, 2, 5u64, false).selection_change(),
+        None
+    );
+}
 
 #[test]
 fn test_event_construction_and_getters() {
@@ -64,6 +94,17 @@ fn test_standard_event_factories() {
     let sel_event = Event::selection_changed(4, "sel-1", 10, 103, ItemId::new(500));
     assert_eq!(sel_event.event_type, TypeRef::EVENT_SELECTION_CHANGED);
     assert_eq!(sel_event.item_id_arg(), Some(ItemId::new(500)));
+    assert_eq!(
+        sel_event.selection_change(),
+        Some(SelectionChange::Item(ItemId::new(500)))
+    );
+
+    // 3b. SELECTION_CHANGED with no value: the user left the collection with nothing selected.
+    let cleared = Event::selection_cleared(8, "sel-2", 10, 103);
+    assert_eq!(cleared.event_type, TypeRef::EVENT_SELECTION_CHANGED);
+    assert!(cleared.arguments.is_empty());
+    assert_eq!(cleared.item_id_arg(), None);
+    assert_eq!(cleared.selection_change(), Some(SelectionChange::Cleared));
 
     // 4. TEXT_EDIT
     let text_event = Event::text_edit(5, "txt-1", 10, 104, "hello world", EditSeq::new(1).unwrap());

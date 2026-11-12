@@ -475,20 +475,20 @@ pub fn install_search_handlers(session: &Session, view: &refresh::SharedView) {
         refresh::search_edited(&edited, session, event);
     });
     let previous = std::sync::Arc::clone(view);
-    session.on(SEARCH_PREVIOUS, ACTIVATE, move |session, _| {
-        refresh::search_stepped(&previous, session, search::SearchStep::Previous);
+    session.on(SEARCH_PREVIOUS, ACTIVATE, move |session, event| {
+        refresh::search_stepped(&previous, session, event, search::SearchStep::Previous);
     });
     let next = std::sync::Arc::clone(view);
-    session.on(SEARCH_NEXT, ACTIVATE, move |session, _| {
-        refresh::search_stepped(&next, session, search::SearchStep::Next);
+    session.on(SEARCH_NEXT, ACTIVATE, move |session, event| {
+        refresh::search_stepped(&next, session, event, search::SearchStep::Next);
     });
     let pid = std::sync::Arc::clone(view);
     session.on(PID_INPUT, TEXT_EDIT, move |session, event| {
         refresh::pid_edited(&pid, session, event);
     });
     let go = std::sync::Arc::clone(view);
-    session.on(PID_GO, ACTIVATE, move |session, _| {
-        refresh::pid_requested(&go, session);
+    session.on(PID_GO, ACTIVATE, move |session, event| {
+        refresh::pid_requested(&go, session, event);
     });
 }
 

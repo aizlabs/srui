@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-017-G02",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Generic report of a user-cleared List, Table or Tree selection (§4 inv. 13, §6.3, §7.6, §7.7, §8, §18.2, §22.5, §27, §32): SELECTION_CHANGED with no value, specified in spec/registries.md, with Rust and Swift constructors and reader, client plumbing, adapter emission, and adoption by ui-gallery, process-monitor and srtop; no registry, proto or framing change and no application-specific client path",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX017G02-001",
+      "feature": "SELECTION_CHANGED with no value on a List, Table or Tree means a user action left the collection with nothing selected; servers treat it as clearing the selection and never as malformed, a present non-ItemId value stays malformed, a server-caused deselection sends nothing, multiple selection stays one event per item and a partial deselection stays unreported; specified in spec/registries.md §4.2 and §4.4 with the compatibility note, registry description updated, generated outputs unchanged",
+      "scope": "PX-017-G02/spec/registries.md; protocol/registry.yaml description; protocol/conformance-vectors/suites/manifest.json gap text",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017-G02",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017-G02.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX017G02-002",
+      "feature": "Rust Event::selection_cleared and Event::selection_change returning SelectionChange::{Item, Cleared} (None for a malformed value or another event type), re-exported by srui-sdk; Swift Event.selectionCleared; the argumentless event round-trips on the wire",
+      "scope": "PX-017-G02/server-rust/semantic-tree src/event.rs, src/lib.rs, tests/event_test.rs, tests/wire_test.rs; server-rust/sdk src/lib.rs; client-macos SemanticModel/Event.swift",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017-G02",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017-G02.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX017G02-003",
+      "feature": "TableCollectionAdapter and OutlineCollectionAdapter report one cleared selection when a user deselect empties the selection; a Tree collapse that hides the selection sends only EXPANSION_CHANGED, never a clear; commits, promotions, withdrawals, pending promotions and restores stay suppressed; PX-011-G01 withdrawal unchanged; multiple selection unchanged",
+      "scope": "PX-017-G02/client-macos Collections/TableCollectionAdapter.swift, Collections/OutlineCollectionAdapter.swift, RendererAppKit/ControlFactory.swift, RendererAppKit/SemanticInteraction.swift; RendererAppKitTests CollectionAdaptersTests, HierarchicalTreeTests, WidgetSemanticsConformanceTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017-G02",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017-G02.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX017G02-004",
+      "feature": "The cleared selection travels through SessionController native dispatch, EventOutbox.sendSelectionCleared (retained, replayed unchanged on same-session resume) and the in-process automation action SemanticAction.selectionCleared / clearSelection(), refused for selection_mode none",
+      "scope": "PX-017-G02/client-macos Session/SessionController.swift, Session/EventOutbox.swift, Accessibility/Accessibility.swift; SRUITests EventOutboxTests, SessionControllerThreadingTests, SemanticInspectionAutomationTests; AccessibilityTests SemanticInspectorTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017-G02",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017-G02.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX017G02-005",
+      "feature": "ui-gallery clears its recorded collection selection on a cleared event and still rejects a non-ItemId value; process-monitor forgets only that client's selection, so Kill Selected refuses a deselected process",
+      "scope": "PX-017-G02/examples/ui-gallery src/lib.rs, tests/gallery_test.rs; examples/process-monitor src/monitor.rs, src/state.rs, src/testing.rs, tests/filtering_selection_test.rs, tests/kill_security_test.rs",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017-G02",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017-G02.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX017G02-006",
+      "feature": "srtop reads the cleared form: the inspector says the selection was cleared under a new generation and reads nothing, follow stops with that reason and clears its hint, and turning follow on afterwards is refused; verified over native SSH with deselectAll(nil) through the table delegate",
+      "scope": "PX-017-G02/apps/srtop src/inspector.rs, src/follow.rs, src/refresh.rs, README.md, tests/follow_test.rs, tests/inspector_test.rs; client-macos SRUITests ProcessExplorerShellTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-017-G02",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-017-G02.md"
+      ]
+    }
+  ]
+}

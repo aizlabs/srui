@@ -35,6 +35,9 @@
 //!   turns itself off, its hint is cleared, and the status says which and why:
 //!   `exited` only when a scan established it, `is no longer observed`
 //!   otherwise ([`crate::lastseen`], PX-021). It never moves to another row.
+//!   A user who deselects the followed row (a `SELECTION_CHANGED` with no
+//!   `value`, PX-017-G02) stops follow the same way, and turning follow on
+//!   with nothing selected is refused.
 //! - **Off.** No hint is held, and follow promotes nothing. Only an explicit
 //!   search promotes, as before (PX-011).
 
@@ -51,6 +54,10 @@ pub const FOLLOW_DESCRIPTION: &str =
 pub const OFF_STATUS: &str =
     "Follow: off · the selection stays on its process and the table stays where you scroll it";
 pub const UNCOLLECTED_FOLLOW_STATUS: &str = "Follow disabled: process collection not started";
+/// Follow stopped because the user left the table with nothing selected
+/// (PX-017-G02).
+pub const SELECTION_CLEARED_FOLLOW_STATUS: &str =
+    "Follow stopped: the selection was cleared; select a row and turn follow on again";
 /// The longest follow status, before the cut mark.
 pub const MAX_FOLLOW_STATUS_BYTES: usize = 512;
 /// The most of a process name the status quotes.
@@ -264,6 +271,14 @@ impl Follow {
         FollowView {
             checked: true,
             status: bounded(&status, MAX_FOLLOW_STATUS_BYTES),
+        }
+    }
+
+    /// The user left the table with nothing selected (PX-017-G02): follow,
+    /// if on, stops and says so. It never moves to another row.
+    pub(crate) fn cleared(&mut self) {
+        if let State::On(_) = self.state {
+            self.state = State::Stopped(SELECTION_CLEARED_FOLLOW_STATUS.into());
         }
     }
 

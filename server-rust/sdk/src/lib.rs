@@ -28,8 +28,8 @@ pub use srui_semantic_tree::{
     decode_value, encode_event, encode_message, encode_node_record, encode_operation,
     encode_transaction, encode_value, CapabilitySet, ClientInstanceId, EditSeq, EnumToken, Event,
     EventId, EventValidationError, ModelItem, ModelTreeViolation, NegotiationError, NodeRecord,
-    Profile, ResourceHash, Revision, ServerCapabilities, StoreLimits, Transaction, TxnError,
-    WireError, DEFAULT_MAX_MODEL_TREE_DEPTH,
+    Profile, ResourceHash, Revision, SelectionChange, ServerCapabilities, StoreLimits, Transaction,
+    TxnError, WireError, DEFAULT_MAX_MODEL_TREE_DEPTH,
 };
 
 // Platform-neutral keyboard shortcuts (§7.7, §22.5)
@@ -123,7 +123,8 @@ pub const DESCENDANT_COUNT: PropertyRef = PropertyRef::DESCENDANT_COUNT;
 pub const ACTIVATE: TypeRef = TypeRef::EVENT_ACTIVATE;
 /// Event type reference for value change (`VALUE_CHANGED`, §7.6).
 pub const VALUE_CHANGED: TypeRef = TypeRef::EVENT_VALUE_CHANGED;
-/// Event type reference for selection change (`SELECTION_CHANGED`, §7.6).
+/// Event type reference for selection change (`SELECTION_CHANGED`, §7.6). An event with no `value`
+/// reports a user-cleared selection; [`Event::selection_change`] tells it from a selected item.
 pub const SELECTION_CHANGED: TypeRef = TypeRef::EVENT_SELECTION_CHANGED;
 /// Event type reference for text edit (`TEXT_EDIT`, §7.6, §22.6).
 pub const TEXT_EDIT: TypeRef = TypeRef::EVENT_TEXT_EDIT;

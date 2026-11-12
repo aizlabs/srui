@@ -9,6 +9,8 @@
 // - §6.1 Core Objects: An `Event` represents a client-originated semantic user action.
 // - §7.6 Standard Events: Controls emit high-level semantic events (`ACTIVATE`, `VALUE_CHANGED`,
 //   `SELECTION_CHANGED`, `EXPANSION_CHANGED`, `TEXT_EDIT`, `VIEWPORT_CHANGED`) rather than raw pointer coordinates.
+//   `SELECTION_CHANGED` names one selected `ItemId` in `value`, or carries no `value` when a user
+//   action left the collection with nothing selected (`spec/registries.md` §4.4).
 // - §7.7 Semantic Input Routing: Events report what happened to which semantic node, carrying
 //   `eventSeq`, a retry-safe `eventId`, `observedRevision`, target `nodeId`, `eventType`, and
 //   event-specific arguments.
@@ -296,6 +298,26 @@ public struct Event: Equatable, Sendable, CustomStringConvertible {
             nodeId: nodeId,
             eventType: TypeRef.EVENT_SELECTION_CHANGED,
             arguments: [PropertyRef.VALUE: .itemID(itemId)]
+        )
+    }
+
+    /// Convenience constructor for a cleared collection selection: `SELECTION_CHANGED` with no
+    /// `value` (§7.6; `spec/registries.md` §4.4). Sent once when a user action leaves a `List`,
+    /// `Table` or `Tree` with no selected item; it means "nothing is selected now". A deselection
+    /// the server caused is never reported.
+    public static func selectionCleared(
+        eventSeq: UInt64,
+        eventId: EventId,
+        observedRevision: Revision,
+        nodeId: NodeId
+    ) -> Event {
+        Event(
+            eventSeq: eventSeq,
+            eventId: eventId,
+            observedRevision: observedRevision,
+            nodeId: nodeId,
+            eventType: TypeRef.EVENT_SELECTION_CHANGED,
+            arguments: [:]
         )
     }
 

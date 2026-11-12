@@ -764,6 +764,9 @@ public final class ControlFactory {
         adapter.onLocalSelection = { [weak self] nodeID, itemIDs in
             self?.noteLocalSelection(nodeID: nodeID, itemIDs: itemIDs)
         }
+        adapter.onSelectionCleared = { [weak self] nodeID in
+            self?.onInteraction?(.selectionCleared(nodeID: nodeID))
+        }
         tableView.dataSource = adapter
         tableView.delegate = adapter
         scrollView.documentView = tableView
@@ -808,6 +811,9 @@ public final class ControlFactory {
         )
         adapter.onLocalSelection = { [weak self] nodeID, itemIDs in
             self?.noteLocalSelection(nodeID: nodeID, itemIDs: itemIDs)
+        }
+        adapter.onSelectionCleared = { [weak self] nodeID in
+            self?.onInteraction?(.selectionCleared(nodeID: nodeID))
         }
         adapter.onExpansionChanged = { [weak self] nodeID, itemID, expanded in
             self?.onInteraction?(.expansionChanged(nodeID: nodeID, itemID: itemID, expanded: expanded))

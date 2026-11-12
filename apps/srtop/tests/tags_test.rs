@@ -14,6 +14,11 @@
 //! * Threads are never tagged and never descendants; a hidden kernel thread's
 //!   tag is counted; a row hidden under a collapsed parent cannot be tagged.
 //! * A request beyond the tag limit is refused whole.
+//! * Merged with main: a request acts on the process the inspector
+//!   describes, so a user-cleared selection (PX-017-G02) tags nothing and
+//!   only the selecting client's collapse takes the target (PX-018); a
+//!   tagged row the row limit drops unconfirmed turns historical while the
+//!   inspector never calls it ended (PX-013 review round).
 //!
 //! Every request goes through the real handler (`ACTIVATE` on the tag
 //! buttons) and every commit is applied by a client replica.
@@ -134,8 +139,14 @@ struct Harness {
 }
 
 fn harness(source: &mut impl ProcessSource) -> Harness {
+    harness_limited(source, usize::MAX)
+}
+
+/// [`harness`] with the published-row ceiling lowered to `limit`.
+fn harness_limited(source: &mut impl ProcessSource, limit: usize) -> Harness {
     let session = Arc::new(Session::mint());
     let (view, _) = start_from_source(&session, source).unwrap();
+    let view = view.with_published_limit(limit);
     let view: SharedView = Arc::new(Mutex::new(view));
     install_tag_handlers(&session, &view);
     install_view_handlers(&session, &view);
@@ -202,6 +213,11 @@ impl Harness {
 
     /// A click on a tag button: an `ACTIVATE` that names only the button.
     fn click(&mut self, button: NodeId) {
+        self.click_as(CLIENT, button);
+    }
+
+    /// [`Self::click`], by the client instance `client`.
+    fn click_as(&mut self, client: &[u8], button: NodeId) {
         self.seq += 1;
         let wire = DomainEvent::activate(
             self.seq,
@@ -209,7 +225,25 @@ impl Harness {
             self.revision(),
             button,
         )
-        .with_client_instance_id(CLIENT.to_vec())
+        .with_client_instance_id(client.to_vec())
+        .to_wire();
+        self.send(wire);
+    }
+
+    /// `client` collapses or expands the tree row of `pid` locally and
+    /// reports it with `EXPANSION_CHANGED` (PX-018).
+    fn disclose_as(&mut self, client: &[u8], pid: u64, expanded: bool) {
+        let item = self.item_of(pid);
+        self.seq += 1;
+        let wire = DomainEvent::expansion_changed(
+            self.seq,
+            format!("tags-disclosure-{}", self.seq),
+            self.revision(),
+            TREE,
+            item,
+            expanded,
+        )
+        .with_client_instance_id(client.to_vec())
         .to_wire();
         self.send(wire);
     }
@@ -713,6 +747,177 @@ fn a_row_hidden_under_a_collapsed_parent_cannot_be_tagged_and_is_not_counted_hid
     );
     // A collapsed row is in the model, not hidden by a filter.
     assert!(!h.status().contains("hidden"), "{}", h.status());
+}
+
+/// Merge with main (PX-018 × PX-020): disclosure is each client's own, so
+/// another client's collapse never takes the selection a tag request acts
+/// on. A tag request acts on the process the inspector describes, which
+/// every client is shown, whichever client clicks. Only the selecting
+/// client's collapse drops the selection, and then nothing is tagged.
+#[test]
+fn only_the_selecting_clients_collapse_takes_the_tag_target() {
+    const OTHER: &[u8] = b"tags-other-client-instance";
+    let mut source = Steps::new(vec![family()]);
+    let mut h = harness(&mut source);
+    h.show_tree(true);
+    h.select(11);
+    // The other client hides `cc` under `build` on its own screen only, and
+    // a sample republishes the tree over that report.
+    h.disclose_as(OTHER, 10, false);
+    h.sample(&mut source);
+    assert!(
+        h.text(INSPECTOR_STATUS)
+            .starts_with("Selected process: PID 11 · cc"),
+        "{}",
+        h.text(INSPECTOR_STATUS)
+    );
+    h.click_as(OTHER, TAG_TOGGLE);
+    assert_eq!(h.view().tags().tagged(), 1);
+    assert_eq!(h.tagged(), set(&[11]));
+    assert!(h.status().ends_with("Tagged PID 11 · cc"), "{}", h.status());
+    // The selecting client collapses `build` too: its selection is gone.
+    h.disclose_as(CLIENT, 10, false);
+    assert_eq!(
+        h.text(INSPECTOR_STATUS),
+        srui_process_explorer::inspector::NO_SELECTION_STATUS
+    );
+    h.click_as(OTHER, TAG_TOGGLE);
+    assert_eq!(h.view().tags().tagged(), 1, "the hidden row stays tagged");
+    assert!(
+        h.status()
+            .ends_with("Nothing tagged: select a process row first"),
+        "{}",
+        h.status()
+    );
+}
+
+/// Merge with main (PX-017-G02 × PX-020): a selection the user cleared is
+/// not a tag target, and clearing the tags leaves the cleared selection and
+/// the follow status it stopped with as they are.
+#[test]
+fn a_cleared_selection_tags_nothing_and_clearing_tags_keeps_it_cleared() {
+    let mut source = Steps::new(vec![family()]);
+    let mut h = harness(&mut source);
+    h.select(10);
+    h.click(TAG_DESCENDANTS);
+    assert_eq!(h.tagged(), set(&[10, 11, 12, 13]));
+    h.follow(true);
+    let node = h.shown_collection();
+    h.event(node, TypeRef::EVENT_SELECTION_CHANGED, Vec::new());
+    assert_eq!(
+        h.text(INSPECTOR_STATUS),
+        srui_process_explorer::inspector::CLEARED_SELECTION_STATUS
+    );
+    assert_eq!(
+        h.text(FOLLOW_STATUS),
+        srui_process_explorer::follow::SELECTION_CLEARED_FOLLOW_STATUS
+    );
+    for button in [TAG_TOGGLE, TAG_DESCENDANTS] {
+        h.click(button);
+        assert_eq!(h.tagged(), set(&[10, 11, 12, 13]), "nothing changed");
+        assert!(
+            h.status()
+                .ends_with("Nothing tagged: select a process row first"),
+            "{}",
+            h.status()
+        );
+    }
+    let promoted = h.property(node, VALUE);
+    h.click(TAGS_CLEAR);
+    assert!(h.tagged().is_empty());
+    assert_eq!(
+        h.text(INSPECTOR_STATUS),
+        srui_process_explorer::inspector::CLEARED_SELECTION_STATUS,
+        "clearing tags is not a selection"
+    );
+    assert_eq!(
+        h.text(FOLLOW_STATUS),
+        srui_process_explorer::follow::SELECTION_CLEARED_FOLLOW_STATUS
+    );
+    assert_eq!(h.property(node, VALUE), promoted);
+}
+
+/// Merge with main (PX-013 review round, PX-019 × PX-020), as amended by
+/// PX-021: a tagged process that retention kept unconfirmed and the row
+/// ceiling then dropped turns historical, worded `no longer observed`, never
+/// "exited", and the inspector says the same. A request on it refuses the
+/// historical record. When a later complete scan lists the same instance
+/// again, under a new item ID, the tag is live again on that row (PX-021
+/// correction round 2, F4): "no longer observed" never claimed it ended.
+#[test]
+fn a_tagged_process_the_row_limit_drops_turns_historical_and_is_never_called_ended() {
+    let first = vec![
+        record(1, "init", 0, 1),
+        record(10, "a", 1, 10),
+        record(20, "b", 1, 20),
+        record(30, "c", 1, 30),
+    ];
+    let second = vec![
+        record(1, "init", 0, 1),
+        record(10, "a", 1, 10),
+        record(30, "c", 1, 30),
+        record(40, "d", 1, 40),
+    ];
+    let mut source = Steps::new(vec![first.clone(), second, first]);
+    source.unenumerable.insert(1);
+    let mut h = harness_limited(&mut source, 4);
+    h.select(20);
+    let b = h.item_of(20);
+    h.click(TAG_TOGGLE);
+    assert_eq!(h.tagged(), set(&[20]));
+
+    // An incomplete scan keeps `b` unconfirmed, and `d` takes its place
+    // under the ceiling.
+    h.sample(&mut source);
+    assert!(
+        h.rows().iter().all(|row| row.0 != b),
+        "the ceiling dropped b"
+    );
+    assert_eq!(h.view().tags().tagged(), 0);
+    assert_eq!(h.view().historical_tags(), ["PID 20 · b"]);
+    assert!(
+        h.status().starts_with(
+            "Tags: 0 tagged · 1 historical: PID 20 · b no longer observed, last observed "
+        ),
+        "{}",
+        h.status()
+    );
+    let inspector = h.text(INSPECTOR_STATUS);
+    assert!(
+        inspector.starts_with(
+            "Selected process: PID 20 · b · no longer observed: kept while scans could not account for it, then left out at the row limit; whether it exited is unknown"
+        ),
+        "{inspector}"
+    );
+    h.click(TAG_TOGGLE);
+    assert!(
+        h.status().ends_with(
+            "Nothing tagged: PID 20 · b is no longer observed: a historical record is never tagged"
+        ),
+        "{}",
+        h.status()
+    );
+    assert_eq!(h.view().tags().tagged(), 0);
+    for text in [h.text(INSPECTOR_STATUS), h.status()] {
+        assert!(
+            !text.contains("· exited") && !text.contains("b exited"),
+            "an eviction was called an exit: {text}"
+        );
+    }
+
+    // A complete scan lists `b` again, as a new row: the same instance, so
+    // its tag is live again, on that row.
+    h.sample(&mut source);
+    let again = h.item_of(20);
+    assert_ne!(again, b);
+    assert_eq!(h.tagged(), set(&[20]));
+    assert!(h.view().historical_tags().is_empty());
+    assert!(
+        h.status()
+            .contains("Tagged again: PID 20 · b is listed again after it was no longer observed"),
+        "{}",
+        h.status()
+    );
 }
 
 /// `root` (1000) and `children` processes under it, then a step in which

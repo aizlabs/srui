@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-020",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Stable multi-selection and descendant tagging: explicit server-side tags kept by process instance, independent of the single native selection, shown in a Tag column; tag or untag the selected process, tag it with its sampled descendants frozen at the request, clear all; hidden tags counted; bounded historical tags on exit; no process-changing action; no protocol, registry, SDK, renderer or client source change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md",
+      "H5": "https://raw.githubusercontent.com/htop-dev/htop/3.5.3/Action.c"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX020-001",
+      "feature": "Explicit tags by process instance, independent of the selection: a server-side tag set keyed by the whole ProcessKey (source, host, boot, PID namespace, PID, creation token), never by PID, row or name; tags survive sorting, filtering, the column chooser, the view switch and pausing; a newer process reusing a tagged PID is never tagged; tagging, untagging and clearing never select, deselect, promote, withdraw, scroll or follow anything",
+      "scope": "PX-020/tags (src/tags.rs) Tags, is_tagged, toggle, clear; refresh (src/refresh.rs) visible_in tag marking, request_tags, tag_target; tests/tags_test.rs tags_survive_sorting_the_column_chooser_and_the_view_switch_and_clearing_keeps_the_selection, descendant_tags_are_frozen_survive_filters_and_turn_historical_when_a_process_ends, a_paused_view_tags_its_frozen_rows, a_cleared_selection_tags_nothing_and_clearing_tags_keeps_it_cleared (merge with main, PX-017-G02); client-macos ProcessExplorerShellTests tagsMarkProcessInstancesIndependentlyOfTheSelectionAndSurviveSortFilterTreeAndExit",
+      "source_refs": [
+        "D1",
+        "D2",
+        "H5"
+      ],
+      "owner": "PX-020",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-020.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX020-002",
+      "feature": "Tag controls: standard Buttons Tag or untag selected (node 79, primary+shift+t), Tag selected and descendants (node 80, primary+shift+d) and Clear tags (node 81, no shortcut) and a tags status Text (node 82) in a Row (node 78) between the thread controls and the collections, disabled in the uncollected shell; each handler is its button's ACTIVATE, an exact audit pair, which reads nothing the event carries and acts on the server's own resolved selection",
+      "scope": "PX-020/lib (src/lib.rs) TAGS_ROW, TAG_TOGGLE, TAG_DESCENDANTS, TAGS_CLEAR, TAGS_STATUS, KEYBOARD_SHORTCUTS, initialize_rows, install_tag_handlers; refresh (src/refresh.rs) TagRequest, tag_requested, TAGS_RESERVE_BYTES; main (src/main.rs); tests/no_process_control_test.rs TAG_BUTTON_CONSTANTS and their bypass self-tests; src/lib.rs empty_shell_has_exact_structure_and_no_action_or_terminal_nodes, keyboard_shortcuts_are_canonical_unique_modified_and_on_admitted_controls; client-macos ProcessExplorerShellTests keyboardShortcuts",
+      "source_refs": [
+        "D1",
+        "D2",
+        "H5"
+      ],
+      "owner": "PX-020",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-020.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX020-003",
+      "feature": "Tag column and bounds: a Tag column after the chosen columns (in the tree before Parent) whose cell is 'tagged' or empty, not a catalogued, sortable or choosable column; the row ceiling charges every row an empty tag cell and reserves the tagged cells' extra bytes once (TAG_CELLS_RESERVE_BYTES = MAX_TAGGED x 6), so tagging never changes which rows fit; at most MAX_TAGGED = 1024 processes are tagged, a request beyond it refused whole",
+      "scope": "PX-020/projection (src/projection.rs) Row::tagged, set_tagged, tag_cell, lay_out; refresh (src/refresh.rs) column_headings, bound_to_publishable_collection, TAG_CELL_BYTES, TAG_CELLS_RESERVE_BYTES, Effect::Update record; tags (src/tags.rs) MAX_TAGGED; src/refresh.rs tagging_the_most_rows_at_the_ceiling_keeps_every_row_inside_its_reserve, the_shell_status_and_summary_fit_their_snapshot_allowances; tests/tags_test.rs a_request_beyond_the_tag_limit_is_refused_whole",
+      "source_refs": [
+        "D1",
+        "D2",
+        "H5"
+      ],
+      "owner": "PX-020",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-020.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX020-004",
+      "feature": "Descendant tagging frozen at the request: the selected process and every descendant the latest sample shows under it, resolved by the process tree's own parent rule (a parent PID read by the scan, held by exactly one confirmed record that started no later, cycles broken as the tree breaks them) whatever the filters hide, each tagged as its own process instance; a child started later is never added; not a process group; a row kept from an earlier scan has no descendants",
+      "scope": "PX-020/tree (src/tree.rs) descendants; tags (src/tags.rs) tag_with_descendants; refresh (src/refresh.rs) request_tags; tests/tags_test.rs descendant_tags_are_frozen_survive_filters_and_turn_historical_when_a_process_ends, a_paused_view_tags_its_frozen_rows; tests/procfs_test.rs live::a_live_tagged_family_keeps_its_frozen_membership_and_an_ended_worker_turns_historical",
+      "source_refs": [
+        "D1",
+        "D2",
+        "H5"
+      ],
+      "owner": "PX-020",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-020.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX020-005",
+      "feature": "Exit: a tagged process that leaves the collection (it ended, or no scan lists it) keeps a historical tag, named by PID and name as last shown, listed in the tags status and never put back on a row; at most MAX_HISTORICAL_TAGS = 64 are kept, oldest forgotten first and counted; Clear tags removes live and historical tags",
+      "scope": "PX-020/tags (src/tags.rs) departed, retire, history, status, MAX_HISTORICAL_TAGS; refresh (src/refresh.rs) apply; tests/tags_test.rs descendant_tags_are_frozen_survive_filters_and_turn_historical_when_a_process_ends, historical_tags_are_bounded_newest_kept_and_cleared, a_tagged_process_the_row_limit_drops_turns_historical_and_is_never_called_ended (merge with main, PX-013 review round); tests/procfs_test.rs live::a_live_tagged_family_keeps_its_frozen_membership_and_an_ended_worker_turns_historical",
+      "source_refs": [
+        "D1",
+        "D2",
+        "H5"
+      ],
+      "owner": "PX-020",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-020.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX020-006",
+      "feature": "Hidden tags counted: the tags status says how many tagged processes the filters hide, how many are kernel threads hidden by Show kernel threads, and how many are beyond the publishable size limit; a row hidden under a collapsed tree parent is not counted; once the selecting client collapses a parent above its selected row, that selection is gone and nothing is tagged, while another client's collapse leaves it taggable",
+      "scope": "PX-020/refresh (src/refresh.rs) visible_in, Visible::tags, tags_effects; tags (src/tags.rs) TagCounts, status; tests/tags_test.rs threads_are_never_tagged_and_a_hidden_kernel_thread_tag_is_counted, a_row_hidden_under_a_collapsed_parent_cannot_be_tagged_and_is_not_counted_hidden, only_the_selecting_clients_collapse_takes_the_tag_target (merge with main, PX-018 per-client disclosure), descendant_tags_are_frozen_survive_filters_and_turn_historical_when_a_process_ends",
+      "source_refs": [
+        "D1",
+        "D2",
+        "H5"
+      ],
+      "owner": "PX-020",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-020.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX020-007",
+      "feature": "Threads are never tagged and never descendants: a tag request on a thread row is refused with the reason, a process's thread rows never carry its tag, and hiding or showing threads changes no tag",
+      "scope": "PX-020/tags (src/tags.rs) toggle, tag_with_descendants; tree (src/tree.rs) descendants; tests/tags_test.rs threads_are_never_tagged_and_a_hidden_kernel_thread_tag_is_counted",
+      "source_refs": [
+        "D1",
+        "D2",
+        "H5"
+      ],
+      "owner": "PX-020",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-020.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX020-008",
+      "feature": "No tag state ahead of a commit: the tags status is planned after the rows and carries the tag set's generation; a request or a sample whose tags status did not commit puts the previous set back, so a failed tag, clear or exit-retiring sample leaves the tags the client still shows",
+      "scope": "PX-020/refresh (src/refresh.rs) Effect::TagsStatus, settle_tags, request_tags, apply; src/refresh.rs tag_commit_tests a_failed_tag_request_keeps_the_set_and_the_status, a_failed_clear_keeps_every_tag, a_failed_sample_keeps_an_ended_process_tagged_until_one_commits",
+      "source_refs": [
+        "D1",
+        "D2",
+        "H5"
+      ],
+      "owner": "PX-020",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-020.md"
+      ]
+    }
+  ]
+}

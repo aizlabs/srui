@@ -392,13 +392,15 @@ fn every_column_sorts_both_ways_by_its_typed_values_with_missing_last() {
         "100".into(),
         "a10".into(),
         "Denied".into(),
-        "Warming up".into()
+        "Warming up".into(),
+        String::new()
     ]));
     assert!(cells.contains(&vec![
         "Unavailable".into(),
         "a9".into(),
         "4.0 KiB".into(),
-        "0.0%".into()
+        "0.0%".into(),
+        String::new()
     ]));
 }
 
@@ -527,7 +529,13 @@ fn changing_cpu_rankings_move_rows_under_their_own_item_ids() {
         rows(&session)[0],
         (
             selected,
-            vec!["9".into(), "zsh".into(), "9 B".into(), "50.0%".into()]
+            vec![
+                "9".into(),
+                "zsh".into(),
+                "9 B".into(),
+                "50.0%".into(),
+                String::new()
+            ]
         )
     );
     for transaction in session.collect_replayed_transactions(revision).unwrap() {
@@ -869,8 +877,8 @@ fn a_click_after_an_in_place_update_sorts_by_current_values() {
     let outcome = view.refresh(&session, &mut source).unwrap();
     assert_eq!((outcome.updated, outcome.moved), (2, 0));
     let cells: Vec<Vec<String>> = rows(&session).into_iter().map(|(_, cells)| cells).collect();
-    assert_eq!(cells[0][2..], ["1.0 KiB", "10.0%"]);
-    assert_eq!(cells[1][2..], ["1.0 KiB", "90.0%"]);
+    assert_eq!(cells[0][2..], ["1.0 KiB", "10.0%", ""]);
+    assert_eq!(cells[1][2..], ["1.0 KiB", "90.0%", ""]);
     view.click_sort(&session, ProcessField::Cpu).unwrap();
     assert_eq!(
         pids(&session),

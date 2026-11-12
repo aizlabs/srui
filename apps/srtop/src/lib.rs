@@ -4,13 +4,14 @@
 //! column chooser, PX-011 find-next/find-previous and jump to PID, PX-015
 //! sampling interval, Pause view/Resume view and manual refresh, PX-016
 //! keyboard shortcuts, PX-017 follow selected process, PX-018 parent/child
-//! process tree). No process
+//! process tree, PX-019 threads, PX-020 tags). No process
 //! is ever opened for control: the only client-input handlers are the sort
 //! buttons', the filter input's, the column chooser buttons', the search
-//! controls', the sampling controls', the follow toggle's, the view switch's
-//! and the tree's selection and disclosure reports, which reorder,
-//! filter, re-lay out, locate, freeze, re-sample, follow or re-arrange the
-//! published rows and touch no process. A
+//! controls', the sampling controls', the follow toggle's, the view switch's,
+//! the tree's selection and disclosure reports, the thread checkboxes' and the
+//! tag buttons', which reorder, filter, re-lay out, locate, freeze,
+//! re-sample, follow, re-arrange or mark the published rows and touch no
+//! process. A
 //! keyboard shortcut (design §§7.4, 7.6, 22.5; PX-016-G01's standard
 //! `shortcut` property) sends the same event its control's click sends, or
 //! only moves local focus; it adds no handler.
@@ -31,6 +32,7 @@ pub mod search;
 pub mod sort;
 pub mod source;
 pub mod summary;
+pub mod tags;
 pub mod threads;
 pub mod tree;
 
@@ -191,6 +193,17 @@ pub const USER_THREADS_TOGGLE: NodeId = NodeId::new(75);
 pub const KERNEL_THREADS_TOGGLE: NodeId = NodeId::new(76);
 pub const THREADS_STATUS: NodeId = NodeId::new(77);
 pub const THREADS_NODE_COUNT: usize = 4;
+/// The tag controls (PX-020): a Row between the thread controls and the
+/// collections holding the "Tag or untag selected", "Tag selected and
+/// descendants" and "Clear tags" buttons and the tags status, which counts
+/// the tagged processes, says how many the filters hide, and names the
+/// historical tags of tagged processes no longer listed.
+pub const TAGS_ROW: NodeId = NodeId::new(78);
+pub const TAG_TOGGLE: NodeId = NodeId::new(79);
+pub const TAG_DESCENDANTS: NodeId = NodeId::new(80);
+pub const TAGS_CLEAR: NodeId = NodeId::new(81);
+pub const TAGS_STATUS: NodeId = NodeId::new(82);
+pub const TAGS_NODE_COUNT: usize = 5;
 pub const VIEW_LABEL: &str = "Show process tree";
 pub const VIEW_DESCRIPTION: &str =
     "When on, the same processes are shown as a tree under their parents instead of the table. The server resolves each parent from the latest scan and never guesses one: a process whose parent is not in the scan, unreadable, a newer process reusing its PID, hidden by the filters, or caught in a cycle is shown at the top, and its Parent column says why. Expanding and collapsing are local; sorting orders each parent's children. The selection and follow carry over.";
@@ -223,8 +236,10 @@ pub const LIST_SHORTCUT: &str = "primary+l";
 /// shortcut selects whole. No node, handler or event is added. The view
 /// switch's (PX-018)
 /// is its click, like the follow toggle's; the list-focus shortcut moves to
-/// the tree while the tree is shown.
-pub const KEYBOARD_SHORTCUTS: [(NodeId, &str); 16] = [
+/// the tree while the tree is shown. The two tag buttons' (PX-020) are their
+/// clicks; "Clear tags" has none, so clearing every tag takes a deliberate
+/// click.
+pub const KEYBOARD_SHORTCUTS: [(NodeId, &str); 18] = [
     (SAMPLING_PAUSE, "primary+alt+p"),
     (SAMPLING_REFRESH, "primary+r"),
     (FILTER_INPUT, "primary+alt+f"),
@@ -239,6 +254,8 @@ pub const KEYBOARD_SHORTCUTS: [(NodeId, &str); 16] = [
     (COLUMNS_RESTORE, "primary+alt+r"),
     (FOLLOW_TOGGLE, "primary+shift+f"),
     (VIEW_TOGGLE, "primary+t"),
+    (TAG_TOGGLE, "primary+shift+t"),
+    (TAG_DESCENDANTS, "primary+shift+d"),
     (TABLE, LIST_SHORTCUT),
     (INSPECTOR_COMMAND, "primary+i"),
 ];
@@ -328,8 +345,9 @@ pub const STATUS_TEXT: &str = "Read-only · Process collection not started";
 /// the column chooser's row with its buttons (PX-068), the seven search
 /// controls (PX-011), the six user-filter controls (PX-012), the six of
 /// the inspector (PX-013, PX-014), the six sampling controls (PX-015) and the
-/// three follow controls (PX-017), the view switch and tree (PX-018) and the
-/// four thread controls (PX-019). Rows are model items, never nodes.
+/// three follow controls (PX-017), the view switch and tree (PX-018), the
+/// four thread controls (PX-019) and the five tag controls (PX-020). Rows are
+/// model items, never nodes.
 pub const SHELL_NODE_COUNT: usize = 5
     + summary::NODE_COUNT
     + SAMPLING_NODE_COUNT
@@ -342,7 +360,8 @@ pub const SHELL_NODE_COUNT: usize = 5
     + INSPECTOR_NODE_COUNT
     + FOLLOW_NODE_COUNT
     + VIEW_NODE_COUNT
-    + THREADS_NODE_COUNT;
+    + THREADS_NODE_COUNT
+    + TAGS_NODE_COUNT;
 
 /// The sort button that orders `field`.
 pub fn sort_button_of(field: catalogue::ProcessField) -> NodeId {
@@ -561,6 +580,27 @@ pub fn install_thread_handlers(session: &Session, view: &refresh::SharedView) {
     );
 }
 
+/// Installs the tag buttons' handlers (§7.6, PX-020): "Tag or untag
+/// selected", "Tag selected and descendants" and "Clear tags", each an
+/// `ACTIVATE` applied before the event is acknowledged. A click names only
+/// which button it was: the process is the server's own resolved selection
+/// and the descendants the latest sample's, never anything the event names.
+/// None touches a process: a tag only marks published rows.
+pub fn install_tag_handlers(session: &Session, view: &refresh::SharedView) {
+    let toggle = std::sync::Arc::clone(view);
+    session.on(TAG_TOGGLE, ACTIVATE, move |session, _| {
+        refresh::tag_requested(&toggle, session, refresh::TagRequest::Toggle);
+    });
+    let descendants = std::sync::Arc::clone(view);
+    session.on(TAG_DESCENDANTS, ACTIVATE, move |session, _| {
+        refresh::tag_requested(&descendants, session, refresh::TagRequest::Descendants);
+    });
+    let clear = std::sync::Arc::clone(view);
+    session.on(TAGS_CLEAR, ACTIVATE, move |session, _| {
+        refresh::tag_requested(&clear, session, refresh::TagRequest::Clear);
+    });
+}
+
 /// Installs the sampling controls' handlers (§7.6, §22.6, PX-015): the Pause
 /// view/Resume view, Refresh now and Apply interval buttons' `ACTIVATE`, and
 /// the interval field's `TEXT_EDIT`. Each is applied before the event is
@@ -631,6 +671,7 @@ pub fn initialize(session: &Session) -> Result<(), SessionError> {
         false,
         None,
         threads::UNCOLLECTED_STATUS,
+        tags::UNCOLLECTED_STATUS,
     )
 }
 
@@ -822,7 +863,8 @@ fn plural(count: usize) -> &'static str {
 /// `sampling` is the collecting view's sampling state (PX-015), or `None` for
 /// the shell that collects nothing, whose sampling controls are disabled.
 ///
-/// `threads_status` is the threads status (PX-019) for `items`.
+/// `threads_status` is the threads status (PX-019) for `items`, and
+/// `tags_status` the tags status (PX-020).
 // One commit's worth of shell state; each argument is a separate part of it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn initialize_rows(
@@ -835,6 +877,7 @@ pub(crate) fn initialize_rows(
     sort_enabled: bool,
     sampling: Option<&sampling::Sampling>,
     threads_status: &str,
+    tags_status: &str,
 ) -> Result<(), SessionError> {
     let (sampling_view, interval_text) = match sampling {
         Some(sampling) => (sampling.view(), sampling.input().to_string()),
@@ -1191,6 +1234,45 @@ pub(crate) fn initialize_rows(
                 TextRole::Caption
             })
             .create(ui)?;
+        // The tag controls (PX-020): three standard Buttons and a status Text
+        // in a Row above the collections. Nothing starts tagged.
+        Row::builder(TAGS_ROW)
+            .parent(COLUMN)
+            .spacing_role(SpacingRole::Normal)
+            .create(ui)?;
+        for (button, label, description) in [
+            (
+                TAG_TOGGLE,
+                tags::TAG_TOGGLE_LABEL,
+                tags::TAG_TOGGLE_DESCRIPTION,
+            ),
+            (
+                TAG_DESCENDANTS,
+                tags::TAG_DESCENDANTS_LABEL,
+                tags::TAG_DESCENDANTS_DESCRIPTION,
+            ),
+            (
+                TAGS_CLEAR,
+                tags::TAGS_CLEAR_LABEL,
+                tags::TAGS_CLEAR_DESCRIPTION,
+            ),
+        ] {
+            Button::builder(button)
+                .parent(TAGS_ROW)
+                .label(label)
+                .accessible_description(description)
+                .create(ui)?;
+            ui.set(button, ENABLED, sort_enabled)?;
+        }
+        Text::builder(TAGS_STATUS)
+            .parent(TAGS_ROW)
+            .text(tags_status)
+            .role(if sort_enabled {
+                TextRole::Status
+            } else {
+                TextRole::Caption
+            })
+            .create(ui)?;
         Table::builder(TABLE)
             .parent(COLUMN)
             .model_ref(MODEL)
@@ -1415,9 +1497,30 @@ mod tests {
             // the six sampling controls (PX-015) and the three follow
             // controls (PX-017) and the view switch's row, toggle and
             // status and the process tree (PX-018) and the thread controls'
-            // row, two toggles and status (PX-019).
-            assert_eq!(store.node_count(), 77);
-            assert_eq!(SHELL_NODE_COUNT, 77);
+            // row, two toggles and status (PX-019) and the tag controls' row,
+            // three buttons and status (PX-020).
+            assert_eq!(store.node_count(), 82);
+            assert_eq!(SHELL_NODE_COUNT, 82);
+            // A shell that samples nothing has nothing to tag, and says so
+            // (PX-020).
+            assert_eq!(
+                store.children_of(TAGS_ROW),
+                Some([TAG_TOGGLE, TAG_DESCENDANTS, TAGS_CLEAR, TAGS_STATUS].as_slice())
+            );
+            for (button, label) in [
+                (TAG_TOGGLE, tags::TAG_TOGGLE_LABEL),
+                (TAG_DESCENDANTS, tags::TAG_DESCENDANTS_LABEL),
+                (TAGS_CLEAR, tags::TAGS_CLEAR_LABEL),
+            ] {
+                let node = store.get_node(button).unwrap();
+                assert_eq!(node.node_type, TypeRef::BUTTON);
+                assert_eq!(node.get_property(LABEL), Some(&Value::String(label.into())));
+                assert_eq!(node.get_property(ENABLED), Some(&Value::Bool(false)));
+            }
+            assert_eq!(
+                store.get_node(TAGS_STATUS).unwrap().get_property(TEXT),
+                Some(&Value::String(tags::UNCOLLECTED_STATUS.into()))
+            );
             // A shell that samples nothing has no tasks to choose, and says
             // so (PX-019).
             assert_eq!(
@@ -1518,6 +1621,7 @@ mod tests {
                         FOLLOW_ROW,
                         VIEW_ROW,
                         THREADS_ROW,
+                        TAGS_ROW,
                         TABLE,
                         TREE,
                         INSPECTOR
@@ -1760,7 +1864,9 @@ mod tests {
                     Value::String("PID".into()),
                     Value::String("Name".into()),
                     Value::String("Resident".into()),
-                    Value::String("CPU (100% = 1 CPU)".into())
+                    Value::String("CPU (100% = 1 CPU)".into()),
+                    // The tag column follows the chosen columns (PX-020).
+                    Value::String(tags::TAG_HEADING.into())
                 ]))
             );
         });
@@ -1837,6 +1943,7 @@ mod tests {
                         FOLLOW_ROW,
                         VIEW_ROW,
                         THREADS_ROW,
+                        TAGS_ROW,
                         TABLE,
                         TREE,
                         INSPECTOR

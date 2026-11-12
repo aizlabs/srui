@@ -323,6 +323,7 @@ mod tests {
             cells: Vec::new(),
             value: srui_sdk::Value::UnsignedInt(id),
             display_name: record.display_name,
+            tagged: false,
         }
     }
 

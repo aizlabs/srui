@@ -61,7 +61,7 @@ struct ProcessExplorerShellTests {
         #expect(status.stringValue == (fakeSource ? "Read-only · Fake process snapshot" : "Read-only · Process collection not started"))
         #expect(status.isEditable == false)
         #expect(table.numberOfRows == (fakeSource ? 3 : 0))
-        #expect(table.tableColumns.map(\.title) == ["PID", "Name", "Resident", "CPU (100% = 1 CPU)"])
+        #expect(table.tableColumns.map(\.title) == ["PID", "Name", "Resident", "CPU (100% = 1 CPU)", "Tag"])
         #expect(tableHandle.actionTrampoline == nil)
         if fakeSource {
             // PX-005: the server published the unit, so the generic client shows
@@ -70,9 +70,9 @@ struct ProcessExplorerShellTests {
             // PX-006: likewise for CPU — past 100% of one CPU, a measured zero,
             // and a first sample that is visibly warming up.
             let expected = [
-                ["4101", "worker", "1.1 MiB", "250.0%"],
-                ["4102", "worker", "0 B", "0.0%"],
-                ["Unavailable", "helper", "Denied", "Warming up"],
+                ["4101", "worker", "1.1 MiB", "250.0%", ""],
+                ["4102", "worker", "0 B", "0.0%", ""],
+                ["Unavailable", "helper", "Denied", "Warming up", ""],
             ]
             for row in 0..<3 {
                 for column in 0..<4 {
@@ -270,7 +270,7 @@ struct ProcessExplorerShellTests {
         }
         #expect(window.windowNumber == windowNumber)
         #expect(window.isVisible)
-        #expect(table.tableColumns.map(\.title) == ["PID", "Name", "Resident", "CPU (100% = 1 CPU)"])
+        #expect(table.tableColumns.map(\.title) == ["PID", "Name", "Resident", "CPU (100% = 1 CPU)", "Tag"])
         #expect(tableHandle.actionTrampoline == nil)
         try await Self.capture(window: window, name: "sequence-settled")
         let elapsed = stamps.isEmpty ? Duration.zero : stamps[stamps.count - 1]
@@ -405,9 +405,9 @@ struct ProcessExplorerShellTests {
         let table = try #require(scroll.documentView as? NSTableView)
         #expect(window.title == "Process Explorer")
         #expect(Self.nativeRows(table) == [
-            ["4101", "worker", "1.1 MiB", "250.0%"],
-            ["4102", "worker", "0 B", "0.0%"],
-            ["Unavailable", "helper", "Denied", "Warming up"],
+            ["4101", "worker", "1.1 MiB", "250.0%", ""],
+            ["4102", "worker", "0 B", "0.0%", ""],
+            ["Unavailable", "helper", "Denied", "Warming up", ""],
         ])
         print("PX-008 same-client evidence: explorer window \(window.windowNumber) '\(window.title)' rows=\(Self.nativeRows(table))")
         await controller.stop()
@@ -1399,7 +1399,7 @@ struct ProcessExplorerShellTests {
         #expect(Set(treeModel.items.values.map(\.itemID.value)) == tableIDs, "the same item IDs")
         // The hierarchy renders: indented by depth, under a header naming every column.
         #expect(outline.headerView != nil)
-        #expect(outline.tableColumns.map(\.title) == ["PID", "Name", "Resident", "CPU (100% = 1 CPU)", "Parent"])
+        #expect(outline.tableColumns.map(\.title) == ["PID", "Name", "Resident", "CPU (100% = 1 CPU)", "Tag", "Parent"])
         #expect(pids() == ["1", "100", "200", "300", "310", "311", "301", "700", "500", "600", "800", "801"])
         #expect(levels() == [0, 1, 2, 3, 4, 4, 3, 1, 0, 0, 0, 1])
         let rows = shown()
@@ -1836,8 +1836,8 @@ struct ProcessExplorerShellTests {
             pids() == withThreads && threadsStatus.stringValue.hasPrefix("User threads: 3 thread rows under 1 process")
         }
         let rows = Self.nativeRows(table)
-        #expect(rows[5] == ["201 (thread of 200)", "worker-1", "See process", "60.0%"])
-        #expect(rows[3] == ["200", "server", "800.0 KiB", "100.0%"], "the process row is the whole process")
+        #expect(rows[5] == ["201 (thread of 200)", "worker-1", "See process", "60.0%", ""])
+        #expect(rows[3] == ["200", "server", "800.0 KiB", "100.0%", ""], "the process row is the whole process")
         #expect(threadsStatus.stringValue.contains("threads of 1 process unreadable (1 permission denied)"))
         func itemIDs() -> [String: UInt64] {
             guard let model = applier.store.getModel(ModelId(1)) else { return [:] }
@@ -1912,6 +1912,179 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
+    /// PX-020 over real SSH and the generic client: tags are server-side marks on process
+    /// instances, shown in a Tag column after the chosen columns, independent of the native
+    /// selection. On the `--fake-tree` fixture: the selected `make` is tagged with its sampled
+    /// descendants by its button; `editor` by its shortcut (⇧⌘T); the tags stay on their processes
+    /// through a CPU sort, a filter that hides them (counted in the tags status) and the tree;
+    /// when `make` ends, its tag turns historical while `cc` and `ld`, reparented, keep theirs;
+    /// Clear tags removes every tag and leaves the selection, the inspector and every item ID.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func tagsMarkProcessInstancesIndependentlyOfTheSelectionAndSurviveSortFilterTreeAndExit() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-tree", "--refresh-interval-ms", "300000"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        renderer.textEditingSession.debounceNanoseconds = 0
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer over SSH with its tag controls") {
+            applier.lastAppliedRevision.value >= 1
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(Self.tagsStatusID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        SurfacePresentation.forHostApplication().present(window)
+        window.contentView?.layoutSubtreeIfNeeded()
+        let router = renderer.layoutRenderer.shortcutRouter
+        router.isWindowKey = { $0 === window }
+        func view<T>(_ id: UInt64, as _: T.Type = T.self) throws -> T {
+            try #require(renderer.registry.handle(for: NodeId(id))?.view as? T, "node \(id)")
+        }
+        let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
+        let treeHandle = try #require(renderer.registry.handle(for: NodeId(Self.treeID)))
+        let table = try #require((tableHandle.view as? NSScrollView)?.documentView as? NSTableView)
+        let outline = try #require((treeHandle.view as? NSScrollView)?.documentView as? NSOutlineView)
+        let tagToggle: NSButton = try view(Self.tagToggleID)
+        let tagDescendants: NSButton = try view(Self.tagDescendantsID)
+        let tagsClear: NSButton = try view(Self.tagsClearID)
+        let tagsStatus: NSTextField = try view(Self.tagsStatusID)
+        let inspectorStatus: NSTextField = try view(Self.inspectorLineIDs[0])
+        let sortByCPU: NSButton = try view(Self.sortButtonIDs[3])
+        let refresh: NSButton = try view(63)
+        let filterHandle = try #require(renderer.registry.handle(for: NodeId(Self.filterInputID)))
+        let filterField = try #require(filterHandle.view as? NSTextField)
+        let filterAdapter = try #require(filterHandle.textAdapter)
+        let tagKey = try Self.keyEvent("t", [.command, .shift], keyCode: 17, in: window)
+        let treeKey = try Self.keyEvent("t", [.command], keyCode: 17, in: window)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the twelve table rows") {
+            table.numberOfRows == 12 && tagToggle.isEnabled
+        }
+        // Standard buttons with their own labels and shortcuts; a Tag column after the chosen ones.
+        #expect([tagToggle.title, tagDescendants.title, tagsClear.title]
+                == ["Tag or untag selected", "Tag selected and descendants", "Clear tags"])
+        #expect(tagToggle.toolTip == "Tag or untag selected (⇧⌘T)")
+        #expect(tagDescendants.toolTip == "Tag selected and descendants (⇧⌘D)")
+        #expect(renderer.registry.handle(for: NodeId(Self.tagsClearID))?.shortcutBinding == nil, "Clear tags has no shortcut")
+        #expect(table.tableColumns.map(\.title) == ["PID", "Name", "Resident", "CPU (100% = 1 CPU)", "Tag"])
+        #expect(tagsStatus.stringValue.hasPrefix("Tags: none"))
+        /// The PIDs whose shown rows the Tag column marks, in the table or the outline.
+        func taggedInTable() -> Set<String> {
+            Set(Self.nativeRows(table).filter { $0.last == "tagged" }.map { $0[0] })
+        }
+        func outlineRows() -> [[String]] {
+            (0..<outline.numberOfRows).map { row in
+                let first = (outline.view(atColumn: 0, row: row, makeIfNecessary: true)
+                    as? OutlineCollectionAdapter.TreeCellView)?.label.stringValue ?? ""
+                let others = (1..<outline.tableColumns.count).map { column in
+                    (outline.view(atColumn: column, row: row, makeIfNecessary: true) as? NSTextField)?.stringValue ?? ""
+                }
+                return [first] + others
+            }
+        }
+        func taggedInOutline() -> Set<String> {
+            let tag = outline.tableColumns.count - 2
+            return Set(outlineRows().filter { $0[tag] == "tagged" }.map { $0[0] })
+        }
+        let identities = Set(Self.modelItemIDs(applier))
+
+        // Select `make` natively and tag it with its sampled descendants: `cc` and `ld`.
+        let makeRow = try #require(Self.nativeRows(table).firstIndex { $0.first == "300" })
+        table.selectRowIndexes(IndexSet(integer: makeRow), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on make") {
+            inspectorStatus.stringValue.hasPrefix("Selected process: PID 300 · make")
+        }
+        NativeActivation.click(tagDescendants)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "make and its descendants tagged") {
+            taggedInTable() == ["300", "310", "311"] && tagsStatus.stringValue.hasPrefix("Tags: 3 tagged · Tagged PID 300 · make and 2 sampled descendants")
+        }
+        #expect(table.selectedRowIndexes == IndexSet(integer: makeRow), "tagging never moves the selection")
+        #expect(inspectorStatus.stringValue.hasPrefix("Selected process: PID 300 · make"))
+
+        // `editor` by the shortcut: ⇧⌘T is the button's click.
+        let editorRow = try #require(Self.nativeRows(table).firstIndex { $0.first == "301" })
+        table.selectRowIndexes(IndexSet(integer: editorRow), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on editor") {
+            inspectorStatus.stringValue.hasPrefix("Selected process: PID 301 · editor")
+        }
+        #expect(window.performKeyEquivalent(with: tagKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "editor tagged by its shortcut") {
+            taggedInTable() == ["300", "301", "310", "311"] && tagsStatus.stringValue.hasPrefix("Tags: 4 tagged")
+        }
+
+        // A CPU sort moves the rows; the tags stay on their processes and the selection on editor.
+        NativeActivation.click(sortByCPU)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "sorted by CPU") {
+            sortByCPU.title == "Sort by CPU \u{2193}" && Self.nativeRows(table).first?.first == "301"
+        }
+        #expect(taggedInTable() == ["300", "301", "310", "311"])
+        #expect(table.selectedRowIndexes == IndexSet(integer: 0), "editor is selected where it moved")
+
+        // A filter that hides three tagged processes: they stay tagged, counted as hidden.
+        filterField.stringValue = "make"
+        filterAdapter.notifyTextDidChangeForTests()
+        filterAdapter.notifyEndEditingForTests()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "three tagged processes hidden by the filter") {
+            table.numberOfRows == 1 && taggedInTable() == ["300"]
+                && tagsStatus.stringValue.hasPrefix("Tags: 4 tagged · 3 hidden by the filters")
+        }
+        filterField.stringValue = ""
+        filterAdapter.notifyTextDidChangeForTests()
+        filterAdapter.notifyEndEditingForTests()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "every row back, tagged as before") {
+            table.numberOfRows == 12 && taggedInTable() == ["300", "301", "310", "311"]
+                && !tagsStatus.stringValue.contains("hidden")
+        }
+
+        // The tree shows the same tags, its Tag column before Parent.
+        #expect(window.performKeyEquivalent(with: treeKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the tree shown") {
+            outline.numberOfRows == 12
+        }
+        window.contentView?.layoutSubtreeIfNeeded()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the tree with tags") {
+            taggedInOutline() == ["300", "301", "310", "311"]
+        }
+        #expect(outline.tableColumns.map(\.title) == ["PID", "Name", "Resident", "CPU (100% = 1 CPU)", "Tag", "Parent"])
+
+        // Refresh now: `make` has ended. Its tag is historical; `cc` and `ld`, reparented to
+        // init, keep theirs: a tag follows the process instance, never its place.
+        NativeActivation.click(refresh)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "make's tag historical") {
+            outline.numberOfRows == 11 && taggedInOutline() == ["301", "310", "311"]
+                && tagsStatus.stringValue.hasPrefix("Tags: 3 tagged · 1 no longer listed: PID 300 · make")
+        }
+
+        // Clear tags: every mark goes; the selection, the inspector and the item IDs stay.
+        let selectedBefore = outline.selectedRowIndexes
+        let inspectorBefore = inspectorStatus.stringValue
+        NativeActivation.click(tagsClear)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "every tag cleared") {
+            taggedInOutline().isEmpty
+                && tagsStatus.stringValue.hasSuffix("Cleared 3 tags and 1 historical; the selection is unchanged")
+        }
+        #expect(outline.selectedRowIndexes == selectedBefore, "clearing tags never changes the selection")
+        #expect(!selectedBefore.isEmpty)
+        #expect(inspectorStatus.stringValue == inspectorBefore)
+        #expect(window.performKeyEquivalent(with: treeKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the table again") {
+            table.numberOfRows == 11 && outline.numberOfRows == 0
+        }
+        #expect(Set(Self.modelItemIDs(applier)).isSubset(of: identities), "no row took a new identity")
+        #expect(renderer.registry.handle(for: NodeId(5)) === tableHandle, "the table was never rebuilt")
+        #expect(renderer.registry.handle(for: NodeId(Self.treeID)) === treeHandle, "the tree was never rebuilt")
+        print("PX-020 native SSH evidence: window \(window.windowNumber); rows=\(Self.nativeRows(table)); tags status=\(tagsStatus.stringValue); inspector=\(inspectorStatus.stringValue); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
+    // PX-020: the tag controls.
+    fileprivate static let tagToggleID: UInt64 = 79
+    fileprivate static let tagDescendantsID: UInt64 = 80
+    fileprivate static let tagsClearID: UInt64 = 81
+    fileprivate static let tagsStatusID: UInt64 = 82
+
     // PX-019: the thread controls.
     fileprivate static let userThreadsID: UInt64 = 75
     fileprivate static let kernelThreadsID: UInt64 = 76
@@ -1955,6 +2128,9 @@ struct ProcessExplorerShellTests {
         KeyboardBinding(id: 68, label: "Follow selected process", shortcut: "primary+shift+f", display: "⇧⌘F", initiallyEnabled: true),
         // PX-018: the view switch, between the follow controls and the table.
         KeyboardBinding(id: 71, label: "Show process tree", shortcut: "primary+t", display: "⌘T", initiallyEnabled: true),
+        // PX-020: the two tag buttons, between the thread controls and the table.
+        KeyboardBinding(id: 79, label: "Tag or untag selected", shortcut: "primary+shift+t", display: "⇧⌘T", initiallyEnabled: true),
+        KeyboardBinding(id: 80, label: "Tag selected and descendants", shortcut: "primary+shift+d", display: "⇧⌘D", initiallyEnabled: true),
         KeyboardBinding(id: 5, label: "Processes", shortcut: "primary+l", display: "⌘L", initiallyEnabled: true),
         KeyboardBinding(id: 60, label: "Command line and executable", shortcut: "primary+i", display: "⌘I", initiallyEnabled: true),
     ]
@@ -2662,11 +2838,12 @@ struct ProcessExplorerShellTests {
         #expect(table.selectedRowIndexes == IndexSet(integer: 2))
 
         /// The sorted rows projected onto `columns`, indices into the default layout.
+        // PX-020: the tag column always follows the chosen columns.
         func projected(_ columns: [Int]) -> [[String]] {
-            byName.map { row in columns.map { row[$0] } }
+            byName.map { row in columns.map { row[$0] } + [row[4]] }
         }
         func headings(_ columns: [Int]) -> [String] {
-            columns.map { Self.defaultHeadings[$0] }
+            columns.map { Self.defaultHeadings[$0] } + [Self.defaultHeadings[4]]
         }
         func expectSelectionKept(_ step: String) {
             #expect(Self.modelItemIDs(applier) == sortedIDs, "\(step): every process kept its item ID and its sorted place")
@@ -2736,7 +2913,7 @@ struct ProcessExplorerShellTests {
     }
 
     // PX-068: the catalogued headings, and the short names the chooser's labels may use instead.
-    private static let defaultHeadings = ["PID", "Name", "Resident", "CPU (100% = 1 CPU)"]
+    private static let defaultHeadings = ["PID", "Name", "Resident", "CPU (100% = 1 CPU)", "Tag"]
     private static let columnButtonNames = ["PID", "Name", "Resident", "CPU"]
 
     /// Every enabled native button outside the sort row, with its title.
@@ -2798,7 +2975,7 @@ struct ProcessExplorerShellTests {
         let table = try #require(scroll.documentView as? NSTableView)
 
         #expect(table.numberOfRows == 1000)
-        #expect(table.tableColumns.map(\.title) == ["PID", "Name", "Resident", "CPU (100% = 1 CPU)"])
+        #expect(table.tableColumns.map(\.title) == ["PID", "Name", "Resident", "CPU (100% = 1 CPU)", "Tag"])
 
         // Visible cells in the initial viewport render native strings properly
         for col in 0..<4 {
@@ -2848,9 +3025,9 @@ struct ProcessExplorerShellTests {
     // PX-009: the sort row's four buttons, in column order.
     fileprivate static let sortButtonIDs: [UInt64] = [21, 22, 23, 24]
     private static let fakeRows = [
-        ["4101", "worker", "1.1 MiB", "250.0%"],
-        ["4102", "worker", "0 B", "0.0%"],
-        ["Unavailable", "helper", "Denied", "Warming up"],
+        ["4101", "worker", "1.1 MiB", "250.0%", ""],
+        ["4102", "worker", "0 B", "0.0%", ""],
+        ["Unavailable", "helper", "Denied", "Warming up", ""],
     ]
 
     /// The client `RendererDemoApp --ssh/--socket` builds for every live session: nothing in it
@@ -2949,14 +3126,14 @@ struct ProcessExplorerShellTests {
     // that a repeated snapshot's rows stay byte-identical and publish nothing.
     // PX-006: the CPU cell likewise, one per CPU state the script states.
     private static let initialRows = [
-        ["4101", "worker", "2.0 MiB", "50.0%"],
-        ["4102", "worker", "1023 B", "0.0%"],
-        ["4103", "helper", "Unavailable", "Unavailable"],
+        ["4101", "worker", "2.0 MiB", "50.0%", ""],
+        ["4102", "worker", "1023 B", "0.0%", ""],
+        ["4103", "helper", "Unavailable", "Unavailable", ""],
     ]
     private static let settledRows = [
-        ["4101", "worker", "2.0 MiB", "50.0%"],
-        ["4103", "helper-tool", "Unavailable", "Unavailable"],
-        ["4104", "builder", "5.0 GiB", "Warming up"],
+        ["4101", "worker", "2.0 MiB", "50.0%", ""],
+        ["4103", "helper-tool", "Unavailable", "Unavailable", ""],
+        ["4104", "builder", "5.0 GiB", "Warming up", ""],
     ]
     private static let normalStatus = "Read-only · Fake process sequence"
     private static let retainedRowsMarker = "retained from an earlier scan"
@@ -3551,7 +3728,7 @@ struct ProcessExplorerDevboxScenarioTests {
         let initial = try #require(recorder.states.first)
         #expect(initial.status == Self.liveStatus)
         #expect(!initial.rows.contains { $0[1] == Self.workerName })
-        #expect(table.tableColumns.map(\.title) == ["PID", "Name", "Resident", "CPU (100% = 1 CPU)"])
+        #expect(table.tableColumns.map(\.title) == ["PID", "Name", "Resident", "CPU (100% = 1 CPU)", "Tag"])
 
         // Worker creation, inside the box, as the box's own unprivileged user.
         let spawned = clock.now

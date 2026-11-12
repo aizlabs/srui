@@ -127,6 +127,7 @@ fn assert_shell_intact(session: &Session) {
                     FOLLOW_ROW,
                     srui_process_explorer::VIEW_ROW,
                     srui_process_explorer::THREADS_ROW,
+                    srui_process_explorer::TAGS_ROW,
                     TABLE,
                     srui_process_explorer::TREE,
                     INSPECTOR

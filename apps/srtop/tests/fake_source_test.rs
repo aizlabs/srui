@@ -76,19 +76,25 @@ fn injected_source_is_called_once_and_three_rows_are_model_data() {
                     Value::UnsignedInt(4101),
                     Value::String("worker".into()),
                     Value::String("1.1 MiB".into()),
-                    Value::String("250.0%".into())
+                    Value::String("250.0%".into()),
+                    // The empty tag cell (PX-020).
+                    Value::String(String::new())
                 ]),
                 Value::List(vec![
                     Value::UnsignedInt(4102),
                     Value::String("worker".into()),
                     Value::String("0 B".into()),
-                    Value::String("0.0%".into())
+                    Value::String("0.0%".into()),
+                    // The empty tag cell (PX-020).
+                    Value::String(String::new())
                 ]),
                 Value::List(vec![
                     Value::String("Unavailable".into()),
                     Value::String("helper".into()),
                     Value::String("Denied".into()),
-                    Value::String("Warming up".into())
+                    Value::String("Warming up".into()),
+                    // The empty tag cell (PX-020).
+                    Value::String(String::new())
                 ]),
             ]
         );

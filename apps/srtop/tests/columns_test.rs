@@ -27,6 +27,7 @@ use srui_process_explorer::catalogue::{ProcessField, SortDirection, PROCESS_LIST
 use srui_process_explorer::refresh::ProcessView;
 use srui_process_explorer::sort::SortOrder;
 use srui_process_explorer::source::*;
+use srui_process_explorer::tags::TAG_HEADING;
 use srui_process_explorer::{install_sort_handlers, start_from_source, MODEL, SORT_CPU, TABLE};
 use srui_protocol::{operation, Event as WireEvent};
 use srui_sdk::{
@@ -165,10 +166,13 @@ fn expected_cell(name: &str, field: ProcessField) -> String {
     }
 }
 
+/// The cells of an untagged row in `layout`: one per chosen column, then the
+/// empty tag cell, which follows the chosen columns (PX-020).
 fn expected_cells(name: &str, layout: &[ProcessField]) -> Vec<String> {
     layout
         .iter()
         .map(|field| expected_cell(name, *field))
+        .chain(std::iter::once(String::new()))
         .collect()
 }
 
@@ -252,10 +256,12 @@ fn headings(session: &Session) -> Vec<String> {
     })
 }
 
+/// The headings of `layout`, then the tag column's (PX-020).
 fn headings_of(layout: &[ProcessField]) -> Vec<String> {
     layout
         .iter()
         .map(|field| field.heading().to_string())
+        .chain(std::iter::once(TAG_HEADING.to_string()))
         .collect()
 }
 
@@ -339,9 +345,16 @@ fn names_in_order(session: &Session, name_column: usize) -> Vec<String> {
         .collect()
 }
 
-/// The layout the table publishes, read back from its headings.
+/// The layout the table publishes, read back from its headings: every one
+/// before the tag column, which is last and is not a chosen column (PX-020).
 fn published_layout(session: &Session) -> Vec<ProcessField> {
-    headings(session)
+    let headings = headings(session);
+    let (tag, chosen) = headings.split_last().expect("the tag column");
+    assert_eq!(
+        tag, TAG_HEADING,
+        "the tag column follows the chosen columns"
+    );
+    chosen
         .iter()
         .map(|heading| {
             *PROCESS_LIST
@@ -747,19 +760,28 @@ fn a_refresh_publishes_new_samples_in_the_chosen_layout() {
     assert_eq!(published.len(), 4);
     assert_eq!(
         published["init"],
-        (ids["init"], vec!["init".into(), "90.0%".into()])
+        (
+            ids["init"],
+            vec!["init".into(), "90.0%".into(), String::new()]
+        )
     );
     assert_eq!(
         published["shell"],
-        (ids["shell"], vec!["shell".into(), "50.0%".into()])
+        (
+            ids["shell"],
+            vec!["shell".into(), "50.0%".into(), String::new()]
+        )
     );
     assert_eq!(
         published["daemon"],
-        (ids["daemon"], vec!["daemon".into(), "20.0%".into()])
+        (
+            ids["daemon"],
+            vec!["daemon".into(), "20.0%".into(), String::new()]
+        )
     );
     assert_eq!(
         published["cron"].1,
-        vec!["cron".to_string(), "1.0%".to_string()]
+        vec!["cron".to_string(), "1.0%".to_string(), String::new()]
     );
     assert!(!ids.values().any(|id| *id == published["cron"].0));
 }
@@ -893,7 +915,10 @@ fn reordering_columns_under_an_active_sort_keeps_the_order_and_every_identity() 
         .map(|(id, cells)| (cells[2].clone(), id))
         .collect();
     assert_eq!(after, ids);
-    assert_eq!(rows(&session)[0].1, vec!["90.0%", "1.0 KiB", "init", "7"]);
+    assert_eq!(
+        rows(&session)[0].1,
+        vec!["90.0%", "1.0 KiB", "init", "7", ""]
+    );
     assert_no_row_lost_since(&session, revision);
     assert_table_and_model_kept_since(&session, revision);
     assert_eq!(

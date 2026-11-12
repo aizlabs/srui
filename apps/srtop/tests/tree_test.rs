@@ -494,7 +494,8 @@ fn the_tree_projects_the_same_identities_with_parents_from_the_same_generation()
             (801, 1, 0, s("800")),
         ]
     );
-    // The headings were the tree's from the start: the table's and Parent.
+    // The headings were the tree's from the start: the table's, the tag
+    // column's (PX-020) and Parent.
     assert_eq!(
         h.property(TREE, COLUMNS),
         Some(Value::List(vec![
@@ -502,6 +503,7 @@ fn the_tree_projects_the_same_identities_with_parents_from_the_same_generation()
             Value::String("Name".into()),
             Value::String("Resident".into()),
             Value::String("CPU (100% = 1 CPU)".into()),
+            Value::String("Tag".into()),
             Value::String("Parent".into()),
         ]))
     );
@@ -1210,12 +1212,17 @@ fn a_column_layout_change_re_lays_out_both_collections_and_keeps_the_tree() {
         vec![
             Value::String("Name".into()),
             Value::String("PID".into()),
+            Value::String("Tag".into()),
             Value::String("Parent".into()),
         ]
     );
     assert_eq!(
         headings(TABLE),
-        vec![Value::String("Name".into()), Value::String("PID".into())]
+        vec![
+            Value::String("Name".into()),
+            Value::String("PID".into()),
+            Value::String("Tag".into())
+        ]
     );
     let model = h.replica.get_model(TREE_MODEL).unwrap();
     let first = model.get_item_by_index(0).unwrap();
@@ -1224,6 +1231,7 @@ fn a_column_layout_change_re_lays_out_both_collections_and_keeps_the_tree() {
         Value::List(vec![
             Value::String("init".into()),
             Value::UnsignedInt(1),
+            Value::String(String::new()),
             Value::String("none: started by the kernel".into()),
         ])
     );

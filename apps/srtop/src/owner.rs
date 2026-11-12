@@ -960,7 +960,9 @@ impl OwnerFilter {
         shown: usize,
         matched: usize,
     ) -> OwnerView {
-        let total = collection.len();
+        // Processes, never threads (PX-019): a thread row is shown with its
+        // process and is no process of its own.
+        let total = collection.iter().filter(|row| !row.key.is_thread()).count();
         let mut status = format!("User: {}", scope.who);
         if self.pids.is_active() {
             let count = self.pids.pids.len();

@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-019",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "User threads and kernel-thread visibility: thread-aware source records kept apart from process records, a thread identity of its process instance plus its own TID and creation token, two independent standard checkbox Toggles with a threads status, thread rows after their process in the table and under it in the tree, documented per-thread versus whole-process counters with no double counting, an explicit capability limitation where no per-thread records exist, and the record, row and byte ceilings applied at and past the bound; no protocol, registry, SDK, renderer or client source change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md",
+      "H3": "https://raw.githubusercontent.com/htop-dev/htop/3.5.3/linux/LinuxProcess.c",
+      "S1": "https://docs.rs/sysinfo/latest/sysinfo/struct.Process.html"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX019-001",
+      "feature": "Thread-aware source records with an explicit process/thread distinction: ProcessRecord::kind (user process with the kernel's thread count from stat field 20, kernel thread from PF_KTHREAD, or thread) and ProcessSnapshot::threads (NotProvided, NotRequested, or Read with its own unreadable and capped PID ledgers and denied count), so no process count ever counts a thread; a projection refuses a thread without its listed process, a process record naming a thread, and a thread record naming none",
+      "scope": "PX-019/source (src/source.rs) TaskKind, KIND_NOT_COLLECTED, ThreadScan, ThreadRecords, MAX_THREAD_RECORDS, ProcessSource::collect_threads, ProcessSnapshot::retention, ThreadsSource; projection (src/projection.rs) SessionItemIds::project, Row::kind; tests/threads_test.rs a_thread_without_its_process_or_a_process_naming_a_thread_is_refused_whole, processes_are_never_counted_twice_and_thread_rows_split_their_process",
+      "source_refs": [
+        "D1",
+        "D2",
+        "H3",
+        "S1"
+      ],
+      "owner": "PX-019",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-019.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX019-002",
+      "feature": "Thread identity: a thread's ProcessKey is its process instance's whole key plus ThreadIdentity { tid, creation }, the creation token being /proc/<pid>/task/<tid>/stat field 22 read with the thread's name and counters; a thread that ends loses its row and a new thread, including one reusing a TID, gets a new item ID while every other row keeps its own; the tree attaches a thread by that whole key, never by PID",
+      "scope": "PX-019/source (src/source.rs) ThreadIdentity, ProcessKey::thread, process_key, is_thread_of; sort (src/sort.rs) process_key_order; tree (src/tree.rs) resolve, Link::ThreadOf; tests/threads_test.rs a_thread_that_ends_and_a_reused_tid_get_new_identities_and_nothing_else_moves, procfs_reads_threads_only_when_asked_and_names_what_it_could_not_read, live::a_live_multithreaded_worker_shows_its_threads_and_a_replaced_thread_is_new; client-macos ProcessExplorerShellTests userAndKernelThreadsAreShownUnderTheirProcessWithTheirOwnIdentities",
+      "source_refs": [
+        "D1",
+        "D2",
+        "H3",
+        "S1"
+      ],
+      "owner": "PX-019",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-019.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX019-003",
+      "feature": "Independent user-thread and kernel-thread visibility: standard checkbox Toggles Show user threads (node 75, off) and Show kernel threads (node 76, on) and a threads status Text (node 77) in a Row (node 74) between the view switch and the collections, disabled in the uncollected shell; each handler is its toggle's VALUE_CHANGED, an exact audit pair, which reads only the boolean and always publishes the value the server holds; showing user threads asks the loop for one sample that reads them, hiding them removes every thread row at once, clears an inspector on a thread and takes one sample without them; every real change of the user-thread setting discards a sample taken under the other setting and replaces it, including one Resume view or Refresh now asked for (merge verification F3, N1); hiding kernel threads samples nothing",
+      "scope": "PX-019/lib (src/lib.rs) THREADS_ROW, USER_THREADS_TOGGLE, KERNEL_THREADS_TOGGLE, THREADS_STATUS, initialize_rows, install_thread_handlers; refresh (src/refresh.rs) set_user_threads, set_kernel_threads, threads_effects, threads_requested, poll, THREADS_RESERVE_BYTES; threads (src/threads.rs) ThreadSettings, admits; main (src/main.rs) --fake-threads; tests/threads_test.rs the_kernel_thread_switch_is_independent_of_the_user_thread_switch, hiding_user_threads_clears_an_inspector_that_described_one, the_view_reads_no_thread_while_paused_and_says_when_it_will, a_sample_taken_under_the_other_thread_setting_is_discarded, hiding_user_threads_during_resume_views_sample_takes_another_at_once, hiding_user_threads_during_a_refresh_now_sample_takes_another_at_once, only_a_real_user_thread_change_advances_the_sampling_epoch; sampling (src/sampling.rs) Sampling::invalidate; tests/no_process_control_test.rs VIEW_AND_TREE_INPUTS",
+      "source_refs": [
+        "D1",
+        "D2",
+        "H3",
+        "S1"
+      ],
+      "owner": "PX-019",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-019.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX019-004",
+      "feature": "Thread counts and the counter policy: the threads status counts threads by the kernel's count while hidden and thread rows while shown, each thread once; a process row is the whole process and a thread row that thread alone (its own CPU from task stat fields 14 and 15, Resident 'See process'), documented in the catalogue's metric definitions; per-thread CPU baselines are dropped with the process baselines when the boot or PID namespace changes, so a thread there warms up (Codex review); the summary's process count is the scan's process records",
+      "scope": "PX-019/threads (src/threads.rs) ThreadCounts, status; metric (src/metric.rs) CPU_USAGE, RESIDENT_MEMORY, PROCESS_ID, THREAD_RESIDENT_TEXT, thread_pid_cell; catalogue (src/catalogue.rs) ProcessField::cell, availability; procfs (src/procfs.rs) StatFields::threads, read_threads; tests/threads_test.rs showing_user_threads_adds_each_thread_after_its_process_with_its_own_counters, processes_are_never_counted_twice_and_thread_rows_split_their_process, a_thread_count_the_kernel_did_not_write_is_unread_never_zero, thread_baselines_are_dropped_when_the_boot_or_pid_namespace_changes; src/threads.rs counts_count_each_thread_once_and_the_status_is_bounded",
+      "source_refs": [
+        "D1",
+        "D2",
+        "H3",
+        "S1"
+      ],
+      "owner": "PX-019",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-019.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX019-005",
+      "feature": "Hosts without reliable thread metadata: a source with no per-thread records (every fixture but --fake-threads, and ProcFsSource::live off Linux) states ThreadScan::NotProvided and the status says user threads are unavailable, never zero; a process whose task listing or a thread of which is unreadable or denied is named and counted and its earlier thread rows are kept; a source that does not classify kernel threads says so; earlier thread rows are kept only for the process instance this scan confirmed (whole key), never a process row, never a thread of an ended instance under a reused PID (correction round 1), and never an earlier thread instance under a TID this scan read under a new one (Codex review)",
+      "scope": "PX-019/procfs (src/procfs.rs) threads_supported, threads_unread, read_threads; threads (src/threads.rs) ThreadReport, status; tests/threads_test.rs a_source_without_per_thread_records_says_so_and_never_shows_zero_threads, thread_rows_of_a_process_whose_threads_became_unreadable_are_kept, a_reused_pid_whose_new_threads_are_unreadable_keeps_no_row_of_the_ended_instance, a_reused_pid_past_the_thread_bound_keeps_no_row_of_the_ended_instance_over_scans, a_scan_that_read_no_threads_keeps_no_thread_row_even_of_a_kept_process, a_reused_tid_beside_an_unreadable_thread_keeps_only_the_new_instance, an_evicted_thread_whose_tid_a_new_instance_took_is_ended; source (src/source.rs) ThreadRetention, ProcessSnapshot::thread_retention; refresh (src/refresh.rs) retain_unconfirmed_by",
+      "source_refs": [
+        "D1",
+        "D2",
+        "H3",
+        "S1"
+      ],
+      "owner": "PX-019",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-019.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX019-006",
+      "feature": "Bounds at and past the bound: one scan reads at most MAX_THREAD_RECORDS thread records and names every process whose threads it left unread (kept, not deleted); thread rows are rows under the same frame budget and row ceiling, a thread follows its process so the ceiling and eviction never show a thread without it, and the tree keeps a preorder prefix",
+      "scope": "PX-019/procfs (src/procfs.rs) ProcFsSource::with_thread_limit, read_threads; threads (src/threads.rs) group, kept_with_processes; refresh (src/refresh.rs) apply, visible_in, bound_to_publishable_collection; tests/threads_test.rs the_thread_bound_names_the_processes_it_left_unread_at_and_past_the_bound, the_row_ceiling_keeps_a_process_before_its_threads_at_and_past_the_bound; src/refresh.rs the_shell_status_and_summary_fit_their_snapshot_allowances",
+      "source_refs": [
+        "D1",
+        "D2",
+        "H3",
+        "S1"
+      ],
+      "owner": "PX-019",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-019.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX019-007",
+      "feature": "Integration: filters choose processes and a thread is shown exactly with its process; the table keeps each process's threads after it, ordered among themselves by the active sort; the tree places them as the process's first children with Parent 'thread of P'; the inspector, follow and search name a thread as 'TID t of PID p' and say when it ended; Go to PID never selects a thread",
+      "scope": "PX-019/threads (src/threads.rs) thread_subject; inspector (src/inspector.rs) InspectorView, FixtureDetails; follow (src/follow.rs) who; search (src/search.rs) known_pid, subject; owner (src/owner.rs) OwnerFilter::view; procfs (src/procfs.rs) ProcFsDetails thread reads; tests/threads_test.rs filters_choose_processes_and_threads_follow_them, sorting_orders_processes_and_each_processs_threads_among_themselves, the_tree_places_each_thread_under_its_process_as_its_first_children, the_inspector_and_follow_name_a_thread_and_see_it_end, the_detail_reader_reads_a_thread_and_reports_a_reused_tid_as_ended, threads_stay_with_their_own_instance_when_two_instances_share_a_pid, resuming_republishes_the_threads_status, follow_on_a_thread_says_user_threads_were_hidden",
+      "source_refs": [
+        "D1",
+        "D2",
+        "H3",
+        "S1"
+      ],
+      "owner": "PX-019",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-019.md"
+      ]
+    }
+  ]
+}

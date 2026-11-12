@@ -33,6 +33,15 @@
 //! rows they come from, which is the active sort (PX-009) or else the
 //! source's order, so sorting orders every level and never flattens one.
 //!
+//! A user thread (PX-019) is never resolved by PID: its row is placed under
+//! the row of the process instance its key names — the same process, compared
+//! whole — as one of that process's first children, in the order the rows
+//! come in, and its parent cell says `thread of P`. A thread row is a leaf, and
+//! no process is ever placed under a thread. The thread controls show a
+//! thread row only with its process row, so a thread's process is always
+//! shown; one that is not, or that sits on the deepest level the tree may
+//! hold children on, makes the thread a root that says why.
+//!
 //! The forest is flattened, and every item stamped, by the SDK's
 //! [`srui_sdk::TreeModel`] ([`stamp`]), so the published shape is the one the
 //! runtime validates and refuses beyond its depth limit.
@@ -84,6 +93,8 @@ pub enum RootReason {
     Cycle(u32),
     /// Its parent sits on the deepest level the tree may hold children on.
     DepthLimit(u32),
+    /// A thread whose process row is not shown (PX-019).
+    ThreadProcessNotShown(u32),
 }
 
 /// Where one shown process hangs: under the parent with this PID, or at the
@@ -91,6 +102,8 @@ pub enum RootReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Link {
     Under(u32),
+    /// A thread under its process, whose PID this is (PX-019).
+    ThreadOf(u32),
     Root(RootReason),
 }
 
@@ -100,6 +113,7 @@ impl Link {
     pub fn describe(&self) -> String {
         let reason = match self {
             Self::Under(parent) => return parent.to_string(),
+            Self::ThreadOf(process) => return format!("thread of {process}"),
             Self::Root(reason) => reason,
         };
         match reason {
@@ -127,6 +141,9 @@ impl Link {
             RootReason::ParentHidden(pid) => format!("root: parent {pid} hidden by the filters"),
             RootReason::Cycle(pid) => format!("root: cycle through parent {pid} broken here"),
             RootReason::DepthLimit(pid) => format!("root: parent {pid} at the depth limit"),
+            RootReason::ThreadProcessNotShown(pid) => {
+                format!("root: thread of {pid}, which is not shown")
+            }
         }
     }
 }
@@ -191,10 +208,15 @@ fn known<T: Copy>(observed: &Observed<T>) -> Option<T> {
 /// The resolved link of every row of `visible`: the index of its parent among
 /// `visible`, or why it has none. Cycles are not yet broken.
 fn resolve(visible: &[Row], generation: &Generation<'_>) -> Vec<Result<usize, RootReason>> {
-    // The current generation by PID: rows the latest scan confirmed.
+    // The current generation by PID: rows the latest scan confirmed. A
+    // thread row holds its process's PID and is never anyone's parent
+    // (PX-019).
     let mut by_pid: HashMap<u32, Vec<&Row>> = HashMap::new();
     let mut kept_earlier: HashSet<u32> = HashSet::new();
     for row in generation.unfiltered {
+        if row.key.is_thread() {
+            continue;
+        }
         let Some(pid) = known(&row.key.pid) else {
             continue;
         };
@@ -209,10 +231,24 @@ fn resolve(visible: &[Row], generation: &Generation<'_>) -> Vec<Result<usize, Ro
         .enumerate()
         .map(|(index, row)| (row.item_id, index))
         .collect();
+    // Shown process rows by their whole key, for their threads (PX-019).
+    let processes: HashMap<&crate::source::ProcessKey, usize> = visible
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| !row.key.is_thread())
+        .map(|(index, row)| (&row.key, index))
+        .collect();
     let gaps = generation.gaps;
     visible
         .iter()
         .map(|row| {
+            // A thread hangs under its own process instance, whatever its
+            // PID says (PX-019).
+            if row.key.is_thread() {
+                return processes.get(&row.key.process_key()).copied().ok_or(
+                    RootReason::ThreadProcessNotShown(known(&row.key.pid).unwrap_or(0)),
+                );
+            }
             if generation.unconfirmed.contains(&row.item_id) {
                 return Err(RootReason::Unconfirmed);
             }
@@ -327,6 +363,10 @@ pub(crate) fn arrange(
             Err(_) => roots.push(index),
         }
     }
+    // A process's threads are its first children (PX-019), in their order.
+    for siblings in &mut children {
+        siblings.sort_by_key(|&child| !visible[child].key.is_thread());
+    }
     let mut place: Vec<Option<(u64, Link)>> = vec![None; visible.len()];
     let mut order: Vec<usize> = Vec::with_capacity(visible.len());
     let max_depth = max_levels.max(1) as u64 - 1;
@@ -345,9 +385,17 @@ pub(crate) fn arrange(
                 place[index] = Some((depth, link));
                 order.push(index);
                 let pid = known(&visible[index].key.pid).unwrap_or(0);
+                // A thread is linked as its process's thread (PX-019).
+                let link_of = |child: usize| {
+                    if visible[child].key.is_thread() {
+                        Link::ThreadOf(pid)
+                    } else {
+                        Link::Under(pid)
+                    }
+                };
                 if depth < max_depth {
                     for &child in children[index].iter().rev() {
-                        stack.push((child, depth + 1, Link::Under(pid)));
+                        stack.push((child, depth + 1, link_of(child)));
                     }
                 } else {
                     for &child in &children[index] {
@@ -422,6 +470,8 @@ pub(crate) fn stamp(rows: &mut [Row], max_levels: usize) -> Result<(), TreeModel
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ForestSummary {
     pub rows: usize,
+    /// Of `rows`, the thread rows (PX-019).
+    pub threads: usize,
     pub roots: usize,
     /// Roots that are not the kernel's: each states why it has no parent.
     pub orphans: usize,
@@ -442,6 +492,7 @@ impl ForestSummary {
     pub(crate) fn of(rows: &[Row]) -> Self {
         let mut summary = Self {
             rows: rows.len(),
+            threads: rows.iter().filter(|row| row.key.is_thread()).count(),
             ..Self::default()
         };
         for place in rows.iter().filter_map(|row| row.tree.as_ref()) {
@@ -462,7 +513,9 @@ impl ForestSummary {
                 | RootReason::ParentUnread(_)
                 | RootReason::StartUnread(_)
                 | RootReason::Unconfirmed => summary.absent += 1,
-                RootReason::Cycle(_) | RootReason::DepthLimit(_) => summary.malformed += 1,
+                RootReason::Cycle(_)
+                | RootReason::DepthLimit(_)
+                | RootReason::ThreadProcessNotShown(_) => summary.malformed += 1,
                 RootReason::ParentHidden(_) => summary.hidden += 1,
             }
             summary.orphans += 1;
@@ -484,6 +537,7 @@ mod tests {
 
     fn record(pid: u32, parent: u32, started: u64) -> ProcessRecord {
         ProcessRecord {
+            kind: crate::source::KIND_NOT_COLLECTED,
             lineage: Lineage::new(parent, started),
             owner: OWNER_NOT_COLLECTED,
             key: ProcessKey {
@@ -493,6 +547,7 @@ mod tests {
                 pid_namespace: Observed::Known(PidNamespaceId(1)),
                 pid: Observed::Known(pid),
                 creation: CreationToken::LinuxBootTicks(started),
+                thread: None,
             },
             display_name: DisplayName::from(format!("p{pid}").as_str()),
             resident: Observed::Known(0),
@@ -506,6 +561,7 @@ mod tests {
             sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH),
             records,
             vanished: 0,
+            threads: crate::source::ThreadScan::NotProvided,
             capped: CappedRecords::none(),
             completeness: Completeness::Complete,
             system: SystemSample::not_provided(),
@@ -590,6 +646,7 @@ mod tests {
                     assert_eq!(by_pid[&parent_pid].len(), 1, "an unambiguous parent");
                     assert!(started(parent) <= started(row), "the parent started first");
                 }
+                Link::ThreadOf(_) => panic!("these forests hold no thread"),
                 Link::Root(reason) => {
                     assert_eq!(place.depth, 0, "a root sits at the top");
                     match reason {

@@ -413,6 +413,7 @@ impl ProcessSource for Fixed {
             sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
             records: self.records.clone(),
             vanished: 0,
+            threads: srui_process_explorer::source::ThreadScan::NotProvided,
             capped: self.capped.clone(),
             completeness: self.completeness.clone(),
             system: FakeProcessSource::system(),
@@ -422,6 +423,7 @@ impl ProcessSource for Fixed {
 
 fn record(pid: u32, name: &str, lineage: Lineage, ticks: u64) -> ProcessRecord {
     ProcessRecord {
+        kind: srui_process_explorer::source::KIND_NOT_COLLECTED,
         lineage,
         owner: OWNER_NOT_COLLECTED,
         key: ProcessKey {
@@ -431,6 +433,7 @@ fn record(pid: u32, name: &str, lineage: Lineage, ticks: u64) -> ProcessRecord {
             pid_namespace: Observed::Known(PidNamespaceId(4_026_531_836)),
             pid: Observed::Known(pid),
             creation: CreationToken::Opaque(format!("{name}-{pid}")),
+            thread: None,
         },
         display_name: DisplayName::from(name),
         resident: Observed::Known(4096),

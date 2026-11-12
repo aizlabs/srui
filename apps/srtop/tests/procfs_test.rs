@@ -2897,6 +2897,7 @@ fn details_are_read_for_the_keys_own_instance_and_never_from_a_reused_pid() {
         },
         ProcessKey {
             creation: CreationToken::Opaque("7".into()),
+            thread: None,
             ..init.clone()
         },
     ] {
@@ -2913,6 +2914,7 @@ fn details_are_read_for_the_keys_own_instance_and_never_from_a_reused_pid() {
     let denied = ProcessKey {
         pid: Observed::Known(44),
         creation: CreationToken::LinuxBootTicks(500),
+        thread: None,
         ..worker.clone()
     };
     assert_eq!(

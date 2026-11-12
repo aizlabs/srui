@@ -946,8 +946,12 @@ impl ProcessField {
     /// session-anchored key the row is published under.
     pub fn availability(self, key: &ProcessKey, record: &ProcessRecord) -> Availability {
         match self {
+            // A thread row's ID is its own TID, always read (PX-019).
+            Self::Pid if key.thread.is_some() => Availability::Present,
             Self::Pid => Availability::of_observed(&key.pid),
             Self::Name => Availability::Present,
+            // A thread has no resident memory of its own (PX-019).
+            Self::Resident if key.thread.is_some() => Availability::Unsupported,
             Self::Resident => Availability::of_observed(&record.resident),
             Self::Cpu => Availability::of_cpu(&record.cpu),
         }
@@ -955,8 +959,18 @@ impl ProcessField {
 
     /// The published cell, exactly as PX-002, PX-005 and PX-006 publish it: a
     /// known PID is an unsigned integer and every other cell is text.
+    ///
+    /// A thread row (PX-019) states its TID and its process's PID in the PID
+    /// column, and no resident memory of its own.
     pub fn cell(self, key: &ProcessKey, record: &ProcessRecord) -> Value {
         match self {
+            Self::Pid if key.thread.is_some() => {
+                let tid = key.thread.as_ref().map_or(0, |thread| thread.tid);
+                Value::String(metric::thread_pid_cell(tid, &key.pid))
+            }
+            Self::Resident if key.thread.is_some() => {
+                Value::String(metric::THREAD_RESIDENT_TEXT.to_string())
+            }
             Self::Pid => match key.pid {
                 Observed::Known(pid) => Value::UnsignedInt(u64::from(pid)),
                 Observed::Missing(reason) => {

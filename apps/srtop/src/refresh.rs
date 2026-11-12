@@ -34,7 +34,13 @@
 //! sparse replica cannot place an identity delete (PX-018-G01).
 //! Disclosure stays each client's own (§22.5): the view mirrors the collapsed
 //! items each client instance reported, only to tell when the selecting
-//! client's selection or followed process is hidden there.
+//! client's selection or followed process is hidden there. Since PX-019
+//! the collection can hold user threads too ([`crate::threads`]): each thread
+//! row follows its process row, in the table and under it in the tree, and the
+//! thread controls decide which tasks the collection holds before any filter
+//! applies. The refresh loop asks the source for threads only while they are
+//! shown, and every publication that applies the controls also publishes the
+//! threads status in the same plan.
 //!
 //! Four rules shape this module:
 //!
@@ -119,14 +125,16 @@ use crate::inspector::{
     DetailRead, DetailReads, DetailReadsIdle, DetailRequest, DetailSource, HeldSelection,
     Inspector, InspectorView,
 };
-use crate::owner::{OwnerChoice, OwnerFilter, OwnerView, Scope};
+use crate::owner::{OwnerChoice, OwnerFilter, OwnerView};
 use crate::projection::{Row, SessionItemIds};
 use crate::sampling::{relabel_freshness, Frozen, IntervalError, Sampling, SamplingView};
 use crate::search::{Search, SearchStep, SearchView};
 use crate::sort::{self, SortOrder};
 use crate::source::{ProcessSnapshot, ProcessSource, Retention};
 use crate::summary::{self, CollectorError, Sample};
+use crate::threads::{self, ThreadCounts, ThreadReport, ThreadSettings, ThreadsView};
 use crate::tree::{self, ForestSummary, Generation, ScanGaps};
+use crate::KERNEL_THREADS_TOGGLE;
 use crate::{
     bounded, initialize_rows, published_status_from, sort_button_of, ColumnAction, ScanReport,
     COLUMN_CHOOSER_BUTTONS, FILTER_INPUT, FILTER_STATUS, FOLLOW_STATUS, FOLLOW_TOGGLE,
@@ -134,7 +142,7 @@ use crate::{
     INTERVAL_INPUT, LIST_SHORTCUT, MAX_PUBLISHED_LABEL_BYTES, MODEL, OWNER_ALL, OWNER_INPUT,
     OWNER_MINE, OWNER_STATUS, PID_GO, PID_INPUT, PID_SET_INPUT, SAMPLING_PAUSE, SAMPLING_REFRESH,
     SAMPLING_STATUS, SEARCH_INPUT, SEARCH_NEXT, SEARCH_PREVIOUS, SEARCH_STATUS, STATUS, TABLE,
-    TREE, TREE_MODEL, VIEW_STATUS, VIEW_TOGGLE,
+    THREADS_STATUS, TREE, TREE_MODEL, USER_THREADS_TOGGLE, VIEW_STATUS, VIEW_TOGGLE,
 };
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
 use srui_sdk::{
@@ -337,6 +345,11 @@ pub const VIEW_RESERVE_BYTES: usize = 4096;
 
 /// The longest view status, before the cut mark (PX-018).
 pub const MAX_VIEW_STATUS_BYTES: usize = 512;
+/// The thread controls' allowance in the catch-up snapshot (PX-019): the
+/// row, the two checkboxes with their fixed labels and descriptions, and the
+/// threads status at its widest. Charged at this fixed reserve, never at the
+/// status's current length.
+pub const THREADS_RESERVE_BYTES: usize = 4096;
 
 /// What a model item of the process tree carries beyond a table row's: the
 /// two standard item properties `tree_depth` and `descendant_count`, each a
@@ -581,6 +594,14 @@ pub struct ProcessView {
     status_source: String,
     status_scan: ScanReport,
     status_counts: RefreshCounts,
+    /// Which tasks the collection holds (PX-019): user threads and kernel
+    /// threads, each shown or hidden. Session-wide, like the filters.
+    threads: ThreadSettings,
+    /// The thread controls as the client holds them (PX-019).
+    threads_published: ThreadsView,
+    /// What the last accepted sample said about user threads (PX-019).
+    /// Replaced, never grown, by every sample.
+    thread_report: ThreadReport,
 }
 
 /// The rows every active filter keeps, and what the filters' controls say
@@ -590,6 +611,12 @@ struct Visible {
     rows: Vec<Row>,
     /// How many rows every filter keeps, before that bound.
     matched: usize,
+    /// Of `matched`, the process rows (PX-019): what the user filter and the
+    /// summary count, which never count a thread.
+    matched_processes: usize,
+    /// How many rows the thread controls let the collection hold, before any
+    /// filter (PX-019): the text filter's total.
+    total: usize,
     /// How many kept rows the bound left out.
     truncated: usize,
     /// Whether any filter is active.
@@ -656,6 +683,7 @@ impl ProcessView {
             follow: &mut self.follow_published,
             mode: &mut self.mode,
             view_status: &mut self.view_status,
+            threads: &mut self.threads_published,
         }
     }
 
@@ -700,6 +728,10 @@ impl ProcessView {
         // The shell starts in the default layout (PX-068).
         let columns = ColumnLayout::default();
         let unfiltered_rows = ids.project(&snapshot, &columns)?;
+        // The thread controls start at their defaults (PX-019): no thread row
+        // is shown, whatever the first sample read, and the kernel's are.
+        let threads = ThreadSettings::default();
+        let thread_report = ThreadReport::of(&snapshot.threads);
         // The user filter starts at every visible user, and its cache starts
         // naming the daemon's own account at once (PX-012).
         let owner = OwnerFilter::new(&source.accounts());
@@ -714,7 +746,11 @@ impl ProcessView {
         // later is brought up by one snapshot of this same model. The status is
         // charged its fixed reserve, never its current length, so the rows that
         // fit do not depend on what this tick's status happens to say.
-        let mut rows = unfiltered_rows.clone();
+        let mut rows: Vec<Row> = unfiltered_rows
+            .iter()
+            .filter(|row| threads::admits(threads, row))
+            .cloned()
+            .collect();
         let truncated = bound_to_publishable_collection(&mut rows, published_limit);
         let status_counts = RefreshCounts {
             truncated,
@@ -736,17 +772,29 @@ impl ProcessView {
         }));
         let owner_published = {
             let scope = owner.scope(&unfiltered_rows, &committed_filter);
-            owner.view(&scope, &unfiltered_rows, rows.len(), unfiltered_rows.len())
+            let shown = rows.iter().filter(|row| !row.key.is_thread()).count();
+            owner.view(&scope, &unfiltered_rows, shown, shown + truncated)
+        };
+        let threads_published = ThreadsView {
+            status: threads::status(
+                threads,
+                thread_report,
+                ThreadCounts::of(&unfiltered_rows),
+                false,
+            ),
+            user: threads.user,
+            kernel: threads.kernel,
         };
         initialize_rows(
             session,
             rows.iter().map(Row::to_model_item).collect(),
-            unfiltered_rows.len(),
+            rows.len() + truncated,
             &status,
             &summary,
             &owner_published,
             true,
             Some(&sampling),
+            &threads_published.status,
         )?;
         let sampling_published = sampling.view();
         ids.retain(&unfiltered_rows);
@@ -754,8 +802,8 @@ impl ProcessView {
         let filter_status = committed_filter.format_committed_status(
             committed_generation,
             rows.len(),
-            unfiltered_rows.len(),
-            unfiltered_rows.len(),
+            rows.len() + truncated,
+            rows.len() + truncated,
         );
         Ok((
             Self {
@@ -801,6 +849,9 @@ impl ProcessView {
                 status_source: source_status,
                 status_scan: ScanReport::of(&snapshot),
                 status_counts,
+                threads,
+                threads_published,
+                thread_report,
             },
             snapshot,
         ))
@@ -868,6 +919,8 @@ impl ProcessView {
         source: &mut impl ProcessSource,
     ) -> Result<Refreshed, SessionError> {
         let source_status = source.status_text().to_string();
+        // User threads are read only while they are shown (PX-019).
+        source.collect_threads(self.threads_requested());
         let snapshot = source.snapshot();
         self.apply(session, &source_status, &snapshot)
     }
@@ -908,8 +961,53 @@ impl ProcessView {
         };
         let confirmed_ids: HashSet<ItemId> = confirmed.iter().map(|row| row.item_id).collect();
         let confirmed_empty = confirmed.is_empty();
+        // A thread row this scan did not confirm is kept only beside the
+        // process instance it belongs to, confirmed by this scan under the
+        // same whole key, and only when the scan says it could not read that
+        // process's threads (PX-019): never a process row, and never a thread
+        // of an earlier instance under a reused PID.
+        let thread_retention = if rejected.is_some() {
+            crate::source::ThreadRetention::None
+        } else {
+            snapshot.thread_retention()
+        };
+        let live_processes: HashSet<crate::source::ProcessKey> = confirmed
+            .iter()
+            .filter(|row| !row.key.is_thread())
+            .map(|row| row.key.clone())
+            .collect();
+        // The TIDs this scan read, each with the process instance it read it
+        // under. A thread row this scan did not confirm under a TID it read
+        // there is an earlier instance the new one replaced: it has ended,
+        // whatever else the scan could not read (PX-019, Codex review).
+        let read_tids: HashSet<(crate::source::ProcessKey, u32)> = confirmed
+            .iter()
+            .filter_map(|row| {
+                let thread = row.key.thread.as_ref()?;
+                Some((row.key.process_key(), thread.tid))
+            })
+            .collect();
+        let superseded = |key: &crate::source::ProcessKey| {
+            key.thread
+                .as_ref()
+                .is_some_and(|thread| read_tids.contains(&(key.process_key(), thread.tid)))
+        };
         let mut unfiltered_target =
-            retain_unconfirmed(&self.unfiltered_rows, confirmed, &retention);
+            retain_unconfirmed_by(&self.unfiltered_rows, confirmed, |row| {
+                !superseded(&row.key)
+                    && (retention.keeps(&row.key)
+                        || (row.key.is_thread()
+                            && thread_retention.covers(&row.key.pid)
+                            && live_processes.contains(&row.key.process_key())))
+            });
+        // A scan that read no threads (PX-019) says nothing about any thread:
+        // they were hidden when it was taken, or its source reads none. Its
+        // earlier thread rows leave the collection rather than linger as rows
+        // kept from an earlier scan; a scan that did read threads keeps only
+        // those of the processes whose threads it could not read.
+        if rejected.is_none() && snapshot.threads.read().is_none() {
+            unfiltered_target.retain(|row| !row.key.is_thread());
+        }
         // Once a sort is active the target is published in it, confirmed and
         // retained rows alike: a retained row sorts under the values it was
         // published with, not last as though its values were missing. The order
@@ -918,18 +1016,42 @@ impl ProcessView {
         if let Some(order) = self.sort {
             unfiltered_target.sort_by(|left, right| sort::compare(order, left, right));
         }
+        // Each process's threads follow it, in that order among themselves
+        // (PX-019); a thread whose process row is gone goes with it.
+        let (grouped, orphaned) = threads::group(unfiltered_target);
+        let mut unfiltered_target = grouped;
         // Retention is bounded by construction, whatever a scan can and cannot
         // enumerate: the rows carried forward are evicted down to what the
         // published-row ceiling leaves once this scan's own rows are counted.
         let evicted_ids =
             evict_unconfirmed_beyond(&mut unfiltered_target, &confirmed_ids, self.published_limit);
-        let evicted = evicted_ids.len();
+        // A guard, not a case that occurs: every thread row follows its
+        // process, a thread of an unconfirmed process is itself unconfirmed,
+        // and eviction works from the end, so it takes a process's threads
+        // before the process and this regrouping drops nothing. Were it ever
+        // to drop a thread, that thread would be evicted, never ended
+        // (PX-019).
+        let mut evicted_ids = evicted_ids;
+        let (unfiltered_target, evicted_threads) = threads::group_dropping(unfiltered_target);
+        evicted_ids.extend(evicted_threads);
+        let evicted = evicted_ids.len() + orphaned;
         // The inspector learns what this scan established about its target
         // before anything is planned (PX-013 review round): its latest row, or
         // that retention dropped it unconfirmed, which is not an exit, or that
-        // a scan entitled to say so found it gone.
+        // a scan entitled to say so found it gone. A thread's absence is
+        // left unaccounted for, beyond the record retention, only while its
+        // own process instance is confirmed by this scan and the scan read no
+        // threads or could not read that process's threads (PX-019): the same
+        // whole-key rule the row retention above keeps thread rows by.
+        let threads_read = snapshot.threads.read().is_some();
         self.inspector
-            .observe_scan(&unfiltered_target, &evicted_ids, &retention);
+            .observe_scan(&unfiltered_target, &evicted_ids, |key| {
+                !superseded(key)
+                    && (retention.keeps(key)
+                        || (key.is_thread()
+                            && live_processes.contains(&key.process_key())
+                            && (!threads_read || thread_retention.covers(&key.pid))))
+            });
         // The rows this scan did not confirm, which a PID jump never selects
         // (PX-011) and the tree never takes a parent from (PX-018): bounded by
         // the collection, and replaced on every refresh.
@@ -948,11 +1070,16 @@ impl ProcessView {
         // Every filter is applied to the collection together (PX-012): the
         // user filter, the PID set and the text filter. The tree is arranged
         // from this generation (PX-018).
+        if rejected.is_none() {
+            // What this sample said about threads (PX-019).
+            self.thread_report = ThreadReport::of(&snapshot.threads);
+        }
         let visible = self.visible_in(self.mode, &unfiltered_target, &unconfirmed, &gaps);
         let forest = visible.forest;
+        let total = visible.total;
         let (target, matched, filter_truncated) =
             (visible.rows, visible.matched, visible.truncated);
-        let filter_matches = visible.restricted.then_some(matched);
+        let filter_matches = visible.restricted.then_some(visible.matched_processes);
         let owner_view = visible.owner;
         let beyond_text = visible.beyond_text;
         // The summary shows the last successful sample (PX-007): this scan, if
@@ -986,8 +1113,7 @@ impl ProcessView {
         let status = refresh_status(source_status, snapshot, &counts);
         debug_assert!(status.len() <= STATUS_RESERVE_BYTES);
         self.remember_status(source_status, snapshot, counts);
-        let filter_status =
-            self.filter_status_for(target.len(), matched, unfiltered_target.len(), beyond_text);
+        let filter_status = self.filter_status_for(target.len(), matched, total, beyond_text);
 
         let (batch, max_ops, max_bytes) = self.planning_limits(session);
 
@@ -1002,6 +1128,7 @@ impl ProcessView {
             plan.push(Planned::new(Effect::FilterStatus(filter_status)));
         }
         plan.extend(self.owner_effects(owner_view));
+        plan.extend(self.threads_effects(&unfiltered_target));
         // Then the summary, whose lines are scalar properties: only the ones a
         // client would see change are planned (PX-007).
         plan.extend(summary_effects(&self.summary, &summary));
@@ -1023,7 +1150,8 @@ impl ProcessView {
         // Follow last of all (PX-017): it stops when this plan hides or ends
         // the followed process, and a hint it sets names the row's final
         // place, after every row operation of this plan.
-        self.follow.track(&target, &unfiltered_target);
+        self.follow
+            .track(&target, &unfiltered_target, self.threads.user);
         let follow = self.follow_after(self.mode, &target, false, &plan);
         plan.extend(follow);
 
@@ -1129,6 +1257,10 @@ impl ProcessView {
         }
         self.unfiltered_rows
             .sort_by(|left, right| sort::compare(order, left, right));
+        // Each process's threads follow it, sorted among themselves (PX-019).
+        // Every thread row's process row is here, so none is dropped.
+        let (grouped, _) = threads::group(std::mem::take(&mut self.unfiltered_rows));
+        self.unfiltered_rows = grouped;
         let mut plan = Vec::new();
         if let Some(previous) = self.sort.filter(|previous| previous.field != order.field) {
             plan.push(Planned::new(Effect::SortLabel {
@@ -1409,7 +1541,7 @@ impl ProcessView {
             next_gen,
             self.committed_generation,
             self.rows.len(),
-            self.unfiltered_rows.len(),
+            self.admitted_rows(),
         );
         self.pending_filter = Some(pending);
 
@@ -1518,6 +1650,11 @@ impl ProcessView {
     /// line states in the same commit on every path that publishes these rows
     /// — a sample, a view switch either way, a sort, a filter — and the
     /// filter status says how many of the matching rows are shown.
+    ///
+    /// The thread controls (PX-019) first choose the rows the collection
+    /// holds at all — thread rows only while user threads are shown, kernel
+    /// threads only while they are — and the filters then choose processes
+    /// among those: a thread row is kept exactly when its process row is.
     fn visible_in(
         &self,
         mode: ViewMode,
@@ -1525,20 +1662,30 @@ impl ProcessView {
         unconfirmed: &HashSet<ItemId>,
         gaps: &ScanGaps,
     ) -> Visible {
-        let scope = self.owner.scope(unfiltered, &self.committed_filter);
-        let (rows, matched, truncated, forest) = match mode {
+        let settings = self.threads;
+        let admitted: std::borrow::Cow<'_, [Row]> =
+            if unfiltered.iter().all(|row| threads::admits(settings, row)) {
+                std::borrow::Cow::Borrowed(unfiltered)
+            } else {
+                std::borrow::Cow::Owned(
+                    unfiltered
+                        .iter()
+                        .filter(|row| threads::admits(settings, row))
+                        .cloned()
+                        .collect(),
+                )
+            };
+        let scope = self.owner.scope(&admitted, &self.committed_filter);
+        let kept = threads::kept_with_processes(&admitted, |row| scope.keeps(row));
+        let matched = kept.len();
+        let matched_processes = kept.iter().filter(|row| !row.key.is_thread()).count();
+        let (rows, truncated, forest) = match mode {
             ViewMode::Table => {
-                let (rows, matched, truncated) =
-                    project_visible_rows(unfiltered, &scope, self.published_limit);
-                (rows, matched, truncated, None)
+                let mut rows = kept;
+                let truncated = bound_to_publishable_collection(&mut rows, self.published_limit);
+                (rows, truncated, None)
             }
             ViewMode::Tree => {
-                let kept: Vec<Row> = unfiltered
-                    .iter()
-                    .filter(|row| scope.keeps(row))
-                    .cloned()
-                    .collect();
-                let matched = kept.len();
                 let generation = Generation {
                     unfiltered,
                     unconfirmed,
@@ -1557,15 +1704,20 @@ impl ProcessView {
                     }
                 }
                 let forest = ForestSummary::of(&rows);
-                (rows, matched, truncated, Some(forest))
+                (rows, truncated, Some(forest))
             }
         };
-        let owner = self.owner.view(&scope, unfiltered, rows.len(), matched);
+        let shown_processes = rows.iter().filter(|row| !row.key.is_thread()).count();
+        let owner = self
+            .owner
+            .view(&scope, &admitted, shown_processes, matched_processes);
         Visible {
             restricted: scope.is_restricted(),
             beyond_text: scope.restricts_beyond_text(),
+            total: admitted.len(),
             rows,
             matched,
+            matched_processes,
             truncated,
             owner,
             forest,
@@ -1659,14 +1811,14 @@ impl ProcessView {
         let visible = self.visible_in(mode, &self.unfiltered_rows, &self.unconfirmed, &self.gaps);
         let forest = visible.forest;
         let target = visible.rows;
-        let filter_matches = visible.restricted.then_some(visible.matched);
+        let filter_matches = visible.restricted.then_some(visible.matched_processes);
         // A paused view re-projects its frozen rows, and its freshness line
         // keeps saying it is paused (PX-015).
         let summary = self.labelled(self.summarize_with_matches(filter_matches));
         let filter_status = self.filter_status_for(
             target.len(),
             visible.matched,
-            self.unfiltered_rows.len(),
+            visible.total,
             visible.beyond_text,
         );
         let (batch, max_ops, max_bytes) = self.planning_limits(session);
@@ -1683,6 +1835,7 @@ impl ProcessView {
             plan.push(Planned::new(Effect::FilterStatus(filter_status)));
         }
         plan.extend(self.owner_effects(visible.owner));
+        plan.extend(self.threads_effects(&self.unfiltered_rows));
         plan.extend(summary_effects(&self.summary, &summary));
 
         let switched = match switch {
@@ -1733,7 +1886,8 @@ impl ProcessView {
         // client reveals the hinted item wherever it moves. A switch carries
         // it into the shown view: the new collection holds no hint yet
         // (PX-018).
-        self.follow.track(&target, &self.unfiltered_rows);
+        self.follow
+            .track(&target, &self.unfiltered_rows, self.threads.user);
         let follow = self.follow_after(mode, &target, switched, &plan);
         plan.extend(follow);
         if switched {
@@ -2626,6 +2780,166 @@ impl ProcessView {
         self.republish_in(session, Vec::new(), Some(to))
     }
 
+    /// Which tasks the collection holds (PX-019).
+    pub fn thread_settings(&self) -> ThreadSettings {
+        self.threads
+    }
+
+    /// The threads status this view last published (PX-019).
+    pub fn threads_status(&self) -> &str {
+        &self.threads_published.status
+    }
+
+    /// Whether the next sample should read user threads (PX-019): while they
+    /// are shown. The refresh loop asks the source before every sample.
+    pub fn threads_requested(&self) -> bool {
+        self.threads.user
+    }
+
+    /// How many rows the thread controls let the collection hold (PX-019).
+    fn admitted_rows(&self) -> usize {
+        self.unfiltered_rows
+            .iter()
+            .filter(|row| threads::admits(self.threads, row))
+            .count()
+    }
+
+    /// The thread controls' changes for the server-side collection
+    /// `unfiltered` (PX-019).
+    fn threads_effects(&self, unfiltered: &[Row]) -> Vec<Planned> {
+        let status = threads::status(
+            self.threads,
+            self.thread_report,
+            ThreadCounts::of(unfiltered),
+            self.sampling.frozen().is_some(),
+        );
+        let published = &self.threads_published;
+        let mut plan = Vec::new();
+        if status != published.status {
+            plan.push(Planned::new(Effect::ThreadsStatus(status)));
+        }
+        for (node, was, now) in [
+            (USER_THREADS_TOGGLE, published.user, self.threads.user),
+            (KERNEL_THREADS_TOGGLE, published.kernel, self.threads.kernel),
+        ] {
+            if was != now {
+                plan.push(Planned::new(Effect::ThreadToggle { node, on: now }));
+            }
+        }
+        plan
+    }
+
+    /// Applies one "Show user threads" request (PX-019): `Some(true)` shows
+    /// user threads, `Some(false)` hides them, `None` (a request without a
+    /// boolean) changes nothing. The checkbox's value is always published, so
+    /// a request that changes nothing puts the client's checkbox back (§6.3).
+    ///
+    /// Either change retires a sample already being taken, which was taken
+    /// under the other setting, and asks the refresh loop for one sample at
+    /// once in its place; a paused view takes none until it is resumed.
+    /// Showing them: that sample reads them, and until it is published the
+    /// threads status says they appear with the next sample. Hiding them
+    /// republishes at once without their rows; an inspector that
+    /// described a thread is cleared, as the client's selection of that row is
+    /// gone with it. That is not a user deselect (PX-017-G02): the inspector
+    /// says nothing is selected, not that the selection was cleared, and
+    /// follow states its own reason.
+    pub fn set_user_threads(
+        &mut self,
+        session: &Session,
+        on: Option<bool>,
+    ) -> Result<Refreshed, SessionError> {
+        let Some(on) = on.filter(|on| *on != self.threads.user) else {
+            let plan = vec![Planned::new(Effect::ThreadToggle {
+                node: USER_THREADS_TOGGLE,
+                on: self.threads.user,
+            })];
+            return self.publish_controls(session, plan);
+        };
+        let before = self.threads;
+        // A sample already being taken was taken under the other setting: it
+        // is discarded when it returns, so a scan that read no threads never
+        // lands after they are shown again, nor one that read them after they
+        // are hidden (PX-019, merge verification F3). One sample is asked for
+        // in its place, so a Resume view or Refresh now sample it retires is
+        // still taken (merge verification N1); when showing, that sample
+        // reads the threads.
+        self.sampling.invalidate();
+        let held = self.inspector.hold();
+        let selected_thread = self
+            .inspector
+            .selected_row()
+            .filter(|row| row.key.is_thread())
+            .map(|row| row.item_id);
+        self.threads.user = on;
+        if !on && selected_thread.is_some() {
+            // The row left the collection; the user did not deselect it
+            // (PX-017-G02's `clear`), so this is the hidden-row clear.
+            self.inspector.clear_hidden();
+        }
+        let published = self.republish(session, Vec::new());
+        self.settle_thread_request(before, held, selected_thread);
+        published
+    }
+
+    /// Puts back what a thread checkbox request changed ahead of its plan
+    /// when the plan did not reach the client (PX-019, on PX-018's rule): the
+    /// setting, when the checkbox's own value never committed, and the
+    /// inspector on a thread, when that thread's row is still published —
+    /// the client then still shows it, selected.
+    fn settle_thread_request(
+        &mut self,
+        before: ThreadSettings,
+        held: crate::inspector::HeldSelection,
+        selected_thread: Option<ItemId>,
+    ) {
+        if self.threads_published.user != self.threads.user
+            || self.threads_published.kernel != self.threads.kernel
+        {
+            self.threads = ThreadSettings {
+                user: if self.threads_published.user == self.threads.user {
+                    self.threads.user
+                } else {
+                    before.user
+                },
+                kernel: if self.threads_published.kernel == self.threads.kernel {
+                    self.threads.kernel
+                } else {
+                    before.kernel
+                },
+            };
+        }
+        if selected_thread.is_some_and(|item| self.rows.iter().any(|row| row.item_id == item))
+            && self.inspector.selected() != selected_thread
+        {
+            self.inspector.restore(held);
+        }
+    }
+
+    /// Applies one "Show kernel threads" request (PX-019), like
+    /// [`Self::set_user_threads`]: the kernel's tasks are already in every
+    /// sample, so hiding or showing them republishes at once and samples
+    /// nothing. A hidden kernel thread is hidden as a filter hides a row.
+    pub fn set_kernel_threads(
+        &mut self,
+        session: &Session,
+        on: Option<bool>,
+    ) -> Result<Refreshed, SessionError> {
+        let Some(on) = on.filter(|on| *on != self.threads.kernel) else {
+            let plan = vec![Planned::new(Effect::ThreadToggle {
+                node: KERNEL_THREADS_TOGGLE,
+                on: self.threads.kernel,
+            })];
+            return self.publish_controls(session, plan);
+        };
+        let before = self.threads;
+        let held = self.inspector.hold();
+        self.threads.kernel = on;
+        let published = self.republish(session, Vec::new());
+        self.settle_thread_request(before, held, None);
+        published
+    }
+
     /// Applies one `EXPANSION_CHANGED` report from the tree (PX-018): the
     /// reporting `client` has already expanded or collapsed `item` locally,
     /// and the server only records what that client was told. Nothing about
@@ -2847,6 +3161,9 @@ impl ProcessView {
     /// for the current sampling state.
     fn publish_sampling(&mut self, session: &Session) -> Result<Refreshed, SessionError> {
         let mut plan = self.sampling_effects();
+        // The threads status says whether a hidden-until-sampled thread waits
+        // for Resume view (PX-019), so it changes with the pause too.
+        plan.extend(self.threads_effects(&self.unfiltered_rows));
         let summary = self.labelled(self.summary.clone());
         plan.extend(summary_effects(&self.summary, &summary));
         plan.extend(self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed));
@@ -2988,6 +3305,36 @@ pub fn view_toggled(
         .and_then(|event| event.bool_arg());
     if let Err(error) = lock_view(view).set_view(session, on) {
         eprintln!("srtop: view not published: {error}");
+    }
+}
+
+/// Dispatches one `VALUE_CHANGED` on the user-thread checkbox to the shared
+/// view (PX-019). Only the event's boolean argument is read.
+pub fn user_threads_toggled(
+    view: &std::sync::Mutex<ProcessView>,
+    session: &Session,
+    event: &srui_protocol::Event,
+) {
+    let on = srui_semantic_tree::Event::try_from(event.clone())
+        .ok()
+        .and_then(|event| event.bool_arg());
+    if let Err(error) = lock_view(view).set_user_threads(session, on) {
+        eprintln!("srtop: user threads not published: {error}");
+    }
+}
+
+/// Dispatches one `VALUE_CHANGED` on the kernel-thread checkbox to the
+/// shared view (PX-019). Only the event's boolean argument is read.
+pub fn kernel_threads_toggled(
+    view: &std::sync::Mutex<ProcessView>,
+    session: &Session,
+    event: &srui_protocol::Event,
+) {
+    let on = srui_semantic_tree::Event::try_from(event.clone())
+        .ok()
+        .and_then(|event| event.bool_arg());
+    if let Err(error) = lock_view(view).set_kernel_threads(session, on) {
+        eprintln!("srtop: kernel threads not published: {error}");
     }
 }
 
@@ -3246,10 +3593,17 @@ fn view_status(mode: ViewMode, forest: Option<&ForestSummary>) -> String {
     let (ViewMode::Tree, Some(forest)) = (mode, forest) else {
         return TABLE_VIEW_STATUS.to_string();
     };
+    let processes = forest.rows - forest.threads;
+    // Threads are counted apart from processes, never as processes (PX-019).
+    let threads = match forest.threads {
+        0 => String::new(),
+        1 => " and 1 thread".to_string(),
+        count => format!(" and {count} threads"),
+    };
     let mut clauses = vec![format!(
-        "View: process tree · {} {} under {} {}",
-        forest.rows,
-        if forest.rows == 1 {
+        "View: process tree · {} {}{threads} under {} {}",
+        processes,
+        if processes == 1 {
             "process"
         } else {
             "processes"
@@ -3373,26 +3727,6 @@ fn input_value(session: &Session, node: NodeId) -> String {
             .unwrap_or("")
             .to_string()
     })
-}
-
-/// Filters `unfiltered` rows according to `filter`, preserving their active order,
-/// and bounds them to `limit`. Returns the matching visible rows, the total match count,
-/// and the count of truncated matching rows beyond `limit`.
-fn project_visible_rows(
-    unfiltered: &[Row],
-    scope: &Scope<'_>,
-    limit: usize,
-) -> (Vec<Row>, usize, usize) {
-    let mut matching = Vec::new();
-    let mut total_matches = 0;
-    for row in unfiltered {
-        if scope.keeps(row) {
-            total_matches += 1;
-            matching.push(row.clone());
-        }
-    }
-    let truncated = bound_to_publishable_collection(&mut matching, limit);
-    (matching, total_matches, truncated)
 }
 
 /// The text a `TEXT_EDIT` event on `node` carries, or else the value the store
@@ -3585,6 +3919,7 @@ fn count(plan: &[Planned], result: &mut Refreshed) {
             | Effect::SamplingEnabled(_)
             | Effect::SamplingValue(_) => result.controls += 1,
             Effect::FollowValue(_) | Effect::FollowStatus(_) => result.controls += 1,
+            Effect::ThreadsStatus(_) | Effect::ThreadToggle { .. } => result.controls += 1,
             Effect::Delete(_) if planned.moving => {}
             Effect::Insert(_, rows) if planned.moving => result.moved += rows.len(),
             Effect::Delete(ids) => result.deleted += ids.len(),
@@ -3914,7 +4249,8 @@ fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
             + COMMAND_RESERVE_BYTES
             + SAMPLING_RESERVE_BYTES
             + FOLLOW_RESERVE_BYTES
-            + VIEW_RESERVE_BYTES,
+            + VIEW_RESERVE_BYTES
+            + THREADS_RESERVE_BYTES,
     );
     let mut spent = 0usize;
     let mut kept = 0usize;
@@ -3993,24 +4329,36 @@ fn evict_unconfirmed_beyond(
     evicted
 }
 
+/// [`retain_unconfirmed_by`] under a record [`Retention`] alone.
+#[cfg(test)]
+fn retain_unconfirmed(published: &[Row], confirmed: Vec<Row>, retention: &Retention) -> Vec<Row> {
+    retain_unconfirmed_by(published, confirmed, |row| retention.keeps(&row.key))
+}
+
 /// Keeps rows the scan did not confirm and could not account for, in the
 /// position they already hold relative to the rows it did confirm.
 ///
-/// `retention` decides which unconfirmed rows those are: a scan that named the
+/// `keeps` decides which unconfirmed rows those are: a scan that named the
 /// records it skipped keeps only those, so an unrelated process that really
 /// ended is still deleted while one denied record is unreadable. Only a scan
-/// whose uncertainty cannot be enumerated at all keeps every absent row.
+/// whose uncertainty cannot be enumerated at all keeps every absent row. A
+/// thread row is also kept beside the process instance this scan confirmed
+/// when the scan could not read that process's threads (PX-019).
 ///
 /// A retained row is anchored to the confirmed row that followed it, so a
 /// scan that misses a record for one tick does not move that row to the end of
 /// the table and back again on the next.
-fn retain_unconfirmed(published: &[Row], confirmed: Vec<Row>, retention: &Retention) -> Vec<Row> {
+fn retain_unconfirmed_by(
+    published: &[Row],
+    confirmed: Vec<Row>,
+    keeps: impl Fn(&Row) -> bool,
+) -> Vec<Row> {
     let position: HashMap<ItemId, usize> = confirmed
         .iter()
         .enumerate()
         .map(|(index, row)| (row.item_id, index))
         .collect();
-    let uncertain = |row: &Row| !position.contains_key(&row.item_id) && retention.keeps(&row.key);
+    let uncertain = |row: &Row| !position.contains_key(&row.item_id) && keeps(row);
     if !published.iter().any(uncertain) {
         return confirmed;
     }
@@ -4022,7 +4370,7 @@ fn retain_unconfirmed(published: &[Row], confirmed: Vec<Row>, retention: &Retent
             Some(&index) => anchor = Some(index),
             // An absent row this scan accounted for really ended: it is left out
             // of the target, which deletes it.
-            None if !retention.keeps(&row.key) => {}
+            None if !keeps(row) => {}
             None => match anchor {
                 Some(index) => before.entry(index).or_default().push(row.clone()),
                 None => tail.push(row.clone()),
@@ -4174,6 +4522,13 @@ enum Effect {
     FollowValue(bool),
     /// The follow status text set (PX-017).
     FollowStatus(String),
+    /// The threads status text set (PX-019).
+    ThreadsStatus(String),
+    /// One thread checkbox's value set to what the server holds (PX-019).
+    ThreadToggle {
+        node: NodeId,
+        on: bool,
+    },
     Delete(Vec<ItemId>),
     Insert(u64, Vec<Row>),
     Update(Vec<Row>),
@@ -4208,6 +4563,8 @@ struct Published<'a> {
     mode: &'a mut ViewMode,
     /// The view status as announced (PX-018).
     view_status: &'a mut String,
+    /// The thread controls as announced (PX-019).
+    threads: &'a mut ThreadsView,
 }
 
 /// The planned operations that turn the `published` summary into `target`:
@@ -4335,6 +4692,12 @@ impl Planned {
             Effect::FollowStatus(text) => {
                 Operation::set_property(FOLLOW_STATUS, TEXT, Value::String(text.clone()))
             }
+            Effect::ThreadsStatus(text) => {
+                Operation::set_property(THREADS_STATUS, TEXT, Value::String(text.clone()))
+            }
+            Effect::ThreadToggle { node, on } => {
+                Operation::set_property(*node, VALUE, Value::Bool(*on))
+            }
             Effect::Delete(ids) => Operation::model_delete_items(MODEL, ids.iter().copied()),
             Effect::Insert(index, rows) => {
                 Operation::model_insert(MODEL, *index, rows.iter().map(Row::to_model_item))
@@ -4405,7 +4768,10 @@ impl Effect {
             Self::SamplingEnabled(_) | Self::FollowValue(_) => {
                 VALUE_FRAMING_BYTES + SCALAR_VALUE_BYTES
             }
-            Self::FollowStatus(text) => VALUE_FRAMING_BYTES + text.len(),
+            Self::FollowStatus(text) | Self::ThreadsStatus(text) => {
+                VALUE_FRAMING_BYTES + text.len()
+            }
+            Self::ThreadToggle { .. } => VALUE_FRAMING_BYTES + SCALAR_VALUE_BYTES,
             Self::SearchStatus(text) => VALUE_FRAMING_BYTES + text.len(),
             Self::SearchValue { value, .. } => VALUE_FRAMING_BYTES + value.len(),
             // The `SET_PROPERTY` of the item ID, and a whole second operation:
@@ -4458,6 +4824,7 @@ impl Effect {
             follow,
             mode,
             view_status,
+            threads,
         } = published;
         match self {
             Self::ViewMode(shown) => **mode = *shown,
@@ -4506,6 +4873,14 @@ impl Effect {
             Self::SamplingEnabled(enabled) => sampling.refresh_enabled = *enabled,
             Self::FollowValue(checked) => follow.checked = *checked,
             Self::FollowStatus(text) => follow.status.clone_from(text),
+            Self::ThreadsStatus(text) => threads.status.clone_from(text),
+            Self::ThreadToggle { node, on } => {
+                if *node == USER_THREADS_TOGGLE {
+                    threads.user = *on;
+                } else {
+                    threads.kernel = *on;
+                }
+            }
             Self::Promote(_, row) => **promoted = Some(row.item_id),
             Self::KeepVisible(_, row) => **keep_visible = Some(row.item_id),
             Self::ClearKeepVisible(_) => **keep_visible = None,
@@ -5224,7 +5599,8 @@ fn ticker_every(interval: Duration) -> tokio::time::Interval {
 /// ([`crate::sampling`]). It owns the only timer: one ticker, replaced — never
 /// joined by a second — when the interval changes or the view resumes, and
 /// not polled at all while the view is paused, when no sample is taken. A
-/// Refresh now press or a Resume view wakes it through the view's one
+/// Refresh now press, a Resume view or a change of "Show user threads"
+/// (PX-019) wakes it through the view's one
 /// [`tokio::sync::Notify`] for one sample through this same path. A sample is
 /// published only if the view's epoch is still the one it was taken under.
 /// The ticker and the wake belong to this future, so cancelling `shutdown`
@@ -5260,7 +5636,13 @@ pub async fn poll<S>(
             _ = wake.notified() => false,
             _ = ticker.tick(), if !paused => true,
         };
-        let request = lock_view(&view).sampling.take_request();
+        // The request's epoch and the thread setting are read together, so a
+        // sample is always taken under the setting of the epoch it is
+        // applied under (PX-019).
+        let (request, threads) = {
+            let mut held = lock_view(&view);
+            (held.sampling.take_request(), held.threads_requested())
+        };
         paused = request.paused;
         if request.retime || request.interval != interval {
             interval = request.interval;
@@ -5277,8 +5659,10 @@ pub async fn poll<S>(
             // The next periodic sample is one interval after this one.
             ticker = ticker_every(interval);
         }
+        // User threads are read only while they are shown (PX-019).
         // Reading a host's process filesystem blocks; keep it off the runtime.
         let sampled = tokio::task::spawn_blocking(move || {
+            source.collect_threads(threads);
             let snapshot = source.snapshot();
             (source, snapshot)
         })
@@ -5401,11 +5785,13 @@ mod tests {
                 let key = ProcessKey {
                     pid: Observed::Known(index as u32 + 1),
                     creation: crate::source::CreationToken::Opaque(format!("widest-{index}")),
+                    thread: None,
                     ..template.clone()
                 };
                 // The cells are the widest missing words, so the order values
                 // are missing in both metric columns (PX-009).
                 let record = ProcessRecord {
+                    kind: crate::source::KIND_NOT_COLLECTED,
                     lineage: crate::source::Lineage::NOT_COLLECTED,
                     owner: crate::source::OWNER_NOT_COLLECTED,
                     key: key.clone(),
@@ -5416,6 +5802,7 @@ mod tests {
                 Row {
                     owner: crate::source::OWNER_NOT_COLLECTED,
                     lineage: crate::source::Lineage::NOT_COLLECTED,
+                    kind: crate::source::KIND_NOT_COLLECTED,
                     tree: None,
                     sort: crate::sort::SortValues::of_record(&key, &record),
                     display_name: name.clone(),
@@ -5768,11 +6155,13 @@ mod tests {
             let mut snapshot = FakeProcessSource.snapshot();
             snapshot.records = (first..self.rows)
                 .map(|index| ProcessRecord {
+                    kind: crate::source::KIND_NOT_COLLECTED,
                     lineage: crate::source::Lineage::NOT_COLLECTED,
                     owner: crate::source::OWNER_NOT_COLLECTED,
                     key: ProcessKey {
                         pid: Observed::Known(index + 1),
                         creation: CreationToken::Opaque(format!("host-{index}")),
+                        thread: None,
                         ..template.clone()
                     },
                     display_name: self.name.clone(),
@@ -5871,7 +6260,8 @@ mod tests {
                 + COMMAND_RESERVE_BYTES
                 + SAMPLING_RESERVE_BYTES
                 + FOLLOW_RESERVE_BYTES
-                + VIEW_RESERVE_BYTES);
+                + VIEW_RESERVE_BYTES
+                + THREADS_RESERVE_BYTES);
         let mut published = Vec::new();
         for system in [
             SystemSample::not_provided(),
@@ -6110,6 +6500,7 @@ mod tests {
             &owner,
             false,
             Some(&sampling),
+            &"t".repeat(crate::threads::MAX_THREADS_STATUS_BYTES),
         )
         .unwrap();
         // PX-011: every search value at its widest — the status at its bound,
@@ -6295,6 +6686,21 @@ mod tests {
             )),
         });
         let view = encoded(&[crate::VIEW_ROW, VIEW_TOGGLE, VIEW_STATUS, TREE]) + tree_extras;
+        // PX-019: the thread controls, their status at its bound.
+        let threads = encoded(&[
+            crate::THREADS_ROW,
+            USER_THREADS_TOGGLE,
+            KERNEL_THREADS_TOGGLE,
+            THREADS_STATUS,
+        ]);
+        assert!(
+            threads <= THREADS_RESERVE_BYTES,
+            "the widest thread controls encode to {threads} bytes, above their {THREADS_RESERVE_BYTES} byte reserve"
+        );
+        assert!(
+            threads > THREADS_RESERVE_BYTES / 4,
+            "the reserve must be measured against thread controls that really are wide: {threads}"
+        );
         let sampling = encoded(&[
             crate::SAMPLING_ROW,
             SAMPLING_PAUSE,
@@ -6456,6 +6862,7 @@ mod tests {
                     + SAMPLING_RESERVE_BYTES
                     + FOLLOW_RESERVE_BYTES
                     + VIEW_RESERVE_BYTES
+                    + THREADS_RESERVE_BYTES
                     + TRANSACTION_ENVELOPE_BYTES,
             "a snapshot with no row is {frame} bytes, above the allowances the row budget \
              leaves for it"
@@ -6473,9 +6880,13 @@ mod tests {
                 + SAMPLING_RESERVE_BYTES
                 + FOLLOW_RESERVE_BYTES
                 + VIEW_RESERVE_BYTES
+                + THREADS_RESERVE_BYTES
         );
         println!(
             "PX-018 view switch and tree at their widest: encoded={view} reserve={VIEW_RESERVE_BYTES}"
+        );
+        println!(
+            "PX-019 thread controls at their widest: encoded={threads} reserve={THREADS_RESERVE_BYTES}"
         );
         println!(
             "PX-013 inspector at its widest: encoded={inspector} reserve={INSPECTOR_RESERVE_BYTES}"
@@ -6640,6 +7051,7 @@ mod tests {
                 vec![Row {
                     owner: crate::source::OWNER_NOT_COLLECTED,
                     lineage: crate::source::Lineage::NOT_COLLECTED,
+                    kind: crate::source::KIND_NOT_COLLECTED,
                     tree: None,
                     key: template.key.clone(),
                     display_name: template.display_name.clone(),
@@ -6791,10 +7203,12 @@ mod tests {
             let template = snapshot.records[0].clone();
             snapshot.records = (1..=self.0)
                 .map(|pid| ProcessRecord {
+                    kind: crate::source::KIND_NOT_COLLECTED,
                     lineage: crate::source::Lineage::NOT_COLLECTED,
                     key: ProcessKey {
                         pid: Observed::Known(pid),
                         creation: CreationToken::Opaque(format!("numbered-{pid}")),
+                        thread: None,
                         ..template.key.clone()
                     },
                     ..template.clone()
@@ -6968,7 +7382,9 @@ mod disclosure_commit_tests {
                             pid_namespace: Observed::Known(PidNamespaceId(1)),
                             pid: Observed::Known(pid),
                             creation: CreationToken::Opaque(format!("{name}-{pid}")),
+                            thread: None,
                         },
+                        kind: crate::source::KIND_NOT_COLLECTED,
                         display_name: DisplayName::from(name),
                         resident: Observed::Known(4096),
                         cpu: CpuUsage::Measured(CpuInterval {
@@ -7006,6 +7422,7 @@ mod disclosure_commit_tests {
                 capped: CappedRecords::none(),
                 completeness: Completeness::Complete,
                 system: FakeProcessSource::system(),
+                threads: crate::source::ThreadScan::NotProvided,
             }
         }
     }
@@ -7392,5 +7809,199 @@ mod disclosure_commit_tests {
         assert_eq!(view.disclosure_clients(), MAX_DISCLOSURE_CLIENTS - 1);
         view.set_view(&session, Some(false)).unwrap();
         assert_eq!(view.disclosure_clients(), 0);
+    }
+}
+
+/// PX-019 on PX-018's disclosure mirror: what a thread request, or a sample
+/// that hides a selected thread, leaves behind when its plan does not
+/// commit, through the test-only [`commit_fault`] seam.
+#[cfg(test)]
+mod thread_commit_tests {
+    use super::*;
+    use crate::source::{
+        BootId, CappedRecords, Completeness, CpuUsage, CreationToken, DisplayName,
+        FakeProcessSource, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+        SnapshotTime, SourceId, TaskKind, ThreadIdentity, ThreadRecords, ThreadScan, ThreadsSource,
+        OWNER_NOT_COLLECTED,
+    };
+
+    /// The one client these tests report from (PX-018's per-client mirror).
+    const CLIENT: &[u8] = b"thread-client";
+
+    fn item(view: &ProcessView, pid: u32, tid: Option<u32>) -> ItemId {
+        view.rows
+            .iter()
+            .find(|row| {
+                row.key.pid == Observed::Known(pid)
+                    && row.key.thread.as_ref().map(|thread| thread.tid) == tid
+            })
+            .map(|row| row.item_id)
+            .unwrap_or_else(|| panic!("{pid}/{tid:?} is shown"))
+    }
+
+    fn threads_shown() -> (Session, ThreadsSource, ProcessView) {
+        let session = Session::mint();
+        let mut source = ThreadsSource::default();
+        let (mut view, _) = ProcessView::start(&session, &mut source).unwrap();
+        view.set_user_threads(&session, Some(true)).unwrap();
+        view.refresh(&session, &mut source).unwrap();
+        (session, source, view)
+    }
+
+    #[test]
+    fn a_failed_hide_of_user_threads_keeps_the_setting_and_the_inspector() {
+        let (session, _source, mut view) = threads_shown();
+        let worker = item(&view, 200, Some(201));
+        view.select_item_in(&session, CLIENT, TABLE, Some(worker))
+            .unwrap();
+        assert_eq!(view.inspector().selected(), Some(worker));
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.set_user_threads(&session, Some(false)).is_err());
+        }
+        assert!(
+            view.threads_requested(),
+            "the checkbox never changed on the client"
+        );
+        assert_eq!(
+            view.inspector().selected(),
+            Some(worker),
+            "still selected there"
+        );
+        assert!(view.rows.iter().any(|row| row.item_id == worker));
+        view.set_user_threads(&session, Some(false)).unwrap();
+        assert!(!view.threads_requested());
+        assert_eq!(view.inspector().selected(), None);
+        assert!(view.rows.iter().all(|row| !row.key.is_thread()));
+    }
+
+    #[test]
+    fn a_failed_hide_of_kernel_threads_keeps_the_setting() {
+        let (session, _source, mut view) = threads_shown();
+        let shown = view.item_ids();
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.set_kernel_threads(&session, Some(false)).is_err());
+        }
+        assert!(view.thread_settings().kernel);
+        assert_eq!(view.item_ids(), shown);
+        view.set_kernel_threads(&session, Some(false)).unwrap();
+        assert!(!view.thread_settings().kernel);
+        assert_eq!(view.item_ids().len(), shown.len() - 2);
+    }
+
+    /// `p` with two threads, which a later sample moves under `q`.
+    struct Movable {
+        moved: bool,
+    }
+
+    impl Movable {
+        fn process(pid: u32, name: &str, parent: u32) -> ProcessRecord {
+            ProcessRecord {
+                lineage: Lineage::new(parent, u64::from(pid)),
+                owner: OWNER_NOT_COLLECTED,
+                key: ProcessKey {
+                    source: SourceId("movable-threads".into()),
+                    host: Observed::Known(HostId("h".into())),
+                    boot: Observed::Known(BootId("b".into())),
+                    pid_namespace: Observed::Known(PidNamespaceId(1)),
+                    pid: Observed::Known(pid),
+                    creation: CreationToken::Opaque(format!("{name}-{pid}")),
+                    thread: None,
+                },
+                display_name: DisplayName::from(name),
+                resident: Observed::Known(4096),
+                cpu: CpuUsage::WarmingUp,
+                kind: Observed::Known(TaskKind::Process {
+                    threads: Observed::Known(2),
+                }),
+            }
+        }
+    }
+
+    impl ProcessSource for Movable {
+        fn status_text(&self) -> &str {
+            "Read-only · Movable thread fixture"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            let p = Self::process(20, "p", if self.moved { 10 } else { 1 });
+            let mut read = ThreadRecords::with_limit(16);
+            read.records = [(20, "p"), (21, "p-worker")]
+                .into_iter()
+                .map(|(tid, name)| ProcessRecord {
+                    key: ProcessKey {
+                        thread: Some(ThreadIdentity {
+                            tid,
+                            creation: CreationToken::Opaque(format!("t{tid}")),
+                        }),
+                        ..p.key.clone()
+                    },
+                    display_name: DisplayName::from(name),
+                    resident: Observed::Missing(crate::source::MissingReason::Unavailable),
+                    kind: Observed::Known(TaskKind::Thread),
+                    ..p.clone()
+                })
+                .collect();
+            ProcessSnapshot {
+                source: SourceId("movable-threads".into()),
+                sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH),
+                records: vec![
+                    Self::process(1, "init", 0),
+                    Self::process(10, "q", 1),
+                    Self::process(11, "q-child", 10),
+                    p,
+                ],
+                vanished: 0,
+                capped: CappedRecords::none(),
+                completeness: Completeness::Complete,
+                system: FakeProcessSource::system(),
+                threads: ThreadScan::Read(read),
+            }
+        }
+    }
+
+    /// A sample that would move a selected thread, with its process, under a
+    /// parent the client keeps collapsed and does not commit leaves the
+    /// mirror and the inspector as they were; the one that commits clears
+    /// the inspector. The thread rows are part of the rows the plan's
+    /// `rows_end` waits for.
+    #[test]
+    fn a_failed_sample_that_would_hide_a_selected_thread_restores_the_inspector() {
+        let session = Session::mint();
+        let mut source = Movable { moved: false };
+        let (mut view, _) = ProcessView::start(&session, &mut source).unwrap();
+        view.set_user_threads(&session, Some(true)).unwrap();
+        view.refresh(&session, &mut source).unwrap();
+        view.set_view(&session, Some(true)).unwrap();
+        let worker = item(&view, 20, Some(21));
+        let q = item(&view, 10, None);
+        view.select_item_in(&session, CLIENT, TREE, Some(worker))
+            .unwrap();
+        view.expansion_changed(&session, CLIENT, TREE, q, false)
+            .unwrap();
+        assert_eq!(view.inspector().selected(), Some(worker));
+        source.moved = true;
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.refresh(&session, &mut source).is_err());
+        }
+        assert_eq!(
+            view.inspector().selected(),
+            Some(worker),
+            "still shown there"
+        );
+        assert!(view.collapsed_by(CLIENT).contains(&q));
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.inspector().selected(), None, "hidden under q now");
+        assert!(view.collapsed_by(CLIENT).contains(&q));
+        let depth = |row_item: ItemId| {
+            view.rows
+                .iter()
+                .find(|row| row.item_id == row_item)
+                .and_then(|row| row.tree.as_ref())
+                .map(|place| place.depth)
+        };
+        assert_eq!(depth(worker), Some(3), "under p, under q");
     }
 }

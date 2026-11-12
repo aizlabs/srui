@@ -113,7 +113,8 @@ fn pid_text(pid: &Observed<u32>) -> String {
 fn who(row: &Row) -> String {
     format!(
         "{} · {}",
-        pid_text(&row.key.pid),
+        // A thread is named by its TID and its process's PID (PX-019).
+        crate::threads::thread_subject(row).unwrap_or_else(|| pid_text(&row.key.pid)),
         bounded(row.display_name.as_str(), MAX_NAME_ECHO_BYTES)
     )
 }
@@ -168,8 +169,9 @@ impl Follow {
 
     /// Keeps follow on the rows a client will hold, `rows`, out of the
     /// server-side collection `unfiltered`. Stops follow, never retargets it,
-    /// when the process is not among `rows`.
-    pub(crate) fn track(&mut self, rows: &[Row], unfiltered: &[Row]) {
+    /// when the process is not among `rows`. `user_threads` is whether user
+    /// threads are shown (PX-019): a followed thread hidden with them says so.
+    pub(crate) fn track(&mut self, rows: &[Row], unfiltered: &[Row], user_threads: bool) {
         let State::On(followed) = &mut self.state else {
             return;
         };
@@ -179,6 +181,10 @@ impl Follow {
             return;
         }
         let why = match position(unfiltered, item) {
+            Some(_) if followed.key.is_thread() && !user_threads => format!(
+                "Follow stopped: {} is no longer shown: user threads are hidden; show them, select a row and turn follow on again",
+                who(followed)
+            ),
             Some(_) => format!(
                 "Follow stopped: {} is no longer shown (filtered out or beyond the row limit); select a row and turn follow on again",
                 who(followed)

@@ -38,7 +38,9 @@
 //!   (PX-013), or a sampling button with `ACTIVATE` or the interval field with
 //!   `TEXT_EDIT` (PX-015), or exactly `FOLLOW_TOGGLE` with `VALUE_CHANGED`
 //!   (PX-017), or exactly `VIEW_TOGGLE` with `VALUE_CHANGED`, `TREE` with
-//!   `SELECTION_CHANGED` or `TREE` with `EXPANSION_CHANGED` (PX-018);
+//!   `SELECTION_CHANGED` or `TREE` with `EXPANSION_CHANGED` (PX-018), or
+//!   exactly `USER_THREADS_TOGGLE` or `KERNEL_THREADS_TOGGLE` with
+//!   `VALUE_CHANGED` (PX-019);
 //!   `on_result`, `on_text_edit`, `on_expansion_changed`
 //!   and a model range provider unconditionally; `include`, called or
 //!   renamed; or a macro definition (`macro_rules!`), whose expansion can
@@ -932,12 +934,16 @@ fn is_follow_toggle(tokens: &[Tok]) -> bool {
 /// `VALUE_CHANGED`, which republishes the same rows in the other collection,
 /// and the tree's `SELECTION_CHANGED` and `EXPANSION_CHANGED`, which resolve
 /// one published item ID for the inspector and record what the client
-/// already expanded or collapsed. None signals, opens for control or
+/// already expanded or collapsed; and the thread controls' `VALUE_CHANGED`
+/// (PX-019), whose boolean chooses which tasks the collection holds and
+/// whether the next sample reads threads. None signals, opens for control or
 /// reconfigures a process.
 const VIEW_AND_TREE_INPUTS: &[(&str, &str)] = &[
     ("VIEW_TOGGLE", "VALUE_CHANGED"),
     ("TREE", "SELECTION_CHANGED"),
     ("TREE", "EXPANSION_CHANGED"),
+    ("USER_THREADS_TOGGLE", "VALUE_CHANGED"),
+    ("KERNEL_THREADS_TOGGLE", "VALUE_CHANGED"),
 ];
 
 /// Whether an `on(..)` argument list is exactly one of

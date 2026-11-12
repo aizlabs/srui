@@ -39,6 +39,7 @@ fn key(pid: Option<u32>, token: &str) -> ProcessKey {
             Observed::Known,
         ),
         creation: CreationToken::Opaque(token.into()),
+        thread: None,
     }
 }
 
@@ -63,6 +64,7 @@ fn record(
         display_name = display_name.with_command(cmd_bytes);
     }
     ProcessRecord {
+        kind: srui_process_explorer::source::KIND_NOT_COLLECTED,
         lineage: srui_process_explorer::source::Lineage::NOT_COLLECTED,
         owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
         key: key(pid, token),
@@ -85,6 +87,7 @@ impl ProcessSource for FixtureSource {
             source: SourceId(SOURCE.into()),
             records: self.0.clone(),
             vanished: 0,
+            threads: srui_process_explorer::source::ThreadScan::NotProvided,
             capped: CappedRecords::none(),
             system: SystemSample::not_provided(),
             completeness: Completeness::Complete,

@@ -445,6 +445,7 @@ fn test_probe_100000_rows_limits_and_truncation() {
     let mut excess_records = snap.records.clone();
     for i in 0..5 {
         excess_records.push(ProcessRecord {
+            kind: srui_process_explorer::source::KIND_NOT_COLLECTED,
             lineage: srui_process_explorer::source::Lineage::NOT_COLLECTED,
             owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
             key: ProcessKey {
@@ -454,6 +455,7 @@ fn test_probe_100000_rows_limits_and_truncation() {
                 pid_namespace: Observed::Known(srui_process_explorer::source::PidNamespaceId(1)),
                 pid: Observed::Known(200000 + i),
                 creation: CreationToken::Opaque(format!("excess-{i}")),
+                thread: None,
             },
             display_name: DisplayName::from(format!("excess-{i}").as_str()),
             resident: Observed::Known(1024),
@@ -468,6 +470,7 @@ fn test_probe_100000_rows_limits_and_truncation() {
         ),
         records: excess_records,
         vanished: 0,
+        threads: srui_process_explorer::source::ThreadScan::NotProvided,
         capped: srui_process_explorer::source::CappedRecords::none(),
         completeness: srui_process_explorer::source::Completeness::Complete,
         system: SyntheticProcessSource::system(),

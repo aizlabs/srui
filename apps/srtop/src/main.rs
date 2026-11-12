@@ -2,13 +2,13 @@
 use srui_process_explorer::{
     initialize, install_column_handlers, install_filter_handlers, install_follow_handlers,
     install_inspector, install_owner_handlers, install_sampling_handlers, install_search_handlers,
-    install_sort_handlers, install_view_handlers,
+    install_sort_handlers, install_thread_handlers, install_view_handlers,
     procfs::ProcFsSource,
     refresh::{poll, ProcessView, DEFAULT_REFRESH_INTERVAL},
     sampling::parse_interval,
     source::{
         FakeProcessSource, FollowSource, ProcessSource, RepeatedNamesSource, ScriptedFakeSource,
-        SyntheticProcessSource, TreeSource,
+        SyntheticProcessSource, ThreadsSource, TreeSource,
     },
     update_title, FIXTURE_TITLE,
 };
@@ -38,6 +38,10 @@ enum Collection {
     /// The PX-018 fixture: a small process forest with a missing parent, a
     /// reused parent PID and a cycle, whose `make` ends and is reparented.
     Tree,
+    /// The PX-019 fixture: user processes with threads, kernel threads, a
+    /// process whose threads are denied, and a thread that ends and a TID
+    /// that is reused.
+    Threads,
     Sequence,
     Live,
     Scale(usize),
@@ -75,6 +79,9 @@ where
     // The view switch moves the same rows into the process tree, whose
     // disclosure stays the client's (PX-018).
     install_view_handlers(session, &view);
+    // The thread controls choose which tasks the collection holds, and the
+    // loop reads user threads only while they are shown (PX-019).
+    install_thread_handlers(session, &view);
     // The inspector reads details through its own reader of the source's
     // records, on its own bounded worker (PX-013).
     install_inspector(session, &view, source.details());
@@ -89,7 +96,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--socket")) {
         return Err("usage: srtop --socket PATH [--smoke-fixture] \
-             [--fake-source | --fake-repeated-names | --fake-follow | --fake-tree | --fake-sequence \
+             [--fake-source | --fake-repeated-names | --fake-follow | --fake-tree | --fake-threads \
+             | --fake-sequence \
              | --live-source | --procfs | --scale-source COUNT] \
              [--refresh-interval-ms MS | --scale-interval-ms MS]"
             .into());
@@ -102,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(value) = args.next() {
         let select = |current: &mut Collection, chosen| {
             if *current != Collection::None {
-                return Err("choose one of --fake-source, --fake-repeated-names, --fake-follow, --fake-tree, --fake-sequence, --live-source (or --procfs) or --scale-source");
+                return Err("choose one of --fake-source, --fake-repeated-names, --fake-follow, --fake-tree, --fake-threads, --fake-sequence, --live-source (or --procfs) or --scale-source");
             }
             *current = chosen;
             Ok(())
@@ -113,6 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some("--fake-repeated-names") => select(&mut collection, Collection::RepeatedNames)?,
             Some("--fake-follow") => select(&mut collection, Collection::Follow)?,
             Some("--fake-tree") => select(&mut collection, Collection::Tree)?,
+            Some("--fake-threads") => select(&mut collection, Collection::Threads)?,
             Some("--fake-sequence") => select(&mut collection, Collection::Sequence)?,
             Some("--live-source") | Some("--procfs") => select(&mut collection, Collection::Live)?,
             Some("--scale-source") => {
@@ -182,6 +191,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Collection::Tree => collect(
             &session,
             TreeSource::default(),
+            interval,
+            &shutdown,
+            &mut connections,
+        ),
+        Collection::Threads => collect(
+            &session,
+            ThreadsSource::default(),
             interval,
             &shutdown,
             &mut connections,

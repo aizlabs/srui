@@ -1,11 +1,12 @@
 //! Server-side row projection and session-local item allocation
 //! (§§6.2, 8; PX-002 rows, PX-003 process-instance keys, PX-004 refresh,
 //! PX-005 and PX-006 metric cells, PX-042 catalogued columns, PX-068 chosen
-//! columns, PX-018 lineage and tree places).
+//! columns, PX-018 lineage and tree places, PX-019 thread rows).
 use crate::catalogue::{ColumnLayout, PROCESS_LIST};
 use crate::sort::SortValues;
 use crate::source::{
-    BootId, DisplayName, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessSnapshot,
+    BootId, DisplayName, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+    ProcessSnapshot, TaskKind,
 };
 use crate::tree::TreePlace;
 use srui_sdk::{ItemId, PropertyRef, Value};
@@ -44,6 +45,9 @@ pub(crate) struct Row {
     /// The parent PID and start time the scan read (PX-018): server-side input
     /// to the process tree only, never published as identity.
     pub(crate) lineage: Lineage,
+    /// What kind of task the row is (PX-019): server-side input to the thread
+    /// controls only. A thread row's key names its thread.
+    pub(crate) kind: Observed<TaskKind>,
     /// The row's place in the published process tree (PX-018), or `None` for
     /// a table row. A tree row's `value` ends with its parent cell, and its
     /// model item carries the standard `tree_depth` and `descendant_count`.
@@ -226,34 +230,62 @@ impl SessionItemIds {
         self.assigned.len()
     }
 
+    /// The rows of `snapshot` in `layout`: one per process record, in the
+    /// source's order, each followed by the rows of its threads, if the scan
+    /// read any (PX-019).
+    ///
+    /// A snapshot is refused whole, before anything is allocated, when two of
+    /// its records share an identity, when a process record names a thread or
+    /// a thread record names none, or when a thread record's process is not
+    /// among the snapshot's own process records: a thread is shown only with
+    /// the process instance it belongs to, matched by that instance's whole
+    /// key, never by PID.
     pub(crate) fn project(
         &mut self,
         snapshot: &ProcessSnapshot,
         layout: &ColumnLayout,
     ) -> io::Result<Vec<Row>> {
+        let invalid =
+            |what: &str| Err(io::Error::new(io::ErrorKind::InvalidData, what.to_string()));
         // The keys are anchored before anything is looked up, on a copy of the
         // session identity, so a snapshot this projection rejects leaves the
         // remembered identity exactly as it was.
         let mut identity = self.identity.clone();
-        let keys: Vec<ProcessKey> = snapshot
-            .records
-            .iter()
-            .map(|record| identity.anchor(record.key.clone()))
-            .collect();
-        let mut seen = HashSet::with_capacity(keys.len());
-        if keys.iter().any(|key| !seen.insert(key)) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "duplicate process instance identity",
-            ));
+        let threads = snapshot.threads.records();
+        let mut ordered: Vec<(&ProcessRecord, ProcessKey)> =
+            Vec::with_capacity(snapshot.records.len() + threads.len());
+        let mut by_process: HashMap<ProcessKey, Vec<(&ProcessRecord, ProcessKey)>> = HashMap::new();
+        for record in threads {
+            let key = identity.anchor(record.key.clone());
+            if key.thread.is_none() || record.kind != Observed::Known(TaskKind::Thread) {
+                return invalid("a thread record that names no thread");
+            }
+            by_process
+                .entry(key.process_key())
+                .or_default()
+                .push((record, key));
+        }
+        for record in &snapshot.records {
+            let key = identity.anchor(record.key.clone());
+            if key.thread.is_some() || record.kind == Observed::Known(TaskKind::Thread) {
+                return invalid("a process record that names a thread");
+            }
+            let own = by_process.remove(&key);
+            ordered.push((record, key));
+            ordered.extend(own.into_iter().flatten());
+        }
+        if !by_process.is_empty() {
+            return invalid("a thread of a process this scan did not list");
+        }
+        let mut seen = HashSet::with_capacity(ordered.len());
+        if ordered.iter().any(|(_, key)| !seen.insert(key)) {
+            return invalid("duplicate process instance identity");
         }
         // Accepted: what this scan observed of the source's global identity is
         // what later scans anchor to.
         self.identity = identity;
-        snapshot
-            .records
-            .iter()
-            .zip(keys)
+        ordered
+            .into_iter()
             .map(|(record, key)| {
                 let item_id = match self.assigned.get(&key) {
                     Some(id) => *id,
@@ -286,6 +318,7 @@ impl SessionItemIds {
                     display_name: record.display_name.clone(),
                     owner: record.owner.clone(),
                     lineage: record.lineage.clone(),
+                    kind: record.kind.clone(),
                     tree: None,
                 })
             })

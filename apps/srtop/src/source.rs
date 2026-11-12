@@ -60,6 +60,54 @@ pub struct ProcessKey {
     pub pid_namespace: Observed<PidNamespaceId>,
     pub pid: Observed<u32>,
     pub creation: CreationToken,
+    /// The thread this key names within that process instance (PX-019), or
+    /// `None` for the process (thread group) itself. A thread's identity is
+    /// its process's whole identity above *and* its own TID and creation
+    /// token, so a thread that ends and a newcomer under the same TID — in
+    /// the same process or in a later instance of the same PID — are
+    /// different keys and never share an item ID.
+    pub thread: Option<ThreadIdentity>,
+}
+
+/// The thread component of a [`ProcessKey`] (PX-019): the thread's own ID and
+/// the highest-resolution creation token the source observes for it. On Linux
+/// the token is field 22 of `/proc/<pid>/task/<tid>/stat`, the thread's start
+/// time in clock ticks since boot, read in the same read as the thread's name
+/// and counters. A TID alone is never a thread instance: the kernel hands TIDs
+/// out from the same allocator as PIDs and reuses them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ThreadIdentity {
+    pub tid: u32,
+    pub creation: CreationToken,
+}
+
+impl ProcessKey {
+    /// The key of the process this key belongs to: itself for a process, its
+    /// process instance for a thread (PX-019).
+    pub fn process_key(&self) -> ProcessKey {
+        ProcessKey {
+            thread: None,
+            ..self.clone()
+        }
+    }
+
+    /// Whether this key names a thread rather than a process (PX-019).
+    pub fn is_thread(&self) -> bool {
+        self.thread.is_some()
+    }
+
+    /// Whether this key is a thread of the process `process` names: the same
+    /// process instance, compared whole, never by PID alone (PX-019).
+    pub fn is_thread_of(&self, process: &ProcessKey) -> bool {
+        self.thread.is_some()
+            && process.thread.is_none()
+            && self.source == process.source
+            && self.host == process.host
+            && self.boot == process.boot
+            && self.pid_namespace == process.pid_namespace
+            && self.pid == process.pid
+            && self.creation == process.creation
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -467,7 +515,36 @@ pub struct ProcessRecord {
     /// unread parent or start time is [`Observed::Missing`], never PID 0 or
     /// time 0, and never a [`Completeness`] degradation.
     pub lineage: Lineage,
+    /// What kind of task this record is (PX-019): a user process with the
+    /// thread count the kernel states for it, a kernel thread, or one thread
+    /// of a user process. A record in [`ProcessSnapshot::records`] is never a
+    /// thread, and a record in [`ProcessSnapshot::threads`] always is. A source
+    /// that cannot tell a kernel thread from a user process says so with
+    /// [`KIND_NOT_COLLECTED`], never by calling every record a user process.
+    pub kind: Observed<TaskKind>,
 }
+
+/// What kind of task one record describes (PX-019).
+///
+/// On Linux a process is a thread group, every thread of which is a task with
+/// its own `/proc/<pid>/task/<tid>` record; a kernel thread is a task the
+/// kernel runs for itself (`PF_KTHREAD`), with no user address space, listed
+/// in `/proc` like a process of one thread.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TaskKind {
+    /// A user process (thread group). `threads` is how many threads the kernel
+    /// says it has (`/proc/<pid>/stat` field 20), read with the record's
+    /// identity; it counts threads whether or not their records were read.
+    Process { threads: Observed<u32> },
+    /// A kernel thread.
+    KernelThread,
+    /// One thread of a user process, whose key names it.
+    Thread,
+}
+
+/// The kind of a record whose source does not say whether it is a kernel
+/// thread or a user process (PX-019).
+pub const KIND_NOT_COLLECTED: Observed<TaskKind> = Observed::Missing(MissingReason::Unavailable);
 
 /// Where one process instance says it sits in its host's process tree, as one
 /// scan read it (PX-018): its parent's PID and its own start time.
@@ -821,6 +898,83 @@ pub struct ProcessSnapshot {
     /// read — and missing — on its own. They are published only from a scan
     /// whose process list was read; see [`crate::summary`].
     pub system: SystemSample,
+    /// The user threads this scan read, kept apart from `records` so nothing
+    /// that counts processes ever counts a thread (PX-019).
+    pub threads: ThreadScan,
+}
+
+/// The most thread records one scan reads (PX-019): the record bound again,
+/// so a host whose processes each have one thread never reaches it. A process
+/// whose threads the bound leaves unread is named in
+/// [`ThreadRecords::capped`], and its thread rows are kept, not deleted.
+pub const MAX_THREAD_RECORDS: usize = 65_536;
+
+/// What one scan says about user threads (PX-019).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadScan {
+    /// This source cannot enumerate threads at all: a fixture without thread
+    /// records, or a platform with no reliable per-thread records. It is a
+    /// capability limitation, published as one, never zero threads.
+    NotProvided,
+    /// User threads are hidden, so this scan did not read them.
+    NotRequested,
+    /// The threads this scan read, and which processes it could not read them
+    /// for.
+    Read(ThreadRecords),
+}
+
+impl ThreadScan {
+    /// The thread records, if threads were read.
+    pub fn records(&self) -> &[ProcessRecord] {
+        match self {
+            Self::Read(read) => &read.records,
+            _ => &[],
+        }
+    }
+
+    /// What was read, if threads were read.
+    pub fn read(&self) -> Option<&ThreadRecords> {
+        match self {
+            Self::Read(read) => Some(read),
+            _ => None,
+        }
+    }
+}
+
+/// The user threads one scan read (PX-019), and the processes whose threads
+/// it could not account for. Bounded by [`MAX_THREAD_RECORDS`] records and by
+/// the two ledgers' own limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadRecords {
+    /// One record per thread, each keyed by its process instance and its own
+    /// TID and creation token, grouped by process in the order of
+    /// [`ProcessSnapshot::records`] and by ascending TID within one.
+    pub records: Vec<ProcessRecord>,
+    /// Processes whose thread listing, or one of whose threads, could not be
+    /// read: their earlier thread rows are kept, and none of their threads is
+    /// claimed to have ended.
+    pub unreadable: PidLedger,
+    /// Of `unreadable`, how many were refused rather than failed.
+    pub denied: usize,
+    /// Processes whose threads were never read because the scan had already
+    /// read [`MAX_THREAD_RECORDS`] thread records.
+    pub capped: PidLedger,
+    /// Threads that ended between their listing and their read: ordinary
+    /// churn, never a degradation.
+    pub vanished: usize,
+}
+
+impl ThreadRecords {
+    /// Nothing read yet, naming at most `limit` processes in each ledger.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            records: Vec::new(),
+            unreadable: PidLedger::with_limit(limit),
+            denied: 0,
+            capped: PidLedger::with_limit(limit),
+            vanished: 0,
+        }
+    }
 }
 
 impl ProcessSnapshot {
@@ -862,6 +1016,12 @@ impl ProcessSnapshot {
     /// not exist at sample time, and its row is deleted like any other exit. An
     /// identity file the scan could not read degrades every record equally and
     /// hides none, so it skips nothing and scopes nothing.
+    ///
+    /// The thread ledgers (PX-019) take no part in this: a process whose
+    /// threads were not read was itself read, so its PID names the instance
+    /// this scan saw, and keeping absent rows by that PID would keep a dead
+    /// instance beside its successor. Which earlier thread rows such a scan
+    /// keeps is [`Self::thread_retention`], matched by process instance.
     pub fn retention(&self) -> Retention {
         if !self.capped.is_enumerable() {
             return Retention::Unenumerable;
@@ -874,6 +1034,58 @@ impl ProcessSnapshot {
             uncertain.extend(skipped.pids().iter().copied());
         }
         Retention::Skipped(uncertain)
+    }
+
+    /// Which processes' earlier thread rows this scan keeps (PX-019): those
+    /// whose threads it could not read or never reached, because nothing
+    /// says those threads ended.
+    ///
+    /// It names PIDs, so it is only ever applied together with the process
+    /// instance: an absent thread row is kept only when its process row is one
+    /// this scan confirmed, under the same whole key, and its PID is named
+    /// here. A process row is never kept by it, and neither is a thread of an
+    /// earlier instance under a reused PID. A ledger that could not name every
+    /// such process keeps the absent threads of every process this scan
+    /// confirmed, never more.
+    pub fn thread_retention(&self) -> ThreadRetention {
+        let ThreadScan::Read(threads) = &self.threads else {
+            return ThreadRetention::None;
+        };
+        let mut named = BTreeSet::new();
+        for ledger in [&threads.unreadable, &threads.capped] {
+            if !ledger.is_enumerable() {
+                return ThreadRetention::Every;
+            }
+            named.extend(ledger.pids().iter().copied());
+        }
+        ThreadRetention::Named(named)
+    }
+}
+
+/// Which absent thread rows one scan keeps (PX-019), always together with
+/// the process instance the scan confirmed; see
+/// [`ProcessSnapshot::thread_retention`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadRetention {
+    /// The scan read no threads: it keeps no thread row on their account.
+    None,
+    /// The threads of the processes with these PIDs were not read or not
+    /// reached.
+    Named(BTreeSet<u32>),
+    /// The scan could not name every process whose threads it missed.
+    Every,
+}
+
+impl ThreadRetention {
+    /// Whether the threads of the confirmed process instance with `pid` are
+    /// uncertain this scan.
+    pub fn covers(&self, pid: &Observed<u32>) -> bool {
+        match (self, pid) {
+            (Self::None, _) => false,
+            (Self::Every, _) => true,
+            (Self::Named(pids), Observed::Known(pid)) => pids.contains(pid),
+            (Self::Named(_), Observed::Missing(_)) => false,
+        }
     }
 }
 
@@ -904,6 +1116,13 @@ pub trait ProcessSource {
     fn details(&self) -> Option<std::sync::Arc<dyn crate::inspector::DetailSource>> {
         None
     }
+
+    /// Whether the next snapshots read user threads (PX-019): `true` while
+    /// the view shows them. Reading every process's threads costs one more
+    /// listing per process and one read per thread, so a source reads them
+    /// only when asked. A source that cannot ignores this and states
+    /// [`ThreadScan::NotProvided`].
+    fn collect_threads(&mut self, _on: bool) {}
 }
 
 /// A fixture detail that was read: `state`, `parent`, and a start
@@ -988,6 +1207,7 @@ impl FakeProcessSource {
             pid_namespace: Observed::Known(PidNamespaceId(4_026_531_836)),
             pid,
             creation: CreationToken::Opaque(token.into()),
+            thread: None,
         }
     }
 
@@ -1078,6 +1298,7 @@ impl ProcessSource for FakeProcessSource {
                 // A value whose fraction is truncated rather than rounded, and a
                 // multithreaded process using two and a half logical CPUs.
                 ProcessRecord {
+                    kind: KIND_NOT_COLLECTED,
                     lineage: Lineage::new(1, 4_000 * 100),
                     owner: Observed::Known(Self::CURRENT_UID),
                     key: Self::key("worker-a", Observed::Known(4101)),
@@ -1091,6 +1312,7 @@ impl ProcessSource for FakeProcessSource {
                 },
                 // Known zeros, which must survive as zeros.
                 ProcessRecord {
+                    kind: KIND_NOT_COLLECTED,
                     lineage: Lineage::new(4101, 9_000 * 100),
                     owner: Observed::Known(Self::OTHER_UID),
                     key: Self::key("worker-b", Observed::Known(4102)),
@@ -1105,6 +1327,7 @@ impl ProcessSource for FakeProcessSource {
                 // Every field unread or not yet measurable, for different
                 // reasons: the states are per field, not per record.
                 ProcessRecord {
+                    kind: KIND_NOT_COLLECTED,
                     lineage: Lineage {
                         parent: Observed::Missing(MissingReason::Denied),
                         started: Observed::Missing(MissingReason::Denied),
@@ -1117,6 +1340,7 @@ impl ProcessSource for FakeProcessSource {
                 },
             ],
             vanished: 0,
+            threads: ThreadScan::NotProvided,
             capped: CappedRecords::none(),
             completeness: Completeness::Complete,
             system: Self::system(),
@@ -1162,6 +1386,7 @@ impl ProcessSource for RepeatedNamesSource {
                     (name.clone(), name)
                 };
                 ProcessRecord {
+                    kind: KIND_NOT_COLLECTED,
                     lineage: Lineage::NOT_COLLECTED,
                     owner: OWNER_NOT_COLLECTED,
                     key: ProcessKey {
@@ -1183,6 +1408,7 @@ impl ProcessSource for RepeatedNamesSource {
             sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
             records,
             vanished: 0,
+            threads: ThreadScan::NotProvided,
             capped: CappedRecords::none(),
             completeness: Completeness::Complete,
             system: FakeProcessSource::system(),
@@ -1274,6 +1500,7 @@ impl FollowSource {
                     )
                 };
                 ProcessRecord {
+                    kind: KIND_NOT_COLLECTED,
                     lineage: Lineage::NOT_COLLECTED,
                     owner: OWNER_NOT_COLLECTED,
                     key: ProcessKey {
@@ -1304,6 +1531,7 @@ impl ProcessSource for FollowSource {
             ),
             records: Self::records(step),
             vanished: 0,
+            threads: ThreadScan::NotProvided,
             capped: CappedRecords::none(),
             completeness: Completeness::Complete,
             system: FakeProcessSource::system(),
@@ -1384,6 +1612,7 @@ impl TreeSource {
                     parent
                 };
                 ProcessRecord {
+                    kind: KIND_NOT_COLLECTED,
                     lineage: Lineage::new(parent, started),
                     owner: OWNER_NOT_COLLECTED,
                     key: ProcessKey {
@@ -1418,9 +1647,226 @@ impl ProcessSource for TreeSource {
             ),
             records: Self::records(step),
             vanished: 0,
+            threads: ThreadScan::NotProvided,
             capped: CappedRecords::none(),
             completeness: Completeness::Complete,
             system: FakeProcessSource::system(),
+        }
+    }
+}
+
+/// Status label of the thread fixture (PX-019). Like every source, it states
+/// what its data is: a script, never a host.
+pub const THREADS_STATUS_TEXT: &str = "Read-only · Fake processes and threads";
+
+/// PX-019's fixture: user processes with threads, two kernel threads, and a
+/// process whose threads cannot be read, as two steps.
+///
+/// | PID | name | kind | threads (kernel's count) | CPU ticks |
+/// | --- | ---- | ---- | ------------------------ | --------- |
+/// | 1 | `init` | user process | 1 | 5 |
+/// | 2 | `kthreadd` | kernel thread | | 0 |
+/// | 3 | `kworker/0:1` | kernel thread | | 1 |
+/// | 200 | `server` | user process | 3 | the sum of its threads' |
+/// | 300 | `locked` | user process | 2, whose records are denied | 20 |
+///
+/// `server`'s threads at step 0 are TID 200 `server` (the main thread, 10
+/// ticks), 201 `worker-1` (60) and 202 `worker-2` (30): the process's 100
+/// ticks are exactly theirs. From step [`ThreadsSource::CHURN_STEP`] on,
+/// `worker-1` has ended and `worker-3` (TID 203, 50) has started, and TID 202
+/// belongs to a new thread, `worker-2b` (20), under a new creation token: the
+/// process then has 80 ticks. Steps past the end repeat the last one, and
+/// each step's sample time is one second after the last.
+///
+/// Threads are listed only while asked for ([`ProcessSource::collect_threads`]).
+///
+/// This is a fixture, not an observation: it reads no process, no clock and no
+/// file, and it names itself as synthetic in every published status.
+#[derive(Debug, Default)]
+pub struct ThreadsSource {
+    step: usize,
+    threads: bool,
+}
+
+impl ThreadsSource {
+    pub const SOURCE: &'static str = "fake-threads-v1";
+    /// The first step at which `worker-1` has ended and TID 202 is reused:
+    /// the second sample after the first, so the first sample a view takes
+    /// once user threads are shown still has the step-0 threads.
+    pub const CHURN_STEP: usize = 2;
+    /// The account that owns `server` and `locked`.
+    pub const OWNER_UID: u32 = 1000;
+    /// Every process: PID, name, parent PID, kind, CPU ticks at step 0.
+    const PROCESSES: [(u32, &'static str, u32, Kind, u64); 5] = [
+        (1, "init", 0, Kind::User(1), 5),
+        (2, "kthreadd", 0, Kind::Kernel, 0),
+        (3, "kworker/0:1", 2, Kind::Kernel, 1),
+        (200, "server", 1, Kind::User(3), 100),
+        (300, "locked", 1, Kind::User(2), 20),
+    ];
+
+    /// The step this source will publish next.
+    pub fn step(&self) -> usize {
+        self.step
+    }
+
+    /// `server`'s threads at `step`: TID, name, start tick, CPU ticks.
+    pub fn server_threads(step: usize) -> [(u32, &'static str, u64, u64); 3] {
+        if step >= Self::CHURN_STEP {
+            [
+                (200, "server", 200, 10),
+                (202, "worker-2b", 270, 20),
+                (203, "worker-3", 260, 50),
+            ]
+        } else {
+            [
+                (200, "server", 200, 10),
+                (201, "worker-1", 210, 60),
+                (202, "worker-2", 220, 30),
+            ]
+        }
+    }
+
+    fn process_key(pid: u32, name: &str) -> ProcessKey {
+        ProcessKey {
+            source: SourceId(Self::SOURCE.into()),
+            ..FakeProcessSource::key(&format!("threads-{name}"), Observed::Known(pid))
+        }
+    }
+
+    fn one_second(ticks: u64) -> CpuUsage {
+        CpuUsage::Measured(CpuInterval {
+            ticks,
+            ticks_per_second: 100,
+            elapsed: Duration::from_secs(1),
+        })
+    }
+
+    /// The process records of one step.
+    pub fn records(step: usize) -> Vec<ProcessRecord> {
+        Self::PROCESSES
+            .iter()
+            .map(|&(pid, name, parent, kind, ticks)| {
+                let ticks = if pid == 200 {
+                    Self::server_threads(step)
+                        .iter()
+                        .map(|thread| thread.3)
+                        .sum()
+                } else {
+                    ticks
+                };
+                let (kind, owner) = match kind {
+                    Kind::User(threads) => (
+                        TaskKind::Process {
+                            threads: Observed::Known(threads),
+                        },
+                        if pid == 1 { 0 } else { Self::OWNER_UID },
+                    ),
+                    Kind::Kernel => (TaskKind::KernelThread, 0),
+                };
+                ProcessRecord {
+                    key: Self::process_key(pid, name),
+                    display_name: DisplayName::from(name),
+                    resident: if matches!(kind, TaskKind::KernelThread) {
+                        Observed::Known(0)
+                    } else {
+                        Observed::Known(4096 * u64::from(pid))
+                    },
+                    cpu: Self::one_second(ticks),
+                    owner: Observed::Known(owner),
+                    lineage: Lineage::new(parent, u64::from(pid)),
+                    kind: Observed::Known(kind),
+                }
+            })
+            .collect()
+    }
+
+    /// The thread records of one step: `server`'s, and none of `locked`'s,
+    /// which are denied.
+    pub fn threads(step: usize) -> ThreadRecords {
+        let process = Self::process_key(200, "server");
+        let mut read = ThreadRecords::with_limit(MAX_THREAD_RECORDS);
+        read.records = Self::server_threads(step)
+            .iter()
+            .map(|&(tid, name, started, ticks)| ProcessRecord {
+                key: ProcessKey {
+                    thread: Some(ThreadIdentity {
+                        tid,
+                        creation: CreationToken::Opaque(format!("thread-{tid}-{started}")),
+                    }),
+                    ..process.clone()
+                },
+                display_name: DisplayName::from(name),
+                resident: Observed::Missing(MissingReason::Unavailable),
+                cpu: Self::one_second(ticks),
+                owner: Observed::Known(Self::OWNER_UID),
+                lineage: Lineage::new(200, started),
+                kind: Observed::Known(TaskKind::Thread),
+            })
+            .collect();
+        read.unreadable.record(300);
+        read.denied = 1;
+        read
+    }
+}
+
+/// A [`ThreadsSource`] process's kind: a user process with this many threads,
+/// or a kernel thread.
+#[derive(Debug, Clone, Copy)]
+enum Kind {
+    User(u32),
+    Kernel,
+}
+
+impl ProcessSource for ThreadsSource {
+    fn status_text(&self) -> &str {
+        THREADS_STATUS_TEXT
+    }
+
+    fn accounts(&self) -> crate::owner::Accounts {
+        crate::owner::Accounts::fixed(Self::OWNER_UID, &[(0, "root"), (Self::OWNER_UID, "alice")])
+    }
+
+    /// The fixture's details (PX-013): `server` and each of its threads.
+    /// A thread's details are its own state and start; its command is its
+    /// process's.
+    fn details(&self) -> Option<std::sync::Arc<dyn crate::inspector::DetailSource>> {
+        let command = || fixture_command(&[b"server", b"--threads=3"], b"/usr/bin/server");
+        Some(std::sync::Arc::new(crate::inspector::FixtureDetails::new(
+            Self::SOURCE,
+            vec![
+                ("threads-server", fixture_read(b'S', 1, 2, command())),
+                ("thread-200-200", fixture_read(b'S', 1, 2, command())),
+                ("thread-201-210", fixture_read(b'R', 1, 2, command())),
+                ("thread-202-220", fixture_read(b'S', 1, 2, command())),
+                ("thread-202-270", fixture_read(b'R', 1, 3, command())),
+                ("thread-203-260", fixture_read(b'R', 1, 3, command())),
+            ],
+        )))
+    }
+
+    fn collect_threads(&mut self, on: bool) {
+        self.threads = on;
+    }
+
+    fn snapshot(&mut self) -> ProcessSnapshot {
+        let step = self.step;
+        self.step += 1;
+        ProcessSnapshot {
+            source: SourceId(Self::SOURCE.into()),
+            sampled_at: SnapshotTime(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + step as u64),
+            ),
+            records: Self::records(step),
+            vanished: 0,
+            capped: CappedRecords::none(),
+            completeness: Completeness::Complete,
+            system: FakeProcessSource::system(),
+            threads: if self.threads {
+                ThreadScan::Read(Self::threads(step))
+            } else {
+                ThreadScan::NotRequested
+            },
         }
     }
 }
@@ -1509,6 +1955,7 @@ impl ScriptedFakeSource {
             pid_namespace: Observed::Known(PidNamespaceId(4_026_531_836)),
             pid: Observed::Known(pid),
             creation: CreationToken::Opaque(token.into()),
+            thread: None,
         }
     }
 
@@ -1527,6 +1974,7 @@ impl ScriptedFakeSource {
         cpu: CpuUsage,
     ) -> ProcessRecord {
         ProcessRecord {
+            kind: KIND_NOT_COLLECTED,
             lineage: Lineage::NOT_COLLECTED,
             owner: OWNER_NOT_COLLECTED,
             key: Self::key(token, pid),
@@ -1675,6 +2123,7 @@ impl ProcessSource for ScriptedFakeSource {
             ),
             records,
             vanished: 0,
+            threads: ThreadScan::NotProvided,
             capped: CappedRecords::none(),
             completeness,
             system: Self::system(),
@@ -1759,6 +2208,7 @@ impl SyntheticProcessInstance {
             pid_namespace: Observed::Known(PidNamespaceId(4_026_531_836)),
             pid: Observed::Known(self.pid),
             creation: CreationToken::Opaque(format!("scale-{}-{}", self.pid, self.start_tick)),
+            thread: None,
         };
         let display_name =
             DisplayName::from(self.name.as_str()).with_command(self.cmdline.as_bytes());
@@ -1789,6 +2239,15 @@ impl SyntheticProcessInstance {
             }
         };
         ProcessRecord {
+            // The kernel threads among the daemons say so (PX-019); the
+            // fixture states no thread count.
+            kind: Observed::Known(if self.is_kernel_thread {
+                TaskKind::KernelThread
+            } else {
+                TaskKind::Process {
+                    threads: Observed::Missing(MissingReason::Unavailable),
+                }
+            }),
             // A deterministic forest (PX-018) drawn from no random number, so
             // every other value of the fixture is unchanged: PID 1 is the root,
             // and PID `p` names `(p - 2) / 4 + 1` as its parent. A recycled
@@ -2209,6 +2668,7 @@ impl ProcessSource for SyntheticProcessSource {
             sampled_at,
             records,
             vanished: self.vanished,
+            threads: ThreadScan::NotProvided,
             capped: CappedRecords::none(),
             completeness: Completeness::Complete,
             system: Self::system(),

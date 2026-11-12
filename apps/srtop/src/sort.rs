@@ -134,9 +134,12 @@ pub fn value_of(field: ProcessField, key: &ProcessKey, record: &ProcessRecord) -
         return SortValue::Missing;
     }
     match field {
-        ProcessField::Pid => match key.pid {
-            Observed::Known(pid) => SortValue::Number(u64::from(pid)),
-            Observed::Missing(_) => SortValue::Missing,
+        // A thread row orders by its own TID (PX-019); it is only ever
+        // compared with its process's other threads.
+        ProcessField::Pid => match (&key.thread, &key.pid) {
+            (Some(thread), _) => SortValue::Number(u64::from(thread.tid)),
+            (None, Observed::Known(pid)) => SortValue::Number(u64::from(*pid)),
+            (None, Observed::Missing(_)) => SortValue::Missing,
         },
         ProcessField::Name => SortValue::Text(record.display_name.as_str().to_string()),
         ProcessField::Resident => match record.resident {
@@ -212,6 +215,17 @@ pub fn process_key_order(left: &ProcessKey, right: &ProcessKey) -> Ordering {
         })
         .then_with(|| observed_order(&left.pid, &right.pid, |a, b| a.cmp(b)))
         .then_with(|| creation_order(&left.creation, &right.creation))
+        // A process before its threads, and threads by TID, then creation
+        // token (PX-019).
+        .then_with(|| match (&left.thread, &right.thread) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (Some(left), Some(right)) => left
+                .tid
+                .cmp(&right.tid)
+                .then_with(|| creation_order(&left.creation, &right.creation)),
+        })
 }
 
 /// A known component before a missing one, and the values by `compare` when
@@ -271,6 +285,7 @@ mod tests {
             pid_namespace: Observed::Known(PidNamespaceId(1)),
             pid: pid.map_or(Observed::Missing(MissingReason::Denied), Observed::Known),
             creation: CreationToken::Opaque(token.into()),
+            thread: None,
         }
     }
 
@@ -286,6 +301,7 @@ mod tests {
     ) -> Row {
         let key = key(pid, token);
         let record = ProcessRecord {
+            kind: crate::source::KIND_NOT_COLLECTED,
             lineage: crate::source::Lineage::NOT_COLLECTED,
             owner: crate::source::OWNER_NOT_COLLECTED,
             key: key.clone(),
@@ -299,6 +315,7 @@ mod tests {
         Row {
             owner: crate::source::OWNER_NOT_COLLECTED,
             lineage: crate::source::Lineage::NOT_COLLECTED,
+            kind: crate::source::KIND_NOT_COLLECTED,
             tree: None,
             sort: SortValues::of_record(&key, &record),
             key,
@@ -346,6 +363,7 @@ mod tests {
         // present.
         let missing = row(2, None, "u", "name", None, CpuUsage::WarmingUp);
         let record = ProcessRecord {
+            kind: crate::source::KIND_NOT_COLLECTED,
             lineage: crate::source::Lineage::NOT_COLLECTED,
             owner: crate::source::OWNER_NOT_COLLECTED,
             key: missing.key.clone(),

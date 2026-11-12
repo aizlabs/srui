@@ -59,7 +59,7 @@ use crate::command::{CommandContext, COMMAND_HEAD, NO_SELECTION_COMMAND, UNCOLLE
 use crate::metric::format_utc;
 use crate::owner::{AccountName, AccountNames};
 use crate::projection::Row;
-use crate::source::{CreationToken, MissingReason, Observed, ProcessKey, Retention, SourceId};
+use crate::source::{CreationToken, MissingReason, Observed, ProcessKey, SourceId};
 use srui_sdk::{ItemId, Value};
 use std::collections::HashSet;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -229,7 +229,12 @@ impl FixtureDetails {
 
 impl DetailSource for FixtureDetails {
     fn read_details(&self, target: &ProcessKey) -> DetailRead {
-        let CreationToken::Opaque(token) = &target.creation else {
+        // A thread's details are its own (PX-019): keyed by its own token.
+        let creation = target
+            .thread
+            .as_ref()
+            .map_or(&target.creation, |thread| &thread.creation);
+        let CreationToken::Opaque(token) = creation else {
             return DetailRead::Unreadable(MissingReason::Unavailable);
         };
         if target.source != self.source {
@@ -725,8 +730,10 @@ impl Inspector {
     /// Records what one accepted scan established about the target (PX-013
     /// review round), before its publication is planned: `latest` is the
     /// server-side collection the scan leaves, `evicted` the unconfirmed rows
-    /// retention dropped under the published-row ceiling, and `retention` the
-    /// absences the scan could not account for.
+    /// retention dropped under the published-row ceiling, and `retains` the
+    /// absences the scan could not account for (true for a key it would have
+    /// kept unconfirmed: the record retention, and for a thread also the
+    /// thread retention, PX-019).
     ///
     /// * Listed: the stored row takes the latest projection, so a row shown
     ///   after it is gone carries the newest owner and name, never an older one.
@@ -737,7 +744,7 @@ impl Inspector {
         &mut self,
         latest: &[Row],
         evicted: &HashSet<ItemId>,
-        retention: &Retention,
+        retains: impl Fn(&ProcessKey) -> bool,
     ) {
         let Selection::Process(selected) = &mut self.selection else {
             return;
@@ -748,7 +755,7 @@ impl Inspector {
         } else if evicted.contains(&item) {
             selected.evicted = true;
         } else if selected.evicted
-            && !retention.keeps(&selected.row.key)
+            && !retains(&selected.row.key)
             && !latest.iter().any(|row| row.key == selected.row.key)
         {
             selected.details = Details::Ended;
@@ -822,15 +829,16 @@ impl Inspector {
         let shown = rows.iter().find(|row| row.item_id == item);
         let kept = shown.or_else(|| unfiltered.iter().find(|row| row.item_id == item));
         let row = kept.unwrap_or(&selected.row);
-        let head = format!(
-            "Selected process: {} · {}",
-            pid_text(&row.key.pid),
-            row.display_name.as_str()
-        );
+        // A thread row is described as the thread it is (PX-019): its TID and
+        // its process's PID, and its own state and start time.
+        let (noun, subject) = match crate::threads::thread_subject(row) {
+            Some(subject) => ("thread", subject),
+            None => ("process", pid_text(&row.key.pid)),
+        };
+        let head = format!("Selected {noun}: {subject} · {}", row.display_name.as_str());
         let process = format!(
-            "Name: {} · {} · Owner: {}",
+            "Name: {} · {subject} · Owner: {}",
             row.display_name.as_str(),
-            pid_text(&row.key.pid),
             owner_text(&row.owner, names)
         );
         if kept.is_none() && selected.evicted && selected.details != Details::Ended {
@@ -854,11 +862,11 @@ impl Inspector {
         let ended = kept.is_none() || selected.details == Details::Ended;
         if ended {
             return InspectorView::bounded(
-                format!("{head} · this process has ended; select another row"),
+                format!("{head} · this {noun} has ended; select another row"),
                 process,
-                format!("{DETAILS_HEAD}: none: the process has ended"),
-                format!("{METRICS_HEAD}: none: the process has ended"),
-                format!("{COMMAND_HEAD}: none: the process has ended"),
+                format!("{DETAILS_HEAD}: none: the {noun} has ended"),
+                format!("{METRICS_HEAD}: none: the {noun} has ended"),
+                format!("{COMMAND_HEAD}: none: the {noun} has ended"),
             );
         }
         let Some(shown) = shown else {

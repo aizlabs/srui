@@ -126,6 +126,7 @@ fn assert_shell_intact(session: &Session) {
                     COLUMN_CHOOSER_ROW,
                     FOLLOW_ROW,
                     srui_process_explorer::VIEW_ROW,
+                    srui_process_explorer::THREADS_ROW,
                     TABLE,
                     srui_process_explorer::TREE,
                     INSPECTOR
@@ -506,11 +507,13 @@ impl ProcessSource for Widest {
             .map(|index| {
                 let pid = self.first_pid + index;
                 ProcessRecord {
+                    kind: srui_process_explorer::source::KIND_NOT_COLLECTED,
                     lineage: srui_process_explorer::source::Lineage::NOT_COLLECTED,
                     owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
                     key: ProcessKey {
                         pid: Observed::Known(pid),
                         creation: CreationToken::Opaque(format!("widest-{pid}")),
+                        thread: None,
                         ..template.clone()
                     },
                     display_name: name.clone(),
@@ -526,6 +529,7 @@ impl ProcessSource for Widest {
             sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
             records,
             vanished: 0,
+            threads: srui_process_explorer::source::ThreadScan::NotProvided,
             capped: CappedRecords::none(),
             completeness: Completeness::Complete,
             system: SystemSample::not_provided(),
@@ -1026,11 +1030,13 @@ fn a_refresh_beyond_the_transaction_bound_is_published_whole() {
             let records = (0..self.rows)
                 .filter(|index| index % self.stride == 0)
                 .map(|index| ProcessRecord {
+                    kind: srui_process_explorer::source::KIND_NOT_COLLECTED,
                     lineage: srui_process_explorer::source::Lineage::NOT_COLLECTED,
                     owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
                     key: ProcessKey {
                         pid: Observed::Known(index + 1),
                         creation: CreationToken::Opaque(format!("interleaved-{index}")),
+                        thread: None,
                         ..template.clone()
                     },
                     display_name: "worker".into(),
@@ -1043,6 +1049,7 @@ fn a_refresh_beyond_the_transaction_bound_is_published_whole() {
                 sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
                 records,
                 vanished: 0,
+                threads: srui_process_explorer::source::ThreadScan::NotProvided,
                 capped: CappedRecords::none(),
                 completeness: Completeness::Complete,
                 system: SystemSample::not_provided(),

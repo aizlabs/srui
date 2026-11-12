@@ -638,10 +638,11 @@ pub struct ProcessView {
     /// The tags status as the client holds it, with the generation it states
     /// (PX-020).
     tags_published: TagsView,
-    /// Where the tagged processes were among the rows the last row
-    /// publication planned (PX-020): what a change that republishes no row
-    /// (a scan that could not read the process list, a late detail read)
-    /// states the tags status with. Re-deriving it then would arrange the
+    /// Where the tagged processes are among the rows the client holds: those
+    /// of the last row publication whose rows, view and tags status reached
+    /// it (PX-020). What a change that republishes no row (a scan that could
+    /// not read the process list, a late detail read) states the tags status
+    /// with. Re-deriving it then would arrange the
     /// tree from a generation whose every row is unconfirmed, which is not
     /// the one the client holds (PX-021, verification of PR #107's review).
     tag_counts: TagCounts,
@@ -1442,7 +1443,9 @@ impl ProcessView {
         // The tags status after the rows whose tag cells it describes
         // (PX-020).
         plan.extend(self.tags_effects(tag_counts));
-        self.tag_counts = tag_counts;
+        // The client holds these rows, in this view, under this tag set and
+        // its status, once every entry up to here has committed.
+        let counts_end = plan.len();
         // Last, the search re-counted against the rows this plan publishes, so
         // it commits with the final rows rather than ahead of them (PX-011),
         // and the inspector, whose metrics and state follow them (PX-013).
@@ -1501,6 +1504,7 @@ impl ProcessView {
             commit_reaching(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
         self.settle_disclosure(held, reached >= rows_end);
+        self.settle_tag_counts(tag_counts, reached >= counts_end);
         if self.settle_tags(held_tags) {
             self.unretag(retagged);
         }
@@ -2222,7 +2226,9 @@ impl ProcessView {
         // The tags status after the rows whose tag cells it describes
         // (PX-020).
         plan.extend(self.tags_effects(tag_counts));
-        self.tag_counts = tag_counts;
+        // The client holds these rows, in this view, under this tag set and
+        // its status, once every entry up to here has committed.
+        let counts_end = plan.len();
         // The search counts the newly filtered rows; a target a filter hid is
         // reported as no longer shown, never replaced (PX-011). So is the
         // inspector's (PX-013), and a row these rows put under a parent the
@@ -2293,6 +2299,7 @@ impl ProcessView {
             commit_reaching(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
         self.settle_disclosure(held, reached >= rows_end);
+        self.settle_tag_counts(tag_counts, reached >= counts_end);
         refresh_sort_values(&mut self.rows, &target);
         self.ids.retain(&self.unfiltered_rows);
         self.prune_collapsed();
@@ -3336,8 +3343,7 @@ impl ProcessView {
 
     /// The tags status's change for a change that touches no row, such as
     /// a record that aged out or turned `exited` (PX-021): counted among the
-    /// rows the last row publication planned, which are the ones the client
-    /// holds.
+    /// rows the client holds ([`Self::settle_tag_counts`]).
     fn current_tags_effects(&self) -> Vec<Planned> {
         self.tags_effects(self.tag_counts)
     }
@@ -3356,6 +3362,17 @@ impl ProcessView {
             text: status,
             generation: self.tags.generation(),
         })]
+    }
+
+    /// Takes `counts`, those of the rows and the tag set a plan published, as
+    /// the counts the client holds once that plan's rows, view and tags
+    /// status `reached` it. A plan that failed before then leaves the client,
+    /// and so the counts, as they were, as [`Self::settle_tags`] leaves the
+    /// set (verification of PR #107's review, G1).
+    fn settle_tag_counts(&mut self, counts: TagCounts, reached: bool) {
+        if reached {
+            self.tag_counts = counts;
+        }
     }
 
     /// Puts back `held`, the tag set before a request or a sample changed it,
@@ -9363,5 +9380,200 @@ mod expiry_publish_tests {
             "{}",
             view.tags_status()
         );
+    }
+}
+
+/// Verification of the Codex review round (PR #107), G1 and G2: the tag
+/// counts a change that republishes no row states the tags status with are
+/// those of the rows the client holds. They follow a sample or a republish
+/// whose rows reached the client, and never one whose commit failed.
+#[cfg(test)]
+mod tag_counts_commit_tests {
+    use super::*;
+    use crate::catalogue::ProcessField;
+    use crate::source::{
+        BootId, CappedRecords, Completeness, CpuUsage, CreationToken, DisplayName,
+        FakeProcessSource, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+        SkippedRecords, SnapshotTime, SourceId, OWNER_NOT_COLLECTED,
+    };
+
+    const CLIENT: &[u8] = b"tag-counts-client";
+    const BEYOND: &str = "1 beyond the publishable size limit";
+
+    fn record(pid: u32, parent: u32, name: &str) -> ProcessRecord {
+        ProcessRecord {
+            lineage: Lineage::new(parent, u64::from(pid)),
+            owner: OWNER_NOT_COLLECTED,
+            key: ProcessKey {
+                source: SourceId("tag-counts".into()),
+                host: Observed::Known(HostId("h".into())),
+                boot: Observed::Known(BootId("b".into())),
+                pid_namespace: Observed::Known(PidNamespaceId(1)),
+                pid: Observed::Known(pid),
+                creation: CreationToken::Opaque(name.into()),
+                thread: None,
+            },
+            kind: crate::source::KIND_NOT_COLLECTED,
+            display_name: DisplayName::from(name),
+            resident: Observed::Known(4096),
+            cpu: CpuUsage::WarmingUp,
+        }
+    }
+
+    fn usual() -> Vec<ProcessRecord> {
+        vec![
+            record(1, 0, "init"),
+            record(10, 1, "a"),
+            record(20, 1, "b"),
+            record(30, 10, "c"),
+            record(40, 0, "solo"),
+            record(50, 0, "solo2"),
+        ]
+    }
+
+    /// `records` while readable; an unreadable scan reads no process list.
+    struct Source {
+        records: Vec<ProcessRecord>,
+        unreadable: bool,
+        scans: u64,
+    }
+
+    impl ProcessSource for Source {
+        fn status_text(&self) -> &str {
+            "Read-only · Tag-counts fixture"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            self.scans += 1;
+            ProcessSnapshot {
+                source: SourceId("tag-counts".into()),
+                sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH + Duration::from_secs(self.scans)),
+                records: if self.unreadable {
+                    Vec::new()
+                } else {
+                    self.records.clone()
+                },
+                vanished: 0,
+                capped: CappedRecords::none(),
+                completeness: if self.unreadable {
+                    Completeness::from_scan(SkippedRecords::unenumerable(), Vec::new())
+                } else {
+                    Completeness::Complete
+                },
+                system: FakeProcessSource::system(),
+                threads: crate::source::ThreadScan::NotProvided,
+            }
+        }
+    }
+
+    fn pids(view: &ProcessView) -> Vec<u32> {
+        view.rows
+            .iter()
+            .filter_map(|row| match row.key.pid {
+                Observed::Known(pid) => Some(pid),
+                Observed::Missing(_) => None,
+            })
+            .collect()
+    }
+
+    /// A view at row limit 3 over `usual()`, with PID 20 tagged.
+    fn start() -> (Session, ProcessView, Source) {
+        let session = Session::mint();
+        let mut source = Source {
+            records: usual(),
+            unreadable: false,
+            scans: 0,
+        };
+        let (view, _) = ProcessView::start(&session, &mut source).unwrap();
+        let mut view = view.with_published_limit(3);
+        view.refresh(&session, &mut source).unwrap();
+        let item = view
+            .rows
+            .iter()
+            .find(|row| row.key.pid == Observed::Known(20))
+            .map(|row| row.item_id);
+        assert!(item.is_some(), "20 is shown in {:?}", pids(&view));
+        view.select_item(&session, CLIENT, item).unwrap();
+        view.request_tags(&session, TagRequest::Toggle).unwrap();
+        assert_eq!(view.tags().tagged(), 1);
+        (session, view, source)
+    }
+
+    /// An unreadable scan, then the tags status the client holds.
+    fn unreadable_scan(session: &Session, view: &mut ProcessView, source: &mut Source) -> String {
+        source.unreadable = true;
+        view.refresh(session, source).unwrap();
+        source.unreadable = false;
+        view.tags_status().to_string()
+    }
+
+    /// Sorts by PID descending, so 20 is beyond the limit of 3.
+    fn sort_20_out(session: &Session, view: &mut ProcessView) {
+        view.click_sort(session, ProcessField::Pid).unwrap();
+        if pids(view).contains(&20) {
+            view.click_sort(session, ProcessField::Pid).unwrap();
+        }
+        assert!(!pids(view).contains(&20), "{:?}", pids(view));
+    }
+
+    /// G1 (a): a Clear whose commit fails puts the set back, and the client
+    /// keeps its rows and status; the next unreadable scan states that status.
+    #[test]
+    fn a_failed_clear_leaves_the_counts_of_the_rows_the_client_holds() {
+        let (session, mut view, mut source) = start();
+        sort_20_out(&session, &mut view);
+        let before = view.tags_status().to_string();
+        assert!(before.contains(BEYOND), "{before}");
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.request_tags(&session, TagRequest::Clear).is_err());
+        }
+        assert_eq!(view.tags().tagged(), 1, "the set was put back");
+        assert_eq!(view.tags_status(), before);
+        assert_eq!(unreadable_scan(&session, &mut view, &mut source), before);
+    }
+
+    /// G1 (b): a switch to the tree whose commit fails leaves the table
+    /// shown; the next unreadable scan states the table's tags status.
+    #[test]
+    fn a_failed_view_switch_leaves_the_counts_of_the_rows_the_client_holds() {
+        let (session, mut view, mut source) = start();
+        let rows = pids(&view);
+        let before = view.tags_status().to_string();
+        assert!(!before.contains(BEYOND), "{before}");
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.set_view(&session, Some(true)).is_err());
+        }
+        assert_eq!(view.mode, ViewMode::Table);
+        assert_eq!(pids(&view), rows);
+        assert_eq!(unreadable_scan(&session, &mut view, &mut source), before);
+    }
+
+    /// G2 (the sample's write): a readable scan in which a newcomer pushes
+    /// the tagged row beyond the limit; the next unreadable scan keeps saying
+    /// so.
+    #[test]
+    fn a_sample_that_moves_a_tag_beyond_the_limit_sets_the_counts() {
+        let (session, mut view, mut source) = start();
+        assert!(!view.tags_status().contains(BEYOND));
+        source.records.insert(1, record(5, 1, "newcomer"));
+        view.refresh(&session, &mut source).unwrap();
+        assert!(!pids(&view).contains(&20), "{:?}", pids(&view));
+        let status = view.tags_status().to_string();
+        assert!(status.contains(BEYOND), "{status}");
+        assert_eq!(unreadable_scan(&session, &mut view, &mut source), status);
+    }
+
+    /// G2 (the republish's write): a sort that moves the tagged row beyond
+    /// the limit; the next unreadable scan keeps saying so.
+    #[test]
+    fn a_sort_that_moves_a_tag_beyond_the_limit_sets_the_counts() {
+        let (session, mut view, mut source) = start();
+        assert!(!view.tags_status().contains(BEYOND));
+        sort_20_out(&session, &mut view);
+        let status = view.tags_status().to_string();
+        assert!(status.contains(BEYOND), "{status}");
+        assert_eq!(unreadable_scan(&session, &mut view, &mut source), status);
     }
 }

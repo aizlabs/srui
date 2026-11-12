@@ -105,7 +105,7 @@ actor WireMessageCollector<Element: Sendable> {
         collected.count
     }
 
-    func wait(forAtLeast expectedCount: Int, timeout: TimeInterval = 5) async -> [Element] {
+    func wait(forAtLeast expectedCount: Int, timeout: TimeInterval = AsyncTestSupport.roundTripSeconds) async -> [Element] {
         do {
             try await AsyncTestSupport.eventuallyAsync(
                 timeout: .seconds(timeout),

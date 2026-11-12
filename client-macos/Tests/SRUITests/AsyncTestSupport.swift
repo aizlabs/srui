@@ -13,10 +13,13 @@ extension Duration {
     /// session's reader task, negotiated, applied on the `TransactionApplier`, and rendered on the
     /// main actor.
     ///
-    /// The helper's 2-second default stays as it is on purpose — a short default is what keeps a
-    /// genuinely hung condition from spending the whole suite's time budget — but it is not enough
-    /// for a multi-step round trip on a loaded 3-core CI runner. Observed on GitHub's hosted
-    /// runner: `SessionControllerTerminalTests` "A recreated process cold-resumes Terminal after
+    /// It is also the helpers' default. The default used to be 2 seconds, so that a genuinely hung
+    /// condition would not spend the suite's time budget, but 65 call sites relied on it for
+    /// cross-task progress, and five `TextEditingIntegrationTests` waits for a TEXT_EDIT timed out
+    /// together under full-suite load. The longer default costs time only in a test that is
+    /// already failing. Two seconds is not enough for a multi-step round trip on a loaded 3-core
+    /// CI runner. Observed on GitHub's hosted runner: `SessionControllerTerminalTests` "A
+    /// recreated process cold-resumes Terminal after
     /// authoritative negotiation" failed with `Timed out waiting for cold Terminal replay mounted`
     /// while passing locally and on a rerun of the identical tree, i.e. the deadline expired, not
     /// the product.
@@ -53,7 +56,7 @@ enum AsyncTestSupport {
 
     @MainActor
     static func eventually(
-        timeout: Duration = .seconds(2),
+        timeout: Duration = .roundTrip,
         description: String,
         condition: @MainActor () -> Bool
     ) async throws {
@@ -90,7 +93,7 @@ enum AsyncTestSupport {
 
     static func eventuallyAsync(
         isolation: isolated (any Actor)? = #isolation,
-        timeout: Duration = .seconds(2),
+        timeout: Duration = .roundTrip,
         description: String,
         condition: () async -> Bool
     ) async throws {
@@ -196,7 +199,7 @@ final class AsyncTestSignal: @unchecked Sendable {
 
     /// Bounded form: suspends until the threshold is reached, and reports whether it was, so a
     /// caller can keep asserting on the outcome the way a `DispatchSemaphore` timeout let it.
-    func waitOrTimeout(until threshold: Int = 1, timeout: Duration = .seconds(5)) async -> Bool {
+    func waitOrTimeout(until threshold: Int = 1, timeout: Duration = .roundTrip) async -> Bool {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
         while signalCount < threshold {

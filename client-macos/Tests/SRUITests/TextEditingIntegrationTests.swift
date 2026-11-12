@@ -2417,7 +2417,7 @@ struct TextEditingIntegrationTests {
 
     @MainActor
     private func waitUntil(
-        timeout: Double = 2.0,
+        timeout: Double = AsyncTestSupport.roundTripSeconds,
         description: String,
         condition: @MainActor () async -> Bool
     ) async throws {
@@ -2430,7 +2430,7 @@ struct TextEditingIntegrationTests {
 
     private func waitForTextEvent(
         _ collector: EventCollector,
-        timeout: Double = 2.0,
+        timeout: Double = AsyncTestSupport.roundTripSeconds,
         matching predicate: @Sendable (Event) -> Bool = { $0.eventType == .EVENT_TEXT_EDIT }
     ) async throws -> Event {
         try await AsyncTestSupport.eventuallyAsync(

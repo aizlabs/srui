@@ -54,16 +54,20 @@ struct SessionControllerSplitSnapshotTests {
         )
     }
 
+    /// Through the shared poller and its cross-task budget (see `AsyncTestSupport`).
     private static func waitUntil(
-        timeout: TimeInterval = 5.0,
+        isolation: isolated (any Actor)? = #isolation,
+        timeout: TimeInterval = AsyncTestSupport.roundTripSeconds,
         _ condition: @Sendable () async -> Bool
     ) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if await condition() { return true }
-            try? await Task.sleep(nanoseconds: 10_000_000)
+        do {
+            try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(timeout), description: "condition") {
+                await condition()
+            }
+            return true
+        } catch {
+            return await condition()
         }
-        return await condition()
     }
 
     @MainActor

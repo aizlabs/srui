@@ -81,7 +81,8 @@ enum SSHTestSupport {
         return UInt16.random(in: 23000...28000)
     }
 
-    static func waitForPort(port: UInt16, timeoutSeconds: TimeInterval = 5.0) async throws {
+    /// sshd start-up is process launch under whatever load the run is under: the shared budget.
+    static func waitForPort(port: UInt16, timeoutSeconds: TimeInterval = AsyncTestSupport.roundTripSeconds) async throws {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         while Date() < deadline {
             let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)

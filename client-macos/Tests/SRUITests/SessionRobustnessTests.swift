@@ -101,7 +101,7 @@ struct SessionRobustnessTests {
     /// fail loudly instead.
     private static func firstEventObservedRevision(
         in stream: AsyncThrowingStream<Data, Error>,
-        timeout: Double = 5.0
+        timeout: Double = AsyncTestSupport.roundTripSeconds
     ) async throws -> Revision {
         try await withThrowingTaskGroup(of: Revision?.self) { group in
             group.addTask {

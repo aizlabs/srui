@@ -911,6 +911,13 @@ struct SessionRobustnessTests {
         #expect(weakServer != nil)
         pair = nil
 
+        // Released, not necessarily released yet: the thread that ran `createPair`'s last actor
+        // hop can still hold its transient reference to that actor when `createPair` returns, and
+        // under load it did (`weakServer` non-nil right after `pair = nil`). A peer cycle never
+        // clears, so waiting for the release still fails on the leak this test is for.
+        try? await AsyncTestSupport.eventuallyAsync(description: "the released pair deallocated") {
+            weakClient == nil && weakServer == nil
+        }
         #expect(weakClient == nil, "PipeTransport pair retains itself through a peer cycle")
         #expect(weakServer == nil, "PipeTransport pair retains itself through a peer cycle")
     }

@@ -6,7 +6,8 @@ import Foundation
 import Protocol
 import RendererAppKit
 import SemanticModel
-import Session
+// `@testable` only for `nativeRenderedRevisionForTesting`: the assertions read native views.
+@testable import Session
 import Terminal
 import Testing
 import Text
@@ -210,6 +211,12 @@ struct CodingAgentFallbackSocketTests {
                 expected: Revision(expectedRevision)
             )
         }
+        // `waitForRevision` sees the applier's commit, which precedes the main-actor turn that
+        // renders it, and the checks below read the native views: under load the last commit was
+        // applied but not yet painted (5 approvals of 6, progress 0.5). Wait for the render.
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "revision \(expectedRevision) rendered") {
+            controller.nativeRenderedRevisionForTesting == Revision(expectedRevision)
+        }
         surfaceWindow.contentView?.layoutSubtreeIfNeeded()
         #expect(abs(surfaceWindow.frame.width - stableWindowSize.width) < 1)
         #expect(abs(surfaceWindow.frame.height - stableWindowSize.height) < 1)
@@ -247,23 +254,25 @@ struct CodingAgentFallbackSocketTests {
     }
 
     private static func waitForSocket(at path: String) async throws {
-        let deadline = Date().addingTimeInterval(10)
-        while Date() < deadline {
-            if FileManager.default.fileExists(atPath: path) { return }
-            try await Task.sleep(nanoseconds: 100_000_000)
+        do {
+            try await AsyncTestSupport.eventuallyAsync(timeout: .roundTrip, description: "socket") {
+                FileManager.default.fileExists(atPath: path)
+            }
+        } catch {
+            throw CodingAgentSocketError.socketTimeout(path)
         }
-        throw CodingAgentSocketError.socketTimeout(path)
     }
 
     private static func waitForRevision(
         _ applier: TransactionApplier,
         expected: Revision
     ) async throws {
-        let deadline = Date().addingTimeInterval(8)
-        while Date() < deadline {
-            if applier.lastAppliedRevision == expected { return }
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
+        do {
+            try await AsyncTestSupport.eventuallyAsync(timeout: .roundTrip, description: "revision") {
+                applier.lastAppliedRevision == expected
+            }
+            return
+        } catch {}
         throw CodingAgentSocketError.revisionTimeout(
             expected: expected,
             actual: applier.lastAppliedRevision

@@ -976,12 +976,29 @@ impl ProcessView {
             .filter(|row| !row.key.is_thread())
             .map(|row| row.key.clone())
             .collect();
+        // The TIDs this scan read, each with the process instance it read it
+        // under. A thread row this scan did not confirm under a TID it read
+        // there is an earlier instance the new one replaced: it has ended,
+        // whatever else the scan could not read (PX-019, Codex review).
+        let read_tids: HashSet<(crate::source::ProcessKey, u32)> = confirmed
+            .iter()
+            .filter_map(|row| {
+                let thread = row.key.thread.as_ref()?;
+                Some((row.key.process_key(), thread.tid))
+            })
+            .collect();
+        let superseded = |key: &crate::source::ProcessKey| {
+            key.thread
+                .as_ref()
+                .is_some_and(|thread| read_tids.contains(&(key.process_key(), thread.tid)))
+        };
         let mut unfiltered_target =
             retain_unconfirmed_by(&self.unfiltered_rows, confirmed, |row| {
-                retention.keeps(&row.key)
-                    || (row.key.is_thread()
-                        && thread_retention.covers(&row.key.pid)
-                        && live_processes.contains(&row.key.process_key()))
+                !superseded(&row.key)
+                    && (retention.keeps(&row.key)
+                        || (row.key.is_thread()
+                            && thread_retention.covers(&row.key.pid)
+                            && live_processes.contains(&row.key.process_key())))
             });
         // A scan that read no threads (PX-019) says nothing about any thread:
         // they were hidden when it was taken, or its source reads none. Its
@@ -1029,10 +1046,11 @@ impl ProcessView {
         let threads_read = snapshot.threads.read().is_some();
         self.inspector
             .observe_scan(&unfiltered_target, &evicted_ids, |key| {
-                retention.keeps(key)
-                    || (key.is_thread()
-                        && live_processes.contains(&key.process_key())
-                        && (!threads_read || thread_retention.covers(&key.pid)))
+                !superseded(key)
+                    && (retention.keeps(key)
+                        || (key.is_thread()
+                            && live_processes.contains(&key.process_key())
+                            && (!threads_read || thread_retention.covers(&key.pid))))
             });
         // The rows this scan did not confirm, which a PID jump never selects
         // (PX-011) and the tree never takes a parent from (PX-018): bounded by
@@ -5581,7 +5599,8 @@ fn ticker_every(interval: Duration) -> tokio::time::Interval {
 /// ([`crate::sampling`]). It owns the only timer: one ticker, replaced — never
 /// joined by a second — when the interval changes or the view resumes, and
 /// not polled at all while the view is paused, when no sample is taken. A
-/// Refresh now press or a Resume view wakes it through the view's one
+/// Refresh now press, a Resume view or a change of "Show user threads"
+/// (PX-019) wakes it through the view's one
 /// [`tokio::sync::Notify`] for one sample through this same path. A sample is
 /// published only if the view's epoch is still the one it was taken under.
 /// The ticker and the wake belong to this future, so cancelling `shutdown`

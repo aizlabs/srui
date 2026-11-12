@@ -1084,6 +1084,8 @@ impl ProcessSource for ProcFsSource {
         let namespace_changed = identity_changed(&mut self.cpu_namespace, &pid_namespace);
         if boot_changed || namespace_changed {
             self.cpu_baselines.clear();
+            // Thread baselines are keyed by the same numbers (PX-019).
+            self.thread_baselines.clear();
         }
         // The host's own counters restart with its boot, and a PID namespace
         // numbers processes, not CPUs (PX-007).

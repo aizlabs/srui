@@ -141,8 +141,8 @@ pub struct SamplingRequest {
     /// The view's epoch: a sample taken now is applied only if this is still
     /// the epoch when it returns.
     pub epoch: u64,
-    /// Take one sample now (a Refresh now press or a Resume view), however
-    /// many presses asked for it.
+    /// Take one sample now (a Refresh now press, a Resume view, or a change of
+    /// "Show user threads", PX-019), however many requests asked for it.
     pub sample_now: bool,
     /// Restart the ticker: the interval changed, or the view was resumed.
     pub retime: bool,

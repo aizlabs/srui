@@ -2643,3 +2643,122 @@ fn only_a_real_user_thread_change_advances_the_sampling_epoch() {
     h.view().resume_view(&h.session).unwrap();
     assert_eq!(epoch(), start + 9);
 }
+
+// ---- Codex review round (PR #103) ----------------------------------------
+
+/// Thread `PRRT_kwDOUG_6uM62WAQG`: a scan that reads a new thread under a
+/// reused TID while another thread of the same process is unreadable keeps
+/// the unreadable thread's row, but never the replaced instance beside its
+/// successor: it read that TID, so the earlier instance has ended.
+#[test]
+fn a_reused_tid_beside_an_unreadable_thread_keeps_only_the_new_instance() {
+    let tree = Tree::usual();
+    let mut source = ProcFsSource::with_root(&tree.0);
+    let mut h = harness(&mut source);
+    h.toggle(USER_THREADS_TOGGLE, true);
+    h.sample(&mut source);
+    let worker_1 = h.item("101 (thread of 100)");
+    let old = h.item("102 (thread of 100)");
+    tree.remove_thread(100, 102)
+        .thread(100, 102, "worker-2b", 150, 200);
+    let stat = tree.0.join("100/task/101/stat");
+    fs::set_permissions(&stat, fs::Permissions::from_mode(0o000)).unwrap();
+    h.sample(&mut source);
+    fs::set_permissions(&stat, fs::Permissions::from_mode(0o644)).unwrap();
+    // The kept row is anchored behind the rows this scan confirmed, as every
+    // retained row is (PX-004).
+    assert_eq!(
+        named(&h),
+        pairs(&[
+            ("1", "init"),
+            ("1 (thread of 1)", "init"),
+            ("2", "kthreadd"),
+            ("100", "server"),
+            ("100 (thread of 100)", "server"),
+            ("102 (thread of 100)", "worker-2b"),
+            ("101 (thread of 100)", "worker-1"),
+            ("200", "bare"),
+            ("300", "locked"),
+        ])
+    );
+    assert_eq!(h.item("101 (thread of 100)"), worker_1, "kept, unread");
+    assert_ne!(h.item("102 (thread of 100)"), old, "the new instance");
+    assert!(
+        h.text(THREADS_STATUS)
+            .starts_with("User threads: 4 thread rows under 2 processes"),
+        "{}",
+        h.text(THREADS_STATUS)
+    );
+    // The tree holds each TID once too.
+    h.toggle(VIEW_TOGGLE, true);
+    let tids: Vec<String> = h.tree().into_iter().map(|row| row.pid).collect();
+    assert_eq!(
+        tids.iter()
+            .filter(|pid| *pid == "102 (thread of 100)")
+            .count(),
+        1,
+        "{tids:?}"
+    );
+}
+
+/// The same rule for an inspector on a thread the row ceiling dropped: a
+/// scan that read its TID under a new instance ends it, even while that
+/// process's threads are otherwise unreadable.
+#[test]
+fn an_evicted_thread_whose_tid_a_new_instance_took_is_ended() {
+    let mut h = evicted_thread();
+    let mut threads = ThreadsSource::threads(ThreadsSource::CHURN_STEP);
+    threads.unreadable.record(200);
+    threads.denied = 2;
+    h.sample(&mut Fixed(threads_snapshot(
+        records_with_newcomer(|_| true),
+        threads,
+    )));
+    assert_eq!(h.text(INSPECTOR_STATUS), evicted_ended());
+}
+
+/// Thread `PRRT_kwDOUG_6uM62joAd`: thread CPU baselines taken under another
+/// boot or PID namespace are dropped with the process baselines, so a thread
+/// with the same PID, start times and TID there warms up rather than being
+/// measured against the other source's counter.
+#[test]
+fn thread_baselines_are_dropped_when_the_boot_or_pid_namespace_changes() {
+    let tree = Tree::usual();
+    let mut source = ProcFsSource::with_root(&tree.0);
+    source.collect_threads(true);
+    let measured = |snapshot: &ProcessSnapshot| -> Vec<(u32, bool)> {
+        tids(&snapshot.threads.read().unwrap().records)
+            .into_iter()
+            .zip(snapshot.threads.records())
+            .map(|((_, tid), record)| (tid, matches!(record.cpu, CpuUsage::Measured(_))))
+            .collect()
+    };
+    source.snapshot();
+    tree.thread(100, 101, "worker-1", 110, 80);
+    assert!(
+        measured(&source.snapshot()).contains(&(101, true)),
+        "same source"
+    );
+    for change in ["boot", "namespace"] {
+        match change {
+            "boot" => fs::write(tree.0.join("sys/kernel/random/boot_id"), "other-boot\n").unwrap(),
+            _ => {
+                fs::remove_file(tree.0.join("self/ns/pid")).unwrap();
+                std::os::unix::fs::symlink("pid:[4026599999]", tree.0.join("self/ns/pid")).unwrap();
+            }
+        }
+        tree.thread(100, 101, "worker-1", 110, 120);
+        let snapshot = source.snapshot();
+        assert!(
+            measured(&snapshot).iter().all(|(_, measured)| !measured),
+            "{change}: {:?}",
+            measured(&snapshot)
+        );
+        // The next scan of the same source measures again.
+        tree.thread(100, 101, "worker-1", 110, 150);
+        assert!(
+            measured(&source.snapshot()).contains(&(101, true)),
+            "{change}"
+        );
+    }
+}

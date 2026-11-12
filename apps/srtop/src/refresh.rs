@@ -954,14 +954,9 @@ impl ProcessView {
     /// not in the next one, `kept` (PX-021), and drops the tombstones that
     /// are too old or no longer watched. Watched means the inspector's
     /// target, the followed process, or a tagged process.
-    ///
-    /// A tombstone that only said "no longer observed" of an instance this
-    /// scan lists again, `listed`, is dropped first: its last-observed time
-    /// is no longer true. An established exit is final and stays.
     fn record_departures(
         &mut self,
         kept: impl Fn(ItemId) -> bool,
-        listed: impl Fn(&ProcessKey) -> bool,
         evidence: &Evidence<'_>,
         sampled_at: SystemTime,
     ) {
@@ -969,7 +964,6 @@ impl ProcessView {
         let (inspected, followed) = self.watched_keys();
         let watched =
             |key: &ProcessKey| inspected.as_ref() == Some(key) || followed.as_ref() == Some(key);
-        self.last_seen.drop_relisted(listed);
         let mut left = Vec::new();
         for row in &self.unfiltered_rows {
             if kept(row.item_id) {
@@ -1014,13 +1008,17 @@ impl ProcessView {
     /// longer watched (PX-021), on every sample the view accepts, whatever
     /// the scan could read: age is time, not a scan outcome. Says whether a
     /// historical tag went.
+    ///
+    /// Between samples only the inspector's target and the tags watch a
+    /// record: follow stops in the very sample its process leaves
+    /// ([`Follow::track`]), so the followed process is never a recorded one
+    /// by the next sample.
     fn expire_tombstones(&mut self) -> bool {
         let now = self.clock.now();
-        let (inspected, followed) = self.watched_keys();
+        let inspected = self.inspector.selected_row().map(|row| row.key.clone());
         let before = self.last_seen.forgotten_tags();
-        self.last_seen.expire(now, |key| {
-            inspected.as_ref() == Some(key) || followed.as_ref() == Some(key)
-        });
+        self.last_seen
+            .expire(now, |key| inspected.as_ref() == Some(key));
         self.last_seen.forgotten_tags() != before
     }
 
@@ -1185,6 +1183,62 @@ impl ProcessView {
             // What this sample said about threads (PX-019).
             self.thread_report = ThreadReport::of(&snapshot.threads);
         }
+        // A record that said only "no longer observed" of an instance this
+        // scan lists again is dropped: it was observed after all, so its
+        // last-observed time is no longer true (PX-021). An established exit
+        // is final and stays. A historical tag dropped so is the same
+        // instance's tag, under the same whole key, and is live again, before
+        // the rows are chosen so that its row carries its tag cell; the set
+        // before is held until the tags status commits.
+        let relisted = {
+            // The thread instances this collection holds, built only if a
+            // thread record asks. A recorded instance had left the collection,
+            // and rows carried forward are only rows it already held, so one
+            // it holds again is one this scan listed.
+            let listed_threads: std::cell::OnceCell<HashSet<&ProcessKey>> =
+                std::cell::OnceCell::new();
+            self.last_seen.drop_relisted(|key: &ProcessKey| {
+                if key.is_thread() {
+                    listed_threads
+                        .get_or_init(|| {
+                            unfiltered_target
+                                .iter()
+                                .filter(|row| row.key.is_thread())
+                                .map(|row| &row.key)
+                                .collect()
+                        })
+                        .contains(key)
+                } else {
+                    live_processes.contains(key)
+                }
+            })
+        };
+        let mut retagged: Vec<Tombstone> =
+            relisted.into_iter().filter(Tombstone::is_tagged).collect();
+        let held_retag = (!retagged.is_empty()).then(|| self.tags.clone());
+        let room = crate::tags::MAX_TAGGED.saturating_sub(self.tags.tagged());
+        if retagged.len() > room {
+            // No room under the tag limit: their records are no longer true,
+            // so they go, and their tags are counted as forgotten.
+            let beyond = retagged.split_off(room);
+            self.last_seen.forget_tags(beyond.len() as u64);
+            self.tags.refuse(format!(
+                "{} listed again, but {} processes are already tagged, the limit: {} forgotten",
+                beyond.first().map(Tombstone::subject).unwrap_or_default(),
+                crate::tags::MAX_TAGGED,
+                if beyond.len() == 1 {
+                    "its historical tag is".to_string()
+                } else {
+                    format!("{} historical tags are", beyond.len())
+                },
+            ));
+        }
+        self.tags.retag(
+            &retagged
+                .iter()
+                .map(|tombstone| &tombstone.row)
+                .collect::<Vec<_>>(),
+        );
         let visible = self.visible_in(self.mode, &unfiltered_target, &unconfirmed, &gaps);
         let forest = visible.forest;
         let total = visible.total;
@@ -1220,30 +1274,8 @@ impl ProcessView {
         // commits do: it is what the server knows, not what a client holds.
         {
             let evidence = Evidence::new(snapshot, &retention, &thread_retention, &live_processes);
-            // The thread instances this scan listed, built only if a thread
-            // tombstone asks.
-            let listed_threads: std::cell::OnceCell<HashSet<&ProcessKey>> =
-                std::cell::OnceCell::new();
-            let listed = |key: &ProcessKey| {
-                if key.is_thread() {
-                    listed_threads
-                        .get_or_init(|| {
-                            unfiltered_target
-                                .iter()
-                                .filter(|row| {
-                                    row.key.is_thread() && confirmed_ids.contains(&row.item_id)
-                                })
-                                .map(|row| &row.key)
-                                .collect()
-                        })
-                        .contains(key)
-                } else {
-                    live_processes.contains(key)
-                }
-            };
             self.record_departures(
                 |item| confirmed_ids.contains(&item) || unconfirmed.contains(&item),
-                listed,
                 &evidence,
                 snapshot.sampled_at.0,
             );
@@ -1254,7 +1286,7 @@ impl ProcessView {
         let departed = self
             .tags
             .departed(&self.unfiltered_rows, &unfiltered_target);
-        let held_tags = (!departed.is_empty()).then(|| self.tags.clone());
+        let held_tags = held_retag.or_else(|| (!departed.is_empty()).then(|| self.tags.clone()));
         for (key, _) in &departed {
             // A sample that never committed put this tag back; its tombstone
             // is still kept, and is historical again.
@@ -1357,7 +1389,9 @@ impl ProcessView {
             self.gaps = gaps;
             self.search.observe(&self.rows);
             self.inspector.reread(&self.rows, &confirmed_ids);
-            self.settle_tags(held_tags);
+            if self.settle_tags(held_tags) {
+                self.unretag(retagged);
+            }
             return Ok(result);
         }
 
@@ -1365,7 +1399,9 @@ impl ProcessView {
             commit_reaching(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
         self.settle_disclosure(held, reached >= rows_end);
-        self.settle_tags(held_tags);
+        if self.settle_tags(held_tags) {
+            self.unretag(retagged);
+        }
         // Order values never reach the wire, so every published row takes this
         // sample's whatever committed: a later click sorts by current values,
         // never by the ones a row was first published with.
@@ -3105,9 +3141,13 @@ impl ProcessView {
     /// client then still shows the rows and status of the set before, and the
     /// set may not run ahead of them. A plan that committed its rows in part
     /// leaves cells the next publication restates from the set put back.
-    fn settle_tags(&mut self, held: Option<Tags>) {
+    ///
+    /// Says whether it put the set back.
+    fn settle_tags(&mut self, held: Option<Tags>) -> bool {
+        let mut put_back = false;
         if let Some(held) = held {
             if self.tags_published.generation != self.tags.generation() {
+                put_back = true;
                 self.tags = held;
                 // A tag put back is live again, not historical (PX-021); its
                 // tombstone is kept, and is historical again when a sample
@@ -3121,6 +3161,18 @@ impl ProcessView {
                 for key in &live {
                     self.last_seen.untag(key);
                 }
+            }
+        }
+        put_back
+    }
+
+    /// Keeps `retagged` historical again (PX-021): the sample that made their
+    /// tags live never committed its tags status, so the set was put back
+    /// without them, and the next committed sample makes them live.
+    fn unretag(&mut self, retagged: Vec<Tombstone>) {
+        for tombstone in retagged {
+            if !self.tags.is_tagged(tombstone.key()) {
+                self.last_seen.record(tombstone);
             }
         }
     }
@@ -8224,5 +8276,124 @@ mod tag_commit_tests {
             view.tags_status()
         );
         assert!(tagged_pids(&view).is_empty());
+    }
+}
+
+/// PX-021 correction round 2: a historical tag made live again by a sample
+/// that never committed its tags status is historical again, and the next
+/// committed sample makes it live.
+#[cfg(test)]
+mod retag_commit_tests {
+    use super::*;
+    use crate::source::{
+        BootId, CappedRecords, Completeness, CpuUsage, CreationToken, DisplayName,
+        FakeProcessSource, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+        SkippedRecords, SnapshotTime, SourceId, OWNER_NOT_COLLECTED,
+    };
+
+    fn record(pid: u32, name: &str) -> ProcessRecord {
+        ProcessRecord {
+            lineage: Lineage::new(if pid == 1 { 0 } else { 1 }, u64::from(pid)),
+            owner: OWNER_NOT_COLLECTED,
+            key: ProcessKey {
+                source: SourceId("retag-fixture".into()),
+                host: Observed::Known(HostId("h".into())),
+                boot: Observed::Known(BootId("b".into())),
+                pid_namespace: Observed::Known(PidNamespaceId(1)),
+                pid: Observed::Known(pid),
+                creation: CreationToken::Opaque(name.into()),
+                thread: None,
+            },
+            kind: crate::source::KIND_NOT_COLLECTED,
+            display_name: DisplayName::from(name),
+            resident: Observed::Known(4096),
+            cpu: CpuUsage::WarmingUp,
+        }
+    }
+
+    /// Steps of (records, unenumerable), the last repeated.
+    struct Steps(Vec<(Vec<ProcessRecord>, bool)>, usize);
+
+    impl ProcessSource for Steps {
+        fn status_text(&self) -> &str {
+            "Read-only · Retag fixture"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            let (records, unenumerable) = self.0[self.1.min(self.0.len() - 1)].clone();
+            self.1 += 1;
+            ProcessSnapshot {
+                source: SourceId("retag-fixture".into()),
+                sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH),
+                records,
+                vanished: 0,
+                capped: CappedRecords::none(),
+                completeness: if unenumerable {
+                    Completeness::from_scan(SkippedRecords::unenumerable(), Vec::new())
+                } else {
+                    Completeness::Complete
+                },
+                system: FakeProcessSource::system(),
+                threads: crate::source::ThreadScan::NotProvided,
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_sample_that_would_retag_keeps_the_tag_historical_until_one_commits() {
+        let all = || {
+            vec![
+                record(1, "init"),
+                record(300, "worker"),
+                record(301, "other"),
+            ]
+        };
+        let mut source = Steps(
+            vec![
+                (all(), false),
+                (
+                    vec![record(1, "init"), record(400, "new"), record(401, "newer")],
+                    true,
+                ),
+                (all(), false),
+            ],
+            0,
+        );
+        let session = Session::mint();
+        let (view, _) = ProcessView::start(&session, &mut source).unwrap();
+        let mut view = view.with_published_limit(3);
+        let item = |view: &ProcessView, pid: u32| {
+            view.rows
+                .iter()
+                .find(|row| row.key.pid == Observed::Known(pid))
+                .map(|row| row.item_id)
+        };
+        view.select_item(&session, item(&view, 300)).unwrap();
+        view.request_tags(&session, TagRequest::Toggle).unwrap();
+        view.select_item(&session, item(&view, 1)).unwrap();
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.historical_tags(), ["PID 300 · worker"]);
+        let status = view.tags_status().to_string();
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.refresh(&session, &mut source).is_err());
+        }
+        assert_eq!(view.tags().tagged(), 0, "the set did not run ahead");
+        assert_eq!(
+            view.historical_tags(),
+            ["PID 300 · worker"],
+            "historical again"
+        );
+        assert_eq!(view.tags_status(), status);
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.tags().tagged(), 1);
+        assert!(view.historical_tags().is_empty());
+        assert!(view
+            .rows
+            .iter()
+            .any(|row| row.tagged && row.key.pid == Observed::Known(300)));
+        assert!(view
+            .tags_status()
+            .starts_with("Tags: 1 tagged · Tagged again: PID 300 · worker"));
     }
 }

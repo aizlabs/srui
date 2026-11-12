@@ -20,11 +20,15 @@
 //! A tagged process that leaves the collection keeps a historical tag: its
 //! tombstone in [`crate::lastseen::LastSeen`] (PX-021), which says whether it
 //! exited or is no longer observed and when it was last observed, listed in
-//! the status, never on a row and never matched again, even if the same
-//! instance were listed again. Historical tags are bounded with every other
-//! tombstone, by count ([`MAX_HISTORICAL_TAGS`]), age and bytes, the oldest
-//! forgotten first and counted; "Clear tags" removes every tag, live and
-//! historical. At most [`MAX_TAGGED`] processes are tagged at once:
+//! the status and never on a row. Historical tags are bounded with every
+//! other tombstone, by count ([`MAX_HISTORICAL_TAGS`]), age and bytes, the
+//! oldest forgotten first and counted; "Clear tags" removes every tag, live
+//! and historical. A historical tag whose record says the process exited is
+//! never matched again. One whose record says only "no longer observed"
+//! (the row limit left the process out, or a scan could not confirm its
+//! identity) is live again when a scan lists the very same instance, under
+//! the same whole key, again: it was observed after all (PX-021); a newer
+//! process under its PID is never tagged. At most [`MAX_TAGGED`] processes are tagged at once:
 //! a request that would tag more is refused whole and says so. Nothing here
 //! touches a process: there is no bulk action, and a tag means nothing
 //! outside this session.
@@ -230,6 +234,30 @@ impl Tags {
         self.live
             .extend(keys.into_iter().map(|key| (key, "test".to_string())));
         self.generation += 1;
+    }
+
+    /// Makes the tags of `rows` live again (PX-021): each was a historical
+    /// tag whose record said only "no longer observed", and a scan lists the
+    /// same instance, under the same whole key, again. The caller keeps the
+    /// set within [`MAX_TAGGED`].
+    pub(crate) fn retag(&mut self, rows: &[&Row]) {
+        if rows.is_empty() {
+            return;
+        }
+        for row in rows {
+            self.live.insert(row.key.clone(), who(row));
+        }
+        let outcome = match rows {
+            [row] => format!(
+                "Tagged again: {} is listed again after it was no longer observed",
+                who(row)
+            ),
+            _ => format!(
+                "Tagged again: {} processes are listed again after they were no longer observed",
+                rows.len()
+            ),
+        };
+        self.changed(outcome);
     }
 
     /// Records a request that changed no tag, and why.

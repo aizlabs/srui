@@ -478,23 +478,33 @@ impl LastSeen {
         }
     }
 
-    /// Drops every tombstone that said only "no longer observed" of an
-    /// instance a scan lists again (`listed`): it was observed after all, so
-    /// its last-observed time and verdict are no longer true. A historical
-    /// tag dropped so is not forgotten, and is not put back on a row
-    /// (PX-020). An established exit is final: the kernel never reuses a PID
+    /// Drops, and returns, every tombstone that said only "no longer
+    /// observed" of an instance a scan lists again (`listed`): it was
+    /// observed after all, so its last-observed time and verdict are no
+    /// longer true. A historical tag returned so is not forgotten: the caller
+    /// makes it live again, since it is the same instance under the same
+    /// whole key. An established exit is final: the kernel never reuses a PID
     /// with the same start time within a boot, so only a source that reuses
     /// its own tokens lists an exited instance again, and that record stays.
-    pub(crate) fn drop_relisted(&mut self, listed: impl Fn(&ProcessKey) -> bool) {
+    pub(crate) fn drop_relisted(&mut self, listed: impl Fn(&ProcessKey) -> bool) -> Vec<Tombstone> {
         let mut kept = VecDeque::with_capacity(self.entries.len());
+        let mut dropped = Vec::new();
         for tombstone in std::mem::take(&mut self.entries) {
             if !tombstone.departure.exited() && listed(tombstone.key()) {
                 self.bytes -= tombstone.bytes;
+                dropped.push(tombstone);
             } else {
                 kept.push_back(tombstone);
             }
         }
         self.entries = kept;
+        dropped
+    }
+
+    /// Counts `count` historical tags forgotten without a bound dropping
+    /// their records: their records were dropped for another reason.
+    pub(crate) fn forget_tags(&mut self, count: u64) {
+        self.forgotten_tags += count;
     }
 
     /// Makes the tombstone of `key` a historical tag, if one is kept, and
@@ -888,7 +898,9 @@ mod tests {
         seen.record(tombstone(all[1].clone(), Duration::ZERO));
         seen.record(tombstone(all[2].clone(), Duration::ZERO));
         let listed = |key: &ProcessKey| key == &all[0].key || key == &all[1].key;
-        seen.drop_relisted(listed);
+        let dropped = seen.drop_relisted(listed);
+        assert_eq!(dropped.len(), 1);
+        assert!(dropped[0].is_tagged(), "handed back, to be tagged again");
         assert!(seen.get(&all[0].key).is_none(), "observed again");
         assert!(
             seen.get(&all[1].key).is_some(),

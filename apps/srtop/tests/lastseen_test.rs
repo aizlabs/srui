@@ -1084,3 +1084,281 @@ fn a_thread_of_a_process_no_longer_observed_is_not_exited() {
         Some(Departure::NotObserved(Unobserved::WithProcess))
     );
 }
+
+// ---- Correction round 2 ----
+
+impl Harness {
+    /// The tag cell of the shown row with `pid` and `name` (PX-020).
+    fn tag_cell(&self, pid: u32, name: &str) -> Option<String> {
+        self.session.with_store(|store| {
+            store
+                .get_model(MODEL)
+                .unwrap()
+                .items
+                .values()
+                .find_map(|item| match &item.value {
+                    Value::List(cells)
+                        if cells[0] == Value::UnsignedInt(u64::from(pid))
+                            && cells[1] == Value::String(name.into()) =>
+                    {
+                        match cells.last() {
+                            Some(Value::String(tag)) => Some(tag.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+        })
+    }
+}
+
+/// F4: a tagged process left out at the row limit keeps a historical tag
+/// that says "no longer observed"; when a scan lists the very same instance
+/// again, the tag is live again, on its row, and Clear counts it as a tag.
+#[test]
+fn a_tag_whose_process_is_listed_again_is_live_again() {
+    let mut h = Harness::with(
+        vec![
+            complete(vec![
+                record(1, "init", "init"),
+                record(300, "w", "worker"),
+                record(301, "o", "other"),
+            ]),
+            unenumerable(vec![
+                record(1, "init", "init"),
+                record(400, "n", "new"),
+                record(401, "m", "newer"),
+            ]),
+            complete(vec![
+                record(1, "init", "init"),
+                record(300, "w", "worker"),
+                record(301, "o", "other"),
+            ]),
+        ],
+        |view| view.with_published_limit(3),
+    );
+    h.select(300, "worker");
+    h.view.request_tags(&h.session, TagRequest::Toggle).unwrap();
+    h.select(1, "init");
+    h.refresh();
+    assert_eq!(h.view.tags().tagged(), 0);
+    assert!(
+        h.view.tags_status().starts_with(&format!(
+            "Tags: 0 tagged · 1 historical: PID 300 · worker no longer observed, last observed {}",
+            at(0)
+        )),
+        "{}",
+        h.view.tags_status()
+    );
+    // Listed again under the same whole key: tagged again, on its new row.
+    h.refresh();
+    assert_eq!(h.view.tags().tagged(), 1);
+    assert!(h.view.historical_tags().is_empty());
+    assert_eq!(h.view.last_seen().forgotten_tags(), 0);
+    assert!(h.view.tags().is_tagged(&key(300, "w", host())));
+    assert_eq!(h.tag_cell(300, "worker").as_deref(), Some("tagged"));
+    assert_eq!(
+        h.view.tags_status(),
+        "Tags: 1 tagged · Tagged again: PID 300 · worker is listed again after it was no longer observed"
+    );
+    h.view.request_tags(&h.session, TagRequest::Clear).unwrap();
+    assert!(h
+        .view
+        .tags_status()
+        .ends_with("Cleared 1 tag and 0 historical; the selection is unchanged"));
+    assert_eq!(h.tag_cell(300, "worker").as_deref(), Some(""));
+}
+
+/// F4: a tag whose record says the process exited is never live again, even
+/// when a source that reuses its own tokens lists the same key again.
+#[test]
+fn an_exited_tag_stays_historical_when_its_key_is_listed_again() {
+    let mut h = Harness::new(vec![
+        complete(vec![record(1, "init", "init"), record(300, "w", "worker")]),
+        complete(vec![record(1, "init", "init")]),
+        complete(vec![record(1, "init", "init"), record(300, "w", "worker")]),
+    ]);
+    h.select(300, "worker");
+    h.view.request_tags(&h.session, TagRequest::Toggle).unwrap();
+    h.select(1, "init");
+    h.refresh();
+    h.refresh();
+    assert_eq!(h.view.tags().tagged(), 0);
+    assert_eq!(h.view.historical_tags(), ["PID 300 · worker"]);
+    assert_eq!(h.tag_cell(300, "worker").as_deref(), Some(""));
+    assert!(h
+        .view
+        .tags_status()
+        .starts_with("Tags: 0 tagged · 1 historical: PID 300 · worker exited"));
+}
+
+/// F5 (kills R6): a newer process under the PID is another instance; the
+/// record of the one left out at the row limit survives it.
+#[test]
+fn a_newer_process_under_the_pid_never_drops_the_old_record() {
+    let mut h = Harness::with(
+        vec![
+            complete(vec![
+                record(1, "init", "init"),
+                record(300, "w", "worker"),
+                record(301, "o", "other"),
+            ]),
+            unenumerable(vec![
+                record(1, "init", "init"),
+                record(400, "n", "new"),
+                record(401, "m", "newer"),
+            ]),
+            complete(vec![
+                record(1, "init", "init"),
+                record(300, "x", "successor"),
+                record(301, "o", "other"),
+            ]),
+        ],
+        |view| view.with_published_limit(3),
+    );
+    h.select(300, "worker");
+    h.refresh();
+    h.refresh();
+    assert!(h.item(300, "successor").is_some());
+    assert_eq!(
+        h.view
+            .last_seen()
+            .get(&key(300, "w", host()))
+            .map(|tombstone| tombstone.departure()),
+        Some(Departure::NotObserved(Unobserved::Evicted)),
+        "the earlier instance's record stands"
+    );
+    assert!(
+        h.status()
+            .starts_with("Selected process: PID 300 · worker · no longer observed: "),
+        "{}",
+        h.status()
+    );
+}
+
+/// F5 (kills R7): a thread left out at the row limit and then listed again
+/// was observed after all: its record goes.
+#[test]
+fn a_thread_listed_again_drops_its_no_longer_observed_record() {
+    let mut h = threads_shown(
+        vec![
+            (
+                complete(vec![record(1, "init", "init"), server()]),
+                threads_read(vec![t200(), t201()], &[]),
+            ),
+            (
+                complete(vec![record(1, "init", "init"), server()]),
+                threads_read(vec![t200(), t201()], &[]),
+            ),
+            (
+                complete(vec![
+                    record(1, "init", "init"),
+                    server(),
+                    record(400, "n", "new"),
+                ]),
+                threads_read(vec![t200()], &[200]),
+            ),
+            (
+                complete(vec![record(1, "init", "init"), server()]),
+                threads_read(vec![t200(), t201()], &[]),
+            ),
+        ],
+        |view| view.with_published_limit(4),
+    );
+    h.refresh();
+    assert_eq!(
+        thread_departure(&h),
+        Some(Departure::NotObserved(Unobserved::Evicted))
+    );
+    h.refresh();
+    assert_eq!(thread_departure(&h), None, "observed again");
+    assert!(
+        h.status().starts_with("Selected thread: TID 201 of PID 200 · worker-1 · listed again after it was no longer observed"),
+        "{}",
+        h.status()
+    );
+}
+
+/// N4 (kills E5): a paused view takes no sample, so its records do not age
+/// out until it is resumed.
+#[test]
+fn a_paused_view_expires_nothing_until_it_resumes() {
+    let clock = Arc::new(FakeClock(Mutex::new(Duration::from_secs(10))));
+    let injected: Arc<dyn MonotonicClock> = clock.clone();
+    let mut h = Harness::with(
+        vec![
+            complete(vec![record(1, "init", "init"), record(300, "w", "worker")]),
+            complete(vec![record(1, "init", "init")]),
+        ],
+        |view| view.with_clock(injected),
+    );
+    h.select(300, "worker");
+    h.refresh();
+    assert_eq!(h.view.last_seen().len(), 1);
+    h.view.pause_view(&h.session).unwrap();
+    clock.set(Duration::from_secs(10) + MAX_TOMBSTONE_AGE * 2);
+    h.refresh();
+    assert_eq!(h.view.last_seen().len(), 1, "paused: nothing expires");
+    assert!(h.status().contains("exited"), "{}", h.status());
+    h.view.resume_view(&h.session).unwrap();
+    h.refresh();
+    assert!(
+        h.view.last_seen().is_empty(),
+        "resumed: the first sample expires it"
+    );
+}
+
+/// F4: a tag made live again counts against the tag limit; with no room
+/// left, its record (no longer true) goes, the tag is counted forgotten, and
+/// the status says so.
+#[test]
+fn a_relisted_tag_beyond_the_tag_limit_is_counted_forgotten() {
+    let max = srui_process_explorer::tags::MAX_TAGGED as u32;
+    let unknown = || Observed::Missing(MissingReason::Denied);
+    let children = |host: &dyn Fn() -> Observed<HostId>| -> Vec<ProcessRecord> {
+        (0..max - 1)
+            .map(|n| record_on(10_000 + n, &format!("c{n}"), &format!("c{n}"), host()))
+            .collect()
+    };
+    let mut first = vec![record(1, "init", "init"), record(300, "w", "worker")];
+    first.extend(children(&host));
+    // The host identity unread and PID 300 absent: no longer observed.
+    let mut second = vec![record_on(1, "init", "init", unknown())];
+    second.extend(children(&unknown));
+    let mut h = Harness::new(vec![
+        complete(first.clone()),
+        complete(second),
+        complete(first),
+    ]);
+    h.select(300, "worker");
+    h.view.request_tags(&h.session, TagRequest::Toggle).unwrap();
+    h.select(1, "init");
+    h.refresh();
+    assert_eq!(h.view.historical_tags(), ["PID 300 · worker"]);
+    assert_eq!(
+        h.view
+            .last_seen()
+            .get(&key(300, "w", host()))
+            .map(|tombstone| tombstone.departure()),
+        Some(Departure::NotObserved(Unobserved::IdentityUnconfirmed))
+    );
+    // Fill the tag set: init and its children are the limit.
+    h.select(1, "init");
+    h.view
+        .request_tags(&h.session, TagRequest::Descendants)
+        .unwrap();
+    assert_eq!(h.view.tags().tagged(), max as usize);
+    h.refresh();
+    assert_eq!(
+        h.view.tags().tagged(),
+        max as usize,
+        "no room: not tagged again"
+    );
+    assert!(h.view.historical_tags().is_empty());
+    assert_eq!(h.view.last_seen().forgotten_tags(), 1);
+    assert_eq!(h.tag_cell(300, "worker").as_deref(), Some(""));
+    assert_eq!(
+        h.view.tags_status(),
+        format!("Tags: {max} tagged · 1 historical, forgotten · PID 300 · worker listed again, but {max} processes are already tagged, the limit: its historical tag is forgotten")
+    );
+}

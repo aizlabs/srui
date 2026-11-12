@@ -724,7 +724,10 @@ struct TextEditingIntegrationTests {
         await serverTransport.close()
     }
 
-    @Test("Stopping cancels a blocked writer and retains the newer buffered text callback")
+    @Test(
+        "Stopping cancels a blocked writer and retains the newer buffered text callback",
+        .timeLimit(.minutes(1))
+    )
     @MainActor
     func stopCancelsBlockedWriterAndRetainsBufferedText() async throws {
         let (clientPipe, serverTransport) = await PipeTransport.createPair()
@@ -766,10 +769,11 @@ struct TextEditingIntegrationTests {
             flushImmediately: true
         )
 
-        let clock = ContinuousClock()
-        let started = clock.now
+        // The parked send is released only by the transport's close(), so stop() returning at all
+        // proves it closed rather than waited for the writer; a stop that waits hangs into the
+        // time limit. A 2 s wall-clock bound here failed under load (2.15 s) with nothing wrong.
         await controller.stop()
-        #expect(started.duration(to: clock.now) < .seconds(2))
+        #expect(await delayed.isClosed, "stop() released the blocked writer by closing the transport")
         #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID))
         #expect(renderer.textEditingSession.localValue(for: editorID) == "second")
         #expect(renderer.textEditingSession.nextEditSeqValue(for: editorID) == 3)
@@ -2501,7 +2505,10 @@ private actor DelayedInputTransport: Transport {
         stream
     }
 
+    private(set) var isClosed = false
+
     func close() async {
+        isClosed = true
         inputSuspensionContinuation?.finish()
         await inner.close()
     }

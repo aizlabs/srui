@@ -110,7 +110,7 @@ struct CounterSocketIntegrationTests {
         controller.attachRenderer(renderer)
 
         try await controller.start()
-        try await Self.waitForRevision(applier, expected: Revision(1), timeoutSeconds: 5)
+        try await Self.waitForRevision(applier, expected: Revision(1), timeoutSeconds: AsyncTestSupport.roundTripSeconds)
 
         let textID = NodeId(2)
         let buttonID = NodeId(4)
@@ -129,7 +129,7 @@ struct CounterSocketIntegrationTests {
             try await Self.waitForRevision(
                 applier,
                 expected: Revision(UInt64(cycle + 1)),
-                timeoutSeconds: 5
+                timeoutSeconds: AsyncTestSupport.roundTripSeconds
             )
             try await AsyncTestSupport.eventually(
                 timeout: .roundTrip,
@@ -193,7 +193,7 @@ struct CounterSocketIntegrationTests {
         controller.attachRenderer(renderer)
 
         try await controller.start()
-        try await Self.waitForRevision(applier, expected: Revision(1), timeoutSeconds: 5)
+        try await Self.waitForRevision(applier, expected: Revision(1), timeoutSeconds: AsyncTestSupport.roundTripSeconds)
         try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "HELLO catch-up enables event dispatch") {
             controller.isEventDispatchEnabled
         }
@@ -202,7 +202,7 @@ struct CounterSocketIntegrationTests {
         let buttonID = NodeId(4)
 
         _ = try await controller.sendActivate(nodeId: buttonID)
-        try await Self.waitForRevision(applier, expected: Revision(2), timeoutSeconds: 5)
+        try await Self.waitForRevision(applier, expected: Revision(2), timeoutSeconds: AsyncTestSupport.roundTripSeconds)
         try await AsyncTestSupport.eventually(
             timeout: .roundTrip,
             description: "HELLO catch-up counter render reaches Count: 1"
@@ -326,7 +326,7 @@ struct CounterSocketIntegrationTests {
         controller.attachRenderer(renderer)
 
         try await controller.start()
-        try await Self.waitForRevision(applier, expected: Revision(1), timeoutSeconds: 5)
+        try await Self.waitForRevision(applier, expected: Revision(1), timeoutSeconds: AsyncTestSupport.roundTripSeconds)
 
         let pendingHash = try await Self.waitForImagePendingHash(
             in: renderer,
@@ -404,7 +404,7 @@ struct CounterSocketIntegrationTests {
         controller.attachRenderer(renderer)
 
         try await controller.start()
-        try await Self.waitForRevision(applier, expected: Revision(1), timeoutSeconds: 5)
+        try await Self.waitForRevision(applier, expected: Revision(1), timeoutSeconds: AsyncTestSupport.roundTripSeconds)
 
         // Give the server time to push metadata + chunks; corruption should prevent commit.
         try await Task.sleep(nanoseconds: 1_500_000_000)
@@ -473,16 +473,17 @@ struct CounterSocketIntegrationTests {
         in renderer: AppKitRenderer,
         timeoutSeconds: TimeInterval
     ) async throws -> ResourceHash {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while Date() < deadline {
-            if let hash = renderer.registry.allHandles
-                .first(where: { $0.nodeType == .image })?
-                .pendingResourceHash {
-                return hash
-            }
-            try await Task.sleep(nanoseconds: 50_000_000)
+        func pendingHash() -> ResourceHash? {
+            renderer.registry.allHandles.first(where: { $0.nodeType == .image })?.pendingResourceHash
         }
-        throw SocketIntegrationError.resourceTimeout
+        do {
+            try await AsyncTestSupport.eventually(timeout: .seconds(timeoutSeconds), description: "image pending hash") {
+                pendingHash() != nil
+            }
+        } catch {
+            throw SocketIntegrationError.resourceTimeout
+        }
+        return try #require(pendingHash())
     }
 
     private static func waitForCommittedResource(
@@ -490,25 +491,23 @@ struct CounterSocketIntegrationTests {
         in cache: ResourceCache,
         timeoutSeconds: TimeInterval
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while Date() < deadline {
-            if await cache.contains(hash) {
-                return
+        do {
+            try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(timeoutSeconds), description: "committed resource") {
+                await cache.contains(hash)
             }
-            try await Task.sleep(nanoseconds: 50_000_000)
+        } catch {
+            throw SocketIntegrationError.resourceTimeout
         }
-        throw SocketIntegrationError.resourceTimeout
     }
 
     private static func waitForSocket(at path: String, timeoutSeconds: TimeInterval) async throws {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while Date() < deadline {
-            if FileManager.default.fileExists(atPath: path) {
-                return
+        do {
+            try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(timeoutSeconds), description: "socket") {
+                FileManager.default.fileExists(atPath: path)
             }
-            try await Task.sleep(nanoseconds: 100_000_000)
+        } catch {
+            throw SocketIntegrationError.socketTimeout(path)
         }
-        throw SocketIntegrationError.socketTimeout(path)
     }
 
     private static func waitForRevision(
@@ -516,14 +515,13 @@ struct CounterSocketIntegrationTests {
         expected: Revision,
         timeoutSeconds: TimeInterval
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while Date() < deadline {
-            if applier.lastAppliedRevision == expected {
-                return
+        do {
+            try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(timeoutSeconds), description: "revision") {
+                applier.lastAppliedRevision == expected
             }
-            try await Task.sleep(nanoseconds: 50_000_000)
+        } catch {
+            throw SocketIntegrationError.revisionTimeout(expected: expected, actual: applier.lastAppliedRevision)
         }
-        throw SocketIntegrationError.revisionTimeout(expected: expected, actual: applier.lastAppliedRevision)
     }
 }
 

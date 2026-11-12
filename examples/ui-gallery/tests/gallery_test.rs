@@ -77,6 +77,17 @@ impl Client {
         ))
     }
 
+    /// A user action left `node` with nothing selected: `SELECTION_CHANGED` with no `value`.
+    fn selection_cleared(&mut self, session: &Session, node: NodeId) -> WireEvent {
+        let seq = self.next_seq();
+        self.wire(SemanticEvent::selection_cleared(
+            seq,
+            format!("selection-{seq}"),
+            session.current_revision(),
+            node,
+        ))
+    }
+
     fn text_edit(
         &mut self,
         session: &Session,
@@ -490,17 +501,25 @@ fn malformed_gallery_events_are_settled_as_rejected_without_side_effects() {
         Some(ui::BASELINE_TOGGLE_SWITCH)
     );
 
-    let mut missing_selection = client.selection(app.session(), ids::LIST, ids::LIST_ITEMS[0]);
-    missing_selection.arguments.clear();
+    let seq = client.next_seq();
+    let malformed_selection = client.wire(
+        SemanticEvent::selection_cleared(
+            seq,
+            format!("selection-{seq}"),
+            app.session().current_revision(),
+            ids::LIST,
+        )
+        .with_argument(VALUE, Value::String("row 0".to_string())),
+    );
     assert!(
         matches!(
-            dispatch(app.session(), &missing_selection),
+            dispatch(app.session(), &malformed_selection),
             EventOutcome::Rejected {
                 error: EventValidationError::PolicyRejected(_),
                 ..
             }
         ),
-        "a selection without an item id must be rejected"
+        "a selection whose value is not an item id must be rejected, never read as a clear"
     );
     assert_eq!(app.with_state(|state| state.list_selection), None);
     assert_eq!(
@@ -646,6 +665,44 @@ fn collection_selection_is_resolved_against_authoritative_state() {
         "an item the server does not hold must never become a recorded selection"
     );
     assert!(text_of(app.session(), ids::COLL_SELECTION).contains("refused"));
+}
+
+/// A `SELECTION_CHANGED` with no `value` is the user clearing the selection (§7.6;
+/// spec/registries.md §4.4): it forgets only that collection's recorded selection.
+#[test]
+fn a_cleared_collection_selection_forgets_the_recorded_item() {
+    let app = app();
+    let mut client = Client::new();
+
+    let list = client.selection(app.session(), ids::LIST, ids::LIST_ITEMS[1]);
+    dispatch(app.session(), &list);
+    let table = client.selection(app.session(), ids::TABLE, ids::TABLE_ITEMS[0]);
+    dispatch(app.session(), &table);
+    assert_eq!(
+        app.with_state(|state| state.list_selection),
+        Some(ids::LIST_ITEMS[1])
+    );
+
+    let revision = app.session().current_revision();
+    let cleared = client.selection_cleared(app.session(), ids::LIST);
+    assert!(
+        matches!(
+            dispatch(app.session(), &cleared),
+            EventOutcome::Processed { .. }
+        ),
+        "a cleared selection is processed, never rejected as malformed"
+    );
+    assert_eq!(app.with_state(|state| state.list_selection), None);
+    assert_eq!(
+        app.with_state(|state| state.table_selection),
+        Some(ids::TABLE_ITEMS[0]),
+        "clearing the List leaves the Table's selection alone"
+    );
+    assert!(app.session().current_revision() > revision);
+    assert_eq!(
+        text_of(app.session(), ids::COLL_SELECTION),
+        "List selection cleared \u{b7} nothing is selected"
+    );
 }
 
 // =============================================================================

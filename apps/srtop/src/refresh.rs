@@ -1776,6 +1776,23 @@ impl ProcessView {
             None => self.inspector.refuse(item),
         }
         self.follow.selected(row.as_ref());
+        self.publish_selection(session)
+    }
+
+    /// Applies a user-cleared selection (PX-017-G02): a `SELECTION_CHANGED`
+    /// with no `value`, sent when the user left the table with nothing
+    /// selected. The inspector says the selection was cleared under a new
+    /// generation and reads nothing; follow, if on, stops with that reason
+    /// and clears its hint, and turning it on again is refused until a row is
+    /// selected.
+    pub fn clear_selection(&mut self, session: &Session) -> Result<Refreshed, SessionError> {
+        self.inspector.clear();
+        self.follow.cleared();
+        self.publish_selection(session)
+    }
+
+    /// Publishes the inspector and follow after a selection or a clear.
+    fn publish_selection(&mut self, session: &Session) -> Result<Refreshed, SessionError> {
         let mut plan = self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
         let follow = self.follow_table_effects(&plan);
         plan.extend(follow);
@@ -2061,17 +2078,24 @@ impl ProcessView {
 }
 
 /// Dispatches one `SELECTION_CHANGED` on the table to the shared view
-/// (PX-013). Only the event's `ItemId` argument is read; an event without
-/// one, or with any other value, names no row.
+/// (PX-013). Only the event's `ItemId` argument is read. An event with no
+/// `value` is the user clearing the selection (PX-017-G02); any other value
+/// names no row.
 pub fn selection_changed(
     view: &std::sync::Mutex<ProcessView>,
     session: &Session,
     event: &srui_protocol::Event,
 ) {
-    let item = srui_semantic_tree::Event::try_from(event.clone())
+    let change = srui_semantic_tree::Event::try_from(event.clone())
         .ok()
-        .and_then(|event| event.item_id_arg());
-    if let Err(error) = lock_view(view).select_item(session, item) {
+        .and_then(|event| event.selection_change());
+    let mut view = lock_view(view);
+    let published = match change {
+        Some(srui_sdk::SelectionChange::Cleared) => view.clear_selection(session),
+        Some(srui_sdk::SelectionChange::Item(item)) => view.select_item(session, Some(item)),
+        None => view.select_item(session, None),
+    };
+    if let Err(error) = published {
         eprintln!("srtop: inspector not published: {error}");
     }
 }

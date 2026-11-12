@@ -735,6 +735,34 @@ public actor EventOutbox {
         }
     }
 
+    /// Constructs and sends a cleared selection, `SELECTION_CHANGED` with no `value` (§7.6;
+    /// `spec/registries.md` §4.4), without creating a sequence beyond the window.
+    @discardableResult
+    public func sendSelectionCleared(
+        nodeId: NodeId,
+        observedRevision: Revision,
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation suppliedIncarnation: EventOutboxSessionIncarnation? = nil,
+        via transport: any Transport
+    ) async throws -> Event {
+        let sessionIncarnation = try resolveSessionIncarnation(
+            suppliedIncarnation,
+            binding: binding
+        )
+        return try await allocateAndSend(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation,
+            via: transport
+        ) { eventSeq, eventId in
+            Event.selectionCleared(
+                eventSeq: eventSeq,
+                eventId: eventId,
+                observedRevision: observedRevision,
+                nodeId: nodeId
+            )
+        }
+    }
+
     /// Constructs and sends an `EXPANSION_CHANGED` event (§7.6, §22.5) without creating a sequence
     /// beyond the window. `value` is the new disclosure state; `items` names the one ItemId.
     @discardableResult

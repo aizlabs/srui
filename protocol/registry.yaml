@@ -649,7 +649,7 @@ events:
   - id: 3
     name: SELECTION_CHANGED
     kind: semantic
-    description: "Selection change within a collection or choice control (e.g. List, Table, Tree, Tabs, ChoiceGroup, Select)"
+    description: "Selection change within a collection or choice control (e.g. List, Table, Tree, Tabs, ChoiceGroup, Select). On a List, Table or Tree, value names the one ItemId the user selected; no value means a user action left the collection with nothing selected (spec/registries.md §4.4)."
 
   - id: 4
     name: EXPANSION_CHANGED

@@ -397,6 +397,16 @@ struct SemanticInspectionAutomationTests {
             } catch {
                 Issue.record("Expected unsupportedAction, got \(error)")
             }
+            // A cleared selection is a SELECTION_CHANGED too, refused the same way (PX-017-G02).
+            do {
+                _ = try await collection.clearSelection()
+                Issue.record("Expected default-none collection clear to be unsupported")
+            } catch SemanticAutomationError.unsupportedAction(let nodeID, let eventType) {
+                #expect(nodeID == SemanticInspectionFixture.collectionID)
+                #expect(eventType == .EVENT_SELECTION_CHANGED)
+            } catch {
+                Issue.record("Expected unsupportedAction, got \(error)")
+            }
 
             let sentinel = try #require(
                 inspector.find(role: .button, label: SemanticInspectionFixture.sentinelLabel)
@@ -406,6 +416,28 @@ struct SemanticInspectionAutomationTests {
             let captured = await harness.transport.recordedEvents()
             #expect(captured.map(\.event.nodeId) == [SemanticInspectionFixture.sentinelID])
         }
+    }
+
+    @Test("A cleared selection is admitted only on a List, Table or Tree that can select")
+    func clearedSelectionIsRefusedOutsideSelectableCollections() {
+        // PX-017-G02 (spec/registries.md §4.4): Select, ChoiceGroup and Tabs emit
+        // SELECTION_CHANGED with an item, but the argumentless form is defined only for
+        // List, Table and Tree, and never for selection_mode none.
+        let single: [PropertyRef: Value] = [.selectionMode: .enumToken(.selectionModeSingle)]
+        for nodeType in [TypeRef.select, .choiceGroup, .tabs] {
+            let node = Node(id: 9, nodeType: nodeType, properties: single)
+            #expect(SessionController.selectionActionIsRefused(.selectionCleared, on: node), "\(nodeType)")
+            #expect(!SessionController.selectionActionIsRefused(.selectionChanged(ItemId(1)), on: node), "\(nodeType)")
+        }
+        for nodeType in [TypeRef.list, .table, .tree] {
+            let selectable = Node(id: 9, nodeType: nodeType, properties: single)
+            #expect(!SessionController.selectionActionIsRefused(.selectionCleared, on: selectable))
+            #expect(!SessionController.selectionActionIsRefused(.selectionChanged(ItemId(1)), on: selectable))
+            let none = Node(id: 9, nodeType: nodeType)
+            #expect(SessionController.selectionActionIsRefused(.selectionCleared, on: none))
+            #expect(SessionController.selectionActionIsRefused(.selectionChanged(ItemId(1)), on: none))
+        }
+        #expect(!SessionController.selectionActionIsRefused(.activate, on: Node(id: 9, nodeType: .button)))
     }
 
     @Test("Native and inspected Tree disclosure each send one EXPANSION_CHANGED without a reply")

@@ -32,6 +32,9 @@
 //! in one transaction, and every tree edit is one index-based transaction,
 //! because a hierarchical model is judged whole after its last operation and a
 //! sparse replica cannot place an identity delete (PX-018-G01).
+//! Disclosure stays each client's own (§22.5): the view mirrors the collapsed
+//! items each client instance reported, only to tell when the selecting
+//! client's selection or followed process is hidden there.
 //!
 //! Four rules shape this module:
 //!
@@ -546,12 +549,20 @@ pub struct ProcessView {
     /// What the latest scan could not see (PX-018), which explains an absent
     /// parent. Replaced, never grown, by every sample.
     gaps: ScanGaps,
-    /// The tree items the client last reported collapsed (PX-018), through
-    /// `EXPANSION_CHANGED`. Disclosure is the client's (§22.5): this is only
-    /// what the server was told, used to say when a followed or selected
-    /// process is hidden under a collapsed parent. Bounded by the published
-    /// rows and pruned to them on every publication; emptied with the tree.
-    collapsed: HashSet<ItemId>,
+    /// The tree items each client last reported collapsed (PX-018), through
+    /// `EXPANSION_CHANGED`, by the client instance that reported them.
+    /// Disclosure is each client's own (§22.5): this is only what the server
+    /// was told, used to say when a followed or selected process is hidden
+    /// under a collapsed parent on the client whose selection it is
+    /// (`holder`). A client that never reported is all expanded, as a fresh
+    /// `OutlineCollectionAdapter` is. Bounded by the published rows and
+    /// [`MAX_DISCLOSURE_CLIENTS`], pruned to the rows on every publication;
+    /// emptied with the tree.
+    disclosure: Disclosure,
+    /// Whose selection the inspector and follow describe (PX-018): the client
+    /// that reported it, or every client for a promotion made in process.
+    /// Only that client's disclosure can hide it.
+    holder: Holder,
     /// The §26 `max_model_tree_depth` the tree is arranged under (PX-018): the
     /// store's own limit, at most the wire default every client enforces.
     tree_levels: usize,
@@ -773,7 +784,8 @@ impl ProcessView {
                 sampling_published,
                 mode: ViewMode::Table,
                 gaps: ScanGaps::of(&snapshot),
-                collapsed: HashSet::new(),
+                disclosure: Disclosure::default(),
+                holder: Holder::Every,
                 tree_levels: session.with_store(|store| {
                     store
                         .limits()
@@ -833,9 +845,15 @@ impl ProcessView {
         &self.view_status
     }
 
-    /// The tree items the client last reported collapsed (PX-018).
-    pub fn collapsed(&self) -> &HashSet<ItemId> {
-        &self.collapsed
+    /// The tree items `client` last reported collapsed (PX-018); empty for a
+    /// client that reported none, which shows the tree all expanded.
+    pub fn collapsed_by(&self, client: &[u8]) -> HashSet<ItemId> {
+        self.disclosure.of(client).cloned().unwrap_or_default()
+    }
+
+    /// How many clients' disclosure this view mirrors (PX-018).
+    pub fn disclosure_clients(&self) -> usize {
+        self.disclosure.clients.len()
     }
 
     /// Samples the source once and publishes the difference.
@@ -1885,6 +1903,26 @@ impl ProcessView {
         session: &Session,
         query: &str,
     ) -> Result<Refreshed, SessionError> {
+        self.search_as(session, Holder::Every, query)
+    }
+
+    /// [`Self::set_search`], typed by `client` (PX-018): the match it
+    /// promotes is that client's selection.
+    pub fn set_search_from(
+        &mut self,
+        session: &Session,
+        client: &[u8],
+        query: &str,
+    ) -> Result<Refreshed, SessionError> {
+        self.search_as(session, Holder::Client(client.to_vec()), query)
+    }
+
+    fn search_as(
+        &mut self,
+        session: &Session,
+        holder: Holder,
+        query: &str,
+    ) -> Result<Refreshed, SessionError> {
         let selected = self.search.set_query(query, &self.rows);
         let raw = self.search.query().raw().to_string();
         let mut plan = Vec::new();
@@ -1895,7 +1933,7 @@ impl ProcessView {
             }));
         }
         plan.extend(self.promotion(selected));
-        self.publish_search(session, plan)
+        self.publish_search(session, plan, holder)
     }
 
     /// Applies one Next or Previous click (PX-011).
@@ -1904,9 +1942,28 @@ impl ProcessView {
         session: &Session,
         step: SearchStep,
     ) -> Result<Refreshed, SessionError> {
+        self.step_search_as(session, Holder::Every, step)
+    }
+
+    /// [`Self::step_search`], clicked by `client` (PX-018).
+    pub fn step_search_from(
+        &mut self,
+        session: &Session,
+        client: &[u8],
+        step: SearchStep,
+    ) -> Result<Refreshed, SessionError> {
+        self.step_search_as(session, Holder::Client(client.to_vec()), step)
+    }
+
+    fn step_search_as(
+        &mut self,
+        session: &Session,
+        holder: Holder,
+        step: SearchStep,
+    ) -> Result<Refreshed, SessionError> {
         let selected = self.search.step(step, &self.rows);
         let plan = self.promotion(selected).into_iter().collect();
-        self.publish_search(session, plan)
+        self.publish_search(session, plan, holder)
     }
 
     /// Keeps the PID field's text (PX-011). Typing never moves the target; it
@@ -1924,16 +1981,33 @@ impl ProcessView {
                 value: kept,
             }));
         }
-        self.publish_search(session, plan)
+        self.publish_search(session, plan, Holder::Every)
     }
 
     /// Applies one Go to PID click (PX-011): an explicit new search that
     /// resolves the PID field to the published row the latest scan confirmed
     /// with that PID.
     pub fn go_to_pid(&mut self, session: &Session) -> Result<Refreshed, SessionError> {
+        self.go_to_pid_as(session, Holder::Every)
+    }
+
+    /// [`Self::go_to_pid`], clicked by `client` (PX-018).
+    pub fn go_to_pid_from(
+        &mut self,
+        session: &Session,
+        client: &[u8],
+    ) -> Result<Refreshed, SessionError> {
+        self.go_to_pid_as(session, Holder::Client(client.to_vec()))
+    }
+
+    fn go_to_pid_as(
+        &mut self,
+        session: &Session,
+        holder: Holder,
+    ) -> Result<Refreshed, SessionError> {
         let selected = self.search.go_to_pid(&self.rows, &self.unconfirmed);
         let plan = self.promotion(selected).into_iter().collect();
-        self.publish_search(session, plan)
+        self.publish_search(session, plan, holder)
     }
 
     /// The promotion of the row an explicit search just `selected` (PX-011,
@@ -1994,11 +2068,13 @@ impl ProcessView {
     }
 
     /// Publishes `plan` and the search controls' changes over the rows already
-    /// published (PX-011). The rows are not touched.
+    /// published (PX-011). The rows are not touched. A promotion in `plan` is
+    /// `holder`'s selection (PX-018).
     fn publish_search(
         &mut self,
         session: &Session,
         mut plan: Vec<Planned>,
+        holder: Holder,
     ) -> Result<Refreshed, SessionError> {
         // A promotion is a selection too: the inspector follows it, under a
         // new generation, exactly as it follows a click (PX-013).
@@ -2006,17 +2082,21 @@ impl ProcessView {
             Effect::Promote(_, row) => Some(row.as_ref().clone()),
             _ => None,
         });
-        // The promotion reveals its match: in the tree the client expands the
-        // collapsed parents above it before it reports them, so the mirror
-        // expands them now (PX-018).
-        let mut revealed = Vec::new();
+        // The promotion reveals its match: in the tree every client expands
+        // the collapsed parents above it before it reports them, so every
+        // client's mirror expands them now (PX-018).
+        let mut unrevealed = None;
         if let Some(row) = &promoted {
             self.inspector.select(row);
+            self.holder = holder;
             // While follow is on, the match is the process followed next
             // (PX-017): the hint moves to it.
             self.follow.selected(Some(row));
+            let held = self.disclosure.clone();
             let rows = std::mem::take(&mut self.rows);
-            revealed = self.reveal_in_mirror(&rows, row.item_id);
+            if self.reveal_in_mirror(&rows, row.item_id) {
+                unrevealed = Some(held);
+            }
             self.rows = rows;
         }
         plan.extend(self.search_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed));
@@ -2030,9 +2110,11 @@ impl ProcessView {
         let (published, reached) = self.publish_controls_reaching(session, plan);
         // A promotion that never committed revealed nothing on a client, even
         // when the same item was already promoted before: the mirror keeps
-        // the parents the client keeps collapsed.
+        // the parents the clients keep collapsed.
         if promotion_at.is_some_and(|at| reached <= at) {
-            self.collapsed.extend(revealed);
+            if let Some(held) = unrevealed {
+                self.disclosure = held;
+            }
         }
         published
     }
@@ -2115,22 +2197,26 @@ impl ProcessView {
     pub fn select_item(
         &mut self,
         session: &Session,
+        client: &[u8],
         item: Option<ItemId>,
     ) -> Result<Refreshed, SessionError> {
-        self.select_item_in(session, self.mode.node(), item)
+        self.select_item_in(session, client, self.mode.node(), item)
     }
 
-    /// [`Self::select_item`], reported by the collection `node` (PX-018). Only
-    /// the shown collection's selection is the user's: a report from the
-    /// hidden one — sent before a switch reached that client — names rows it
-    /// no longer holds, and is ignored rather than taken for an empty
-    /// selection, so it neither clears the inspector nor stops follow. A
-    /// report naming a tree row now hidden under a collapsed parent is a
-    /// selection the client has since dropped: the inspector is cleared and
-    /// follow is left as it is.
+    /// [`Self::select_item`], reported by `client` on the collection `node`
+    /// (PX-018). Only the shown collection's selection is the user's: a
+    /// report from the hidden one — sent before a switch reached that client
+    /// — names rows it no longer holds, and is ignored rather than taken for
+    /// an empty selection, so it neither clears the inspector nor stops
+    /// follow. A report naming a tree row now hidden under a parent the
+    /// reporting client keeps collapsed is a selection that client has since
+    /// dropped: the inspector is cleared and follow is left as it is. Another
+    /// client's disclosure never hides it: each client discloses on its own,
+    /// and one that attaches later starts all expanded.
     pub fn select_item_in(
         &mut self,
         session: &Session,
+        client: &[u8],
         node: NodeId,
         item: Option<ItemId>,
     ) -> Result<Refreshed, SessionError> {
@@ -2138,6 +2224,10 @@ impl ProcessView {
             return Ok(Refreshed::default());
         }
         let row = item.and_then(|item| self.rows.iter().find(|row| row.item_id == item).cloned());
+        // The selection is now this client's: its disclosure, and no other
+        // client's, decides whether the inspector's and follow's process is
+        // hidden (PX-018).
+        self.holder = Holder::Client(client.to_vec());
         // A row hidden under a parent the client keeps collapsed cannot be
         // selected there: a report naming one was sent before a commit moved
         // the row under that parent, and the client has since dropped the
@@ -2258,8 +2348,9 @@ impl ProcessView {
 
     /// The follow controls for a client that holds `rows` in `mode`: in the
     /// tree, the status also says when the followed process is hidden under a
-    /// parent the client reported collapsed, because `keep_visible` never
-    /// expands one and a local expand never scrolls (PX-017-G01, PX-018).
+    /// parent the selecting client (`holder`) reported collapsed, because
+    /// `keep_visible` never expands one and a local expand never scrolls
+    /// (PX-017-G01, PX-018).
     fn follow_view_in(&self, mode: ViewMode, rows: &[Row]) -> FollowView {
         match mode {
             ViewMode::Table => self.follow.view(rows),
@@ -2273,52 +2364,53 @@ impl ProcessView {
         }
     }
 
-    /// The outermost tree row the client reported collapsed whose subtree in
-    /// `rows` holds `item`, if any (PX-018).
+    /// The outermost tree row the selecting client (`holder`) reported
+    /// collapsed whose subtree in `rows` holds `item`, if any (PX-018). Every
+    /// client holds a promotion made in process, so any client's collapsed
+    /// parent hides that one.
     fn hidden_under<'a>(&self, rows: &'a [Row], item: ItemId) -> Option<&'a Row> {
-        if self.collapsed.is_empty() {
-            return None;
+        match &self.holder {
+            Holder::Client(client) => {
+                let collapsed = self.disclosure.of(client)?;
+                outermost_collapsed(rows, item, |row| collapsed.contains(row))
+            }
+            Holder::Every => {
+                if self.disclosure.clients.is_empty() {
+                    return None;
+                }
+                outermost_collapsed(rows, item, |row| self.disclosure.any_collapsed(row))
+            }
         }
-        let at = rows.iter().position(|row| row.item_id == item)?;
-        rows[..at]
-            .iter()
-            .enumerate()
-            .find(|(index, row)| {
-                self.collapsed.contains(&row.item_id)
-                    && row
-                        .tree
-                        .as_ref()
-                        .is_some_and(|place| at as u64 <= *index as u64 + place.descendants)
-            })
-            .map(|(_, row)| row)
     }
 
     /// Forgets every collapsed item the published tree no longer holds, with
     /// exactly the client's rule (`OutlineCollectionAdapter.pruneCollapsedItems`
-    /// keeps every collapsed item its model still holds): an item that has no
-    /// children for a while stays collapsed, and hides the children it gains
-    /// again (PX-018-G01, PX-018). Outside the tree nothing is collapsed.
+    /// keeps every collapsed item its model still holds), for every client:
+    /// an item that has no children for a while stays collapsed, and hides the
+    /// children it gains again (PX-018-G01, PX-018). Outside the tree nothing
+    /// is collapsed.
     fn prune_collapsed(&mut self) {
         if self.mode != ViewMode::Tree {
-            self.collapsed.clear();
+            self.disclosure.clear();
             return;
         }
-        prune_collapsed_to(&mut self.collapsed, &self.rows);
+        self.disclosure.prune_to(&self.rows);
     }
 
-    /// Brings the server's mirror of the client's disclosure and selection up
-    /// to `target`, the rows a plan is about to publish (PX-018).
+    /// Brings the server's mirror of the clients' disclosure and of the
+    /// selection up to `target`, the rows a plan is about to publish (PX-018).
     ///
-    /// The client keeps a collapsed item while its model holds it, and every
+    /// A client keeps a collapsed item while its model holds it, and every
     /// item starts expanded in a tree a view switch (`fresh`) just filled. A
-    /// shown row that `target` places under a collapsed item has no row on
-    /// that client, so its native selection is gone: the outline restores a
-    /// selection only to a shown row, with selection events suppressed while
-    /// it applies the commit, so no `SELECTION_CHANGED` reports it. The
-    /// inspector is cleared to match, exactly as for a collapse
-    /// ([`Self::expansion_changed`]). Follow is not a selection: it stays on
-    /// its process, and its status says it is hidden under the collapsed
-    /// parent.
+    /// shown row that `target` places under an item the selecting client
+    /// keeps collapsed has no row on that client, so its native selection is
+    /// gone: the outline restores a selection only to a shown row, with
+    /// selection events suppressed while it applies the commit, so no
+    /// `SELECTION_CHANGED` reports it. The inspector is cleared to match,
+    /// exactly as for a collapse ([`Self::expansion_changed`]). Another
+    /// client's collapsed items never clear it. Follow is not a selection: it
+    /// stays on its process, and its status says it is hidden under the
+    /// collapsed parent.
     ///
     /// The plan has not committed yet, so what this changes is held: if the
     /// rows never reach the client ([`Self::settle_disclosure`]), the mirror
@@ -2328,13 +2420,13 @@ impl ProcessView {
     /// switch fills a tree that starts expanded.
     fn reconcile_disclosure(&mut self, target: &[Row], fresh: bool) -> HeldDisclosure {
         let held = HeldDisclosure {
-            collapsed: self.collapsed.clone(),
+            disclosure: self.disclosure.clone(),
             inspector: self.inspector.hold(),
         };
         if fresh {
-            self.collapsed.clear();
+            self.disclosure.clear();
         }
-        prune_collapsed_to(&mut self.collapsed, target);
+        self.disclosure.prune_to(target);
         let hidden = self
             .inspector
             .selected()
@@ -2354,41 +2446,24 @@ impl ProcessView {
     /// would miss a reparent that keeps the preorder's item IDs in place.
     fn settle_disclosure(&mut self, held: HeldDisclosure, landed: bool) {
         if !landed {
-            self.collapsed = held.collapsed;
+            self.disclosure = held.disclosure;
             self.inspector.restore(held.inspector);
         }
     }
 
-    /// Mirrors a revealing promotion of `item` on the tree (PX-018): the
-    /// client expands exactly the collapsed items whose subtree holds it
-    /// (`OutlineCollectionAdapter.expandCollapsedAncestors`) and only then
-    /// reports each with `EXPANSION_CHANGED(true)`. The mirror expands them
-    /// when the promotion is planned, so a sample landing before those
-    /// reports sees the match shown, and the reports change nothing. Returns
-    /// the items it expanded.
-    fn reveal_in_mirror(&mut self, rows: &[Row], item: ItemId) -> Vec<ItemId> {
-        if self.mode != ViewMode::Tree || self.collapsed.is_empty() {
-            return Vec::new();
+    /// Mirrors a revealing promotion of `item` on the tree (PX-018): every
+    /// client applies the promotion and expands exactly its collapsed items
+    /// whose subtree holds it
+    /// (`OutlineCollectionAdapter.expandCollapsedAncestors`), and only then
+    /// reports each with `EXPANSION_CHANGED(true)`. Every client's mirror
+    /// expands them when the promotion is planned, so a sample landing before
+    /// those reports sees the match shown, and the reports change nothing.
+    /// Returns whether it expanded any.
+    fn reveal_in_mirror(&mut self, rows: &[Row], item: ItemId) -> bool {
+        if self.mode != ViewMode::Tree {
+            return false;
         }
-        let Some(at) = rows.iter().position(|row| row.item_id == item) else {
-            return Vec::new();
-        };
-        let opened: Vec<ItemId> = rows[..at]
-            .iter()
-            .enumerate()
-            .filter(|(index, row)| {
-                self.collapsed.contains(&row.item_id)
-                    && row
-                        .tree
-                        .as_ref()
-                        .is_some_and(|place| at as u64 <= *index as u64 + place.descendants)
-            })
-            .map(|(_, row)| row.item_id)
-            .collect();
-        for opened in &opened {
-            self.collapsed.remove(opened);
-        }
-        opened
+        self.disclosure.reveal(rows, item)
     }
 
     /// The row operations that turn the published rows into `target` in the
@@ -2496,16 +2571,19 @@ impl ProcessView {
     }
 
     /// Applies one `EXPANSION_CHANGED` report from the tree (PX-018): the
-    /// client has already expanded or collapsed `item` locally, and the
-    /// server only records what it was told. Nothing about the rows is
-    /// published: disclosure is the client's (§22.5).
+    /// reporting `client` has already expanded or collapsed `item` locally,
+    /// and the server only records what that client was told. Nothing about
+    /// the rows is published: disclosure is each client's own (§22.5), and a
+    /// report changes only its own client's mirror.
     ///
-    /// A collapse that hides the inspector's process has also deselected its
-    /// row on that client, without a `SELECTION_CHANGED` (an `NSOutlineView`
-    /// cannot select a row it does not show), so the inspector is cleared to
-    /// match instead of describing a selection the client no longer shows.
-    /// Follow is not a selection and stays on its process; its status says it
-    /// is hidden under the collapsed parent until that is expanded again.
+    /// A collapse that hides the inspector's process on the client whose
+    /// selection it is (`holder`) has also deselected its row there, without
+    /// a `SELECTION_CHANGED` (an `NSOutlineView` cannot select a row it does
+    /// not show), so the inspector is cleared to match instead of describing
+    /// a selection that client no longer shows; another client's collapse
+    /// leaves it. Follow is not a selection and stays on its process; its
+    /// status says it is hidden under the collapsed parent until that is
+    /// expanded again.
     /// A report from the hidden collection, about an item the tree does not
     /// hold, or one that changes nothing, publishes nothing. A report about
     /// an item that has become a leaf since the client acted is applied: the
@@ -2514,6 +2592,7 @@ impl ProcessView {
     pub fn expansion_changed(
         &mut self,
         session: &Session,
+        client: &[u8],
         node: NodeId,
         item: ItemId,
         expanded: bool,
@@ -2530,15 +2609,11 @@ impl ProcessView {
         if !self.rows.iter().any(|row| row.item_id == item) {
             return Ok(Refreshed::default());
         }
-        let changed = if expanded {
-            self.collapsed.remove(&item)
-        } else {
-            self.collapsed.insert(item)
-        };
-        if !changed {
+        if !self.disclosure.record(client, item, expanded) {
             return Ok(Refreshed::default());
         }
-        if !expanded {
+        // Only a collapse by the client that holds the selection can hide it.
+        if !expanded && self.holder.is(client) {
             let hidden = self
                 .inspector
                 .selected()
@@ -2775,13 +2850,14 @@ pub fn selection_changed(
     session: &Session,
     event: &srui_protocol::Event,
 ) {
+    let client = event.client_instance_id.as_slice();
     let Ok(event) = srui_semantic_tree::Event::try_from(event.clone()) else {
         return;
     };
     let item = event.item_id_arg();
     // The table's and the tree's selections both reach here (PX-018); only
-    // the shown collection's is the user's.
-    if let Err(error) = lock_view(view).select_item_in(session, event.node_id, item) {
+    // the shown collection's is the user's, and it is the reporting client's.
+    if let Err(error) = lock_view(view).select_item_in(session, client, event.node_id, item) {
         eprintln!("srtop: inspector not published: {error}");
     }
 }
@@ -2803,7 +2879,9 @@ pub fn view_toggled(
 
 /// Dispatches one `EXPANSION_CHANGED` on the tree to the shared view
 /// (PX-018). Only a well-formed report is read: its one `ItemId` and its
-/// boolean; anything else names nothing.
+/// boolean; anything else names nothing. It is mirrored for the client
+/// instance that sent it, which the session checked against that
+/// connection's handshake.
 pub fn expansion_reported(
     view: &std::sync::Mutex<ProcessView>,
     session: &Session,
@@ -2816,8 +2894,13 @@ pub fn expansion_reported(
     else {
         return;
     };
-    let published =
-        lock_view(view).expansion_changed(session, change.node, change.item, change.expanded);
+    let published = lock_view(view).expansion_changed(
+        session,
+        &event.client_instance_id,
+        change.node,
+        change.item,
+        change.expanded,
+    );
     if let Err(error) = published {
         eprintln!("srtop: disclosure not published: {error}");
     }
@@ -2841,17 +2924,178 @@ pub fn follow_toggled(
 /// What [`ProcessView::reconcile_disclosure`] changed, held until its plan
 /// commits (PX-018).
 struct HeldDisclosure {
-    collapsed: HashSet<ItemId>,
+    disclosure: Disclosure,
     inspector: HeldSelection,
 }
 
-/// Keeps only the collapsed items `rows` still hold (PX-018).
-fn prune_collapsed_to(collapsed: &mut HashSet<ItemId>, rows: &[Row]) {
-    if collapsed.is_empty() {
-        return;
+/// Most clients whose tree disclosure one view mirrors at once (PX-018).
+///
+/// Nothing srtop receives announces a detach, so the mirror of a client
+/// that collapsed a parent and went away stays until its items leave the
+/// tree, the view leaves the tree, or it is the least recently reporting of
+/// more clients than this. An evicted client is mirrored all expanded until
+/// it reports again.
+pub const MAX_DISCLOSURE_CLIENTS: usize = 64;
+
+/// The tree items each client reported collapsed (PX-018), by the
+/// `client_instance_id` of the reports. A client with nothing collapsed has
+/// no entry: it shows the tree all expanded, as every client does before it
+/// first collapses an item, a fresh attachment included.
+#[derive(Debug, Clone, Default)]
+struct Disclosure {
+    clients: HashMap<Vec<u8>, ClientDisclosure>,
+    /// Orders the clients' last reports, for eviction.
+    next_report: u64,
+}
+
+/// One client's collapsed items and when it last reported (PX-018).
+#[derive(Debug, Clone)]
+struct ClientDisclosure {
+    collapsed: HashSet<ItemId>,
+    reported: u64,
+}
+
+impl Disclosure {
+    /// What `client` keeps collapsed; `None` when it keeps nothing collapsed.
+    fn of(&self, client: &[u8]) -> Option<&HashSet<ItemId>> {
+        self.clients.get(client).map(|entry| &entry.collapsed)
     }
-    let held: HashSet<ItemId> = rows.iter().map(|row| row.item_id).collect();
-    collapsed.retain(|item| held.contains(item));
+
+    /// Whether any client keeps `item` collapsed.
+    fn any_collapsed(&self, item: &ItemId) -> bool {
+        self.clients
+            .values()
+            .any(|entry| entry.collapsed.contains(item))
+    }
+
+    /// Records one report from `client`; whether it changed its mirror.
+    fn record(&mut self, client: &[u8], item: ItemId, expanded: bool) -> bool {
+        let reported = self.next_report;
+        self.next_report = self.next_report.wrapping_add(1);
+        if expanded {
+            let Some(entry) = self.clients.get_mut(client) else {
+                return false;
+            };
+            entry.reported = reported;
+            if !entry.collapsed.remove(&item) {
+                return false;
+            }
+            if entry.collapsed.is_empty() {
+                self.clients.remove(client);
+            }
+            return true;
+        }
+        if let Some(entry) = self.clients.get_mut(client) {
+            entry.reported = reported;
+            return entry.collapsed.insert(item);
+        }
+        if self.clients.len() >= MAX_DISCLOSURE_CLIENTS {
+            // lc-debt: least-recently-reporting eviction stands in for a detach
+            // notice srtop does not get (`srui_sessiond::handle_connection`
+            // exposes no attachment identity); drop a client's entry on its
+            // detach once the SDK reports one.
+            let oldest = self
+                .clients
+                .iter()
+                .min_by_key(|(_, entry)| entry.reported)
+                .map(|(id, _)| id.clone());
+            if let Some(oldest) = oldest {
+                self.clients.remove(&oldest);
+            }
+        }
+        self.clients.insert(
+            client.to_vec(),
+            ClientDisclosure {
+                collapsed: HashSet::from([item]),
+                reported,
+            },
+        );
+        true
+    }
+
+    /// Forgets every client's collapsed items: a tree that is emptied or
+    /// filled afresh starts expanded on every client.
+    fn clear(&mut self) {
+        self.clients.clear();
+    }
+
+    /// Keeps only the collapsed items `rows` still hold, for every client.
+    fn prune_to(&mut self, rows: &[Row]) {
+        if self.clients.is_empty() {
+            return;
+        }
+        let held: HashSet<ItemId> = rows.iter().map(|row| row.item_id).collect();
+        self.clients.retain(|_, entry| {
+            entry.collapsed.retain(|item| held.contains(item));
+            !entry.collapsed.is_empty()
+        });
+    }
+
+    /// Expands, for every client, the items whose subtree in `rows` holds
+    /// `item`; whether any was collapsed.
+    fn reveal(&mut self, rows: &[Row], item: ItemId) -> bool {
+        if self.clients.is_empty() {
+            return false;
+        }
+        let Some(at) = rows.iter().position(|row| row.item_id == item) else {
+            return false;
+        };
+        let ancestors: Vec<ItemId> = rows[..at]
+            .iter()
+            .enumerate()
+            .filter(|(index, row)| holds(row, *index, at))
+            .map(|(_, row)| row.item_id)
+            .collect();
+        let mut opened = false;
+        self.clients.retain(|_, entry| {
+            for ancestor in &ancestors {
+                opened |= entry.collapsed.remove(ancestor);
+            }
+            !entry.collapsed.is_empty()
+        });
+        opened
+    }
+}
+
+/// Whose selection the inspector and follow describe (PX-018).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Holder {
+    /// A promotion made in process, which every client applies.
+    Every,
+    /// The selection one client reported, or a promotion it asked for.
+    Client(Vec<u8>),
+}
+
+impl Holder {
+    /// Whether `client`'s disclosure can hide this holder's selection.
+    fn is(&self, client: &[u8]) -> bool {
+        match self {
+            Holder::Every => true,
+            Holder::Client(holder) => holder.as_slice() == client,
+        }
+    }
+}
+
+/// Whether the tree row at `index` holds the row at `at` in its subtree.
+fn holds(row: &Row, index: usize, at: usize) -> bool {
+    row.tree
+        .as_ref()
+        .is_some_and(|place| at as u64 <= index as u64 + place.descendants)
+}
+
+/// The outermost row of `rows` that `collapsed` names and whose subtree
+/// holds `item`, if any (PX-018).
+fn outermost_collapsed(
+    rows: &[Row],
+    item: ItemId,
+    collapsed: impl Fn(&ItemId) -> bool,
+) -> Option<&Row> {
+    let at = rows.iter().position(|row| row.item_id == item)?;
+    rows[..at]
+        .iter()
+        .enumerate()
+        .find(|(index, row)| collapsed(&row.item_id) && holds(row, *index, at))
+        .map(|(_, row)| row)
 }
 
 /// The item the last promotion in `plan` names, if it promotes one.
@@ -3078,7 +3322,8 @@ pub fn search_edited(
     event: &srui_protocol::Event,
 ) {
     let text = edited_text(session, event, SEARCH_INPUT);
-    if let Err(error) = lock_view(view).set_search(session, &text) {
+    // The match it promotes is the typing client's selection (PX-018).
+    if let Err(error) = lock_view(view).set_search_from(session, &event.client_instance_id, &text) {
         eprintln!("srtop: search not published: {error}");
     }
 }
@@ -3126,16 +3371,29 @@ pub fn pid_set_edited(
     }
 }
 
-/// Dispatches one Next or Previous click to the shared view (PX-011).
-pub fn search_stepped(view: &std::sync::Mutex<ProcessView>, session: &Session, step: SearchStep) {
-    if let Err(error) = lock_view(view).step_search(session, step) {
+/// Dispatches one Next or Previous click to the shared view (PX-011). Only
+/// the clicking client's identity is read from the event: the match it
+/// promotes is that client's selection (PX-018).
+pub fn search_stepped(
+    view: &std::sync::Mutex<ProcessView>,
+    session: &Session,
+    event: &srui_protocol::Event,
+    step: SearchStep,
+) {
+    let stepped = lock_view(view).step_search_from(session, &event.client_instance_id, step);
+    if let Err(error) = stepped {
         eprintln!("srtop: search step not published: {error}");
     }
 }
 
-/// Dispatches one Go to PID click to the shared view (PX-011).
-pub fn pid_requested(view: &std::sync::Mutex<ProcessView>, session: &Session) {
-    if let Err(error) = lock_view(view).go_to_pid(session) {
+/// Dispatches one Go to PID click to the shared view (PX-011). Only the
+/// clicking client's identity is read from the event (PX-018).
+pub fn pid_requested(
+    view: &std::sync::Mutex<ProcessView>,
+    session: &Session,
+    event: &srui_protocol::Event,
+) {
+    if let Err(error) = lock_view(view).go_to_pid_from(session, &event.client_instance_id) {
         eprintln!("srtop: PID search not published: {error}");
     }
 }
@@ -6556,6 +6814,9 @@ mod disclosure_commit_tests {
         SnapshotTime, SourceId, OWNER_NOT_COLLECTED,
     };
 
+    /// The one client these tests report from.
+    const CLIENT: &[u8] = b"disclosure-client";
+
     struct Family(Vec<ProcessRecord>);
 
     impl Family {
@@ -6632,8 +6893,12 @@ mod disclosure_commit_tests {
 
     fn collapse(session: &Session, view: &mut ProcessView, pid: u32) {
         let item = item(view, pid);
-        view.expansion_changed(session, TREE, item, false).unwrap();
-        assert!(view.collapsed.contains(&item), "PID {pid} collapsed");
+        view.expansion_changed(session, CLIENT, TREE, item, false)
+            .unwrap();
+        assert!(
+            view.collapsed_by(CLIENT).contains(&item),
+            "PID {pid} collapsed"
+        );
     }
 
     #[test]
@@ -6663,7 +6928,8 @@ mod disclosure_commit_tests {
         ]);
         let (session, mut view) = tree(&mut source);
         let xray = item(&view, 30);
-        view.select_item_in(&session, TREE, Some(xray)).unwrap();
+        view.select_item_in(&session, CLIENT, TREE, Some(xray))
+            .unwrap();
         collapse(&session, &mut view, 10);
         assert_eq!(view.inspector().selected(), Some(xray));
         let before: Vec<ItemId> = view.item_ids();
@@ -6678,7 +6944,7 @@ mod disclosure_commit_tests {
             Some(xray),
             "the client still shows xray selected"
         );
-        assert!(view.collapsed.contains(&item(&view, 10)));
+        assert!(view.collapsed_by(CLIENT).contains(&item(&view, 10)));
         // The next sample commits, and hides xray then.
         view.refresh(&session, &mut source).unwrap();
         assert_eq!(view.inspector().selected(), None);
@@ -6710,12 +6976,12 @@ mod disclosure_commit_tests {
             "still the old promotion"
         );
         assert!(
-            view.collapsed.contains(&alpha),
+            view.collapsed_by(CLIENT).contains(&alpha),
             "the client keeps alpha collapsed"
         );
         // When the promotion commits, alpha is revealed.
         view.go_to_pid(&session).unwrap();
-        assert!(!view.collapsed.contains(&alpha));
+        assert!(!view.collapsed_by(CLIENT).contains(&alpha));
     }
 
     /// A view switch that does not commit (`republish_in`, with no entry
@@ -6732,7 +6998,8 @@ mod disclosure_commit_tests {
         let (session, mut view) = tree(&mut source);
         let alpha = item(&view, 10);
         let xray = item(&view, 30);
-        view.select_item_in(&session, TREE, Some(xray)).unwrap();
+        view.select_item_in(&session, CLIENT, TREE, Some(xray))
+            .unwrap();
         collapse(&session, &mut view, 10);
         {
             let _armed = commit_fault::arm(0);
@@ -6740,13 +7007,13 @@ mod disclosure_commit_tests {
         }
         assert_eq!(view.view_mode(), ViewMode::Tree);
         assert!(
-            view.collapsed.contains(&alpha),
+            view.collapsed_by(CLIENT).contains(&alpha),
             "the client keeps alpha collapsed"
         );
         assert_eq!(view.inspector().selected(), Some(xray));
         // The switch that commits starts the table with nothing collapsed.
         view.set_view(&session, Some(false)).unwrap();
-        assert!(view.collapsed.is_empty());
+        assert!(view.collapsed_by(CLIENT).is_empty());
         assert_eq!(view.inspector().selected(), Some(xray));
     }
 
@@ -6770,7 +7037,8 @@ mod disclosure_commit_tests {
         let alpha = item(&view, 10);
         let rho = item(&view, 20);
         let xray = item(&view, 13);
-        view.select_item_in(&session, TREE, Some(xray)).unwrap();
+        view.select_item_in(&session, CLIENT, TREE, Some(xray))
+            .unwrap();
         collapse(&session, &mut view, 10);
         collapse(&session, &mut view, 20);
         let both: HashSet<ItemId> = [alpha, rho].into_iter().collect();
@@ -6786,12 +7054,12 @@ mod disclosure_commit_tests {
                 .set_filter(&session, "alpha | beta | mid | xray")
                 .is_err());
         }
-        assert_eq!(view.collapsed, both, "nothing pruned");
+        assert_eq!(view.collapsed_by(CLIENT), both, "nothing pruned");
         assert_eq!(view.inspector().selected(), Some(xray), "nothing cleared");
         // The filter that commits hides rho and puts xray under alpha.
         view.set_filter(&session, "alpha | beta | mid | xray")
             .unwrap();
-        assert_eq!(view.collapsed, [alpha].into_iter().collect());
+        assert_eq!(view.collapsed_by(CLIENT), [alpha].into_iter().collect());
         assert_eq!(view.inspector().selected(), None);
     }
 
@@ -6815,6 +7083,44 @@ mod disclosure_commit_tests {
         }
         view.jump_to_pid(&session, "4").unwrap();
         let open: HashSet<ItemId> = [item(&view, 5), item(&view, 7)].into_iter().collect();
-        assert_eq!(view.collapsed, open, "only the match's ancestors opened");
+        assert_eq!(
+            view.collapsed_by(CLIENT),
+            open,
+            "only the match's ancestors opened"
+        );
+    }
+
+    /// Codex review round 4: the per-client mirror is bounded. A client with
+    /// nothing collapsed holds no entry; past [`MAX_DISCLOSURE_CLIENTS`] the
+    /// least recently reporting client is evicted (and mirrored all
+    /// expanded); leaving the tree forgets every client.
+    #[test]
+    fn the_per_client_mirror_is_bounded_and_closed() {
+        let mut source = Family::new(&[(10, "alpha", 0, 10), (11, "beta", 10, 11)]);
+        let (session, mut view) = tree(&mut source);
+        let alpha = item(&view, 10);
+        let client = |index: usize| format!("client-{index}").into_bytes();
+        for index in 0..=MAX_DISCLOSURE_CLIENTS {
+            view.expansion_changed(&session, &client(index), TREE, alpha, false)
+                .unwrap();
+        }
+        assert_eq!(view.disclosure_clients(), MAX_DISCLOSURE_CLIENTS);
+        assert!(
+            view.collapsed_by(&client(0)).is_empty(),
+            "the oldest evicted"
+        );
+        assert!(view.collapsed_by(&client(1)).contains(&alpha));
+        let last = client(MAX_DISCLOSURE_CLIENTS);
+        assert!(view.collapsed_by(&last).contains(&alpha));
+        // Expanding its last collapsed item drops the client's entry.
+        view.expansion_changed(&session, &last, TREE, alpha, true)
+            .unwrap();
+        assert_eq!(view.disclosure_clients(), MAX_DISCLOSURE_CLIENTS - 1);
+        // An expansion from a client never mirrored adds nothing.
+        view.expansion_changed(&session, b"never-collapsed", TREE, alpha, true)
+            .unwrap();
+        assert_eq!(view.disclosure_clients(), MAX_DISCLOSURE_CLIENTS - 1);
+        view.set_view(&session, Some(false)).unwrap();
+        assert_eq!(view.disclosure_clients(), 0);
     }
 }

@@ -1393,6 +1393,118 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
+    /// PX-018, Codex review round 4: disclosure is each client's own. The first client selects and
+    /// follows `cc`, then collapses its parent `make`, which hides it there. A second client that
+    /// attaches to the same running srtop starts with every item expanded and inherits nothing of
+    /// that collapse; selecting `ld`, a child of `make` it shows, is its own selection: the
+    /// inspector describes it and follow retargets to it, in the tree and not hidden.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func aFreshClientDoesNotInheritAnotherClientsCollapsedParent() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-tree", "--refresh-interval-ms", "300000"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the first client with its view switch") {
+            applier.lastAppliedRevision.value >= 1
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(Self.treeID)) != nil
+                && renderer.registry.handle(for: NodeId(Self.viewToggleID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        SurfacePresentation.forHostApplication().present(window)
+        window.contentView?.layoutSubtreeIfNeeded()
+        renderer.layoutRenderer.shortcutRouter.isWindowKey = { $0 === window }
+        /// One client's tree: its outline, its adapter, and the shared status lines it shows.
+        @MainActor
+        struct Client {
+            let applier: TransactionApplier
+            let outline: NSOutlineView
+            let adapter: OutlineCollectionAdapter
+            let inspector: NSTextField
+            let follow: NSTextField
+            func pids() -> [String] {
+                (0..<outline.numberOfRows).map { row in
+                    (outline.view(atColumn: 0, row: row, makeIfNecessary: true)
+                        as? OutlineCollectionAdapter.TreeCellView)?.label.stringValue ?? ""
+                }
+            }
+            func row(_ pid: String) throws -> Int { try #require(pids().firstIndex(of: pid), "PID \(pid) is shown") }
+            func item(_ pid: String) throws -> ItemId {
+                let model = try #require(applier.store.getModel(ModelId(2)))
+                return try #require(model.getItemByIndex(adapter.modelIndex(forRow: try row(pid)))).itemID
+            }
+        }
+        func client(_ renderer: AppKitRenderer, _ applier: TransactionApplier) throws -> Client {
+            let tree = try #require(renderer.registry.handle(for: NodeId(Self.treeID)))
+            return Client(
+                applier: applier,
+                outline: try #require((tree.view as? NSScrollView)?.documentView as? NSOutlineView),
+                adapter: try #require(tree.modelAdapter as? OutlineCollectionAdapter),
+                inspector: try #require(renderer.registry.handle(for: NodeId(Self.inspectorLineIDs[0]))?.view as? NSTextField),
+                follow: try #require(renderer.registry.handle(for: NodeId(Self.followStatusID))?.view as? NSTextField))
+        }
+        let first = try client(renderer, applier)
+        let treeKey = try Self.keyEvent("t", [.command], keyCode: 17, in: window)
+        let followKey = try Self.keyEvent("f", [.command, .shift], keyCode: 3, in: window)
+        let viewToggle = try #require(renderer.registry.handle(for: NodeId(Self.viewToggleID))?.view as? NSButton)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the switch enabled") { viewToggle.isEnabled }
+        #expect(window.performKeyEquivalent(with: treeKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the first client's tree") {
+            first.outline.numberOfRows == 12
+        }
+        first.outline.selectRowIndexes(IndexSet(integer: try first.row("310")), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on cc") {
+            first.inspector.stringValue.hasPrefix("Selected process: PID 310 · cc")
+        }
+        #expect(window.performKeyEquivalent(with: followKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "following cc in the tree") {
+            first.follow.stringValue.hasPrefix("Following PID 310 · cc · item 5 of 12 in the tree")
+        }
+        // The first client collapses `make`: `cc` is hidden there, so its selection is gone.
+        let make = try first.item("300")
+        #expect(first.adapter.setExpanded(false, itemID: make, outlineView: first.outline))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the server told of the collapse") {
+            first.inspector.stringValue == "Selected process: none · select a row to inspect it"
+                && first.follow.stringValue.hasPrefix("Following PID 310 · cc · hidden under collapsed PID 300 · make")
+        }
+
+        // A second client attaches to the same srtop: every item is expanded there.
+        let (secondController, secondApplier, secondRenderer) =
+            Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await secondController.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "a second client's tree") {
+            secondController.isEventDispatchEnabled
+                && secondRenderer.registry.handle(for: NodeId(Self.treeID)) != nil
+                && secondApplier.lastAppliedRevision == applier.lastAppliedRevision
+                && ((secondRenderer.registry.handle(for: NodeId(Self.treeID))?.view as? NSScrollView)?
+                    .documentView as? NSOutlineView)?.numberOfRows == 12
+        }
+        let secondWindow = try #require(secondRenderer.registry.handle(for: NodeId(1))?.window)
+        defer { secondWindow.orderOut(nil); secondWindow.close() }
+        SurfacePresentation.forHostApplication().present(secondWindow)
+        secondWindow.contentView?.layoutSubtreeIfNeeded()
+        let second = try client(secondRenderer, secondApplier)
+        #expect(second.adapter.isExpanded(make) && second.adapter.collapsedItemIDs.isEmpty, "nothing inherited")
+        #expect(second.pids() == ["1", "100", "200", "300", "310", "311", "301", "700", "500", "600", "800", "801"])
+        #expect(first.pids().count == 10, "still collapsed on the first client")
+        // Selecting `ld`, which it shows, is the second client's selection.
+        second.outline.selectRowIndexes(IndexSet(integer: try second.row("311")), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the second client's selection described") {
+            second.inspector.stringValue.hasPrefix("Selected process: PID 311 · ld")
+                && second.follow.stringValue.hasPrefix("Following PID 311 · ld · item 6 of 12 in the tree")
+                && first.follow.stringValue.hasPrefix("Following PID 311 · ld · item 6 of 12 in the tree")
+        }
+        #expect(!second.follow.stringValue.contains("hidden"))
+        #expect(second.outline.selectedRowIndexes == IndexSet(integer: try second.row("311")))
+        print("PX-018 Codex round 4 native SSH evidence: first window \(window.windowNumber) rows=\(first.pids()); second window \(secondWindow.windowNumber) rows=\(second.pids()); inspector=\(second.inspector.stringValue); follow=\(second.follow.stringValue); revision=\(secondApplier.lastAppliedRevision.value)")
+        await secondController.stop()
+        await controller.stop()
+    }
+
     /// PX-017 on `keep_visible`: rapid arrow keys while following are never overwritten, even
     /// when a sample lands mid-burst. Under the CPU sort, each round starts on row 36 and presses
     /// Down 20 times (real key-down events into the native table), clicking Refresh now after the

@@ -23,9 +23,9 @@ use srui_process_explorer::inspector::NO_SELECTION_STATUS;
 use srui_process_explorer::refresh::{lock_view, ProcessView, SharedView, ViewMode};
 use srui_process_explorer::source::*;
 use srui_process_explorer::{
-    install_follow_handlers, install_inspector, install_view_handlers, start_from_source,
-    FOLLOW_STATUS, INSPECTOR_STATUS, LIST_SHORTCUT, MODEL, TABLE, TREE, TREE_MODEL, VIEW_STATUS,
-    VIEW_TOGGLE,
+    install_follow_handlers, install_inspector, install_search_handlers, install_view_handlers,
+    start_from_source, FOLLOW_STATUS, INSPECTOR_STATUS, LIST_SHORTCUT, MODEL, PID_GO, TABLE, TREE,
+    TREE_MODEL, VIEW_STATUS, VIEW_TOGGLE,
 };
 use srui_protocol::{operation, ClientModelRangeRequest, DEFAULT_MAX_FRAME_SIZE};
 use srui_sdk::{
@@ -33,11 +33,13 @@ use srui_sdk::{
 };
 use srui_semantic_tree::{EnumToken, Event as DomainEvent, SemanticStore, StandardVisibility};
 use srui_sessiond::{EventOutcome, ModelRangeFulfillment, Session};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 const CLIENT: &[u8] = b"tree-client-instance";
+/// Another client instance attached to the same session.
+const OTHER: &[u8] = b"tree-other-client-instance";
 
 /// One row of the published tree, as a client reads it off the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +57,8 @@ struct Harness {
     view: SharedView,
     replica: SemanticStore,
     seq: u64,
+    /// The event sequence of every client but [`CLIENT`].
+    other_seqs: HashMap<Vec<u8>, u64>,
 }
 
 fn harness(source: &mut impl ProcessSource) -> Harness {
@@ -70,12 +74,14 @@ fn harness_with(
     let view: SharedView = Arc::new(Mutex::new(adjust(view)));
     install_view_handlers(&session, &view);
     install_follow_handlers(&session, &view);
+    install_search_handlers(&session, &view);
     install_inspector(&session, &view, None);
     let mut harness = Harness {
         session,
         view,
         replica: SemanticStore::new(),
         seq: 0,
+        other_seqs: HashMap::new(),
     };
     harness.sync();
     harness
@@ -107,17 +113,39 @@ impl Harness {
     }
 
     fn send(&mut self, node: NodeId, event: TypeRef, arguments: Vec<(PropertyRef, Value)>) {
-        self.seq += 1;
+        self.send_from(CLIENT, node, event, arguments);
+    }
+
+    /// The next event sequence number of `client`, each client's own.
+    fn next_seq(&mut self, client: &[u8]) -> u64 {
+        let seq = if client == CLIENT {
+            &mut self.seq
+        } else {
+            self.other_seqs.entry(client.to_vec()).or_default()
+        };
+        *seq += 1;
+        *seq
+    }
+
+    /// One event from `client`, at the current revision.
+    fn send_from(
+        &mut self,
+        client: &[u8],
+        node: NodeId,
+        event: TypeRef,
+        arguments: Vec<(PropertyRef, Value)>,
+    ) {
+        let seq = self.next_seq(client);
         let wire = DomainEvent::new(
             None,
-            self.seq,
-            format!("tree-event-{}", self.seq),
+            seq,
+            format!("tree-event-{seq}"),
             self.revision(),
             node,
             event,
             arguments,
         )
-        .with_client_instance_id(CLIENT.to_vec())
+        .with_client_instance_id(client.to_vec())
         .to_wire();
         let outcome = self.session.process_event(&wire).expect("event admitted");
         assert!(
@@ -137,7 +165,12 @@ impl Harness {
     }
 
     fn select(&mut self, node: NodeId, item: ItemId) {
-        self.send(
+        self.select_from(CLIENT, node, item);
+    }
+
+    fn select_from(&mut self, client: &[u8], node: NodeId, item: ItemId) {
+        self.send_from(
+            client,
             node,
             TypeRef::EVENT_SELECTION_CHANGED,
             vec![(PropertyRef::VALUE, Value::ItemId(item))],
@@ -145,16 +178,20 @@ impl Harness {
     }
 
     fn disclose(&mut self, item: ItemId, expanded: bool) {
-        self.seq += 1;
+        self.disclose_from(CLIENT, item, expanded);
+    }
+
+    fn disclose_from(&mut self, client: &[u8], item: ItemId, expanded: bool) {
+        let seq = self.next_seq(client);
         let wire = DomainEvent::expansion_changed(
-            self.seq,
-            format!("tree-disclosure-{}", self.seq),
+            seq,
+            format!("tree-disclosure-{seq}"),
             self.revision(),
             TREE,
             item,
             expanded,
         )
-        .with_client_instance_id(CLIENT.to_vec())
+        .with_client_instance_id(client.to_vec())
         .to_wire();
         let outcome = self.session.process_event(&wire).expect("event admitted");
         assert!(matches!(outcome, EventOutcome::Processed { .. }));
@@ -167,6 +204,31 @@ impl Harness {
             TypeRef::EVENT_VALUE_CHANGED,
             vec![(PropertyRef::VALUE, Value::Bool(on))],
         );
+    }
+
+    /// A fresh client instance attaches to the running session: it takes
+    /// the catch-up snapshot, which carries rows and hints but no disclosure,
+    /// so its outline starts with every item expanded.
+    fn attach(&mut self, client: &[u8]) {
+        let hello = srui_protocol::ClientHello {
+            core_version: "0.5.0".to_string(),
+            profiles: vec!["org.srui.standard-widgets/1".to_string()],
+            limits: None,
+            client_instance_id: client.to_vec(),
+            client_metadata: Default::default(),
+            known_resource_hashes: vec![],
+        };
+        let snapshot = self
+            .session
+            .bootstrap_fresh_client(&hello)
+            .expect("a fresh client attaches")
+            .snapshot
+            .expect("a catch-up snapshot");
+        let snapshot = srui_semantic_tree::ResyncSnapshot::try_from(snapshot)
+            .expect("the catch-up snapshot decodes");
+        SemanticStore::new()
+            .replace_from_snapshot(&snapshot)
+            .expect("the fresh client accepts the snapshot");
     }
 
     fn sample(&mut self, source: &mut impl ProcessSource) {
@@ -900,7 +962,7 @@ fn a_collapse_that_hides_the_selection_clears_the_inspector_and_follow_says_wher
     assert_eq!(h.view().follow().following(), Some(cc), "follow stays on");
     assert_eq!(h.tree(), rows, "disclosure publishes no row");
     assert!(h.tree_operations_since(before).is_empty());
-    assert!(h.view().collapsed().contains(&session));
+    assert!(h.view().collapsed_by(CLIENT).contains(&session));
     // Expanding `session` while `make` is still open shows it again.
     h.disclose(session, true);
     assert!(h
@@ -919,7 +981,7 @@ fn a_collapse_that_hides_the_selection_clears_the_inspector_and_follow_says_wher
     assert_eq!(h.revision(), ignored);
     // When `make` ends, it leaves the collapsed set with its row.
     h.sample(&mut source);
-    assert!(!h.view().collapsed().contains(&make));
+    assert!(!h.view().collapsed_by(CLIENT).contains(&make));
     assert!(h
         .text(FOLLOW_STATUS)
         .starts_with("Following PID 310 · cc · item"));
@@ -1361,7 +1423,7 @@ fn a_collapsed_process_that_loses_its_last_child_stays_collapsed_for_the_next_on
     h.select(TREE, foxtrot);
     h.follow(true);
     h.disclose(alpha, false);
-    assert!(h.view().collapsed().contains(&alpha));
+    assert!(h.view().collapsed_by(CLIENT).contains(&alpha));
     // `beta` ends: `alpha` has no child left, and stays collapsed, as on the
     // client.
     source
@@ -1377,7 +1439,7 @@ fn a_collapsed_process_that_loses_its_last_child_stays_collapsed_for_the_next_on
         0
     );
     assert!(
-        h.view().collapsed().contains(&alpha),
+        h.view().collapsed_by(CLIENT).contains(&alpha),
         "a collapsed leaf stays collapsed while the tree holds it"
     );
     // `foxtrot` is reparented under `alpha`, which the client still keeps
@@ -1408,7 +1470,7 @@ fn a_collapsed_process_that_loses_its_last_child_stays_collapsed_for_the_next_on
         .records
         .retain(|record| record.key.pid != Observed::Known(10));
     h.sample(&mut source);
-    assert!(!h.view().collapsed().contains(&alpha));
+    assert!(!h.view().collapsed_by(CLIENT).contains(&alpha));
 }
 
 /// Codex review round 1, finding 2: a refresh, or a republish, that places
@@ -1491,7 +1553,7 @@ fn a_selected_process_moved_under_a_collapsed_parent_clears_the_inspector() {
     h.show_tree(false);
     h.select(TABLE, xray);
     h.show_tree(true);
-    assert!(h.view().collapsed().is_empty());
+    assert!(h.view().collapsed_by(CLIENT).is_empty());
     assert!(h.text(INSPECTOR_STATUS).contains("PID 13"));
     assert!(h
         .text(FOLLOW_STATUS)
@@ -1523,7 +1585,7 @@ fn a_sample_between_a_search_reveal_and_its_expansion_report_keeps_the_match() {
     assert_eq!(h.item_property(TREE, VALUE), Some(beta), "promoted");
     assert!(h.text(INSPECTOR_STATUS).contains("PID 11"));
     assert!(
-        !h.view().collapsed().contains(&alpha),
+        !h.view().collapsed_by(CLIENT).contains(&alpha),
         "the reveal expanded alpha in the mirror"
     );
     // The client's `EXPANSION_CHANGED(true)` is still in flight.
@@ -1586,7 +1648,7 @@ fn a_disclosure_report_for_an_item_that_became_a_leaf_is_still_mirrored() {
     );
     h.disclose(alpha, true);
     assert!(
-        !h.view().collapsed().contains(&alpha),
+        !h.view().collapsed_by(CLIENT).contains(&alpha),
         "the late report is mirrored"
     );
     // `xray` is reparented under `alpha`, which the client shows expanded.
@@ -1631,7 +1693,7 @@ fn a_disclosure_report_for_an_item_that_became_a_leaf_is_still_mirrored() {
     );
     h.disclose(alpha, false);
     assert!(
-        h.view().collapsed().contains(&alpha),
+        h.view().collapsed_by(CLIENT).contains(&alpha),
         "the late collapse is mirrored"
     );
     set_parent(&mut source, 10);
@@ -1710,4 +1772,144 @@ fn a_delayed_selection_of_a_row_now_hidden_by_a_collapsed_parent_is_not_applied(
     h.disclose(alpha, true);
     h.select(TREE, xray);
     assert!(h.text(INSPECTOR_STATUS).contains("PID 30"));
+}
+
+/// Codex review round 4: disclosure is each client's own. Client A collapses
+/// `alpha`, which hides the selected and followed `beta` there. A fresh
+/// client then attaches to the same running session: its outline starts all
+/// expanded and the snapshot carries no disclosure, so it shows `alpha`'s
+/// children and reports nothing. Its selection of a child it shows is its
+/// own: the inspector describes it, follow retargets to it and does not call
+/// it hidden, and a sample keeps it, whatever A keeps collapsed.
+#[test]
+fn a_fresh_client_does_not_inherit_another_clients_collapsed_parent() {
+    let mut source = family(&[
+        (10, "alpha", 0, 10),
+        (11, "beta", 10, 11),
+        (12, "gamma", 10, 12),
+        (30, "xray", 0, 60),
+    ]);
+    let mut h = harness(&mut source);
+    h.show_tree(true);
+    let alpha = h.item_of(10);
+    let beta = h.item_of(11);
+    let gamma = h.item_of(12);
+    h.select(TREE, beta);
+    h.follow(true);
+    h.disclose(alpha, false);
+    assert_eq!(h.text(INSPECTOR_STATUS), NO_SELECTION_STATUS);
+    assert!(h
+        .text(FOLLOW_STATUS)
+        .starts_with("Following PID 11 · beta · hidden under collapsed PID 10 · alpha"));
+
+    h.attach(OTHER);
+    h.select_from(OTHER, TREE, gamma);
+    let inspector = h.text(INSPECTOR_STATUS);
+    assert!(
+        inspector.starts_with("Selected process: PID 12 · gamma"),
+        "{inspector}"
+    );
+    assert_eq!(h.view().follow().following(), Some(gamma));
+    let follow = h.text(FOLLOW_STATUS);
+    assert!(
+        follow.starts_with("Following PID 12 · gamma · item 3 of 4 in the tree"),
+        "{follow}"
+    );
+    // A sample re-evaluates the selection against the selecting client's
+    // disclosure, not A's.
+    h.sample(&mut source);
+    assert!(h
+        .text(INSPECTOR_STATUS)
+        .starts_with("Selected process: PID 12 · gamma"));
+    // The process A could no longer see is selectable on the fresh client.
+    h.select_from(OTHER, TREE, beta);
+    assert!(h
+        .text(INSPECTOR_STATUS)
+        .starts_with("Selected process: PID 11 · beta"));
+    assert!(h
+        .text(FOLLOW_STATUS)
+        .starts_with("Following PID 11 · beta · item 2 of 4 in the tree"));
+    // A's mirror is A's alone.
+    assert!(h.view().collapsed_by(CLIENT).contains(&alpha));
+    assert!(h.view().collapsed_by(OTHER).is_empty());
+}
+
+/// Codex review round 4, two clients at once: a collapse on one client never
+/// clears the inspector or hides follow for a selection another client made
+/// and still shows; the selecting client's own collapse does.
+#[test]
+fn concurrent_clients_each_hide_only_their_own_selection() {
+    let mut source = family(&[
+        (10, "alpha", 0, 10),
+        (11, "beta", 10, 11),
+        (12, "gamma", 10, 12),
+        (30, "xray", 0, 60),
+    ]);
+    let mut h = harness(&mut source);
+    h.show_tree(true);
+    let alpha = h.item_of(10);
+    let beta = h.item_of(11);
+    // The other client selects and follows `beta`.
+    h.select_from(OTHER, TREE, beta);
+    h.follow(true);
+    // This client collapses `alpha`: nothing the other client sees changes.
+    let quiet = h.revision();
+    h.disclose(alpha, false);
+    assert_eq!(h.revision(), quiet, "nothing published");
+    assert!(h
+        .text(INSPECTOR_STATUS)
+        .starts_with("Selected process: PID 11 · beta"));
+    assert!(h
+        .text(FOLLOW_STATUS)
+        .starts_with("Following PID 11 · beta · item 2 of 4 in the tree"));
+    h.sample(&mut source);
+    assert!(h
+        .text(INSPECTOR_STATUS)
+        .starts_with("Selected process: PID 11 · beta"));
+    // The other client collapses `alpha` too: its own selection is hidden.
+    h.disclose_from(OTHER, alpha, false);
+    assert_eq!(h.text(INSPECTOR_STATUS), NO_SELECTION_STATUS);
+    assert!(h
+        .text(FOLLOW_STATUS)
+        .starts_with("Following PID 11 · beta · hidden under collapsed PID 10 · alpha"));
+    // It expands it again and reselects; this client's collapse still
+    // leaves that selection alone.
+    h.disclose_from(OTHER, alpha, true);
+    h.select_from(OTHER, TREE, beta);
+    assert!(h
+        .text(INSPECTOR_STATUS)
+        .starts_with("Selected process: PID 11 · beta"));
+    assert!(h
+        .text(FOLLOW_STATUS)
+        .starts_with("Following PID 11 · beta · item 2 of 4 in the tree"));
+}
+
+/// Codex review round 4: a Go to PID promotion reveals its match on every
+/// client, and is the clicking client's selection: another client's later
+/// collapse does not clear it.
+#[test]
+fn a_promotion_is_the_selection_of_the_client_that_asked_for_it() {
+    let mut source = family(&[
+        (10, "alpha", 0, 10),
+        (11, "beta", 10, 11),
+        (30, "xray", 0, 60),
+    ]);
+    let mut h = harness(&mut source);
+    h.show_tree(true);
+    let alpha = h.item_of(10);
+    let beta = h.item_of(11);
+    h.disclose(alpha, false);
+    h.view().set_pid_input(&h.session, "11").unwrap();
+    h.sync();
+    h.send_from(OTHER, PID_GO, TypeRef::EVENT_ACTIVATE, vec![]);
+    assert_eq!(h.item_property(TREE, VALUE), Some(beta), "promoted");
+    assert!(h
+        .text(INSPECTOR_STATUS)
+        .starts_with("Selected process: PID 11 · beta"));
+    // This client re-collapses `alpha` after the reveal: the promotion was
+    // the other client's, which still shows it.
+    h.disclose(alpha, false);
+    assert!(h
+        .text(INSPECTOR_STATUS)
+        .starts_with("Selected process: PID 11 · beta"));
 }

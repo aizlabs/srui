@@ -30,6 +30,7 @@ struct CodingAgentFallbackSocketTests {
             "coding-agent demo binary missing; build examples/coding-agent-demo before Swift tests"
         )
 
+        try await FixtureBinaries.absorbFirstLaunchAssessment(binary.path, arguments: FixtureBinaries.codingAgentRefusal)
         let server = Process()
         server.executableURL = binary
         server.arguments = ["--socket", socketPath]

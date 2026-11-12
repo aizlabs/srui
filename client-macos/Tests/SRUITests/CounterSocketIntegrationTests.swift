@@ -35,6 +35,7 @@ struct CounterSocketIntegrationTests {
         let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
         defer { TestFixtureDirectory.release(runtimeDirectory) }
 
+        try await FixtureBinaries.absorbFirstLaunchAssessment(counterBinary.path, arguments: FixtureBinaries.counterRefusal)
         let server = Process()
         server.executableURL = counterBinary
         server.arguments = ["--socket", socketPath]
@@ -82,6 +83,7 @@ struct CounterSocketIntegrationTests {
         defer { TestFixtureDirectory.release(tempDir) }
         let socketPath = tempDir.appendingPathComponent("counter.sock").path
 
+        try await FixtureBinaries.absorbFirstLaunchAssessment(counterBinary.path, arguments: FixtureBinaries.counterRefusal)
         let server = Process()
         server.executableURL = counterBinary
         server.arguments = ["--socket", socketPath]
@@ -165,6 +167,7 @@ struct CounterSocketIntegrationTests {
             return
         }
 
+        try await FixtureBinaries.absorbFirstLaunchAssessment(counterBinary.path, arguments: FixtureBinaries.counterRefusal)
         let server = Process()
         server.executableURL = counterBinary
         server.arguments = ["--socket", socketPath]
@@ -236,6 +239,7 @@ struct CounterSocketIntegrationTests {
             return
         }
 
+        try await FixtureBinaries.absorbFirstLaunchAssessment(counterBinary.path, arguments: FixtureBinaries.counterRefusal)
         let server = Process()
         server.executableURL = counterBinary
         server.arguments = ["--socket", socketPath, "--require-profile", "org.srui.unsupported-feature/1"]
@@ -297,6 +301,7 @@ struct CounterSocketIntegrationTests {
             "counter binary lacks --image-fixture; rebuild examples/counter"
         )
 
+        try await FixtureBinaries.absorbFirstLaunchAssessment(counterBinary.path, arguments: FixtureBinaries.counterRefusal)
         let server = Process()
         server.executableURL = counterBinary
         server.arguments = ["--socket", socketPath, "--image-fixture"]
@@ -374,6 +379,7 @@ struct CounterSocketIntegrationTests {
             "counter binary lacks --image-fixture; rebuild examples/counter"
         )
 
+        try await FixtureBinaries.absorbFirstLaunchAssessment(counterBinary.path, arguments: FixtureBinaries.counterRefusal)
         let server = Process()
         server.executableURL = counterBinary
         server.arguments = ["--socket", socketPath, "--image-fixture"]

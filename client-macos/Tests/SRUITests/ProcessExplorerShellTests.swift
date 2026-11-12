@@ -3344,8 +3344,9 @@ struct ProcessExplorerShellTests {
         try #require(FileManager.default.isExecutableFile(atPath: bridgeBinary.path),
                      "The real SSH bridge is required; this test must not soft-skip")
         // Neither run does anything: srtop with no arguments prints its usage, the bridge with a
-        // bare `--socket` refuses it. Only the exec matters (see `assessedExecutables`).
-        try await absorbFirstLaunchAssessment(of: [(appBinary.path, []), (bridgeBinary.path, ["--socket"])])
+        // bare `--socket` refuses it. Only the exec matters (see `FixtureBinaries`).
+        try await FixtureBinaries.absorbFirstLaunchAssessment(appBinary.path, arguments: FixtureBinaries.srtopRefusal)
+        try await FixtureBinaries.absorbFirstLaunchAssessment(bridgeBinary.path, arguments: FixtureBinaries.bridgeRefusal)
         let temp = try TestFixtureDirectory.make(prefix: "px001")
         let socket = temp.appendingPathComponent("s.sock").path
         let hostKey = temp.appendingPathComponent("host_key").path
@@ -3409,24 +3410,6 @@ struct ProcessExplorerShellTests {
             }
             TestFixtureDirectory.release(temp)
             throw error
-        }
-    }
-
-    /// Executables this process has already run once.
-    ///
-    /// macOS assesses a newly linked executable on its first exec, before `main`, and
-    /// `apps/srtop/test.sh` relinks srtop and the bridge right before these tests (`cargo test`
-    /// and `cargo build` alternately replace `target/debug/srtop`). Measured on a busy machine: the first
-    /// exec took 12–19 s, the next 0.02 s. Charged to a 5 s socket wait, or to an SSH session
-    /// whose subsystem is that bridge, the assessment failed tests with nothing wrong in srtop.
-    @MainActor private static var assessedExecutables: Set<String> = []
-
-    /// Runs each executable once, outside every deadline; the test's `.timeLimit` bounds it.
-    @MainActor
-    private static func absorbFirstLaunchAssessment(of runs: [(path: String, arguments: [String])]) async throws {
-        for run in runs where !assessedExecutables.contains(run.path) {
-            _ = try await runToCompletion(run.path, run.arguments)
-            assessedExecutables.insert(run.path)
         }
     }
 

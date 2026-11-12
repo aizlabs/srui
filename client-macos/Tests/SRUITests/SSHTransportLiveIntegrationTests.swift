@@ -68,6 +68,8 @@ struct SSHTransportLiveIntegrationTests {
         try sshdConfigContent.write(to: URL(fileURLWithPath: sshdConfigPath), atomically: true, encoding: .utf8)
 
         // 1. Launch Rust counter server
+        try await FixtureBinaries.absorbFirstLaunchAssessment(counterBinary.path, arguments: FixtureBinaries.counterRefusal)
+        try await FixtureBinaries.absorbFirstLaunchAssessment(bridgeBinary.path, arguments: FixtureBinaries.bridgeRefusal)
         let counterServer = Process()
         counterServer.executableURL = counterBinary
         counterServer.arguments = ["--socket", socketPath]

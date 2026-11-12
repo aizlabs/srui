@@ -62,9 +62,15 @@ private final class StderrAccumulator: @unchecked Sendable {
 /// The SSH child's exit status, recorded by its termination handler, so a failed write can report
 /// why the child went away rather than the `EPIPE` its exit caused (§19.1, §25, §4 inv. 13).
 private final class ChildExitRecord: @unchecked Sendable {
+    private struct Waiter {
+        let continuation: CheckedContinuation<Int32?, Never>
+        /// Ends the wait at its bound; cancelled once the wait ends any other way.
+        let timer: Task<Void, Never>
+    }
+
     private let lock = NSLock()
     private var status: Int32?
-    private var waiters: [UUID: CheckedContinuation<Int32?, Never>] = [:]
+    private var waiters: [UUID: Waiter] = [:]
 
     /// The recorded status, without waiting.
     var recorded: Int32? {
@@ -85,26 +91,51 @@ private final class ChildExitRecord: @unchecked Sendable {
         waiters.removeAll()
         lock.unlock()
         for waiter in parked.values {
-            waiter.resume(returning: exitStatus)
+            waiter.timer.cancel()
+            waiter.continuation.resume(returning: exitStatus)
         }
     }
 
-    /// The exit status, waiting at most `timeout` for the child to exit; `nil` if it has not.
+    /// The exit status, waiting at most `timeout` for the child to exit; `nil` if it has not, if
+    /// the calling task is cancelled, or if `expireAll()` ends the wait first.
     func status(waitingAtMost timeout: Duration) async -> Int32? {
         let id = UUID()
-        return await withCheckedContinuation { continuation in
-            lock.lock()
-            if let status {
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                if let status {
+                    lock.unlock()
+                    continuation.resume(returning: status)
+                    return
+                }
+                // Checked under the lock: a cancellation that ran its handler before this
+                // registration found nothing to expire, and is caught here instead.
+                if Task.isCancelled {
+                    lock.unlock()
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let timer = Task {
+                    try? await Task.sleep(for: timeout)
+                    self.expire(id)
+                }
+                waiters[id] = Waiter(continuation: continuation, timer: timer)
                 lock.unlock()
-                continuation.resume(returning: status)
-                return
             }
-            waiters[id] = continuation
-            lock.unlock()
-            Task {
-                try? await Task.sleep(for: timeout)
-                self.expire(id)
-            }
+        } onCancel: {
+            self.expire(id)
+        }
+    }
+
+    /// Ends every wait now, without a status: the transport is closing.
+    func expireAll() {
+        lock.lock()
+        let parked = waiters
+        waiters.removeAll()
+        lock.unlock()
+        for waiter in parked.values {
+            waiter.timer.cancel()
+            waiter.continuation.resume(returning: nil)
         }
     }
 
@@ -112,7 +143,8 @@ private final class ChildExitRecord: @unchecked Sendable {
         lock.lock()
         let waiter = waiters.removeValue(forKey: id)
         lock.unlock()
-        waiter?.resume(returning: nil)
+        waiter?.timer.cancel()
+        waiter?.continuation.resume(returning: nil)
     }
 }
 
@@ -323,10 +355,17 @@ public actor SSHTransport: Transport {
         } catch let error as TransportError {
             // A write fails with `EPIPE` once the child has closed its stdin, which `ssh` does by
             // exiting. Classify by that exit (bounded wait), not by the order the two were seen.
-            if case .ioError = error, !isClosed,
-               let status = await childExit.status(waitingAtMost: childExitClassificationBound),
-               let failure = Self.exitFailure(status: status, stderr: stderrAccumulator.summary()) {
-                throw failure
+            if case .ioError = error, !isClosed {
+                let status = await childExit.status(waitingAtMost: childExitClassificationBound)
+                // Re-checked after the wait: a `close()` made meanwhile terminated the child
+                // itself, so its exit status (SIGTERM) says nothing about the connection.
+                if isClosed {
+                    throw exitFailureAtClose ?? TransportError.closed
+                }
+                if let status,
+                   let failure = Self.exitFailure(status: status, stderr: stderrAccumulator.summary()) {
+                    throw failure
+                }
             }
             let stderrDiag = stderrAccumulator.summary()
             guard !stderrDiag.isEmpty else { throw error }
@@ -466,6 +505,9 @@ public actor SSHTransport: Transport {
         exitFailureAtClose = childExit.recorded.flatMap {
             Self.exitFailure(status: $0, stderr: stderrAccumulator.summary())
         }
+        // A send waiting to classify its failed write resolves as `.closed` now, rather than
+        // after the bound or on the SIGTERM this close sends.
+        childExit.expireAll()
 
         let wasConnected = isConnected
         isConnected = false

@@ -160,36 +160,18 @@ enum SSHTestSupport {
         SSHDRegistry.shared.remove(pid)
     }
 
-    /// Writes an executable `/bin/sh` stand-in at `path` and runs it once, outside every test
-    /// deadline, before returning.
+    /// A `/bin/sh` stand-in for `ssh`, written and run once per suite per process, that runs
+    /// whatever its suite last wrote to `behavior`.
     ///
     /// macOS assesses a newly written executable on its first exec, before it runs a line: right
     /// after a loaded run, a fresh two-line script took 6-13 s to start and 0.03 s the next time.
     /// A stub's first real run sits inside a test's wait, so that assessment failed
-    /// `SSHTransportDescriptorOwnershipTests` ("Timed out waiting for stub wrote its pid") with
-    /// nothing wrong. The warm-up run passes `--srui-warm-up`, which the prologue added here
-    /// answers by exiting; no `ssh` argument vector starts with it.
-    static func writeAssessedStub(at path: String, body: String) async throws {
-        let script = "#!/bin/sh\n[ \"$1\" = \"--srui-warm-up\" ] && exit 0\n" + body + "\n"
-        try script.write(to: URL(fileURLWithPath: path), atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
-        let warmUp = Process()
-        warmUp.executableURL = URL(fileURLWithPath: path)
-        warmUp.arguments = ["--srui-warm-up"]
-        warmUp.standardInput = FileHandle.nullDevice
-        warmUp.standardOutput = FileHandle.nullDevice
-        warmUp.standardError = FileHandle.nullDevice
-        // Awaited through the termination handler, not `waitUntilExit()`, which would service the
-        // main run loop of a main-actor caller.
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            warmUp.terminationHandler = { _ in continuation.resume() }
-            do {
-                try warmUp.run()
-            } catch {
-                warmUp.terminationHandler = nil
-                continuation.resume(throwing: error)
-            }
-        }
+    /// `SSHTransportDescriptorOwnershipTests` ("Timed out waiting for stub wrote its pid"), and a
+    /// fresh stub per test paid it again inside each test's time limit. One stub per suite pays it
+    /// once, here, outside every deadline; `behavior` is sourced, not executed, so changing it
+    /// costs nothing. The suite must be `.serialized`: its tests share `behavior`.
+    static func assessedStub(for suite: String) async throws -> (path: String, behavior: String) {
+        try await AssessedStubs.shared.stub(for: suite)
     }
 
     static func generateEd25519Key(at path: String) throws {
@@ -228,5 +210,74 @@ enum SSHTestSupportError: Error, CustomStringConvertible {
         case .portTimeout(let port):
             return "timed out waiting for port \(port) to open"
         }
+    }
+}
+
+/// One assessed stub per suite, per process. The directories are `TestFixtureDirectory`s, removed
+/// by its exit hook.
+private actor AssessedStubs {
+    static let shared = AssessedStubs()
+    private var stubs: [String: Task<(path: String, behavior: String), Error>] = [:]
+
+    func stub(for suite: String) async throws -> (path: String, behavior: String) {
+        if let existing = stubs[suite] {
+            return try await existing.value
+        }
+        let task = Task<(path: String, behavior: String), Error> {
+            let directory = try TestFixtureDirectory.make(prefix: "srui-stub")
+            let path = directory.appendingPathComponent("ssh-stub").path
+            let behavior = directory.appendingPathComponent("behavior.sh").path
+            // The warm-up passes `--srui-warm-up`, which no `ssh` argument vector starts with.
+            let script = "#!/bin/sh\n[ \"$1\" = \"--srui-warm-up\" ] && exit 0\n. \"\(behavior)\"\n"
+            try script.write(to: URL(fileURLWithPath: path), atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+            try await FixtureBinaries.absorbFirstLaunchAssessment(path, arguments: ["--srui-warm-up"])
+            return (path, behavior)
+        }
+        stubs[suite] = task
+        return try await task.value
+    }
+}
+
+/// Fixture executables launched by tests: each is run once per process, outside every test
+/// deadline, before its first real launch.
+///
+/// macOS assesses a newly linked executable on its first exec, before `main`. Measured on a busy
+/// machine: 12-19 s for the first exec of a just-relinked `srtop`, 0.02 s for the next (sampled
+/// stuck in `_dyld_start`). A fixture's first launch sits inside a socket or port wait of 5-10 s,
+/// so a rebuild of `srui-sessiond`, `counter` or the bridge failed tests with nothing wrong in
+/// them (`SSHTransportPersistenceIntegrationTests` failed 2 of 2 on its 5 s socket wait right after
+/// a sessiond relink). Each warm-up passes arguments that make the binary refuse and exit.
+enum FixtureBinaries {
+    nonisolated(unsafe) private static var assessed: Set<String> = []
+    /// Guards `assessed`.
+    private static let lock = NSLock()
+
+    static let sessiondRefusal = ["--socket"]
+    static let bridgeRefusal = ["--socket"]
+    static let counterRefusal = ["--port", "srui-warm-up"]
+    static let codingAgentRefusal: [String] = []
+    static let srtopRefusal: [String] = []
+
+    static func absorbFirstLaunchAssessment(_ path: String, arguments: [String]) async throws {
+        guard !lock.withLock({ assessed.contains(path) }) else { return }
+        let warmUp = Process()
+        warmUp.executableURL = URL(fileURLWithPath: path)
+        warmUp.arguments = arguments
+        warmUp.standardInput = FileHandle.nullDevice
+        warmUp.standardOutput = FileHandle.nullDevice
+        warmUp.standardError = FileHandle.nullDevice
+        // Awaited through the termination handler, not `waitUntilExit()`, which would service the
+        // main run loop of a main-actor caller. The calling test's `.timeLimit` bounds it.
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            warmUp.terminationHandler = { _ in continuation.resume() }
+            do {
+                try warmUp.run()
+            } catch {
+                warmUp.terminationHandler = nil
+                continuation.resume(throwing: error)
+            }
+        }
+        _ = lock.withLock { assessed.insert(path) }
     }
 }

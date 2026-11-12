@@ -769,11 +769,16 @@ struct TextEditingIntegrationTests {
             flushImmediately: true
         )
 
-        // The parked send is released only by the transport's close(), so stop() returning at all
-        // proves it closed rather than waited for the writer; a stop that waits hangs into the
-        // time limit. A 2 s wall-clock bound here failed under load (2.15 s) with nothing wrong.
+        // The parked send is released only by the transport's close() or by cancelling the
+        // send's task, so stop() returning at all proves it did one of them rather than wait for
+        // the writer; a stop that waits hangs into the time limit. The bound catches a stop that
+        // releases the writer only after a delay: it was 2 s, which failed under load at 2.15 s
+        // with nothing wrong, so it is 4 s, still under a 5 s stall before close().
+        let clock = ContinuousClock()
+        let started = clock.now
         await controller.stop()
-        #expect(await delayed.isClosed, "stop() released the blocked writer by closing the transport")
+        #expect(started.duration(to: clock.now) < .seconds(4))
+        #expect(await delayed.isClosed, "stop() closed the transport")
         #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID))
         #expect(renderer.textEditingSession.localValue(for: editorID) == "second")
         #expect(renderer.textEditingSession.nextEditSeqValue(for: editorID) == 3)

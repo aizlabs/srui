@@ -432,6 +432,13 @@ enum Selection {
     Process(Box<Selected>),
 }
 
+/// A selection and its generation, held across a plan (PX-018).
+#[derive(Debug, Clone)]
+pub(crate) struct HeldSelection {
+    generation: SelectionGeneration,
+    selection: Selection,
+}
+
 /// The inspector's server-side state: the current target, its generation and
 /// its details, and the detail worker.
 pub struct Inspector {
@@ -614,6 +621,32 @@ impl Inspector {
     pub(crate) fn refuse(&mut self, item: Option<ItemId>) {
         self.generation = self.generation.next();
         self.selection = Selection::Refused(item);
+    }
+
+    /// The selection and its generation, held so a plan that never reached
+    /// the client can put them back (PX-018).
+    pub(crate) fn hold(&self) -> HeldSelection {
+        HeldSelection {
+            generation: self.generation,
+            selection: self.selection.clone(),
+        }
+    }
+
+    /// Puts back a selection [`Self::hold`] held (PX-018). A detail read for
+    /// it that is still loading is accepted again when it returns.
+    pub(crate) fn restore(&mut self, held: HeldSelection) {
+        self.generation = held.generation;
+        self.selection = held.selection;
+    }
+
+    /// Describes nothing again, under a new generation (PX-018): the
+    /// selecting client no longer shows a selection, because a parent it
+    /// keeps collapsed in the tree hides the selected row. Unlike
+    /// [`Self::clear`], the user did not deselect, so follow stays on.
+    /// Nothing is read, and a read still loading is dropped when it returns.
+    pub(crate) fn clear_hidden(&mut self) {
+        self.generation = self.generation.next();
+        self.selection = Selection::None;
     }
 
     /// Records that the user left the table with nothing selected, under a

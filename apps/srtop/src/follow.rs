@@ -209,6 +209,35 @@ impl Follow {
         }
     }
 
+    /// The controls for a client that holds the process tree's preorder
+    /// `rows` (PX-018). Off and stopped read as in the table. On, the status
+    /// says where in the tree the followed process is, and when it is hidden
+    /// under `hidden_under`, a parent the client reported collapsed: the
+    /// tree's `keep_visible` hint never expands a parent, and a local expand
+    /// never scrolls (PX-017-G01), so the user is told to expand it.
+    pub(crate) fn view_tree(&self, rows: &[Row], hidden_under: Option<&Row>) -> FollowView {
+        let State::On(followed) = &self.state else {
+            return self.view(rows);
+        };
+        let status = match (hidden_under, position(rows, followed.item_id)) {
+            (Some(parent), _) => format!(
+                "Following {} · hidden under collapsed {}: expand it to see the followed process; the tree never expands it for you, and expanding never scrolls",
+                who(followed),
+                who(parent)
+            ),
+            (None, at) => format!(
+                "Following {}{} · the tree scrolls to it whenever it moves to another row; following never changes the selection, and scrolling yourself never stops it",
+                who(followed),
+                at.map(|index| format!(" · item {} of {} in the tree", index + 1, rows.len()))
+                    .unwrap_or_default()
+            ),
+        };
+        FollowView {
+            checked: true,
+            status: bounded(&status, MAX_FOLLOW_STATUS_BYTES),
+        }
+    }
+
     /// The user left the table with nothing selected (PX-017-G02): follow,
     /// if on, stops and says so. It never moves to another row.
     pub(crate) fn cleared(&mut self) {

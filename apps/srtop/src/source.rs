@@ -1,7 +1,7 @@
 //! Typed, injectable one-shot process snapshots and process-instance identity
 //! (design §§6.3, 8, 12, 22; PX-002 records, PX-003 identity and completeness,
 //! PX-004 retention, PX-007 system-wide figures, PX-012 owners and the
-//! accounts a source states).
+//! accounts a source states, PX-018 each record's parent PID and start time).
 //! This module reads no process state: adapters live in their own modules and the
 //! fake adapter below uses constants only, with no OS enumeration or clock read.
 //!
@@ -462,6 +462,47 @@ pub struct ProcessRecord {
     /// not read is [`Observed::Missing`] — never UID 0, never "root" — and is
     /// per field, like `resident`: never a [`Completeness`] degradation.
     pub owner: Observed<u32>,
+    /// The record's parent PID and start time, as this scan read them (PX-018):
+    /// what the process tree is resolved from. Per field, like `owner`: an
+    /// unread parent or start time is [`Observed::Missing`], never PID 0 or
+    /// time 0, and never a [`Completeness`] degradation.
+    pub lineage: Lineage,
+}
+
+/// Where one process instance says it sits in its host's process tree, as one
+/// scan read it (PX-018): its parent's PID and its own start time.
+///
+/// On Linux both come from the same `/proc/<pid>/stat` line, read through the
+/// same pinned directory, as the record's identity: field 4 is the parent PID
+/// and field 22 the start time in kernel clock ticks since boot, which is also
+/// the record's [`CreationToken::LinuxBootTicks`]. A parent PID is a number,
+/// not an identity: [`crate::tree`] attaches a child to a parent only when a
+/// record of the same generation holds that PID and started no later than the
+/// child, so a PID the kernel has since handed to a newer process is never
+/// taken for the parent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Lineage {
+    /// The parent PID: `Known(0)` for a task the kernel started itself.
+    pub parent: Observed<u32>,
+    /// The start time in kernel clock ticks since boot.
+    pub started: Observed<u64>,
+}
+
+impl Lineage {
+    /// The lineage of a record whose source does not collect one: both fields
+    /// unread, so the record is a root of the tree for that reason.
+    pub const NOT_COLLECTED: Self = Self {
+        parent: Observed::Missing(MissingReason::Unavailable),
+        started: Observed::Missing(MissingReason::Unavailable),
+    };
+
+    /// A lineage whose parent PID and start time were both read.
+    pub const fn new(parent: u32, started: u64) -> Self {
+        Self {
+            parent: Observed::Known(parent),
+            started: Observed::Known(started),
+        }
+    }
 }
 
 /// The owner of a record whose source does not collect owners (PX-012).
@@ -1037,6 +1078,7 @@ impl ProcessSource for FakeProcessSource {
                 // A value whose fraction is truncated rather than rounded, and a
                 // multithreaded process using two and a half logical CPUs.
                 ProcessRecord {
+                    lineage: Lineage::new(1, 4_000 * 100),
                     owner: Observed::Known(Self::CURRENT_UID),
                     key: Self::key("worker-a", Observed::Known(4101)),
                     display_name: DisplayName::from("worker").with_command(b"worker --role=worker"),
@@ -1049,6 +1091,7 @@ impl ProcessSource for FakeProcessSource {
                 },
                 // Known zeros, which must survive as zeros.
                 ProcessRecord {
+                    lineage: Lineage::new(4101, 9_000 * 100),
                     owner: Observed::Known(Self::OTHER_UID),
                     key: Self::key("worker-b", Observed::Known(4102)),
                     display_name: DisplayName::from("worker").with_command(b"worker --role=worker"),
@@ -1062,6 +1105,10 @@ impl ProcessSource for FakeProcessSource {
                 // Every field unread or not yet measurable, for different
                 // reasons: the states are per field, not per record.
                 ProcessRecord {
+                    lineage: Lineage {
+                        parent: Observed::Missing(MissingReason::Denied),
+                        started: Observed::Missing(MissingReason::Denied),
+                    },
                     owner: Observed::Missing(MissingReason::Denied),
                     key: Self::key("helper", Observed::Missing(MissingReason::Unavailable)),
                     display_name: DisplayName::from("helper").with_command(b"helper --daemon"),
@@ -1115,6 +1162,7 @@ impl ProcessSource for RepeatedNamesSource {
                     (name.clone(), name)
                 };
                 ProcessRecord {
+                    lineage: Lineage::NOT_COLLECTED,
                     owner: OWNER_NOT_COLLECTED,
                     key: ProcessKey {
                         source: SourceId(Self::SOURCE.into()),
@@ -1226,6 +1274,7 @@ impl FollowSource {
                     )
                 };
                 ProcessRecord {
+                    lineage: Lineage::NOT_COLLECTED,
                     owner: OWNER_NOT_COLLECTED,
                     key: ProcessKey {
                         source: SourceId(Self::SOURCE.into()),
@@ -1243,6 +1292,120 @@ impl FollowSource {
 impl ProcessSource for FollowSource {
     fn status_text(&self) -> &str {
         FOLLOW_STATUS_TEXT
+    }
+
+    fn snapshot(&mut self) -> ProcessSnapshot {
+        let step = self.step;
+        self.step += 1;
+        ProcessSnapshot {
+            source: SourceId(Self::SOURCE.into()),
+            sampled_at: SnapshotTime(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + step as u64),
+            ),
+            records: Self::records(step),
+            vanished: 0,
+            capped: CappedRecords::none(),
+            completeness: Completeness::Complete,
+            system: FakeProcessSource::system(),
+        }
+    }
+}
+
+/// Status label of the process-tree fixture (PX-018). Like every source, it
+/// states what its data is: a script, never a host.
+pub const TREE_STATUS_TEXT: &str = "Read-only · Fake process tree";
+
+/// PX-018's fixture: a small process forest with every way a parent can fail
+/// to be one, as two steps.
+///
+/// | PID | name | parent | start tick | CPU ticks |
+/// | --- | ---- | ------ | ---------- | --------- |
+/// | 1 | `init` | 0 (the kernel) | 1 | 10 |
+/// | 100 | `session` | 1 | 100 | 20 |
+/// | 200 | `shell` | 100 | 200 | 30 |
+/// | 300 | `make` | 200 | 300 | 40 |
+/// | 301 | `editor` | 200 | 310 | 90 |
+/// | 310 | `cc` | 300 | 400 | 70 |
+/// | 311 | `ld` | 300 | 410 | 50 |
+/// | 500 | `orphan-worker` | 9999, which no record holds | 500 | 60 |
+/// | 600 | `reused-child` | 700, which started after it | 600 | 15 |
+/// | 700 | `newer` | 1 | 650 | 25 |
+/// | 800 | `loop-a` | 801 | 800 | 5 |
+/// | 801 | `loop-b` | 800 | 800 | 6 |
+///
+/// From step [`TreeSource::REPARENTED_STEP`] on, `make` has ended and its two
+/// children name PID 1 as their parent, as the kernel reparents an orphan to
+/// init. Steps past the end repeat the last one, and each step's sample time
+/// is one second after the last. Every CPU share is distinct, so a CPU sort
+/// orders every set of siblings exactly.
+///
+/// This is a fixture, not an observation: it reads no process, no clock and no
+/// file, and it names itself as synthetic in every published status.
+#[derive(Debug, Default)]
+pub struct TreeSource {
+    step: usize,
+}
+
+impl TreeSource {
+    pub const SOURCE: &'static str = "fake-tree-v1";
+    /// The first step at which `make` has ended and `cc` and `ld` are init's.
+    pub const REPARENTED_STEP: usize = 1;
+    /// Every record: PID, name, parent PID, start tick, CPU ticks.
+    pub const RECORDS: [(u32, &'static str, u32, u64, u64); 12] = [
+        (1, "init", 0, 1, 10),
+        (100, "session", 1, 100, 20),
+        (200, "shell", 100, 200, 30),
+        (300, "make", 200, 300, 40),
+        (301, "editor", 200, 310, 90),
+        (310, "cc", 300, 400, 70),
+        (311, "ld", 300, 410, 50),
+        (500, "orphan-worker", 9999, 500, 60),
+        (600, "reused-child", 700, 600, 15),
+        (700, "newer", 1, 650, 25),
+        (800, "loop-a", 801, 800, 5),
+        (801, "loop-b", 800, 800, 6),
+    ];
+
+    /// The step this source will publish next.
+    pub fn step(&self) -> usize {
+        self.step
+    }
+
+    /// The records of one step.
+    pub fn records(step: usize) -> Vec<ProcessRecord> {
+        let reparented = step >= Self::REPARENTED_STEP;
+        Self::RECORDS
+            .iter()
+            .filter(|(pid, ..)| !(reparented && *pid == 300))
+            .map(|&(pid, name, parent, started, ticks)| {
+                let parent = if reparented && parent == 300 {
+                    1
+                } else {
+                    parent
+                };
+                ProcessRecord {
+                    lineage: Lineage::new(parent, started),
+                    owner: OWNER_NOT_COLLECTED,
+                    key: ProcessKey {
+                        source: SourceId(Self::SOURCE.into()),
+                        ..FakeProcessSource::key(&format!("tree-{name}"), Observed::Known(pid))
+                    },
+                    display_name: DisplayName::from(name),
+                    resident: Observed::Known(4096 * u64::from(pid)),
+                    cpu: CpuUsage::Measured(CpuInterval {
+                        ticks,
+                        ticks_per_second: 100,
+                        elapsed: Duration::from_secs(1),
+                    }),
+                }
+            })
+            .collect()
+    }
+}
+
+impl ProcessSource for TreeSource {
+    fn status_text(&self) -> &str {
+        TREE_STATUS_TEXT
     }
 
     fn snapshot(&mut self) -> ProcessSnapshot {
@@ -1364,6 +1527,7 @@ impl ScriptedFakeSource {
         cpu: CpuUsage,
     ) -> ProcessRecord {
         ProcessRecord {
+            lineage: Lineage::NOT_COLLECTED,
             owner: OWNER_NOT_COLLECTED,
             key: Self::key(token, pid),
             display_name: name.into(),
@@ -1625,6 +1789,19 @@ impl SyntheticProcessInstance {
             }
         };
         ProcessRecord {
+            // A deterministic forest (PX-018) drawn from no random number, so
+            // every other value of the fixture is unchanged: PID 1 is the root,
+            // and PID `p` names `(p - 2) / 4 + 1` as its parent. A recycled
+            // PID's new instance starts later than the children of the PID's
+            // old one, so those children are shown as roots, never under it.
+            lineage: Lineage::new(
+                if self.pid <= 1 {
+                    0
+                } else {
+                    (self.pid - 2) / 4 + 1
+                },
+                self.start_tick,
+            ),
             owner: OWNER_NOT_COLLECTED,
             key,
             display_name,

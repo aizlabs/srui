@@ -1,13 +1,14 @@
 //! Server-side row projection and session-local item allocation
 //! (§§6.2, 8; PX-002 rows, PX-003 process-instance keys, PX-004 refresh,
 //! PX-005 and PX-006 metric cells, PX-042 catalogued columns, PX-068 chosen
-//! columns).
+//! columns, PX-018 lineage and tree places).
 use crate::catalogue::{ColumnLayout, PROCESS_LIST};
 use crate::sort::SortValues;
 use crate::source::{
-    BootId, DisplayName, HostId, Observed, PidNamespaceId, ProcessKey, ProcessSnapshot,
+    BootId, DisplayName, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessSnapshot,
 };
-use srui_sdk::{ItemId, Value};
+use crate::tree::TreePlace;
+use srui_sdk::{ItemId, PropertyRef, Value};
 use srui_semantic_tree::ModelItem;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -40,11 +41,26 @@ pub(crate) struct Row {
     /// The owner UID the scan read (PX-012): server-side filter input only,
     /// never published as identity.
     pub(crate) owner: Observed<u32>,
+    /// The parent PID and start time the scan read (PX-018): server-side input
+    /// to the process tree only, never published as identity.
+    pub(crate) lineage: Lineage,
+    /// The row's place in the published process tree (PX-018), or `None` for
+    /// a table row. A tree row's `value` ends with its parent cell, and its
+    /// model item carries the standard `tree_depth` and `descendant_count`.
+    pub(crate) tree: Option<TreePlace>,
 }
 
 impl Row {
     pub(crate) fn to_model_item(&self) -> ModelItem {
-        ModelItem::with_value(self.item_id, self.value.clone())
+        let mut item = ModelItem::with_value(self.item_id, self.value.clone());
+        if let Some(place) = &self.tree {
+            item.set_property(PropertyRef::TREE_DEPTH, Value::UnsignedInt(place.depth));
+            item.set_property(
+                PropertyRef::DESCENDANT_COUNT,
+                Value::UnsignedInt(place.descendants),
+            );
+        }
+        item
     }
 
     /// Brings every scan-derived field of this row up to `latest`, the same
@@ -70,10 +86,27 @@ impl Row {
         }
     }
 
-    /// This row with its published value projected onto `layout`.
+    /// This row with its published value projected onto `layout`: a tree row
+    /// keeps its parent cell last (PX-018).
     pub(crate) fn laid_out(&self, layout: &ColumnLayout) -> Self {
+        let value = match (&self.tree, lay_out(&self.cells, layout)) {
+            (Some(place), Value::List(mut cells)) => {
+                cells.push(place.parent_cell());
+                Value::List(cells)
+            }
+            (_, value) => value,
+        };
+        Self {
+            value,
+            ..self.clone()
+        }
+    }
+
+    /// This row as a table row: no tree place, and no parent cell (PX-018).
+    pub(crate) fn flat(&self, layout: &ColumnLayout) -> Self {
         Self {
             value: lay_out(&self.cells, layout),
+            tree: None,
             ..self.clone()
         }
     }
@@ -252,6 +285,8 @@ impl SessionItemIds {
                     sort,
                     display_name: record.display_name.clone(),
                     owner: record.owner.clone(),
+                    lineage: record.lineage.clone(),
+                    tree: None,
                 })
             })
             .collect()

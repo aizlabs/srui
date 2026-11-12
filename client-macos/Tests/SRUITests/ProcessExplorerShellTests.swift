@@ -1,4 +1,4 @@
-// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012/PX-013/PX-014/PX-015/PX-016/PX-017: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
+// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012/PX-013/PX-014/PX-015/PX-016/PX-017/PX-018: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
 import Testing
 import Foundation
 import AppKit
@@ -8,6 +8,7 @@ import Protocol
 @testable import Session
 import TransportSSH
 import RendererAppKit
+import Collections
 
 /// Serialized as a suite, not per test: `.serialized` on a non-parameterized test function is a
 /// no-op (the compiler warns), and each test here launches its own sshd, srtop and NSWindow. Two of
@@ -1287,6 +1288,390 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
+    /// PX-018: the process tree over real SSH. Switching from the table to the tree with ⌘T keeps
+    /// the selection by item ID and carries follow over; the tree is one native `NSOutlineView`
+    /// whose rows are indented from the server's `tree_depth`, under a visible header with the
+    /// table's columns and Parent; an orphan is a root whose Parent cell says why; collapse and
+    /// expand are local and request no range; sorting by CPU orders each parent's children and
+    /// keeps every level; and switching back restores the table with the selection.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func theProcessTreeKeepsTheSelectionAndFollowAndDisclosesLocally() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-tree", "--refresh-interval-ms", "300000"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        // Every range request the tree emits, recorded before the session's own handler runs.
+        var treeRangeRequests: [CollectionRangeRequest] = []
+        try await controller.start()
+        let forward = renderer.onCollectionRangeRequest
+        renderer.onCollectionRangeRequest = { request in
+            if request.nodeID == NodeId(Self.treeID) { treeRangeRequests.append(request) }
+            forward?(request)
+        }
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer over SSH with its view switch") {
+            applier.lastAppliedRevision.value >= 1
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(Self.treeID)) != nil
+                && renderer.registry.handle(for: NodeId(Self.viewToggleID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        SurfacePresentation.forHostApplication().present(window)
+        window.contentView?.layoutSubtreeIfNeeded()
+        let router = renderer.layoutRenderer.shortcutRouter
+        router.isWindowKey = { $0 === window }
+        func view<T>(_ id: UInt64, as _: T.Type = T.self) throws -> T {
+            try #require(renderer.registry.handle(for: NodeId(id))?.view as? T, "node \(id)")
+        }
+        let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
+        let treeHandle = try #require(renderer.registry.handle(for: NodeId(Self.treeID)))
+        let tableScroll = try #require(tableHandle.view as? NSScrollView)
+        let treeScroll = try #require(treeHandle.view as? NSScrollView)
+        let table = try #require(tableScroll.documentView as? NSTableView)
+        let outline = try #require(treeScroll.documentView as? NSOutlineView)
+        let adapter = try #require(treeHandle.modelAdapter as? OutlineCollectionAdapter)
+        let viewToggle: NSButton = try view(Self.viewToggleID)
+        let viewStatus: NSTextField = try view(Self.viewStatusID)
+        let followStatus: NSTextField = try view(Self.followStatusID)
+        let inspectorStatus: NSTextField = try view(Self.inspectorLineIDs[0])
+        let sortByCPU: NSButton = try view(Self.sortButtonIDs[3])
+        let treeKey = try Self.keyEvent("t", [.command], keyCode: 17, in: window)
+        let followKey = try Self.keyEvent("f", [.command, .shift], keyCode: 3, in: window)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the twelve table rows") {
+            table.numberOfRows == 12 && viewToggle.isEnabled
+        }
+        // The switch is a standard checkbox with its own shortcut; the tree starts collapsed out
+        // of the layout and holds no row.
+        #expect(viewToggle.title == "Show process tree" && viewToggle.state == .off)
+        #expect(renderer.registry.handle(for: NodeId(Self.viewToggleID))?.shortcutBinding?.shortcut.canonical == "primary+t")
+        #expect(viewToggle.toolTip == "Show process tree (⌘T)")
+        #expect(!tableScroll.isHidden && treeScroll.isHidden && outline.numberOfRows == 0)
+        #expect(viewStatus.stringValue.hasPrefix("View: process table"))
+        /// One outline row as the client shows it: its level, indentation and cells.
+        struct ShownRow: Equatable { let level: Int; let indentation: CGFloat; let cells: [String]; let disclosable: Bool }
+        func shown() -> [ShownRow] {
+            (0..<outline.numberOfRows).map { row in
+                let outlineCell = outline.view(atColumn: 0, row: row, makeIfNecessary: true)
+                    as? OutlineCollectionAdapter.TreeCellView
+                let others = (1..<outline.tableColumns.count).map { column in
+                    (outline.view(atColumn: column, row: row, makeIfNecessary: true) as? NSTextField)?.stringValue ?? ""
+                }
+                return ShownRow(level: outlineCell?.level ?? -1, indentation: outlineCell?.indentation ?? -1,
+                                cells: [outlineCell?.label.stringValue ?? ""] + others,
+                                disclosable: outlineCell?.disclosureButton.isHidden == false)
+            }
+        }
+        func pids() -> [String] { shown().map { $0.cells[0] } }
+        func levels() -> [Int] { shown().map(\.level) }
+        func rowOf(_ pid: String) -> Int? { pids().firstIndex(of: pid) }
+        func treeItem(_ pid: String) throws -> ItemId {
+            let row = try #require(rowOf(pid), "PID \(pid) is shown")
+            let item = try #require(applier.store.getModel(ModelId(2))?.getItemByIndex(adapter.modelIndex(forRow: row)))
+            return item.itemID
+        }
+        func isVisible(_ row: Int) -> Bool { NSLocationInRange(row, outline.rows(in: outline.visibleRect)) }
+
+        // Select `cc` (PID 310) in the table and follow it.
+        let ccRow = try #require(Self.nativeRows(table).firstIndex { $0.first == "310" })
+        let ccID = Self.modelItemIDs(applier)[ccRow]
+        table.selectRowIndexes(IndexSet(integer: ccRow), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on cc") {
+            inspectorStatus.stringValue.hasPrefix("Selected process: PID 310 · cc")
+        }
+        #expect(window.performKeyEquivalent(with: followKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "following cc in the table") {
+            followStatus.stringValue.hasPrefix("Following PID 310 · cc · row ")
+                && applier.store.getNode(NodeId(5))?.keepVisible == ItemId(ccID)
+        }
+
+        // ⌘T: the tree replaces the table in one commit, with the same identities.
+        let tableIDs = Set(Self.modelItemIDs(applier))
+        #expect(window.performKeyEquivalent(with: treeKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the tree shown") {
+            viewToggle.state == .on && outline.numberOfRows == 12 && table.numberOfRows == 0
+                && !treeScroll.isHidden && tableScroll.isHidden
+                && viewStatus.stringValue.hasPrefix("View: process tree · 12 processes under 4 roots")
+        }
+        window.contentView?.layoutSubtreeIfNeeded()
+        let treeModel = try #require(applier.store.getModel(ModelId(2)))
+        #expect(Set(treeModel.items.values.map(\.itemID.value)) == tableIDs, "the same item IDs")
+        // The hierarchy renders: indented by depth, under a header naming every column.
+        #expect(outline.headerView != nil)
+        #expect(outline.tableColumns.map(\.title) == ["PID", "Name", "Resident", "CPU (100% = 1 CPU)", "Parent"])
+        #expect(pids() == ["1", "100", "200", "300", "310", "311", "301", "700", "500", "600", "800", "801"])
+        #expect(levels() == [0, 1, 2, 3, 4, 4, 3, 1, 0, 0, 0, 1])
+        let rows = shown()
+        #expect(rows[0].indentation == 0 && rows[4].indentation > rows[3].indentation
+                && rows[3].indentation > rows[2].indentation, "indentation follows the level: \(rows.map(\.indentation))")
+        #expect(rows[0].disclosable && rows[3].disclosable && !rows[4].disclosable)
+        // An orphan is a root whose Parent cell says why; a reused PID is never its parent.
+        #expect(rows[8].cells[1] == "orphan-worker" && rows[8].level == 0
+                && rows[8].cells.last == "root: parent 9999 not in this scan")
+        #expect(rows[9].cells.last == "root: parent 700 started later (PID reused)")
+        #expect(rows[10].cells.last == "root: cycle through parent 801 broken here")
+        #expect(rows[4].cells.last == "300")
+        // The selection and follow carried over by item ID.
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "cc selected and followed in the tree") {
+            outline.selectedRowIndexes == IndexSet(integer: 4)
+                && applier.store.getNode(NodeId(Self.treeID))?.keepVisible == ItemId(ccID)
+                && followStatus.stringValue.hasPrefix("Following PID 310 · cc · item 5 of 12 in the tree")
+        }
+        #expect(applier.store.getNode(NodeId(5))?.keepVisible == nil && applier.store.getNode(NodeId(5))?.promotedSelection == nil)
+        #expect(inspectorStatus.stringValue.hasPrefix("Selected process: PID 310 · cc"))
+
+        // Collapse and expand are local: the rows remap at once and no range is requested.
+        let requestsBefore = treeRangeRequests.count
+        let collapseRevision = applier.lastAppliedRevision.value
+        #expect(adapter.setExpanded(false, itemID: try treeItem("300"), outlineView: outline))
+        #expect(pids() == ["1", "100", "200", "300", "301", "700", "500", "600", "800", "801"], "collapsed at once")
+        #expect(outline.selectedRowIndexes.isEmpty, "the hidden selection is gone locally")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the server told of the collapse") {
+            inspectorStatus.stringValue == "Selected process: none · select a row to inspect it"
+                && followStatus.stringValue.hasPrefix("Following PID 310 · cc · hidden under collapsed PID 300 · make: expand it")
+        }
+        #expect(applier.store.getModel(ModelId(2))?.itemCount == 12, "no row was published")
+        #expect(adapter.setExpanded(true, itemID: try treeItem("300"), outlineView: outline))
+        #expect(pids().count == 12)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the server told of the expand") {
+            followStatus.stringValue.hasPrefix("Following PID 310 · cc · item 5 of 12 in the tree")
+        }
+        #expect(treeRangeRequests.count == requestsBefore, "disclosure requests no range: \(treeRangeRequests)")
+        let disclosureRevisions = applier.lastAppliedRevision.value - collapseRevision
+
+        // Collapse `loop-a`, then sort by CPU: every level is ordered busiest first, no level is
+        // flattened, and the local collapse survives the reorder.
+        #expect(adapter.setExpanded(false, itemID: try treeItem("800"), outlineView: outline))
+        NativeActivation.click(sortByCPU)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the tree by CPU") {
+            sortByCPU.title == "Sort by CPU \u{2193}"
+                && pids() == ["500", "600", "1", "700", "100", "200", "301", "300", "310", "311", "800"]
+        }
+        #expect(levels() == [0, 0, 0, 1, 1, 2, 3, 3, 4, 4, 0], "every parent kept")
+        #expect(!adapter.isExpanded(try treeItem("800")), "the collapse survived the reorder")
+        #expect(adapter.setExpanded(true, itemID: try treeItem("800"), outlineView: outline))
+        // Follow still names cc, which moved; the client revealed it.
+        let ccTreeRow = try #require(rowOf("310"))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "cc revealed at its new row") {
+            followStatus.stringValue.hasPrefix("Following PID 310 · cc · item 9 of 12 in the tree") && isVisible(ccTreeRow)
+        }
+
+        // Select `ld` in the tree: follow retargets; then ⌘T back to the table keeps both.
+        let ldRow = try #require(rowOf("311"))
+        let ldID = try treeItem("311")
+        outline.selectRowIndexes(IndexSet(integer: ldRow), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "following ld in the tree") {
+            inspectorStatus.stringValue.hasPrefix("Selected process: PID 311 · ld")
+                && applier.store.getNode(NodeId(Self.treeID))?.keepVisible == ldID
+        }
+        #expect(window.performKeyEquivalent(with: treeKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the table again") {
+            viewToggle.state == .off && table.numberOfRows == 12 && outline.numberOfRows == 0
+                && !tableScroll.isHidden && treeScroll.isHidden
+        }
+        let ldTableRow = try #require(Self.nativeRows(table).firstIndex { $0.first == "311" })
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "ld selected and followed in the table") {
+            table.selectedRowIndexes == IndexSet(integer: ldTableRow)
+                && applier.store.getNode(NodeId(5))?.keepVisible == ldID
+                && followStatus.stringValue.hasPrefix("Following PID 311 · ld · row ")
+        }
+        #expect(Set(Self.modelItemIDs(applier)) == tableIDs)
+        #expect(applier.store.getNode(NodeId(Self.treeID))?.keepVisible == nil)
+        #expect(renderer.registry.handle(for: NodeId(5)) === tableHandle, "the table was never rebuilt")
+        #expect(renderer.registry.handle(for: NodeId(Self.treeID)) === treeHandle, "the tree was never rebuilt")
+        print("PX-018 native SSH evidence: window \(window.windowNumber); tree rows=\(rows.map(\.cells)); levels=\(rows.map(\.level)); indentation=\(rows.map(\.indentation)); disclosure commits=\(disclosureRevisions); tree range requests=\(treeRangeRequests.count); follow=\(followStatus.stringValue); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
+    /// PX-018, Codex review round 5: the user clicks Go to PID and collapses the match's parent in
+    /// the same turn, before the promotion reaches the client, so the collapse report is made at
+    /// the earlier revision and reaches the server after it selected the match. The client then
+    /// applies the promotion: it expands the parent, selects the match with selection events
+    /// suppressed and reports the expand. The inspector keeps describing the match, which the
+    /// outline shows selected, after every report has been processed.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func aCollapseBeforeTheGoToPIDPromotionArrivesKeepsTheInspectorOnTheMatch() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-tree", "--refresh-interval-ms", "300000"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer with its view switch") {
+            applier.lastAppliedRevision.value >= 1
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(Self.treeID)) != nil
+                && renderer.registry.handle(for: NodeId(Self.viewToggleID)) != nil
+                && renderer.registry.handle(for: NodeId(Self.pidGoID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        SurfacePresentation.forHostApplication().present(window)
+        window.contentView?.layoutSubtreeIfNeeded()
+        renderer.layoutRenderer.shortcutRouter.isWindowKey = { $0 === window }
+        let treeHandle = try #require(renderer.registry.handle(for: NodeId(Self.treeID)))
+        let outline = try #require((treeHandle.view as? NSScrollView)?.documentView as? NSOutlineView)
+        let adapter = try #require(treeHandle.modelAdapter as? OutlineCollectionAdapter)
+        let inspector = try #require(renderer.registry.handle(for: NodeId(Self.inspectorLineIDs[0]))?.view as? NSTextField)
+        let pidHandle = try #require(renderer.registry.handle(for: NodeId(Self.pidInputID)))
+        let pidField = try #require(pidHandle.view as? NSTextField)
+        let pidAdapter = try #require(pidHandle.textAdapter)
+        let go = try #require(renderer.registry.handle(for: NodeId(Self.pidGoID))?.view as? NSButton)
+        let viewToggle = try #require(renderer.registry.handle(for: NodeId(Self.viewToggleID))?.view as? NSButton)
+        func pids() -> [String] {
+            (0..<outline.numberOfRows).map { row in
+                (outline.view(atColumn: 0, row: row, makeIfNecessary: true)
+                    as? OutlineCollectionAdapter.TreeCellView)?.label.stringValue ?? ""
+            }
+        }
+        func type(_ text: String) {
+            pidField.stringValue = text
+            pidAdapter.notifyTextDidChangeForTests()
+            pidAdapter.notifyEndEditingForTests()
+        }
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the switch enabled") { viewToggle.isEnabled }
+        #expect(window.performKeyEquivalent(with: try Self.keyEvent("t", [.command], keyCode: 17, in: window)))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the tree") { outline.numberOfRows == 12 }
+        type("311")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the PID field held") {
+            applier.store.getNode(NodeId(Self.pidInputID))?.getProperty(.value) == .string("311") && go.isEnabled
+        }
+        let makeRow = try #require(pids().firstIndex(of: "300"))
+        let make = try #require(applier.store.getModel(ModelId(2))?.getItemByIndex(adapter.modelIndex(forRow: makeRow))).itemID
+        let observed = applier.lastAppliedRevision.value
+        // One main-actor turn: the click, then the collapse, both at `observed`.
+        NativeActivation.click(go)
+        #expect(adapter.setExpanded(false, itemID: make, outlineView: outline))
+        #expect(applier.lastAppliedRevision.value == observed, "the promotion has not arrived yet")
+        #expect(!pids().contains("311"), "ld hidden locally")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the promotion applied") {
+            adapter.isExpanded(make) && outline.selectedRowIndexes == IndexSet(integer: pids().firstIndex(of: "311") ?? -1)
+        }
+        // A later round trip: once the server holds the new PID text, it has processed the
+        // collapse and the client's expand report, which the client sent before it.
+        type("1")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "every report processed") {
+            applier.store.getNode(NodeId(Self.pidInputID))?.getProperty(.value) == .string("1")
+        }
+        #expect(inspector.stringValue.hasPrefix("Selected process: PID 311 · ld"), "\(inspector.stringValue)")
+        #expect(outline.selectedRowIndexes == IndexSet(integer: try #require(pids().firstIndex(of: "311"))))
+        print("PX-018 Codex round 5 native SSH evidence: window \(window.windowNumber); observed=\(observed); revision=\(applier.lastAppliedRevision.value); rows=\(pids()); inspector=\(inspector.stringValue)")
+        await controller.stop()
+    }
+
+    /// PX-018, Codex review round 4: disclosure is each client's own. The first client selects and
+    /// follows `cc`, then collapses its parent `make`, which hides it there. A second client that
+    /// attaches to the same running srtop starts with every item expanded and inherits nothing of
+    /// that collapse; selecting `ld`, a child of `make` it shows, is its own selection: the
+    /// inspector describes it and follow retargets to it, in the tree and not hidden.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func aFreshClientDoesNotInheritAnotherClientsCollapsedParent() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-tree", "--refresh-interval-ms", "300000"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the first client with its view switch") {
+            applier.lastAppliedRevision.value >= 1
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(Self.treeID)) != nil
+                && renderer.registry.handle(for: NodeId(Self.viewToggleID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        SurfacePresentation.forHostApplication().present(window)
+        window.contentView?.layoutSubtreeIfNeeded()
+        renderer.layoutRenderer.shortcutRouter.isWindowKey = { $0 === window }
+        /// One client's tree: its outline, its adapter, and the shared status lines it shows.
+        @MainActor
+        struct Client {
+            let applier: TransactionApplier
+            let outline: NSOutlineView
+            let adapter: OutlineCollectionAdapter
+            let inspector: NSTextField
+            let follow: NSTextField
+            func pids() -> [String] {
+                (0..<outline.numberOfRows).map { row in
+                    (outline.view(atColumn: 0, row: row, makeIfNecessary: true)
+                        as? OutlineCollectionAdapter.TreeCellView)?.label.stringValue ?? ""
+                }
+            }
+            func row(_ pid: String) throws -> Int { try #require(pids().firstIndex(of: pid), "PID \(pid) is shown") }
+            func item(_ pid: String) throws -> ItemId {
+                let model = try #require(applier.store.getModel(ModelId(2)))
+                return try #require(model.getItemByIndex(adapter.modelIndex(forRow: try row(pid)))).itemID
+            }
+        }
+        func client(_ renderer: AppKitRenderer, _ applier: TransactionApplier) throws -> Client {
+            let tree = try #require(renderer.registry.handle(for: NodeId(Self.treeID)))
+            return Client(
+                applier: applier,
+                outline: try #require((tree.view as? NSScrollView)?.documentView as? NSOutlineView),
+                adapter: try #require(tree.modelAdapter as? OutlineCollectionAdapter),
+                inspector: try #require(renderer.registry.handle(for: NodeId(Self.inspectorLineIDs[0]))?.view as? NSTextField),
+                follow: try #require(renderer.registry.handle(for: NodeId(Self.followStatusID))?.view as? NSTextField))
+        }
+        let first = try client(renderer, applier)
+        let treeKey = try Self.keyEvent("t", [.command], keyCode: 17, in: window)
+        let followKey = try Self.keyEvent("f", [.command, .shift], keyCode: 3, in: window)
+        let viewToggle = try #require(renderer.registry.handle(for: NodeId(Self.viewToggleID))?.view as? NSButton)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the switch enabled") { viewToggle.isEnabled }
+        #expect(window.performKeyEquivalent(with: treeKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the first client's tree") {
+            first.outline.numberOfRows == 12
+        }
+        first.outline.selectRowIndexes(IndexSet(integer: try first.row("310")), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on cc") {
+            first.inspector.stringValue.hasPrefix("Selected process: PID 310 · cc")
+        }
+        #expect(window.performKeyEquivalent(with: followKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "following cc in the tree") {
+            first.follow.stringValue.hasPrefix("Following PID 310 · cc · item 5 of 12 in the tree")
+        }
+        // The first client collapses `make`: `cc` is hidden there, so its selection is gone.
+        let make = try first.item("300")
+        #expect(first.adapter.setExpanded(false, itemID: make, outlineView: first.outline))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the server told of the collapse") {
+            first.inspector.stringValue == "Selected process: none · select a row to inspect it"
+                && first.follow.stringValue.hasPrefix("Following PID 310 · cc · hidden under collapsed PID 300 · make")
+        }
+
+        // A second client attaches to the same srtop: every item is expanded there.
+        let (secondController, secondApplier, secondRenderer) =
+            Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await secondController.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "a second client's tree") {
+            secondController.isEventDispatchEnabled
+                && secondRenderer.registry.handle(for: NodeId(Self.treeID)) != nil
+                && secondApplier.lastAppliedRevision == applier.lastAppliedRevision
+                && ((secondRenderer.registry.handle(for: NodeId(Self.treeID))?.view as? NSScrollView)?
+                    .documentView as? NSOutlineView)?.numberOfRows == 12
+        }
+        let secondWindow = try #require(secondRenderer.registry.handle(for: NodeId(1))?.window)
+        defer { secondWindow.orderOut(nil); secondWindow.close() }
+        SurfacePresentation.forHostApplication().present(secondWindow)
+        secondWindow.contentView?.layoutSubtreeIfNeeded()
+        let second = try client(secondRenderer, secondApplier)
+        #expect(second.adapter.isExpanded(make) && second.adapter.collapsedItemIDs.isEmpty, "nothing inherited")
+        #expect(second.pids() == ["1", "100", "200", "300", "310", "311", "301", "700", "500", "600", "800", "801"])
+        #expect(first.pids().count == 10, "still collapsed on the first client")
+        // Selecting `ld`, which it shows, is the second client's selection.
+        second.outline.selectRowIndexes(IndexSet(integer: try second.row("311")), byExtendingSelection: false)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the second client's selection described") {
+            second.inspector.stringValue.hasPrefix("Selected process: PID 311 · ld")
+                && second.follow.stringValue.hasPrefix("Following PID 311 · ld · item 6 of 12 in the tree")
+                && first.follow.stringValue.hasPrefix("Following PID 311 · ld · item 6 of 12 in the tree")
+        }
+        #expect(!second.follow.stringValue.contains("hidden"))
+        #expect(second.outline.selectedRowIndexes == IndexSet(integer: try second.row("311")))
+        print("PX-018 Codex round 4 native SSH evidence: first window \(window.windowNumber) rows=\(first.pids()); second window \(secondWindow.windowNumber) rows=\(second.pids()); inspector=\(second.inspector.stringValue); follow=\(second.follow.stringValue); revision=\(secondApplier.lastAppliedRevision.value)")
+        await secondController.stop()
+        await controller.stop()
+    }
+
     /// PX-017 on `keep_visible`: rapid arrow keys while following are never overwritten, even
     /// when a sample lands mid-burst. Under the CPU sort, each round starts on row 36 and presses
     /// Down 20 times (real key-down events into the native table), clicking Refresh now after the
@@ -1400,6 +1785,11 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
+    // PX-018: the view switch and the process tree.
+    fileprivate static let viewToggleID: UInt64 = 71
+    fileprivate static let viewStatusID: UInt64 = 72
+    fileprivate static let treeID: UInt64 = 73
+
     // PX-017: the follow controls.
     fileprivate static let followToggleID: UInt64 = 68
     fileprivate static let followStatusID: UInt64 = 69
@@ -1431,6 +1821,8 @@ struct ProcessExplorerShellTests {
         KeyboardBinding(id: 41, label: "Restore default columns", shortcut: "primary+alt+r", display: "⌥⌘R", initiallyEnabled: false),
         // PX-017: the follow checkbox, between the column chooser and the table.
         KeyboardBinding(id: 68, label: "Follow selected process", shortcut: "primary+shift+f", display: "⇧⌘F", initiallyEnabled: true),
+        // PX-018: the view switch, between the follow controls and the table.
+        KeyboardBinding(id: 71, label: "Show process tree", shortcut: "primary+t", display: "⌘T", initiallyEnabled: true),
         KeyboardBinding(id: 5, label: "Processes", shortcut: "primary+l", display: "⌘L", initiallyEnabled: true),
         KeyboardBinding(id: 60, label: "Command line and executable", shortcut: "primary+i", display: "⌘I", initiallyEnabled: true),
     ]

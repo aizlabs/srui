@@ -286,6 +286,7 @@ mod tests {
     ) -> Row {
         let key = key(pid, token);
         let record = ProcessRecord {
+            lineage: crate::source::Lineage::NOT_COLLECTED,
             owner: crate::source::OWNER_NOT_COLLECTED,
             key: key.clone(),
             display_name: name.into(),
@@ -297,6 +298,8 @@ mod tests {
         };
         Row {
             owner: crate::source::OWNER_NOT_COLLECTED,
+            lineage: crate::source::Lineage::NOT_COLLECTED,
+            tree: None,
             sort: SortValues::of_record(&key, &record),
             key,
             item_id: srui_sdk::ItemId::new(id),
@@ -343,6 +346,7 @@ mod tests {
         // present.
         let missing = row(2, None, "u", "name", None, CpuUsage::WarmingUp);
         let record = ProcessRecord {
+            lineage: crate::source::Lineage::NOT_COLLECTED,
             owner: crate::source::OWNER_NOT_COLLECTED,
             key: missing.key.clone(),
             display_name: "name".into(),

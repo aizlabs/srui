@@ -125,7 +125,9 @@ fn assert_shell_intact(session: &Session) {
                     SORT_ROW,
                     COLUMN_CHOOSER_ROW,
                     FOLLOW_ROW,
+                    srui_process_explorer::VIEW_ROW,
                     TABLE,
+                    srui_process_explorer::TREE,
                     INSPECTOR
                 ]
                 .as_slice()
@@ -504,6 +506,7 @@ impl ProcessSource for Widest {
             .map(|index| {
                 let pid = self.first_pid + index;
                 ProcessRecord {
+                    lineage: srui_process_explorer::source::Lineage::NOT_COLLECTED,
                     owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
                     key: ProcessKey {
                         pid: Observed::Known(pid),
@@ -1023,6 +1026,7 @@ fn a_refresh_beyond_the_transaction_bound_is_published_whole() {
             let records = (0..self.rows)
                 .filter(|index| index % self.stride == 0)
                 .map(|index| ProcessRecord {
+                    lineage: srui_process_explorer::source::Lineage::NOT_COLLECTED,
                     owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
                     key: ProcessKey {
                         pid: Observed::Known(index + 1),

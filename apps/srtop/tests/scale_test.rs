@@ -445,6 +445,7 @@ fn test_probe_100000_rows_limits_and_truncation() {
     let mut excess_records = snap.records.clone();
     for i in 0..5 {
         excess_records.push(ProcessRecord {
+            lineage: srui_process_explorer::source::Lineage::NOT_COLLECTED,
             owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
             key: ProcessKey {
                 source: srui_process_explorer::source::SourceId("excess".into()),

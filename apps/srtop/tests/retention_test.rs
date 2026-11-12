@@ -66,6 +66,7 @@ fn key(pid: u32) -> ProcessKey {
 
 fn record(pid: u32) -> ProcessRecord {
     ProcessRecord {
+        lineage: srui_process_explorer::source::Lineage::NOT_COLLECTED,
         owner: srui_process_explorer::source::OWNER_NOT_COLLECTED,
         key: key(pid),
         display_name: format!("worker-{pid}").as_str().into(),

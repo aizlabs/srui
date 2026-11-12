@@ -50,6 +50,7 @@ const SETTLE: Duration = Duration::from_secs(10);
 
 fn record(pid: u32, name: &str, owner: Observed<u32>) -> ProcessRecord {
     ProcessRecord {
+        lineage: srui_process_explorer::source::Lineage::NOT_COLLECTED,
         key: ProcessKey {
             source: SourceId(SOURCE.into()),
             host: Observed::Known(HostId("fixture-host".into())),

@@ -525,6 +525,22 @@ impl LastSeen {
         }
     }
 
+    /// The inspector's detail read found the record of `key`, this exact
+    /// instance (the whole [`ProcessKey`]), gone after it had already left
+    /// the collection: a read still loading when a scan recorded its
+    /// departure. A record that says only "no longer observed" turns
+    /// `exited` through the detail read; an established exit keeps the
+    /// reason first established. Says whether a record changed.
+    pub(crate) fn establish_detail_exit(&mut self, key: &ProcessKey) -> bool {
+        match self.entries.iter_mut().find(|kept| kept.key() == key) {
+            Some(kept) if !kept.departure.exited() => {
+                kept.departure = Departure::Exited(Exit::DetailRead);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Counts `count` historical tags forgotten without a bound dropping
     /// their records: their records were dropped for another reason.
     pub(crate) fn forget_tags(&mut self, count: u64) {

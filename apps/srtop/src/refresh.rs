@@ -1034,21 +1034,18 @@ impl ProcessView {
 
     /// Drops the tombstones that are too old by the injected clock, or no
     /// longer watched (PX-021), on every sample the view accepts, whatever
-    /// the scan could read: age is time, not a scan outcome. Says whether a
-    /// historical tag went.
+    /// the scan could read: age is time, not a scan outcome.
     ///
     ///
     /// The followed process watches its record too: follow can be turned on
     /// for a row a failed commit left on the client after its process left,
     /// and stays on it when a collapse clears the inspector.
-    fn expire_tombstones(&mut self) -> bool {
+    fn expire_tombstones(&mut self) {
         let now = self.clock.now();
         let (inspected, followed) = self.watched_keys();
-        let before = self.last_seen.forgotten_tags();
         self.last_seen.expire(now, |key| {
             inspected.as_ref() == Some(key) || followed.as_ref() == Some(key)
         });
-        self.last_seen.forgotten_tags() != before
     }
 
     /// The most rows this view will publish.
@@ -1127,7 +1124,7 @@ impl ProcessView {
         // This sample ends a resume: the sampling status says live again.
         self.sampling.published_sample();
         // Tombstones age on every accepted sample, a failed one too (PX-021).
-        let tags_expired = self.expire_tombstones();
+        self.expire_tombstones();
         // A snapshot this app cannot identify is not evidence that any process
         // ended. It is published as an error over the last-known rows, exactly
         // like a scan that could not list the process filesystem at all.
@@ -1344,14 +1341,7 @@ impl ProcessView {
         if confirmed_empty && retention.is_global() {
             // Every row is kept on this path, so nothing has left: no tag is
             // retired and no tombstone recorded (PX-020, PX-021).
-            return self.publish_status_only(
-                session,
-                source_status,
-                snapshot,
-                rejected,
-                summary,
-                tags_expired,
-            );
+            return self.publish_status_only(session, source_status, snapshot, rejected, summary);
         }
         // A watched process this generation no longer holds leaves a
         // tombstone that says how it left (PX-021), recorded now whatever the
@@ -1783,7 +1773,6 @@ impl ProcessView {
         snapshot: &ProcessSnapshot,
         rejected: Option<String>,
         summary: summary::Properties,
-        tags_expired: bool,
     ) -> Result<Refreshed, SessionError> {
         let retained = self.rows.len();
         let counts = RefreshCounts {
@@ -1824,21 +1813,14 @@ impl ProcessView {
             self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
         result.controls += inspector.len();
         plan.extend(inspector);
-        // A historical tag that aged out on this sample leaves the tags
-        // status now, not at the next readable scan (PX-021).
-        if tags_expired {
-            let counts = self
-                .visible_in(
-                    self.mode,
-                    &self.unfiltered_rows,
-                    &self.unconfirmed,
-                    &self.gaps,
-                )
-                .tags;
-            let tags = self.tags_effects(counts);
-            result.controls += tags.len();
-            plan.extend(tags);
-        }
+        // A historical tag that aged out leaves the tags status now, not at
+        // the next readable scan (PX-021). The status is reconciled with the
+        // one the client holds on every such scan, not only the one that
+        // expired it, so a status that one could not publish is published by
+        // the next (Codex review of PR #107).
+        let tags = self.current_tags_effects();
+        result.controls += tags.len();
+        plan.extend(tags);
         if plan.is_empty() {
             // An identical failure republishes nothing at all.
             self.ids.retain(&self.unfiltered_rows);
@@ -3342,6 +3324,21 @@ impl ProcessView {
         &self.tags_published.status
     }
 
+    /// The tags status's change for the collection as it stands (PX-020,
+    /// PX-021): for a change that touches no row, such as a record that
+    /// aged out or turned `exited`.
+    fn current_tags_effects(&self) -> Vec<Planned> {
+        let counts = self
+            .visible_in(
+                self.mode,
+                &self.unfiltered_rows,
+                &self.unconfirmed,
+                &self.gaps,
+            )
+            .tags;
+        self.tags_effects(counts)
+    }
+
     /// The tags status's change for tag counts `counts` (PX-020): planned
     /// when its text or the set's generation changed, so a change that keeps
     /// the same words still records the generation the client now holds.
@@ -3596,7 +3593,16 @@ impl ProcessView {
         if !self.inspector.completed(request, read) {
             return Ok(Refreshed::default());
         }
-        let plan = self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
+        // A read that was loading when a scan recorded the target's
+        // departure establishes that record's exit now (PX-021, Codex review
+        // of PR #107): the inspector accepted it only for the target's exact
+        // instance and generation, and the tags status names the record too.
+        let exited = self.inspector.read_exit(&request.key)
+            && self.last_seen.establish_detail_exit(&request.key);
+        let mut plan = self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
+        if exited {
+            plan.extend(self.current_tags_effects());
+        }
         self.publish_controls(session, plan)
     }
 
@@ -9226,5 +9232,133 @@ mod follow_watch_tests {
         );
         view.refresh(&session, &mut source).unwrap();
         assert!(view.last_seen().is_empty(), "nothing watches the record");
+    }
+}
+
+/// Codex review round (PR #107), `PRRT_kwDOUG_6uM62qN_6`: a tags status that
+/// an unreadable scan could not publish after a historical tag aged out is
+/// published by the next unreadable scan, not left naming a record the
+/// server no longer keeps.
+#[cfg(test)]
+mod expiry_publish_tests {
+    use super::*;
+    use crate::lastseen::MAX_TOMBSTONE_AGE;
+    use crate::source::{
+        BootId, CappedRecords, Completeness, CpuUsage, CreationToken, DisplayName,
+        FakeProcessSource, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+        SkippedRecords, SnapshotTime, SourceId, OWNER_NOT_COLLECTED,
+    };
+    use std::sync::Mutex;
+
+    const CLIENT: &[u8] = b"expiry-publish-client";
+
+    fn record(pid: u32, name: &str) -> ProcessRecord {
+        ProcessRecord {
+            lineage: Lineage::new(if pid == 1 { 0 } else { 1 }, u64::from(pid)),
+            owner: OWNER_NOT_COLLECTED,
+            key: ProcessKey {
+                source: SourceId("expiry-publish".into()),
+                host: Observed::Known(HostId("h".into())),
+                boot: Observed::Known(BootId("b".into())),
+                pid_namespace: Observed::Known(PidNamespaceId(1)),
+                pid: Observed::Known(pid),
+                creation: CreationToken::Opaque(name.into()),
+                thread: None,
+            },
+            kind: crate::source::KIND_NOT_COLLECTED,
+            display_name: DisplayName::from(name),
+            resident: Observed::Known(4096),
+            cpu: CpuUsage::WarmingUp,
+        }
+    }
+
+    /// Steps of records, the last repeated; an empty step is a scan that
+    /// could not read the process list.
+    struct Steps(Vec<Vec<ProcessRecord>>, usize);
+
+    impl ProcessSource for Steps {
+        fn status_text(&self) -> &str {
+            "Read-only · Expiry-publish fixture"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            let records = self.0[self.1.min(self.0.len() - 1)].clone();
+            self.1 += 1;
+            let unreadable = records.is_empty();
+            ProcessSnapshot {
+                source: SourceId("expiry-publish".into()),
+                sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH),
+                records,
+                vanished: 0,
+                capped: CappedRecords::none(),
+                completeness: if unreadable {
+                    Completeness::from_scan(SkippedRecords::unenumerable(), Vec::new())
+                } else {
+                    Completeness::Complete
+                },
+                system: FakeProcessSource::system(),
+                threads: crate::source::ThreadScan::NotProvided,
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Clock(Mutex<Duration>);
+
+    impl MonotonicClock for Clock {
+        fn now(&self) -> Duration {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    #[test]
+    fn an_unpublished_tag_expiry_is_published_by_the_next_unreadable_scan() {
+        let clock = Arc::new(Clock::default());
+        let mut source = Steps(
+            vec![
+                vec![record(1, "init"), record(300, "worker")],
+                vec![record(1, "init")],
+                Vec::new(),
+            ],
+            0,
+        );
+        let session = Session::mint();
+        let (view, _) = ProcessView::start(&session, &mut source).unwrap();
+        let mut view = view.with_clock(clock.clone());
+        let item = |view: &ProcessView, pid: u32| {
+            view.rows
+                .iter()
+                .find(|row| row.key.pid == Observed::Known(pid))
+                .map(|row| row.item_id)
+        };
+        view.select_item(&session, CLIENT, item(&view, 300))
+            .unwrap();
+        view.request_tags(&session, TagRequest::Toggle).unwrap();
+        view.select_item(&session, CLIENT, item(&view, 1)).unwrap();
+        view.refresh(&session, &mut source).unwrap();
+        assert!(
+            view.tags_status()
+                .starts_with("Tags: 0 tagged · 1 historical: PID 300 · worker exited"),
+            "{}",
+            view.tags_status()
+        );
+        *clock.0.lock().unwrap() = MAX_TOMBSTONE_AGE;
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.refresh(&session, &mut source).is_err());
+        }
+        assert!(view.last_seen().is_empty(), "the record aged out");
+        assert!(
+            view.tags_status().contains("PID 300 · worker exited"),
+            "the client still holds the old status: {}",
+            view.tags_status()
+        );
+        view.refresh(&session, &mut source).unwrap();
+        assert!(
+            view.tags_status()
+                .starts_with("Tags: 0 tagged · 1 historical, forgotten"),
+            "{}",
+            view.tags_status()
+        );
     }
 }

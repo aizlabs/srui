@@ -1847,3 +1847,131 @@ fn relisted_tags_all_beyond_the_tag_limit_are_counted_in_the_plural() {
         )
     );
 }
+
+// ---- Codex review round (PR #107) ----
+
+/// `PRRT_kwDOUG_6uM62qN_r`: a detail read still outstanding when an
+/// incomplete scan evicted the selected row returns `Ended` afterwards. It
+/// answers the record's own instance, so the record turns `exited` through
+/// the detail read at once, and the inspector and the tags status say so. A
+/// read for another instance under the PID changes nothing. Verifier N1: an
+/// established exit is final, so a later complete scan does not replace its
+/// reason.
+#[test]
+fn a_late_detail_read_establishes_the_exit_of_its_own_record_and_it_stays() {
+    let mut h = Harness::with(
+        vec![
+            complete(vec![
+                record(1, "init", "init"),
+                record(300, "w", "worker"),
+                record(301, "o", "other"),
+            ]),
+            unenumerable(vec![
+                record(1, "init", "init"),
+                record(400, "n", "new"),
+                record(401, "m", "newer"),
+            ]),
+            complete(vec![
+                record(1, "init", "init"),
+                record(400, "n", "new"),
+                record(401, "m", "newer"),
+            ]),
+        ],
+        |view| view.with_published_limit(3),
+    );
+    h.select(300, "worker");
+    h.view.request_tags(&h.session, TagRequest::Toggle).unwrap();
+    let generation = h.view.inspector().generation();
+    h.refresh();
+    let departure = |h: &Harness| {
+        h.view
+            .last_seen()
+            .get(&key(300, "w", host()))
+            .map(|tombstone| tombstone.departure())
+    };
+    assert_eq!(
+        departure(&h),
+        Some(Departure::NotObserved(Unobserved::Evicted))
+    );
+    // A read that answers another instance under PID 300 is stale.
+    h.view
+        .details_read(
+            &h.session,
+            &DetailRequest {
+                key: key(300, "other-instance", host()),
+                generation,
+            },
+            DetailRead::Ended,
+        )
+        .unwrap();
+    assert_eq!(
+        departure(&h),
+        Some(Departure::NotObserved(Unobserved::Evicted))
+    );
+    // The read asked for the selected instance before the scan returns.
+    h.view
+        .details_read(
+            &h.session,
+            &DetailRequest {
+                key: key(300, "w", host()),
+                generation,
+            },
+            DetailRead::Ended,
+        )
+        .unwrap();
+    assert_eq!(departure(&h), Some(Departure::Exited(Exit::DetailRead)));
+    assert_eq!(
+        h.status(),
+        format!(
+            "Selected process: PID 300 · worker · exited: its record was gone when its details were read · last observed {}; a historical record: no action applies to it",
+            at(0)
+        )
+    );
+    assert!(
+        h.view.tags_status().starts_with(&format!(
+            "Tags: 0 tagged · 1 historical: PID 300 · worker exited, last observed {}",
+            at(0)
+        )),
+        "{}",
+        h.view.tags_status()
+    );
+    // A complete scan entitled to account for it keeps the first reason.
+    h.refresh();
+    assert_eq!(departure(&h), Some(Departure::Exited(Exit::DetailRead)));
+}
+
+/// A late `Ended` read for a record a scan already established keeps the
+/// scan's reason.
+#[test]
+fn a_late_detail_read_never_replaces_an_established_exit() {
+    let mut h = Harness::new(vec![
+        complete(vec![record(1, "init", "init"), record(300, "w", "worker")]),
+        complete(vec![record(1, "init", "init")]),
+    ]);
+    h.select(300, "worker");
+    let generation = h.view.inspector().generation();
+    h.refresh();
+    h.view
+        .details_read(
+            &h.session,
+            &DetailRequest {
+                key: key(300, "w", host()),
+                generation,
+            },
+            DetailRead::Ended,
+        )
+        .unwrap();
+    assert_eq!(
+        h.view
+            .last_seen()
+            .get(&key(300, "w", host()))
+            .map(|tombstone| tombstone.departure()),
+        Some(Departure::Exited(Exit::Unlisted))
+    );
+    assert!(
+        h.status()
+            .contains("· exited: a scan that accounts for its PID no longer lists it · "),
+        "{}",
+        h.status()
+    );
+}

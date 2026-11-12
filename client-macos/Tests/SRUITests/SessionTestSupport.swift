@@ -163,7 +163,11 @@ actor SessionFailureRecorder {
         }
     }
 
-    func wait(timeout: TimeInterval = 5) async -> SessionFailure? {
+    /// The default is the shared cross-task budget (`AsyncTestSupport.roundTripSeconds`): the
+    /// failure is reported only after the session renders on a main actor that a full parallel
+    /// run keeps busy for seconds, and 5 s expired that way under load. A negative check passes
+    /// its own short timeout.
+    func wait(timeout: TimeInterval = AsyncTestSupport.roundTripSeconds) async -> SessionFailure? {
         do {
             try await AsyncTestSupport.eventuallyAsync(
                 timeout: .seconds(timeout),

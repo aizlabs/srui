@@ -430,7 +430,7 @@ struct TransactionRateLimiterTests {
         try await serverTransport.send(data: combined)
 
         try await AsyncTestSupport.eventuallyAsync(
-            timeout: .seconds(5),
+            timeout: .roundTrip,
             description: "the out-of-phase resume is refused"
         ) {
             await failures.contains("Unexpected SERVER RESUME_OK")

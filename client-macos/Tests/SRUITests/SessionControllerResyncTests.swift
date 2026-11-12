@@ -190,7 +190,7 @@ struct SessionControllerResyncTests {
         // The applier commits ahead of the renderer inside a transaction's own task, so wait for
         // the painted value rather than sampling it the moment the revision lands.
         try await AsyncTestSupport.eventually(
-            timeout: .seconds(5),
+            timeout: .roundTrip,
             description: "catch-up snapshot and both live transactions applied and painted"
         ) {
             applier.lastAppliedRevision == Revision(4)

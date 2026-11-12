@@ -2733,10 +2733,16 @@ struct ProcessExplorerShellTests {
                 row4102() != nil
             }
             let row = try #require(row4102())
-            let item = Self.modelItemIDs(applier)[row]
+            // The item this click sends, as the native table holds it.
+            let adapter = try #require(renderer.registry.handle(for: NodeId(5))?.modelAdapter as? TableCollectionAdapter)
+            let item = try #require(adapter.itemID(at: row)).value
             table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the click resolved") {
-                native()[0].hasPrefix(selected) || native()[0].contains("is not a row this server shows")
+            // Wait for the answer to *this* click. A refusal names its item, so the previous
+            // attempt's refusal, still on screen, cannot stand in for it: matching any refusal let
+            // a loaded run spend all six attempts in 2.5 s on one stale line.
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the click on item \(item) resolved") {
+                native()[0].hasPrefix(selected)
+                    || native()[0].contains("item \(item) is not a row this server shows")
             }
             if native()[0].hasPrefix(selected) {
                 clickedItem = item

@@ -6,7 +6,9 @@
 //! excluding itself), and refuses a forest deeper than the §26 `max_model_tree_depth` limit before
 //! anything reaches a transaction. The model operations themselves are unchanged: the items go out
 //! through the ordinary `MODEL_RESET_RANGE`/`MODEL_INSERT`/`MODEL_UPDATE`, and the store checks the
-//! shape again at commit ([`srui_semantic_tree::Model::validate_tree_shape`]).
+//! shape again at commit ([`srui_semantic_tree::Model::validate_tree_shape`]). Replacing a
+//! populated model with a smaller forest also deletes the old tail by index range
+//! ([`TreeModel::replace_ops`]), because `MODEL_RESET_RANGE` only rewrites its own range.
 //!
 //! Disclosure is local to the client (§22.5); nothing here carries expansion state.
 //!
@@ -187,14 +189,50 @@ impl TreeModel {
         Ok(items)
     }
 
-    /// One `MODEL_RESET_RANGE` replacing `model`'s whole preorder from index 0 (§8, §13).
+    /// One `MODEL_RESET_RANGE` writing the forest's preorder from index 0, with `total_count` the
+    /// forest size (§8, §13).
     ///
-    /// `total_count` is the forest size; an empty forest yields an empty reset, which leaves
-    /// `item_count` unchanged (a zero `total_count` means "unchanged" on the wire).
+    /// This replaces the whole preorder only when `model` holds no more items than the forest (a
+    /// new or growing model): `MODEL_RESET_RANGE` never removes cached items past its range, so a
+    /// shrinking reset leaves the old tail cached beyond the new `item_count` and the commit is
+    /// refused. An empty forest yields an empty reset, which leaves `item_count` unchanged (a zero
+    /// `total_count` means "unchanged" on the wire). To replace a populated model, use
+    /// [`Self::replace_ops`].
     pub fn reset_op(self, model: ModelId) -> Result<Operation, TreeModelError> {
         let items = self.into_items()?;
         let total = items.len() as u64;
         Ok(Operation::model_reset_range(model, 0, items, Some(total)))
+    }
+
+    /// The operations replacing `model`'s whole preorder, currently `current_item_count` items,
+    /// with this forest (§8, §13). Apply them in order, in one transaction.
+    ///
+    /// When the forest is smaller, a `MODEL_DELETE` of the index range
+    /// `forest size .. current_item_count` comes first, so no old item stays cached past the new
+    /// `item_count` and an `ItemId` moving out of the old tail is not a duplicate; then one
+    /// `MODEL_RESET_RANGE` from index 0 writes the forest (none for an empty forest, so an empty
+    /// forest empties the model). Pass the model's current count, for example
+    /// `ui.get_model(model).map_or(0, |m| m.item_count())`; a stale count fails the commit
+    /// rather than leaving stale items.
+    pub fn replace_ops(
+        self,
+        model: ModelId,
+        current_item_count: u64,
+    ) -> Result<Vec<Operation>, TreeModelError> {
+        let items = self.into_items()?;
+        let total = items.len() as u64;
+        let mut ops = Vec::with_capacity(2);
+        if current_item_count > total {
+            ops.push(Operation::model_delete_range(
+                model,
+                total,
+                current_item_count - total,
+            ));
+        }
+        if total > 0 {
+            ops.push(Operation::model_reset_range(model, 0, items, Some(total)));
+        }
+        Ok(ops)
     }
 }
 

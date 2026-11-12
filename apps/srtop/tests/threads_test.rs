@@ -2066,7 +2066,7 @@ fn a_selected_thread_a_sample_hides_under_a_collapsed_parent_clears_the_inspecto
         .starts_with("Selected thread: TID 21 of PID 20 · p-worker"));
     let q = h.item("10");
     h.disclose(q, false);
-    assert!(h.view().collapsed().contains(&q));
+    assert!(h.view().collapsed_by(CLIENT).contains(&q));
     assert!(
         h.text(INSPECTOR_STATUS)
             .starts_with("Selected thread: TID 21"),
@@ -2093,7 +2093,7 @@ fn a_selected_thread_a_sample_hides_under_a_collapsed_parent_clears_the_inspecto
         srui_process_explorer::inspector::NO_SELECTION_STATUS
     );
     assert!(
-        h.view().collapsed().contains(&q),
+        h.view().collapsed_by(CLIENT).contains(&q),
         "the client keeps q collapsed"
     );
     // Collapsing the thread's own process hides it too, and expanding both
@@ -2123,7 +2123,12 @@ fn a_search_that_matches_a_hidden_thread_opens_its_process_and_ancestors() {
     h.view().set_search(&h.session, "p-worker").unwrap();
     h.sync();
     assert_eq!(h.view().promoted_selection(), Some(worker));
-    let collapsed: BTreeSet<u64> = h.view().collapsed().iter().map(|item| item.get()).collect();
+    let collapsed: BTreeSet<u64> = h
+        .view()
+        .collapsed_by(CLIENT)
+        .iter()
+        .map(|item| item.get())
+        .collect();
     assert_eq!(
         collapsed,
         BTreeSet::from([q.get()]),
@@ -2132,4 +2137,106 @@ fn a_search_that_matches_a_hidden_thread_opens_its_process_and_ancestors() {
     assert!(h
         .text(INSPECTOR_STATUS)
         .starts_with("Selected thread: TID 21 of PID 20 · p-worker"));
+}
+
+/// One fixed snapshot, published on every sample.
+struct Fixed(ProcessSnapshot);
+
+impl ProcessSource for Fixed {
+    fn status_text(&self) -> &str {
+        THREADS_STATUS_TEXT
+    }
+
+    fn snapshot(&mut self) -> ProcessSnapshot {
+        self.0.clone()
+    }
+}
+
+/// Merge with main (PX-013 review round, on PX-019): a selected thread row
+/// that retention drops unconfirmed under the row ceiling is not shown and
+/// never called ended, and a later scan ends it only when it is entitled to
+/// account for that thread. A scan that read no threads, or could not read
+/// that process's threads, is not; one that read them and did not list it is.
+#[test]
+fn an_evicted_thread_is_ended_only_by_a_scan_that_could_read_its_threads() {
+    let mut source = ThreadsSource::default();
+    let mut h = harness_with(&mut source, |view| view.with_published_limit(8));
+    h.toggle(USER_THREADS_TOGGLE, true);
+    h.sample(&mut source);
+    assert_eq!(h.pids().len(), 8);
+    h.select(TABLE, h.item(SERVER_THREADS[2]));
+    let head = "Selected thread: TID 202 of PID 200 · worker-2";
+    assert_eq!(
+        h.text(INSPECTOR_STATUS),
+        format!("{head} · this source provides no details")
+    );
+    let not_shown = format!(
+        "{head} · not confirmed by the latest scan; not shown (dropped under the row limit)"
+    );
+
+    // A process the scan confirms takes the eighth place; `server` and its
+    // threads are retained unconfirmed, and the ceiling drops the last of them.
+    let mut newcomer = ThreadsSource::records(0)[4].clone();
+    newcomer.key.pid = Observed::Known(400);
+    newcomer.key.creation = CreationToken::Opaque("newcomer-400".into());
+    newcomer.display_name = DisplayName::from("newcomer");
+    let with_newcomer = |mut records: Vec<ProcessRecord>| {
+        records.push(newcomer.clone());
+        records
+    };
+    let mut without_server = threads_snapshot(
+        with_newcomer(
+            ThreadsSource::records(0)
+                .into_iter()
+                .filter(|record| record.key.pid != Observed::Known(200))
+                .collect(),
+        ),
+        {
+            let mut threads = ThreadsSource::threads(0);
+            threads.records.clear();
+            threads
+        },
+    );
+    without_server.completeness = Completeness::from_scan(
+        SkippedRecords::unenumerable(),
+        vec![EnumerationIssue {
+            scope: IssueScope::Entry,
+            reason: MissingReason::Denied,
+            detail: "scripted unreadable entry".into(),
+        }],
+    );
+    h.sample(&mut Fixed(without_server));
+    assert!(!h.pids().iter().any(|pid| pid == SERVER_THREADS[2]));
+    assert_eq!(h.text(INSPECTOR_STATUS), not_shown);
+
+    // A scan that read no threads says nothing about any thread.
+    let mut no_threads = threads_snapshot(
+        with_newcomer(ThreadsSource::records(0)),
+        ThreadsSource::threads(0),
+    );
+    no_threads.threads = ThreadScan::NotRequested;
+    h.sample(&mut Fixed(no_threads));
+    assert!(h.pids().iter().all(|pid| !pid.contains("thread")));
+    assert_eq!(h.text(INSPECTOR_STATUS), not_shown);
+
+    // Neither does one that could not read `server`'s threads.
+    let mut unreadable = ThreadsSource::threads(0);
+    unreadable.records.clear();
+    unreadable.unreadable.record(200);
+    unreadable.denied = 2;
+    h.sample(&mut Fixed(threads_snapshot(
+        with_newcomer(ThreadsSource::records(0)),
+        unreadable,
+    )));
+    assert_eq!(h.text(INSPECTOR_STATUS), not_shown);
+
+    // One that read them and no longer lists TID 202's instance ends it.
+    h.sample(&mut Fixed(threads_snapshot(
+        with_newcomer(ThreadsSource::records(0)),
+        ThreadsSource::threads(ThreadsSource::CHURN_STEP),
+    )));
+    assert_eq!(
+        h.text(INSPECTOR_STATUS),
+        format!("{head} · this thread has ended; select another row")
+    );
 }

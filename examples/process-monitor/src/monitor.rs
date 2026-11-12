@@ -160,7 +160,10 @@ impl Monitor {
     /// Handles `SELECTION_CHANGED` on the process table (§7.6).
     ///
     /// Only the item id is trusted, and only if it currently exists in authoritative state. Row
-    /// text, PID text, index, label, and `action_key` from the client are never consulted.
+    /// text, PID text, index, label, and `action_key` from the client are never consulted. An
+    /// event with no `value` is the user clearing the selection (spec/registries.md §4.4): that
+    /// client's recorded selection is forgotten, so "Kill Selected" can no longer reach a process
+    /// the user deselected.
     pub fn on_selection_changed(&self, event: &WireEvent) {
         // A selection belongs to the client instance that made it. An event with no client
         // instance id cannot be attributed to an owner, so it is refused rather than recorded in a
@@ -169,9 +172,18 @@ impl Monitor {
             warn!("rejecting SELECTION_CHANGED without a client instance id");
             return;
         }
-        let Some(item) = decode_item_id(event) else {
-            warn!("rejecting SELECTION_CHANGED without a usable item id argument");
-            return;
+        let item = match decode_selection(event) {
+            Some(SelectionChange::Item(item)) => item,
+            Some(SelectionChange::Cleared) => {
+                let held = lock_or_recover(&self.state)
+                    .clear_selection_for_client(&event.client_instance_id);
+                debug!("selection cleared (one was held: {held})");
+                return;
+            }
+            None => {
+                warn!("rejecting SELECTION_CHANGED whose value is not an item id");
+                return;
+            }
         };
         let mut state = lock_or_recover(&self.state);
         let accepted = state.select_for_client(&event.client_instance_id, item);
@@ -291,12 +303,13 @@ fn decode_semantic_event(event: &WireEvent) -> Option<SemanticEvent> {
     SemanticEvent::try_from(event.clone()).ok()
 }
 
-fn decode_item_id(event: &WireEvent) -> Option<ItemId> {
+/// Reads a `SELECTION_CHANGED`: an item, a cleared selection (no `value`), or `None` when
+/// malformed. A bare unsigned integer is still read as an item, as before.
+fn decode_selection(event: &WireEvent) -> Option<SelectionChange> {
     let decoded = decode_semantic_event(event)?;
     match decoded.value_arg() {
-        Some(Value::ItemId(item)) => Some(*item),
-        Some(Value::UnsignedInt(raw)) => Some(ItemId::new(*raw)),
-        _ => None,
+        Some(Value::UnsignedInt(raw)) => Some(SelectionChange::Item(ItemId::new(*raw))),
+        _ => decoded.selection_change(),
     }
 }
 

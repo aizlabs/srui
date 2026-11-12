@@ -19,7 +19,7 @@
 //!   hidden; a new process that reuses its PID is never followed.
 
 use srui_process_explorer::catalogue::ProcessField;
-use srui_process_explorer::follow::{FOLLOW_LABEL, OFF_STATUS};
+use srui_process_explorer::follow::{FOLLOW_LABEL, OFF_STATUS, SELECTION_CLEARED_FOLLOW_STATUS};
 use srui_process_explorer::refresh::{lock_view, ProcessView, SharedView};
 use srui_process_explorer::source::{FollowSource, ProcessSource, FOLLOW_STATUS_TEXT};
 use srui_process_explorer::{
@@ -334,6 +334,17 @@ impl Harness {
         self.select_at(self.revision(), item);
     }
 
+    /// The user leaves the table with nothing selected: `SELECTION_CHANGED`
+    /// with no `value` (PX-017-G02).
+    fn clear_selection(&mut self) {
+        self.send(
+            self.revision(),
+            TABLE,
+            TypeRef::EVENT_SELECTION_CHANGED,
+            vec![],
+        );
+    }
+
     /// The checkbox's click: the client flips it and sends its value.
     fn toggle(&mut self, on: bool) {
         self.send(
@@ -619,6 +630,55 @@ fn the_row_ceiling_that_hides_the_followed_process_stops_follow() {
         "{}",
         h.status()
     );
+    assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(h.hinted(), None);
+}
+
+/// PX-017-G02: the user deselects the followed row, which the client reports
+/// as a `SELECTION_CHANGED` with no `value`. Follow stops, says the selection
+/// was cleared, and clears its hint; it never moves to another row and
+/// promotes nothing.
+#[test]
+fn clearing_the_selection_while_following_stops_follow_with_a_reason() {
+    let mut h = harness();
+    let tracked = h.follow_tracked();
+    let before = h.revision();
+    h.clear_selection();
+    assert_eq!(h.view().follow().following(), None);
+    assert!(!h.checked());
+    assert_eq!(h.status(), SELECTION_CLEARED_FOLLOW_STATUS);
+    assert_eq!(hint_clears_since(&h.session, before), 1);
+    assert_eq!(h.hinted(), None);
+    assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
+    assert_eq!(h.view().inspector().selected(), None);
+    assert!(h.row_of(tracked).is_some(), "the process is still shown");
+    // A sample does not restart follow.
+    let before = h.revision();
+    h.sample();
+    assert_eq!(h.view().follow().following(), None);
+    assert_eq!(hints_since(&h.session, before), Vec::<ItemId>::new());
+}
+
+/// PX-017-G02, from Codex review of PR #101: select a row, deselect it, then
+/// turn follow on. The server knows nothing is selected, so turning on is
+/// refused and the deselected process is never followed or hinted.
+#[test]
+fn turning_follow_on_after_the_selection_was_cleared_is_refused() {
+    let mut h = harness();
+    let tracked = h.item_of(FollowSource::TRACKED_PID.into());
+    h.select(tracked);
+    assert_eq!(h.view().inspector().selected(), Some(tracked));
+    h.clear_selection();
+    assert_eq!(h.view().inspector().selected(), None);
+    let before = h.revision();
+    h.toggle(true);
+    assert!(!h.checked());
+    assert_eq!(h.view().follow().following(), None);
+    assert_eq!(
+        h.status(),
+        "Follow: off · nothing is selected; select a row, then turn follow on"
+    );
+    assert_eq!(hints_since(&h.session, before), Vec::<ItemId>::new());
     assert_eq!(promotions_since(&h.session, before), Vec::<ItemId>::new());
     assert_eq!(h.hinted(), None);
 }

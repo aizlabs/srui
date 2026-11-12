@@ -174,7 +174,10 @@ struct SessionControllerThreadingTests {
         #expect(currentSnapshot.store == initialStore)
     }
 
-    @Test("Button, toggle, and table interactions route through outbox and capture observed revision")
+    @Test(
+        "Button, toggle, and table interactions route through outbox and capture observed revision",
+        .timeLimit(.minutes(1))
+    )
     @MainActor
     func buttonToggleAndTableRouting() async throws {
         let (clientTransport, serverTransport) = await PipeTransport.createPair()
@@ -323,6 +326,26 @@ struct SessionControllerThreadingTests {
         #expect(tableEvent.eventType == .EVENT_SELECTION_CHANGED)
         #expect(tableEvent.itemIdArg == ItemId(2))
         #expect(tableEvent.observedRevision == Revision(2))
+
+        // 4. PX-017-G02: the user deselects; the native path sends one SELECTION_CHANGED with no
+        // value, in order after the selection (spec/registries.md §4.4).
+        tableView.deselectAll(nil)
+        var clearedEvents: [Event] = []
+        for try await chunk in serverStream {
+            for msg in try streamDecoder.appendAndExtract(incoming: chunk) {
+                if case .event(let wireEvent) = msg.msg {
+                    clearedEvents.append(try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent))
+                }
+            }
+            if !clearedEvents.isEmpty { break }
+        }
+        let clearedEvent = try #require(clearedEvents.first)
+        #expect(clearedEvents.count == 1)
+        #expect(clearedEvent.eventSeq == 4)
+        #expect(clearedEvent.nodeId == tableID)
+        #expect(clearedEvent.eventType == .EVENT_SELECTION_CHANGED)
+        #expect(clearedEvent.arguments.isEmpty)
+        #expect(clearedEvent.observedRevision == Revision(2))
 
         await controller.stop()
         await serverTransport.close()

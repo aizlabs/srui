@@ -37,6 +37,11 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
     public var hasExplicitColumns: Bool = false
     public var selectionMode: StandardSelectionMode = .none
     public var onSelectionChanged: (@MainActor (NodeId, ItemId) -> Void)?
+    /// A user action left the collection with no selected row: reported as `SELECTION_CHANGED`
+    /// with no `value` (§7.6; `spec/registries.md` §4.4). Never called for a server-driven
+    /// deselection (a commit, a promotion or its withdrawal), which runs with selection events
+    /// suppressed.
+    public var onSelectionCleared: (@MainActor (NodeId) -> Void)?
     public var onRangeRequest: (@MainActor (CollectionRangeRequest) -> Void)?
     /// User-originated selection changes, including an empty selection (§22.5). Unlike
     /// `onSelectionChanged` this is not a semantic event; the renderer uses it to keep a local
@@ -322,8 +327,7 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
             tableView.reloadData()
             lastRowUpdate = .fullReload
         } else {
-            reloadVisibleRows(in: tableView)
-            lastRowUpdate = .contentReload(visibleRowIndexes(in: tableView))
+            lastRowUpdate = .contentReload(reloadRealizedRows(in: tableView))
         }
 
         restoreSelection(selectedItemIDs, in: tableView)
@@ -493,6 +497,12 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
         pendingPromotion = nil
         localSelectionSincePromotion = true
         onLocalSelection?(nodeID, selectedIDs)
+        // The user left nothing selected: tell the server once, with no item (§7.6;
+        // spec/registries.md §4.4). A partial deselection in multiple mode is not reported.
+        guard tableView.selectedRowIndexes.isEmpty == false else {
+            onSelectionCleared?(nodeID)
+            return
+        }
         guard selectedIDs.isEmpty == false else { return }
 
         if selectionMode == .single {
@@ -604,14 +614,27 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
         return IndexSet(integersIn: start..<end)
     }
 
-    private func reloadVisibleRows(in tableView: NSTableView) {
-        let indexes = visibleRowIndexes(in: tableView)
+    /// Reloads every row AppKit holds a view for and returns those rows (§8, §22.7).
+    ///
+    /// The visible rows are not enough: AppKit also keeps views for rows outside `visibleRect`,
+    /// those it prepared around the viewport and any realized on demand by
+    /// `view(atColumn:row:makeIfNecessary:)`. A re-sort that keeps the row count must refresh
+    /// them too, or one scrolled into view shows the item a previous commit held at that row,
+    /// for example on the row a local selection just moved to by ItemId. Rows without a view are
+    /// built from the current model when they appear.
+    private func reloadRealizedRows(in tableView: NSTableView) -> IndexSet {
+        var indexes = visibleRowIndexes(in: tableView)
+        let rowCount = tableView.numberOfRows
+        tableView.enumerateAvailableRowViews { _, row in
+            if row >= 0, row < rowCount { indexes.insert(row) }
+        }
         let columnIndexes = IndexSet(integersIn: 0..<tableView.numberOfColumns)
         if !indexes.isEmpty, !columnIndexes.isEmpty {
             tableView.reloadData(forRowIndexes: indexes, columnIndexes: columnIndexes)
         } else {
             tableView.reloadData()
         }
+        return indexes
     }
 
     private func refreshNestedChrome(tableView: NSTableView) {

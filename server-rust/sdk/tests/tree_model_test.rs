@@ -349,3 +349,184 @@ fn tree_reads_columns_like_table() {
     tree.clear_columns(&mut store).unwrap();
     assert_eq!(tree.columns(&store), None);
 }
+
+// --- Replacing a populated model (PR #101 review: a smaller forest must not leave a stale tail) ---
+
+/// A session whose model holds `forest`, committed through `reset_op` on an empty model.
+fn session_holding(name: &str, forest: Vec<TreeNode>) -> Session {
+    let session = Session::new(name);
+    session
+        .transaction(|ui| {
+            ui.apply_op(&Operation::create_model(MODEL, TypeRef::TREE, 0))?;
+            ui.apply_op(&TreeModel::new(forest).reset_op(MODEL).unwrap())?;
+            Ok(())
+        })
+        .expect("populating an empty model");
+    session
+}
+
+/// Replaces the model's whole preorder in one transaction through `TreeModel::replace_ops`.
+fn replace(session: &Session, forest: Vec<TreeNode>) -> Result<(), SdkError> {
+    session.transaction(|ui| {
+        let current = ui.get_model(MODEL).map_or(0, |m| m.item_count());
+        for op in TreeModel::new(forest).replace_ops(MODEL, current).unwrap() {
+            ui.apply_op(&op)?;
+        }
+        Ok(())
+    })
+}
+
+fn cached(session: &Session) -> (u64, Vec<(u64, ModelItem)>) {
+    session.with_store(|store| {
+        let model = store.get_model(MODEL).unwrap();
+        let items = model
+            .iter_cached_items()
+            .map(|(&i, item)| (i, item.clone()))
+            .collect();
+        (model.item_count(), items)
+    })
+}
+
+fn parent_and_child() -> Vec<TreeNode> {
+    vec![TreeNode::new(1u64, "parent").with_child(TreeNode::new(2u64, "child"))]
+}
+
+#[test]
+fn reset_op_alone_cannot_shrink_a_populated_tree() {
+    // `MODEL_RESET_RANGE` rewrites only its own range: index 1 stays cached past the new count.
+    let session = session_holding("reset-shrink", parent_and_child());
+    let revision = session.current_revision();
+    let err = session
+        .transaction(|ui| {
+            let reset = TreeModel::new([TreeNode::new(1u64, "parent")])
+                .reset_op(MODEL)
+                .unwrap();
+            ui.apply_op(&reset)?;
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SdkError::Store(StoreError::InvalidModelTree {
+                index: 1,
+                violation: ModelTreeViolation::DescendantCountOutOfRange { item_count: 1, .. },
+                ..
+            })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(session.current_revision(), revision);
+}
+
+#[test]
+fn replacing_a_parent_and_child_with_the_parent_as_a_leaf_commits() {
+    let session = session_holding("replace-leaf", parent_and_child());
+    replace(&session, vec![TreeNode::new(1u64, "parent")])
+        .expect("a smaller forest replaces the whole preorder");
+    let (count, items) = cached(&session);
+    assert_eq!(count, 1);
+    assert_eq!(items.len(), 1, "no old item stays cached: {items:?}");
+    assert_eq!(items[0].0, 0);
+    assert_eq!(depth_and_count(&items[0].1), (0, 0));
+}
+
+#[test]
+fn replace_ops_delete_the_old_tail_before_the_reset() {
+    let ops = TreeModel::new([TreeNode::new(1u64, "a")])
+        .replace_ops(MODEL, 7)
+        .unwrap();
+    assert_eq!(ops.len(), 2, "{ops:?}");
+    assert_eq!(ops[0], Operation::model_delete_range(MODEL, 1, 6));
+    assert!(matches!(
+        &ops[1],
+        Operation::ModelResetRange { start_index: 0, total_count: Some(1), items, .. } if items.len() == 1
+    ));
+    // Growing or same size: the reset alone.
+    let grow = TreeModel::new(sample_forest())
+        .replace_ops(MODEL, 2)
+        .unwrap();
+    assert!(matches!(
+        grow.as_slice(),
+        [Operation::ModelResetRange {
+            total_count: Some(7),
+            ..
+        }]
+    ));
+    let same = TreeModel::new(sample_forest())
+        .replace_ops(MODEL, 7)
+        .unwrap();
+    assert!(matches!(
+        same.as_slice(),
+        [Operation::ModelResetRange {
+            total_count: Some(7),
+            ..
+        }]
+    ));
+    // Empty forest: delete everything, no reset; nothing at all for an empty model.
+    let empty = TreeModel::new(Vec::new()).replace_ops(MODEL, 7).unwrap();
+    assert_eq!(empty, vec![Operation::model_delete_range(MODEL, 0, 7)]);
+    assert!(TreeModel::new(Vec::new())
+        .replace_ops(MODEL, 0)
+        .unwrap()
+        .is_empty());
+}
+
+/// Smaller forests of every size below the sample's 7 items, with fresh ids, ids reused from the
+/// old tail at new positions, and nested shapes.
+fn smaller_forests() -> Vec<Vec<TreeNode>> {
+    let mut forests = Vec::new();
+    for n in 1..7u64 {
+        // A chain whose ids come from the end of the old preorder (7, 6, ...).
+        let mut chain = TreeNode::new(7 - (n - 1), "leaf");
+        for id in (7 - (n - 1) + 1)..=7 {
+            chain = TreeNode::new(id, "level").with_child(chain);
+        }
+        forests.push(vec![chain]);
+        // Flat roots with fresh ids.
+        forests.push((0..n).map(|i| TreeNode::new(100 + i, "root")).collect());
+        // One root over n - 1 children, ids reversed from the old preorder.
+        forests.push(vec![
+            TreeNode::new(n, "top").with_children((1..n).rev().map(|id| TreeNode::new(id, "kid")))
+        ]);
+    }
+    forests
+}
+
+#[test]
+fn replacing_a_populated_forest_with_any_smaller_forest_matches_building_it_fresh() {
+    for (case, forest) in smaller_forests().into_iter().enumerate() {
+        let expected = cached(&session_holding("fresh", forest.clone()));
+        let session = session_holding("replace-smaller", sample_forest());
+        replace(&session, forest).unwrap_or_else(|err| panic!("case {case}: {err:?}"));
+        let got = cached(&session);
+        assert_eq!(got, expected, "case {case}");
+        assert!(
+            got.1.iter().all(|(i, _)| *i < got.0),
+            "case {case}: {got:?}"
+        );
+    }
+}
+
+#[test]
+fn replacing_a_small_forest_with_a_larger_one_matches_building_it_fresh() {
+    let session = session_holding("replace-grow", parent_and_child());
+    replace(&session, sample_forest()).unwrap();
+    assert_eq!(
+        cached(&session),
+        cached(&session_holding("fresh", sample_forest()))
+    );
+}
+
+#[test]
+fn replacing_a_populated_forest_with_an_empty_one_empties_the_model() {
+    let session = session_holding("replace-empty", sample_forest());
+    replace(&session, Vec::new()).expect("an empty forest empties the model");
+    assert_eq!(cached(&session), (0, Vec::new()));
+    // Replacing the now empty model with an empty forest commits nothing to the model.
+    replace(&session, Vec::new()).unwrap();
+    assert_eq!(cached(&session), (0, Vec::new()));
+    // And it can be populated again.
+    replace(&session, parent_and_child()).unwrap();
+    assert_eq!(cached(&session).0, 2);
+}

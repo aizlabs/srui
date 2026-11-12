@@ -55,8 +55,8 @@
     },
     {
       "feature_id": "SRUI-PX015-004",
-      "feature": "The inspector reads nothing live while paused: a selection made while paused shows its frozen row and Details::Deferred (not read while the view is paused); a read in flight at the pause is dropped on return; details read before the pause stay; Resume view asks for the current target's details again",
-      "scope": "PX-015/inspector (src/inspector.rs) Inspector::pause, Inspector::resume, Inspector::completed, Details::Deferred; tests/sampling_test.rs a_paused_inspector_reads_nothing_live_and_resume_reads_again",
+      "feature": "The inspector reads nothing live while paused: a selection made while paused shows its frozen row and Details::Deferred (not read while the view is paused); Pause view and Resume view each move the current target to a new selection generation, so a read asked for before either is dropped whenever it returns, during the pause or after the resume; details read before the pause stay; Resume view asks for the current target's details again",
+      "scope": "PX-015/inspector (src/inspector.rs) Inspector::pause, Inspector::resume, Inspector::completed, Inspector::renew, Details::Deferred; tests/sampling_test.rs a_paused_inspector_reads_nothing_live_and_resume_reads_again, a_detail_read_from_before_a_pause_and_resume_is_never_shown, a_detail_read_in_flight_across_a_pause_is_dropped",
       "source_refs": [
         "D1",
         "D2"
@@ -84,7 +84,7 @@
     {
       "feature_id": "SRUI-PX015-006",
       "feature": "Manual refresh is one bounded sample through the existing refresh path: Refresh now sets one coalesced request and wakes the loop; presses the loop has not taken are one sample; the next periodic tick follows one interval later; refused while paused (the button is disabled, so event validation rejects it)",
-      "scope": "PX-015/sampling (src/sampling.rs) Sampling::refresh_now, Sampling::take_request; refresh (src/refresh.rs) poll, ProcessView::refresh_now; tests/sampling_test.rs refresh_now_presses_coalesce_into_one_bounded_sample",
+      "scope": "PX-015/sampling (src/sampling.rs) Sampling::refresh_now, Sampling::take_request; refresh (src/refresh.rs) poll, ProcessView::refresh_now; tests/sampling_test.rs refresh_now_presses_coalesce_into_one_bounded_sample, refresh_now_restarts_the_ticker",
       "source_refs": [
         "D1",
         "D2"
@@ -97,8 +97,8 @@
     },
     {
       "feature_id": "SRUI-PX015-007",
-      "feature": "One timer, owned by the loop, ended with it: handlers start no timer or thread; an interval change or resume replaces the loop's one ticker (first tick one new interval later: no burst, no second timer); the ticker and the Notify wake end with poll on shutdown in every sampling state; nothing outlives the view; a client disconnect ends only its connection",
-      "scope": "PX-015/refresh (src/refresh.rs) poll, ticker_every; tests/sampling_test.rs an_interval_change_restarts_the_one_ticker_without_a_burst, the_loop_ends_on_shutdown_in_every_sampling_state_and_releases_the_view; tests/shutdown.rs a_paused_or_retimed_instance_stops_and_releases_its_socket",
+      "feature": "One timer, owned by the loop, ended with it: handlers start no timer or thread; an interval change or resume replaces the loop's one ticker (first tick one new interval later: no burst, no second timer), and a tick of the retired ticker that was already due is ignored unless the request asks for a sample now, whichever ready select! branch the loop takes; the ticker and the Notify wake end with poll on shutdown in every sampling state; nothing outlives the view; a client disconnect ends only its connection",
+      "scope": "PX-015/refresh (src/refresh.rs) poll, ticker_every; tests/sampling_test.rs an_interval_change_restarts_the_one_ticker_without_a_burst, the_loop_ends_on_shutdown_in_every_sampling_state_and_releases_the_view; tests/shutdown.rs a_paused_or_retimed_instance_stops_and_releases_its_socket, a_tick_of_the_retired_ticker_never_starts_an_extra_scan",
       "source_refs": [
         "D1",
         "D2"

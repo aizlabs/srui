@@ -86,6 +86,7 @@ fn four() -> Vec<ProcessRecord> {
 
 struct Fixture {
     records: Vec<ProcessRecord>,
+    completeness: Completeness,
 }
 
 impl ProcessSource for Fixture {
@@ -105,7 +106,7 @@ impl ProcessSource for Fixture {
             vanished: 0,
             capped: CappedRecords::none(),
             system: SystemSample::not_provided(),
-            completeness: Completeness::Complete,
+            completeness: self.completeness.clone(),
         }
     }
 }
@@ -211,11 +212,32 @@ fn start(records: Vec<ProcessRecord>, probe: Option<&Arc<Probe>>) -> Harness {
     start_limited(records, probe, usize::MAX)
 }
 
+/// Asks the account-name cache (PX-012) about every owner in `records` and
+/// waits for its worker to answer them all, before anything is selected. The
+/// inspector's owner text then names each owner as the fixture database
+/// answers it (`alice`, or `no account name`) on its first publication and
+/// every later one, instead of depending on whether that worker answered
+/// before or after a given commit. No test here is about name-lookup delay;
+/// that is PX-012's `a_delayed_name_lookup_never_stalls_publication`.
+fn settle_names(view: &ProcessView, records: &[ProcessRecord]) {
+    let names = view.owner_filter().names();
+    for record in records {
+        if let Observed::Known(uid) = record.owner {
+            let _ = names.name(uid);
+        }
+    }
+    assert!(names.wait_idle(WAIT), "the fixture names were answered");
+}
+
 /// [`start`] with the published-row ceiling lowered to `limit`.
 fn start_limited(records: Vec<ProcessRecord>, probe: Option<&Arc<Probe>>, limit: usize) -> Harness {
     let session = Arc::new(Session::mint());
-    let mut source = Fixture { records };
+    let mut source = Fixture {
+        records,
+        completeness: Completeness::Complete,
+    };
     let (view, _) = start_from_source(&session, &mut source).unwrap();
+    settle_names(&view, &source.records);
     let view = view.with_published_limit(limit);
     let view: SharedView = Arc::new(Mutex::new(view));
     install_search_handlers(&session, &view);
@@ -428,6 +450,12 @@ fn the_inspector_stays_on_its_process_when_sorting_moves_its_row_and_never_shows
     harness.idle();
     let selected = harness.lines();
     assert_eq!(selected[0], "Selected process: PID 200 · beta");
+    // The fixture database has no entry for UID 1001, answered before the
+    // selection (`settle_names`), so this line cannot change under the sort.
+    assert_eq!(
+        selected[1],
+        "Name: beta · PID 200 · Owner: UID 1001 (no account name)"
+    );
     let ids_before: Vec<ItemId> = harness.rows().iter().map(|(id, _)| *id).collect();
     assert_eq!(ids_before.iter().position(|id| *id == b), Some(1));
 
@@ -570,6 +598,185 @@ fn a_sort_that_drops_the_selected_row_under_the_ceiling_shows_it_as_not_shown() 
     assert_eq!(harness.item_of(200), b);
     assert_eq!(harness.lines()[0], "Selected process: PID 200 · beta");
     assert_eq!(probe.calls(), calls, "no sort read anything");
+}
+
+/// PX-013 review round, F1: a refresh that changes the selected instance's
+/// owner (another UID, then denied) publishes the new owner, and no later
+/// publication — a detail completion, a re-selection, a sort — ever brings an
+/// older owner back. The owner lines committed for B are therefore exactly
+/// the sequence of the owners the scans read, never oscillating.
+#[test]
+fn the_inspectors_owner_is_always_the_latest_scans_and_never_reverts() {
+    let probe = Probe::new();
+    let mut harness = start(four(), Some(&probe));
+    let b = harness.item_of(200);
+    harness.select(1, b);
+    harness.idle();
+    let pending = "Name: beta · PID 200 · Owner: UID 1001 (no account name)";
+    assert_eq!(harness.lines()[1], pending);
+    let revision = harness.session.current_revision();
+    let mut seq = 2;
+    let mut settle_and_check = |harness: &mut Harness, expected: &str| {
+        assert_eq!(harness.lines()[1], expected, "after the refresh");
+        // The refresh asked for B's details again; its completion publishes.
+        harness.idle();
+        assert_eq!(harness.lines()[1], expected, "after a detail completion");
+        harness.select(seq, b);
+        seq += 1;
+        harness.idle();
+        assert_eq!(harness.lines()[1], expected, "after a re-selection");
+        harness
+            .view()
+            .click_sort(&harness.session, ProcessField::Name)
+            .unwrap();
+        assert_eq!(harness.lines()[1], expected, "after a sort");
+        harness.idle();
+        assert_eq!(harness.lines()[1], expected, "after everything settled");
+        assert_eq!(harness.view().inspector().selected(), Some(b));
+    };
+
+    // The same instance (same key, same item) now runs as the fixture's own
+    // account.
+    let alice = "Name: beta · PID 200 · Owner: UID 1000 (alice)";
+    let i = harness
+        .source
+        .records
+        .iter()
+        .position(|r| r.display_name.as_str() == "beta")
+        .unwrap();
+    harness.source.records[i].owner = Observed::Known(1000);
+    harness.refresh();
+    assert_eq!(harness.item_of(200), b);
+    settle_and_check(&mut harness, alice);
+
+    // Then its owner can no longer be read.
+    let denied = "Name: beta · PID 200 · Owner: permission denied";
+    harness.source.records[i].owner = Observed::Missing(MissingReason::Denied);
+    harness.refresh();
+    assert_eq!(harness.item_of(200), b);
+    settle_and_check(&mut harness, denied);
+
+    // A last change, with no re-selection after it, and then B ends: the
+    // inspector shows the last scan's owner of it, never the one it had when
+    // it was last selected.
+    let other = "Name: beta · PID 200 · Owner: UID 4242 (no account name)";
+    {
+        let view = harness.view();
+        let names = view.owner_filter().names();
+        let _ = names.name(4242);
+        assert!(names.wait_idle(WAIT));
+    }
+    harness.source.records[i].owner = Observed::Known(4242);
+    harness.refresh();
+    harness.idle();
+    assert_eq!(harness.lines()[1], other);
+    harness.source.records.remove(i);
+    harness.refresh();
+    assert_eq!(
+        harness.lines()[..2],
+        [
+            "Selected process: PID 200 · beta · this process has ended; select another row"
+                .to_string(),
+            other.to_string(),
+        ]
+    );
+
+    let mut owners: Vec<String> = harness
+        .inspector_texts_since(revision)
+        .into_iter()
+        .filter(|text| text.starts_with("Name: beta"))
+        .collect();
+    owners.dedup();
+    assert_eq!(
+        owners,
+        [alice, denied, other],
+        "the owner never reverted or oscillated"
+    );
+}
+
+/// PX-013 review round, F2: an incomplete scan that cannot account for the
+/// selected process keeps its row, and when this scan's newly confirmed rows
+/// leave no room for it under the published-row ceiling, retention drops it.
+/// Nothing established an exit, so the inspector says it is not confirmed and
+/// not shown, keeps its identity and never says "ended". Only a later scan
+/// entitled to account for it may establish that.
+#[test]
+fn a_retained_row_the_ceiling_evicts_is_never_called_ended() {
+    let probe = Probe::new();
+    let mut harness = start_limited(four(), Some(&probe), 4);
+    let b = harness.item_of(200);
+    harness.select(1, b);
+    harness.idle();
+    assert_eq!(harness.lines()[0], "Selected process: PID 200 · beta");
+    let revision = harness.session.current_revision();
+
+    // An incomplete scan that cannot name what it missed: B is absent but
+    // retained, and a new confirmed process takes the fourth place.
+    let beta = harness.source.records.remove(1);
+    harness
+        .source
+        .records
+        .push(record(500, "f", "epsilon", Observed::Known(1000), 1));
+    harness.source.completeness = Completeness::from_scan(
+        SkippedRecords::unenumerable(),
+        vec![EnumerationIssue {
+            scope: IssueScope::Entry,
+            reason: MissingReason::Denied,
+            detail: "scripted unreadable entry".into(),
+        }],
+    );
+    harness.refresh();
+    harness.idle();
+    assert_eq!(harness.rows().len(), 4);
+    assert!(
+        harness.rows().iter().all(|(id, _)| *id != b),
+        "the ceiling dropped B"
+    );
+    let [status, process, details, metrics] = harness.lines();
+    assert_eq!(
+        status,
+        "Selected process: PID 200 · beta · not confirmed by the latest scan; not shown (dropped under the row limit)"
+    );
+    assert_eq!(
+        process,
+        "Name: beta · PID 200 · Owner: UID 1001 (no account name)"
+    );
+    assert_eq!(details, "State, parent and start time: not shown");
+    assert_eq!(metrics, "CPU and resident memory: not shown");
+    assert_eq!(harness.view().inspector().selected(), Some(b));
+    // The same incomplete scan again changes nothing.
+    harness.refresh();
+    assert!(harness.lines()[0].contains("not confirmed by the latest scan"));
+
+    // A complete scan lists B again: the allocator forgot its item when it was
+    // dropped, so it is a new row, which the inspector does not adopt.
+    harness.source.completeness = Completeness::Complete;
+    harness.source.records.insert(1, beta);
+    harness.source.records.pop();
+    harness.refresh();
+    let again = harness.item_of(200);
+    assert_ne!(again, b);
+    assert_eq!(
+        harness.lines()[0],
+        "Selected process: PID 200 · beta · listed again as a new row after the row limit dropped it unconfirmed; select it again"
+    );
+    assert_eq!(harness.view().inspector().selected(), Some(b));
+    for text in harness.inspector_texts_since(revision) {
+        assert!(
+            !text.contains("has ended"),
+            "an eviction was called an exit: {text}"
+        );
+    }
+    assert_eq!(probe.calls(), ["b"], "nothing was read for a row not shown");
+
+    // A complete scan that no longer lists it accounts for its absence: now
+    // the process has ended.
+    harness.source.records.remove(1);
+    harness.refresh();
+    assert_eq!(
+        harness.lines()[0],
+        "Selected process: PID 200 · beta · this process has ended; select another row"
+    );
 }
 
 #[test]

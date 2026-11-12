@@ -398,6 +398,88 @@ struct CollectionAdaptersTests {
         #expect(adapter.numberOfRows(in: tableView) == 500_000)
     }
 
+    /// A re-sort of a model-backed table keeps the row count, so the adapter reloads row content
+    /// in place instead of calling `reloadData()`. AppKit can hold cell views for rows outside
+    /// `visibleRect`: rows it prepared around the viewport, and any view realized on demand by
+    /// `view(atColumn:row:makeIfNecessary:)` (accessibility, a test reading the table). Every such
+    /// view must show the commit's item at its row, or scrolling it into view shows another
+    /// item's cells, here on the very row the selection moved to by ItemId (§8, §22.5, §22.7).
+    /// PX-017's native rapid-arrow test saw exactly this: the selected row showed the next PID.
+    @Test
+    func aResortReloadsEveryRealizedRowNotOnlyTheVisibleOnes() throws {
+        func item(_ id: UInt64) -> ModelItem {
+            ModelItem(itemID: ItemId(id), value: .list([.string("\(6000 + id)")]))
+        }
+        var store = SemanticStore()
+        let modelID = ModelId(72)
+        try store.createModel(id: modelID, modelType: .table, itemCount: 0)
+        // Row r holds ItemId r + 1 ("600(r+1)"), with ItemId 100 inserted at row 55.
+        var ids = Array(UInt64(1)...59)
+        ids.insert(100, at: 55)
+        try store.modelInsert(id: modelID, index: 0, items: ids.map(item))
+        var selections: [ItemId] = []
+        let adapter = TableCollectionAdapter(
+            nodeID: NodeId(4),
+            model: store.getModel(modelID),
+            modelID: modelID,
+            selectionMode: .single,
+            onSelectionChanged: { selections.append($1) }
+        )
+        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 300, height: 90))
+        let tableView = NSTableView(frame: .zero)
+        TableCollectionAdapter.reconcileColumns(in: tableView, columns: ["PID"], fallbackTitle: "Table")
+        tableView.dataSource = adapter
+        tableView.delegate = adapter
+        scrollView.documentView = tableView
+        let window = NSWindow(
+            contentRect: scrollView.frame,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = scrollView
+        defer { window.close() }
+        tableView.reloadData()
+
+        // The user's selection is the bottom visible row, as after a run of Down Arrow presses.
+        tableView.selectRowIndexes(IndexSet(integer: 45), byExtendingSelection: false)
+        tableView.scrollRowToVisible(45)
+        tableView.layoutSubtreeIfNeeded()
+        #expect(selections == [ItemId(46)])
+        let visible = tableView.rows(in: tableView.visibleRect)
+        #expect(NSLocationInRange(46, visible) == false, "row 46 starts below the viewport")
+        _ = tableView.view(atColumn: 0, row: 46, makeIfNecessary: true)
+        var realized: [Int] = []
+        tableView.enumerateAvailableRowViews { _, row in realized.append(row) }
+        #expect(realized.contains(46), "AppKit holds row 46 outside the visible rows \(visible): \(realized)")
+
+        // A sample moves ItemId 100 from row 55 to row 41: rows 41–54 shift down by one, and the
+        // selected ItemId 46 moves from row 45 to row 46, below the viewport.
+        try store.modelDelete(id: modelID, index: nil, count: nil, itemIds: [ItemId(100)])
+        try store.modelInsert(id: modelID, index: 41, items: [item(100)])
+        adapter.update(model: store.getModel(modelID), modelID: modelID, tableView: tableView)
+
+        #expect(tableView.selectedRowIndexes == IndexSet(integer: 46), "the selection keeps its ItemId")
+        #expect(adapter.itemID(at: 46) == ItemId(46))
+        #expect(selections == [ItemId(46)], "a commit emits no SELECTION_CHANGED")
+        func shown(_ row: Int) -> String? {
+            (tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? NSTextField)?.stringValue
+        }
+        tableView.enumerateAvailableRowViews { _, row in
+            #expect(shown(row) == adapter.rowContent(at: row)?.cells.first, "realized row \(row) shows its item")
+        }
+        // Scrolled into view, the selected row shows the selected item.
+        tableView.scrollRowToVisible(46)
+        tableView.layoutSubtreeIfNeeded()
+        #expect(shown(46) == "6046")
+        for row in 40...47 {
+            tableView.scrollRowToVisible(row)
+            tableView.layoutSubtreeIfNeeded()
+            #expect(shown(row) == adapter.rowContent(at: row)?.cells.first, "row \(row) after scrolling to it")
+        }
+    }
+
     @Test
     func modelBackedOutlineIsFlatRootLeaves() throws {
         var store = SemanticStore()

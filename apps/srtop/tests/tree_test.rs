@@ -183,11 +183,17 @@ impl Harness {
     }
 
     fn disclose_from(&mut self, client: &[u8], item: ItemId, expanded: bool) {
+        let observed = self.revision();
+        self.disclose_observed(client, item, expanded, observed);
+    }
+
+    /// A disclosure report `client` made while it held revision `observed`.
+    fn disclose_observed(&mut self, client: &[u8], item: ItemId, expanded: bool, observed: u64) {
         let seq = self.next_seq(client);
         let wire = DomainEvent::expansion_changed(
             seq,
             format!("tree-disclosure-{seq}"),
-            self.revision(),
+            observed,
             TREE,
             item,
             expanded,
@@ -2074,4 +2080,94 @@ fn an_undecodable_selection_is_refused_on_the_shown_tree_and_ignored_from_the_hi
     );
     assert_ne!(h.text(INSPECTOR_STATUS), CLEARED_SELECTION_STATUS);
     assert_ne!(h.text(FOLLOW_STATUS), SELECTION_CLEARED_FOLLOW_STATUS);
+}
+
+/// Codex review round 5: the user clicks Go to PID and, before the promotion
+/// reaches the client, collapses the match's parent. The collapse report,
+/// made at the earlier revision, arrives after the server selected the
+/// match. The client then applies the promotion: it expands the collapsed
+/// parent above the match and selects it with selection events suppressed
+/// (`OutlineCollectionAdapter.resolvePendingPromotion`,
+/// `expandCollapsedAncestors`), and reports the expand. So the delayed
+/// collapse neither clears the inspector nor leaves the parent collapsed in
+/// the mirror; a collapse made after the promotion reached the client still
+/// hides the match and clears the inspector.
+#[test]
+fn a_collapse_made_before_a_revealing_promotion_reached_the_client_keeps_its_match() {
+    let mut source = family(&[
+        (10, "alpha", 0, 10),
+        (11, "beta", 10, 11),
+        (30, "xray", 0, 60),
+    ]);
+    let mut h = harness(&mut source);
+    h.show_tree(true);
+    let alpha = h.item_of(10);
+    let beta = h.item_of(11);
+    h.view().set_pid_input(&h.session, "11").unwrap();
+    h.sync();
+    // The client holds this revision when it clicks Go to PID and then
+    // collapses `alpha`.
+    let before = h.revision();
+    h.send_from(CLIENT, PID_GO, TypeRef::EVENT_ACTIVATE, vec![]);
+    assert_eq!(h.item_property(TREE, VALUE), Some(beta), "promoted");
+    h.disclose_observed(CLIENT, alpha, false, before);
+    assert!(
+        h.text(INSPECTOR_STATUS)
+            .starts_with("Selected process: PID 11 · beta"),
+        "{}",
+        h.text(INSPECTOR_STATUS)
+    );
+    assert!(
+        h.view().collapsed_by(CLIENT).is_empty(),
+        "the promotion expands alpha again on the client"
+    );
+    // The client applies the promotion and reports the expand it made.
+    let quiet = h.revision();
+    h.disclose(alpha, true);
+    assert_eq!(h.revision(), quiet, "the expand report changes nothing");
+    h.sample(&mut source);
+    assert!(h
+        .text(INSPECTOR_STATUS)
+        .starts_with("Selected process: PID 11 · beta"));
+    // A collapse the client makes once it holds the promotion hides beta.
+    h.disclose(alpha, false);
+    assert_eq!(h.text(INSPECTOR_STATUS), NO_SELECTION_STATUS);
+    assert!(h.view().collapsed_by(CLIENT).contains(&alpha));
+}
+
+/// Codex review round 5: every client applies a promotion after the reports
+/// it sent before it, so another client's delayed collapse above the match
+/// is undone too; a delayed collapse of a parent that does not hold the
+/// match is not undone by the promotion and is mirrored as before.
+#[test]
+fn a_delayed_collapse_is_undone_only_above_the_promoted_match() {
+    let mut source = family(&[
+        (10, "alpha", 0, 10),
+        (11, "beta", 10, 11),
+        (20, "delta", 0, 20),
+        (21, "echo", 20, 21),
+        (30, "xray", 0, 60),
+    ]);
+    let mut h = harness(&mut source);
+    h.show_tree(true);
+    let alpha = h.item_of(10);
+    let delta = h.item_of(20);
+    let echo = h.item_of(21);
+    h.view().set_pid_input(&h.session, "11").unwrap();
+    h.sync();
+    let before = h.revision();
+    h.send_from(CLIENT, PID_GO, TypeRef::EVENT_ACTIVATE, vec![]);
+    h.disclose_observed(OTHER, alpha, false, before);
+    assert!(
+        h.view().collapsed_by(OTHER).is_empty(),
+        "undone on the other client too"
+    );
+    h.disclose_observed(OTHER, delta, false, before);
+    assert_eq!(h.view().collapsed_by(OTHER), HashSet::from([delta]));
+    assert!(h
+        .text(INSPECTOR_STATUS)
+        .starts_with("Selected process: PID 11 · beta"));
+    // The other client's own selection under `delta` is hidden there.
+    h.select_from(OTHER, TREE, echo);
+    assert_eq!(h.text(INSPECTOR_STATUS), NO_SELECTION_STATUS);
 }

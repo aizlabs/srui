@@ -1484,6 +1484,82 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
+    /// PX-018, Codex review round 5: the user clicks Go to PID and collapses the match's parent in
+    /// the same turn, before the promotion reaches the client, so the collapse report is made at
+    /// the earlier revision and reaches the server after it selected the match. The client then
+    /// applies the promotion: it expands the parent, selects the match with selection events
+    /// suppressed and reports the expand. The inspector keeps describing the match, which the
+    /// outline shows selected, after every report has been processed.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func aCollapseBeforeTheGoToPIDPromotionArrivesKeepsTheInspectorOnTheMatch() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-tree", "--refresh-interval-ms", "300000"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer with its view switch") {
+            applier.lastAppliedRevision.value >= 1
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(Self.treeID)) != nil
+                && renderer.registry.handle(for: NodeId(Self.viewToggleID)) != nil
+                && renderer.registry.handle(for: NodeId(Self.pidGoID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        SurfacePresentation.forHostApplication().present(window)
+        window.contentView?.layoutSubtreeIfNeeded()
+        renderer.layoutRenderer.shortcutRouter.isWindowKey = { $0 === window }
+        let treeHandle = try #require(renderer.registry.handle(for: NodeId(Self.treeID)))
+        let outline = try #require((treeHandle.view as? NSScrollView)?.documentView as? NSOutlineView)
+        let adapter = try #require(treeHandle.modelAdapter as? OutlineCollectionAdapter)
+        let inspector = try #require(renderer.registry.handle(for: NodeId(Self.inspectorLineIDs[0]))?.view as? NSTextField)
+        let pidHandle = try #require(renderer.registry.handle(for: NodeId(Self.pidInputID)))
+        let pidField = try #require(pidHandle.view as? NSTextField)
+        let pidAdapter = try #require(pidHandle.textAdapter)
+        let go = try #require(renderer.registry.handle(for: NodeId(Self.pidGoID))?.view as? NSButton)
+        let viewToggle = try #require(renderer.registry.handle(for: NodeId(Self.viewToggleID))?.view as? NSButton)
+        func pids() -> [String] {
+            (0..<outline.numberOfRows).map { row in
+                (outline.view(atColumn: 0, row: row, makeIfNecessary: true)
+                    as? OutlineCollectionAdapter.TreeCellView)?.label.stringValue ?? ""
+            }
+        }
+        func type(_ text: String) {
+            pidField.stringValue = text
+            pidAdapter.notifyTextDidChangeForTests()
+            pidAdapter.notifyEndEditingForTests()
+        }
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the switch enabled") { viewToggle.isEnabled }
+        #expect(window.performKeyEquivalent(with: try Self.keyEvent("t", [.command], keyCode: 17, in: window)))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the tree") { outline.numberOfRows == 12 }
+        type("311")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the PID field held") {
+            applier.store.getNode(NodeId(Self.pidInputID))?.getProperty(.value) == .string("311") && go.isEnabled
+        }
+        let makeRow = try #require(pids().firstIndex(of: "300"))
+        let make = try #require(applier.store.getModel(ModelId(2))?.getItemByIndex(adapter.modelIndex(forRow: makeRow))).itemID
+        let observed = applier.lastAppliedRevision.value
+        // One main-actor turn: the click, then the collapse, both at `observed`.
+        NativeActivation.click(go)
+        #expect(adapter.setExpanded(false, itemID: make, outlineView: outline))
+        #expect(applier.lastAppliedRevision.value == observed, "the promotion has not arrived yet")
+        #expect(!pids().contains("311"), "ld hidden locally")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the promotion applied") {
+            adapter.isExpanded(make) && outline.selectedRowIndexes == IndexSet(integer: pids().firstIndex(of: "311") ?? -1)
+        }
+        // A later round trip: once the server holds the new PID text, it has processed the
+        // collapse and the client's expand report, which the client sent before it.
+        type("1")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "every report processed") {
+            applier.store.getNode(NodeId(Self.pidInputID))?.getProperty(.value) == .string("1")
+        }
+        #expect(inspector.stringValue.hasPrefix("Selected process: PID 311 · ld"), "\(inspector.stringValue)")
+        #expect(outline.selectedRowIndexes == IndexSet(integer: try #require(pids().firstIndex(of: "311"))))
+        print("PX-018 Codex round 5 native SSH evidence: window \(window.windowNumber); observed=\(observed); revision=\(applier.lastAppliedRevision.value); rows=\(pids()); inspector=\(inspector.stringValue)")
+        await controller.stop()
+    }
+
     /// PX-018, Codex review round 4: disclosure is each client's own. The first client selects and
     /// follows `cc`, then collapses its parent `make`, which hides it there. A second client that
     /// attaches to the same running srtop starts with every item expanded and inherits nothing of

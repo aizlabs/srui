@@ -563,6 +563,10 @@ pub struct ProcessView {
     /// that reported it, or every client for a promotion made in process.
     /// Only that client's disclosure can hide it.
     holder: Holder,
+    /// The latest revealing promotion committed in the tree (PX-018, Codex
+    /// review round 5): every client applies it after the reports it sent
+    /// before it, and expands the collapsed parents above its match then.
+    revealing: Option<Revealing>,
     /// The §26 `max_model_tree_depth` the tree is arranged under (PX-018): the
     /// store's own limit, at most the wire default every client enforces.
     tree_levels: usize,
@@ -786,6 +790,7 @@ impl ProcessView {
                 gaps: ScanGaps::of(&snapshot),
                 disclosure: Disclosure::default(),
                 holder: Holder::Every,
+                revealing: None,
                 tree_levels: session.with_store(|store| {
                     store
                         .limits()
@@ -2086,6 +2091,7 @@ impl ProcessView {
         // the collapsed parents above it before it reports them, so every
         // client's mirror expands them now (PX-018).
         let mut unrevealed = None;
+        let unselected = (self.inspector.hold(), self.holder.clone());
         if let Some(row) = &promoted {
             self.inspector.select(row);
             self.holder = holder;
@@ -2107,14 +2113,27 @@ impl ProcessView {
         let promotion_at = plan
             .iter()
             .position(|planned| matches!(planned.effect, Effect::Promote(..)));
+        // What every client held before the promotion: a report observed at
+        // this revision or earlier was sent before the client applied it.
+        let before = session.current_revision();
         let (published, reached) = self.publish_controls_reaching(session, plan);
         // A promotion that never committed revealed nothing on a client, even
         // when the same item was already promoted before: the mirror keeps
-        // the parents the clients keep collapsed.
+        // the parents the clients keep collapsed, and the inspector keeps the
+        // selection the clients still show (verification V5-I1). Follow's
+        // retarget is not put back.
         if promotion_at.is_some_and(|at| reached <= at) {
             if let Some(held) = unrevealed {
                 self.disclosure = held;
             }
+            let (inspector, holder) = unselected;
+            self.inspector.restore(inspector);
+            self.holder = holder;
+        } else if let (Some(row), Some(_), ViewMode::Tree) = (&promoted, promotion_at, self.mode) {
+            self.revealing = Some(Revealing {
+                item: row.item_id,
+                before,
+            });
         }
         published
     }
@@ -2428,6 +2447,7 @@ impl ProcessView {
     fn prune_collapsed(&mut self) {
         if self.mode != ViewMode::Tree {
             self.disclosure.clear();
+            self.revealing = None;
             return;
         }
         self.disclosure.prune_to(&self.rows);
@@ -2633,7 +2653,37 @@ impl ProcessView {
         item: ItemId,
         expanded: bool,
     ) -> Result<Refreshed, SessionError> {
+        let observed = session.current_revision();
+        self.expansion_changed_at(session, client, node, item, expanded, observed)
+    }
+
+    /// [`Self::expansion_changed`], made while the client held revision
+    /// `observed` (Codex review round 5). A collapse the client made before
+    /// it applied the latest revealing promotion, of an item whose subtree
+    /// holds that promotion's match, is undone on the client when it applies
+    /// the promotion: it expands the collapsed items above the match, selects
+    /// the match with selection events suppressed
+    /// (`OutlineCollectionAdapter.resolvePendingPromotion`,
+    /// `expandCollapsedAncestors`) and reports the expand. Such a collapse
+    /// therefore leaves the mirror and the inspector as they are, so the
+    /// newer selection the promotion made is kept.
+    pub fn expansion_changed_at(
+        &mut self,
+        session: &Session,
+        client: &[u8],
+        node: NodeId,
+        item: ItemId,
+        expanded: bool,
+        observed: u64,
+    ) -> Result<Refreshed, SessionError> {
         if node != TREE || self.mode != ViewMode::Tree {
+            return Ok(Refreshed::default());
+        }
+        let undone = !expanded
+            && self.revealing.as_ref().is_some_and(|revealing| {
+                observed <= revealing.before && subtree_holds(&self.rows, item, revealing.item)
+            });
+        if undone {
             return Ok(Refreshed::default());
         }
         // The client reports only an item that had children in the revision
@@ -2942,12 +2992,13 @@ pub fn expansion_reported(
     else {
         return;
     };
-    let published = lock_view(view).expansion_changed(
+    let published = lock_view(view).expansion_changed_at(
         session,
         &event.client_instance_id,
         change.node,
         change.item,
         change.expanded,
+        event.observed_revision,
     );
     if let Err(error) = published {
         eprintln!("srtop: disclosure not published: {error}");
@@ -3103,6 +3154,25 @@ impl Disclosure {
         });
         opened
     }
+}
+
+/// A revealing promotion committed in the tree, and the revision every
+/// client held before it (PX-018, Codex review round 5).
+#[derive(Debug, Clone, Copy)]
+struct Revealing {
+    item: ItemId,
+    before: u64,
+}
+
+/// Whether `ancestor`'s subtree in the tree `rows` holds `item`.
+fn subtree_holds(rows: &[Row], ancestor: ItemId, item: ItemId) -> bool {
+    let Some(at) = rows.iter().position(|row| row.item_id == item) else {
+        return false;
+    };
+    rows[..at]
+        .iter()
+        .enumerate()
+        .any(|(index, row)| row.item_id == ancestor && holds(row, index, at))
 }
 
 /// Whose selection the inspector and follow describe (PX-018).
@@ -7136,6 +7206,35 @@ mod disclosure_commit_tests {
             open,
             "only the match's ancestors opened"
         );
+    }
+
+    /// Verification note V5-I1: a promotion that does not commit leaves the
+    /// inspector on the selection the clients still show, not on the match
+    /// its requester's restored mirror hides.
+    #[test]
+    fn a_failed_promotion_keeps_the_inspector_on_the_shown_selection() {
+        let mut source = Family::new(&[
+            (10, "alpha", 0, 10),
+            (11, "beta", 10, 11),
+            (30, "xray", 0, 60),
+        ]);
+        let (session, mut view) = tree(&mut source);
+        let alpha = item(&view, 10);
+        let xray = item(&view, 30);
+        view.select_item_in(&session, CLIENT, TREE, Some(xray))
+            .unwrap();
+        collapse(&session, &mut view, 10);
+        view.set_pid_input(&session, "11").unwrap();
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.go_to_pid_from(&session, CLIENT).is_err());
+        }
+        assert!(view.collapsed_by(CLIENT).contains(&alpha));
+        assert_eq!(view.inspector().selected(), Some(xray), "still xray");
+        // The promotion that commits selects beta and reveals it.
+        view.go_to_pid_from(&session, CLIENT).unwrap();
+        assert_eq!(view.inspector().selected(), Some(item(&view, 11)));
+        assert!(view.collapsed_by(CLIENT).is_empty());
     }
 
     /// Codex review round 4: the per-client mirror is bounded. A client with

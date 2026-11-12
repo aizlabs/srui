@@ -20,11 +20,14 @@
 //!   number of presses into one wake. An interval change replaces the loop's
 //!   ticker, so two never run, and the next periodic sample is one new
 //!   interval after the change: no burst, and no drift from the old phase.
-//! * **A sample is applied only to the view it was taken for.** Every pause and
-//!   every resume advances an epoch, and a sample whose epoch is no longer
-//!   current is discarded, so a scan that was running when the view was paused
-//!   (or paused and resumed) can never change the frozen rows or stand in for
-//!   the sample Resume view asked for.
+//! * **A sample is applied only to the view it was taken for.** Every pause,
+//!   every resume and every change of "Show user threads" (PX-019) advances
+//!   an epoch, and a sample whose epoch is no longer current is discarded, so
+//!   a scan that was running when the view was paused (or paused and resumed)
+//!   can never change the frozen rows or stand in for the sample Resume view
+//!   asked for, and one taken under the other thread setting is never
+//!   applied. A thread-setting change on a live view asks for one new sample
+//!   at once, so the sample it discards is always replaced.
 use crate::bounded;
 use crate::metric::format_utc;
 use crate::refresh::{MAX_REFRESH_INTERVAL, MIN_REFRESH_INTERVAL};
@@ -288,9 +291,16 @@ impl Sampling {
 
     /// Moves to a new epoch, so a sample already being taken is discarded
     /// when it returns: it was taken under a setting that no longer holds
-    /// (PX-019's "Show user threads").
+    /// (PX-019's "Show user threads"). Unless the view is paused, one new
+    /// sample is asked for at once, so a discarded sample — Resume view's
+    /// own, or a Refresh now press — is always replaced; a paused view takes
+    /// none until it is resumed.
     pub(crate) fn invalidate(&mut self) {
         self.epoch += 1;
+        if self.frozen.is_none() {
+            self.sample_now = true;
+            self.wake();
+        }
     }
 
     /// One Refresh now press: one sample, coalesced with any other press the

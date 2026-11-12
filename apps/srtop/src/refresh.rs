@@ -2816,11 +2816,12 @@ impl ProcessView {
     /// boolean) changes nothing. The checkbox's value is always published, so
     /// a request that changes nothing puts the client's checkbox back (§6.3).
     ///
-    /// Showing them asks the refresh loop for one sample at once, which reads
-    /// them; until it is published the threads status says they appear with
-    /// the next sample, and a paused view reads none until it is resumed.
-    /// Hiding them republishes at once without their rows, which the next
-    /// sample, which no longer reads them, then drops; an inspector that
+    /// Either change retires a sample already being taken, which was taken
+    /// under the other setting, and asks the refresh loop for one sample at
+    /// once in its place; a paused view takes none until it is resumed.
+    /// Showing them: that sample reads them, and until it is published the
+    /// threads status says they appear with the next sample. Hiding them
+    /// republishes at once without their rows; an inspector that
     /// described a thread is cleared, as the client's selection of that row is
     /// gone with it. That is not a user deselect (PX-017-G02): the inspector
     /// says nothing is selected, not that the selection was cleared, and
@@ -2841,7 +2842,10 @@ impl ProcessView {
         // A sample already being taken was taken under the other setting: it
         // is discarded when it returns, so a scan that read no threads never
         // lands after they are shown again, nor one that read them after they
-        // are hidden (PX-019, merge verification F3).
+        // are hidden (PX-019, merge verification F3). One sample is asked for
+        // in its place, so a Resume view or Refresh now sample it retires is
+        // still taken (merge verification N1); when showing, that sample
+        // reads the threads.
         self.sampling.invalidate();
         let held = self.inspector.hold();
         let selected_thread = self
@@ -2850,9 +2854,7 @@ impl ProcessView {
             .filter(|row| row.key.is_thread())
             .map(|row| row.item_id);
         self.threads.user = on;
-        if on {
-            self.sampling.refresh_now();
-        } else if selected_thread.is_some() {
+        if !on && selected_thread.is_some() {
             // The row left the collection; the user did not deselect it
             // (PX-017-G02's `clear`), so this is the hidden-row clear.
             self.inspector.clear_hidden();

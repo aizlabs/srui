@@ -2410,3 +2410,236 @@ fn a_sample_taken_under_the_other_thread_setting_is_discarded() {
         h.text(INSPECTOR_STATUS)
     );
 }
+
+// ---- the refresh loop and the user-thread setting (merge verification N1, N2)
+
+/// A gate a scan waits at while it is closed.
+#[derive(Clone, Default)]
+struct Gate(Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+impl Gate {
+    fn close(&self) {
+        *self.0 .0.lock().unwrap() = true;
+    }
+
+    fn open(&self) {
+        *self.0 .0.lock().unwrap() = false;
+        self.0 .1.notify_all();
+    }
+
+    fn pass(&self) {
+        let (closed, changed) = &*self.0;
+        let mut closed = closed.lock().unwrap();
+        while *closed {
+            closed = changed.wait(closed).unwrap();
+        }
+    }
+}
+
+/// Opens the gate when dropped, so a failing test never leaves the loop's
+/// scan held, which would wedge the runtime's shutdown.
+struct OpenOnDrop(Gate);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+/// `ThreadsSource`'s step-0 sample plus one process, PID `1000 + n`, where
+/// `n` counts this source's scans, so the published rows say which scan was
+/// applied last. Reports `(n, threads asked)` as each scan starts, then
+/// waits at the gate.
+struct Held {
+    asked: bool,
+    scans: u32,
+    entered: std::sync::mpsc::Sender<(u32, bool)>,
+    gate: Gate,
+}
+
+impl ProcessSource for Held {
+    fn status_text(&self) -> &str {
+        THREADS_STATUS_TEXT
+    }
+
+    fn collect_threads(&mut self, on: bool) {
+        self.asked = on;
+    }
+
+    fn snapshot(&mut self) -> ProcessSnapshot {
+        let n = self.scans;
+        self.scans += 1;
+        let _ = self.entered.send((n, self.asked));
+        self.gate.pass();
+        let mut marker = ThreadsSource::records(0)[4].clone();
+        marker.key.pid = Observed::Known(1000 + n);
+        marker.key.creation = CreationToken::Opaque(format!("marker-{n}"));
+        marker.display_name = DisplayName::from("marker");
+        let mut records = ThreadsSource::records(0);
+        records.push(marker);
+        let mut snapshot = threads_snapshot(records, ThreadsSource::threads(0));
+        if !self.asked {
+            snapshot.threads = ThreadScan::NotRequested;
+        }
+        snapshot
+    }
+}
+
+const LOOP_WAIT: Duration = Duration::from_secs(10);
+
+/// The refresh loop over a [`Held`] source with a 300 s interval, so no tick
+/// samples during a test; user threads shown, and that request's own
+/// sample (scan 0) taken and published.
+async fn held_loop() -> (
+    Harness,
+    std::sync::mpsc::Receiver<(u32, bool)>,
+    Gate,
+    tokio_util::sync::CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
+    let mut source = ThreadsSource::default();
+    let mut h = harness(&mut source);
+    h.toggle(USER_THREADS_TOGGLE, true);
+    let (entered, scans) = std::sync::mpsc::channel();
+    let gate = Gate::default();
+    let held = Held {
+        asked: false,
+        scans: 0,
+        entered,
+        gate: gate.clone(),
+    };
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let polling = tokio::spawn(srui_process_explorer::refresh::poll(
+        Arc::clone(&h.view),
+        held,
+        Arc::clone(&h.session),
+        Duration::from_secs(300),
+        shutdown.clone(),
+    ));
+    assert_eq!(scans.recv_timeout(LOOP_WAIT).unwrap(), (0, true));
+    published(&mut h, "1000").await;
+    (h, scans, gate, shutdown, polling)
+}
+
+/// Waits until the table shows `pid`.
+async fn published(h: &mut Harness, pid: &str) {
+    let deadline = std::time::Instant::now() + LOOP_WAIT;
+    loop {
+        h.sync();
+        if h.pids().iter().any(|shown| shown == pid) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{pid} never published: {:?}",
+            h.pids()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// N1: hiding user threads while Resume view's own sample is being taken
+/// retires that sample, which was taken with threads, and takes another at
+/// once, without them: the resume is completed, not left saying "sampling
+/// now" for a whole interval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hiding_user_threads_during_resume_views_sample_takes_another_at_once() {
+    let (mut h, scans, gate, shutdown, polling) = held_loop().await;
+    let _open = OpenOnDrop(gate.clone());
+    lock_view(&h.view).pause_view(&h.session).unwrap();
+    gate.close();
+    lock_view(&h.view).resume_view(&h.session).unwrap();
+    assert_eq!(scans.recv_timeout(LOOP_WAIT).unwrap(), (1, true));
+    assert!(h
+        .view()
+        .sampling()
+        .status()
+        .starts_with("Resuming · sampling now"));
+    let discarded = h.view().sampling().discarded();
+    h.toggle(USER_THREADS_TOGGLE, false);
+    gate.open();
+    assert_eq!(
+        scans.recv_timeout(LOOP_WAIT).unwrap(),
+        (2, false),
+        "a new sample at once, without threads"
+    );
+    published(&mut h, "1002").await;
+    assert!(!h.pids().iter().any(|pid| pid == "1001"), "{:?}", h.pids());
+    assert!(h.pids().iter().all(|pid| !pid.contains("thread")));
+    assert_eq!(h.view().sampling().discarded(), discarded + 1);
+    let status = h.view().sampling().status();
+    assert!(status.starts_with("Live · sampling every"), "{status}");
+    shutdown.cancel();
+    tokio::time::timeout(LOOP_WAIT, polling)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// N1: the same for a Refresh now press: the sample it asked for is
+/// replaced, never silently lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hiding_user_threads_during_a_refresh_now_sample_takes_another_at_once() {
+    let (mut h, scans, gate, shutdown, polling) = held_loop().await;
+    let _open = OpenOnDrop(gate.clone());
+    gate.close();
+    assert!(lock_view(&h.view).refresh_now());
+    assert_eq!(scans.recv_timeout(LOOP_WAIT).unwrap(), (1, true));
+    let discarded = h.view().sampling().discarded();
+    h.toggle(USER_THREADS_TOGGLE, false);
+    gate.open();
+    assert_eq!(
+        scans.recv_timeout(LOOP_WAIT).unwrap(),
+        (2, false),
+        "a new sample at once, without threads"
+    );
+    published(&mut h, "1002").await;
+    assert!(!h.pids().iter().any(|pid| pid == "1001"), "{:?}", h.pids());
+    assert_eq!(h.view().sampling().discarded(), discarded + 1);
+    shutdown.cancel();
+    tokio::time::timeout(LOOP_WAIT, polling)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// N2: only a real change of "Show user threads" advances the sampling
+/// epoch, once per change, live or paused; a request that changes nothing
+/// (the same value, or no boolean) and the kernel-thread checkbox never do.
+#[test]
+fn only_a_real_user_thread_change_advances_the_sampling_epoch() {
+    let mut source = ThreadsSource::default();
+    let h = harness(&mut source);
+    let epoch = || h.view().sampling().epoch();
+    let start = epoch();
+    let mut on = false;
+    for change in 1..=6u64 {
+        on = !on;
+        h.view().set_user_threads(&h.session, Some(on)).unwrap();
+        assert_eq!(epoch(), start + change, "change {change}");
+        h.view().set_user_threads(&h.session, Some(on)).unwrap();
+        h.view().set_user_threads(&h.session, None).unwrap();
+        h.view()
+            .set_kernel_threads(&h.session, Some(false))
+            .unwrap();
+        h.view().set_kernel_threads(&h.session, Some(true)).unwrap();
+        h.view().set_kernel_threads(&h.session, None).unwrap();
+        assert_eq!(
+            epoch(),
+            start + change,
+            "no-op requests after change {change}"
+        );
+    }
+    // Paused: a real change still retires a sample in flight; pause and
+    // resume advance it once each, as since PX-015.
+    h.view().pause_view(&h.session).unwrap();
+    assert_eq!(epoch(), start + 7);
+    h.view().set_user_threads(&h.session, Some(!on)).unwrap();
+    h.view().set_user_threads(&h.session, Some(!on)).unwrap();
+    h.view()
+        .set_kernel_threads(&h.session, Some(false))
+        .unwrap();
+    assert_eq!(epoch(), start + 8);
+    h.view().resume_view(&h.session).unwrap();
+    assert_eq!(epoch(), start + 9);
+}

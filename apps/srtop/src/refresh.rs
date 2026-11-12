@@ -638,11 +638,14 @@ pub struct ProcessView {
     /// The tags status as the client holds it, with the generation it states
     /// (PX-020).
     tags_published: TagsView,
-    /// Where the tagged processes are among the rows the client holds: those
-    /// of the last row publication whose rows, view and tags status reached
-    /// it (PX-020). What a change that republishes no row (a scan that could
-    /// not read the process list, a late detail read) states the tags status
-    /// with. Re-deriving it then would arrange the
+    /// The counts the tags status the client holds states (PX-020): those of
+    /// the last row publication whose plan committed through its tags status,
+    /// its rows and view before it. A plan that committed its rows but not
+    /// its tags status leaves the earlier counts, which match the status the
+    /// client still shows rather than its rows; the next accepted sample or
+    /// republish restates both. What a change that republishes no row (a
+    /// scan that could not read the process list, a late detail read) states
+    /// the tags status with. Re-deriving it then would arrange the
     /// tree from a generation whose every row is unconfirmed, which is not
     /// the one the client holds (PX-021, verification of PR #107's review).
     tag_counts: TagCounts,
@@ -9560,6 +9563,39 @@ mod tag_counts_commit_tests {
         source.records.insert(1, record(5, 1, "newcomer"));
         view.refresh(&session, &mut source).unwrap();
         assert!(!pids(&view).contains(&20), "{:?}", pids(&view));
+        let status = view.tags_status().to_string();
+        assert!(status.contains(BEYOND), "{status}");
+        assert_eq!(unreadable_scan(&session, &mut view, &mut source), status);
+    }
+
+    /// H1: a readable sample whose commit fails leaves the client with its
+    /// rows and status; the next unreadable scan states that status, not the
+    /// failed sample's counts.
+    #[test]
+    fn a_failed_sample_leaves_the_counts_of_the_rows_the_client_holds() {
+        let (session, mut view, mut source) = start();
+        let rows = pids(&view);
+        let before = view.tags_status().to_string();
+        assert!(!before.contains(BEYOND), "{before}");
+        source.records.insert(1, record(5, 1, "newcomer"));
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.refresh(&session, &mut source).is_err());
+        }
+        assert_eq!(view.tags_status(), before);
+        assert_eq!(pids(&view), rows, "the client still shows 20");
+        assert_eq!(unreadable_scan(&session, &mut view, &mut source), before);
+    }
+
+    /// H2: with nothing selected, a sort's plan ends with the tags status, so
+    /// the counts follow a plan that committed exactly through its last
+    /// entry.
+    #[test]
+    fn a_sort_whose_plan_ends_at_the_tags_status_sets_the_counts() {
+        let (session, mut view, mut source) = start();
+        view.clear_selection(&session).unwrap();
+        assert!(view.inspector().selected().is_none());
+        sort_20_out(&session, &mut view);
         let status = view.tags_status().to_string();
         assert!(status.contains(BEYOND), "{status}");
         assert_eq!(unreadable_scan(&session, &mut view, &mut source), status);

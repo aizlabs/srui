@@ -59,6 +59,63 @@ private final class StderrAccumulator: @unchecked Sendable {
     }
 }
 
+/// The SSH child's exit status, recorded by its termination handler, so a failed write can report
+/// why the child went away rather than the `EPIPE` its exit caused (§19.1, §25, §4 inv. 13).
+private final class ChildExitRecord: @unchecked Sendable {
+    private let lock = NSLock()
+    private var status: Int32?
+    private var waiters: [UUID: CheckedContinuation<Int32?, Never>] = [:]
+
+    /// The recorded status, without waiting.
+    var recorded: Int32? {
+        lock.lock()
+        defer { lock.unlock() }
+        return status
+    }
+
+    /// Records the exit; the first record wins (the termination handler and the stdout reader
+    /// both report the same exit).
+    func record(_ exitStatus: Int32) {
+        lock.lock()
+        if status == nil {
+            status = exitStatus
+        }
+        let exitStatus = status ?? exitStatus
+        let parked = waiters
+        waiters.removeAll()
+        lock.unlock()
+        for waiter in parked.values {
+            waiter.resume(returning: exitStatus)
+        }
+    }
+
+    /// The exit status, waiting at most `timeout` for the child to exit; `nil` if it has not.
+    func status(waitingAtMost timeout: Duration) async -> Int32? {
+        let id = UUID()
+        return await withCheckedContinuation { continuation in
+            lock.lock()
+            if let status {
+                lock.unlock()
+                continuation.resume(returning: status)
+                return
+            }
+            waiters[id] = continuation
+            lock.unlock()
+            Task {
+                try? await Task.sleep(for: timeout)
+                self.expire(id)
+            }
+        }
+    }
+
+    private func expire(_ id: UUID) {
+        lock.lock()
+        let waiter = waiters.removeValue(forKey: id)
+        lock.unlock()
+        waiter?.resume(returning: nil)
+    }
+}
+
 /// Actor implementing the SRUI secure SSH transport binding over an OpenSSH subsystem channel (§19, §19.1, §25).
 public actor SSHTransport: Transport {
     public let configuration: SSHConfiguration
@@ -86,13 +143,36 @@ public actor SSHTransport: Transport {
     private var isClosed = false
     private var isConnected = false
     private let stderrAccumulator = StderrAccumulator()
+    private let childExit = ChildExitRecord()
+    /// The child's exit failure when the transport closed because the child had already failed
+    /// (the stdout reader finishes the stream, whose termination closes the transport). A later
+    /// `send` reports it instead of a bare `.closed`; a close made while the child ran keeps `nil`.
+    private var exitFailureAtClose: TransportError?
+
+    /// How long a failed write waits for the child's exit status before reporting the raw I/O
+    /// error. `ssh` closes its stdin by exiting, and the `EPIPE` reaches the writer before the
+    /// child is reaped, so without this wait a host-key rejection surfaced as either
+    /// `.connectionFailed` or a bare broken pipe depending on scheduling. Bounded, so a child that
+    /// closed its stdin and keeps running still yields the I/O error.
+    static let defaultChildExitClassificationBound: Duration = .seconds(5)
+    let childExitClassificationBound: Duration
 
     private let stream: AsyncThrowingStream<Data, Error>
     private let continuation: AsyncThrowingStream<Data, Error>.Continuation
     private let finishGuard: StreamFinishGuard
 
     public init(configuration: SSHConfiguration) {
+        self.init(
+            configuration: configuration,
+            childExitClassificationBound: Self.defaultChildExitClassificationBound
+        )
+    }
+
+    /// `childExitClassificationBound` is a parameter only so a test of the bound need not hold a
+    /// child's pipes open for the production five seconds.
+    init(configuration: SSHConfiguration, childExitClassificationBound: Duration) {
         self.configuration = configuration
+        self.childExitClassificationBound = childExitClassificationBound
         let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
         self.stream = stream
         self.continuation = continuation
@@ -165,6 +245,10 @@ public actor SSHTransport: Transport {
         proc.standardInput = inPipe
         proc.standardOutput = outPipe
         proc.standardError = errPipe
+        let childExit = self.childExit
+        proc.terminationHandler = { finished in
+            childExit.record(finished.terminationStatus)
+        }
 
         do {
             try proc.run()
@@ -217,11 +301,19 @@ public actor SSHTransport: Transport {
     }
 
     public func send(data: Data, logicalClass: LogicalChannelClass) async throws {
+        if isClosed {
+            throw exitFailureAtClose ?? TransportError.closed
+        }
         if !isConnected {
             try connect()
         }
-        guard !isClosed, hasStdin, let proc = process, proc.isRunning else {
+        guard hasStdin, let proc = process else {
             throw TransportError.closed
+        }
+        guard proc.isRunning else {
+            // The child already exited: report its exit as the stdout reader does.
+            throw Self.exitFailure(status: proc.terminationStatus, stderr: stderrAccumulator.summary())
+                ?? TransportError.closed
         }
 
         // Off the actor executor: a blocking write to a child that stopped reading would hold this
@@ -229,6 +321,13 @@ public actor SSHTransport: Transport {
         do {
             try await writer.write(data, logicalClass: logicalClass, claiming: stdinLatch)
         } catch let error as TransportError {
+            // A write fails with `EPIPE` once the child has closed its stdin, which `ssh` does by
+            // exiting. Classify by that exit (bounded wait), not by the order the two were seen.
+            if case .ioError = error, !isClosed,
+               let status = await childExit.status(waitingAtMost: childExitClassificationBound),
+               let failure = Self.exitFailure(status: status, stderr: stderrAccumulator.summary()) {
+                throw failure
+            }
             let stderrDiag = stderrAccumulator.summary()
             guard !stderrDiag.isEmpty else { throw error }
             throw TransportError.ioError("\(error.description). Stderr: \(stderrDiag)")
@@ -308,6 +407,7 @@ public actor SSHTransport: Transport {
         let latch = stdoutLatch
         let accumulator = stderrAccumulator
         let gate = backlogGate
+        let childExit = childExit
 
         let thread = Thread {
             var buffer = [UInt8](repeating: 0, count: 65536)
@@ -334,13 +434,13 @@ public actor SSHTransport: Transport {
             }
 
             process.waitUntilExit()
-            let status = process.terminationStatus
-            if status != 0 {
-                let stderrSummary = accumulator.summary()
-                let errorMsg = stderrSummary.isEmpty
-                    ? "SSH process terminated with exit code \(status)"
-                    : "SSH process terminated with exit code \(status): \(stderrSummary)"
-                finishGuard.finish(throwing: TransportError.connectionFailed(errorMsg))
+            // Recorded before the stream finishes, so the close its termination triggers sees it.
+            childExit.record(process.terminationStatus)
+            if let failure = SSHTransport.exitFailure(
+                status: process.terminationStatus,
+                stderr: accumulator.summary()
+            ) {
+                finishGuard.finish(throwing: failure)
             } else {
                 finishGuard.finish()
             }
@@ -351,9 +451,21 @@ public actor SSHTransport: Transport {
         thread.start()
     }
 
+    /// The one classification of a child exit, shared by the stdout reader and `send`: a non-zero
+    /// status is a connection failure carrying the child's stderr; a clean exit is not a failure.
+    private static func exitFailure(status: Int32, stderr: String) -> TransportError? {
+        guard status != 0 else { return nil }
+        return .connectionFailed(stderr.isEmpty
+            ? "SSH process terminated with exit code \(status)"
+            : "SSH process terminated with exit code \(status): \(stderr)")
+    }
+
     public func close() async {
         guard !isClosed else { return }
         isClosed = true
+        exitFailureAtClose = childExit.recorded.flatMap {
+            Self.exitFailure(status: $0, stderr: stderrAccumulator.summary())
+        }
 
         let wasConnected = isConnected
         isConnected = false

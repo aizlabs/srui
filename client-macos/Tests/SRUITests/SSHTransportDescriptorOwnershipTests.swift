@@ -14,22 +14,39 @@ import TransportSSH
 @Suite("SSH Transport Descriptor Ownership (§22.2)", .serialized)
 struct SSHTransportDescriptorOwnershipTests {
 
-    /// Inodes of every FIFO this process currently has open.
-    ///
-    /// Identity, not a count: the suite runs alongside others that open and close descriptors of
-    /// their own, so a process-wide tally is noise. A pipe's inode is stable and unique while it
-    /// exists, which makes "the pipes this transport created" a set we can name and then require
-    /// to be empty after `close()`.
-    private func openPipeInodes() -> Set<UInt64> {
-        var inodes: Set<UInt64> = []
+    /// The kernel pipe handle and its peer for one descriptor of `pid`, or `nil` if it is no pipe.
+    private func pipeEnd(of pid: pid_t, fd: Int32) -> (handle: UInt64, peer: UInt64)? {
+        var info = pipe_fdinfo()
+        let size = Int32(MemoryLayout<pipe_fdinfo>.size)
+        guard proc_pidfdinfo(pid, fd, PROC_PIDFDPIPEINFO, &info, size) == size else { return nil }
+        return (info.pipeinfo.pipe_handle, info.pipeinfo.pipe_peerhandle)
+    }
+
+    /// Handles of every pipe end this process currently has open.
+    private func openPipeHandles() -> Set<UInt64> {
+        var handles: Set<UInt64> = []
         for fd in Int32(0)..<Int32(1024) {
-            var info = stat()
-            guard fstat(fd, &info) == 0 else { continue }
-            if info.st_mode & S_IFMT == S_IFIFO {
-                inodes.insert(UInt64(info.st_ino))
+            if let end = pipeEnd(of: getpid(), fd: fd) {
+                handles.insert(end.handle)
             }
         }
-        return inodes
+        return handles
+    }
+
+    /// The parent-side ends of the stub child's stdin, stdout and stderr: the peers of the child's
+    /// own descriptors 0, 1 and 2.
+    ///
+    /// Identity taken from the child, not "every pipe opened since": suites that run alongside this
+    /// one open and close pipes of their own, and a before/after difference counted those as this
+    /// transport's — a child-exit test holding its stub's pipes for a second failed this suite
+    /// 9 times in 30 under load.
+    private func transportPipeHandles(childPIDFile: String) async throws -> Set<UInt64> {
+        try await AsyncTestSupport.eventuallyAsync(timeout: .roundTrip, description: "stub wrote its pid") {
+            (try? String(contentsOfFile: childPIDFile, encoding: .utf8))?.hasSuffix("\n") == true
+        }
+        let text = try String(contentsOfFile: childPIDFile, encoding: .utf8)
+        let pid = try #require(pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)))
+        return Set((Int32(0)...2).compactMap { pipeEnd(of: pid, fd: $0)?.peer })
     }
 
     /// Writes a stand-in for `ssh` that ignores the posture flags, chatters on stderr, and stays
@@ -37,10 +54,11 @@ struct SSHTransportDescriptorOwnershipTests {
     ///
     /// `exec sleep` rather than a polling loop: the stub must be idle, because these tests run
     /// alongside suites whose deadlines are measured on a shared executor.
-    private func writeStubSSH(at path: String) throws {
+    private func writeStubSSH(at path: String, pidFile: String) throws {
         let script = """
         #!/bin/sh
         echo "stub ssh started" >&2
+        echo $$ > "\(pidFile)"
         exec sleep 3600
         """
         try script.write(to: URL(fileURLWithPath: path), atomically: true, encoding: .utf8)
@@ -50,9 +68,9 @@ struct SSHTransportDescriptorOwnershipTests {
         )
     }
 
-    private func stubConfiguration(in tempDir: URL) throws -> SSHConfiguration {
+    private func stubConfiguration(in tempDir: URL, pidFile: String) throws -> SSHConfiguration {
         let stubPath = tempDir.appendingPathComponent("ssh-stub").path
-        try writeStubSSH(at: stubPath)
+        try writeStubSSH(at: stubPath, pidFile: pidFile)
         return SSHConfiguration(
             host: "127.0.0.1",
             subsystem: "srui",
@@ -61,13 +79,13 @@ struct SSHTransportDescriptorOwnershipTests {
         )
     }
 
-    /// Waits, bounded, for `inodes` to drain — a reader thread performs its release on its own
+    /// Waits, bounded, for `handles` to drain — a reader thread performs its release on its own
     /// thread after `close()` has returned.
-    private func waitForRelease(of inodes: Set<UInt64>) async throws -> Set<UInt64> {
-        var remaining = openPipeInodes().intersection(inodes)
+    private func waitForRelease(of handles: Set<UInt64>) async throws -> Set<UInt64> {
+        var remaining = openPipeHandles().intersection(handles)
         for _ in 0..<60 where !remaining.isEmpty {
             try await Task.sleep(nanoseconds: 50_000_000)
-            remaining = openPipeInodes().intersection(inodes)
+            remaining = openPipeHandles().intersection(handles)
         }
         return remaining
     }
@@ -77,8 +95,8 @@ struct SSHTransportDescriptorOwnershipTests {
         let tempDir = try TestFixtureDirectory.make(prefix: "srui-fd")
         defer { TestFixtureDirectory.release(tempDir) }
 
-        let configuration = try stubConfiguration(in: tempDir)
-        let before = openPipeInodes()
+        let pidFile = tempDir.appendingPathComponent("stub.pid").path
+        let configuration = try stubConfiguration(in: tempDir, pidFile: pidFile)
 
         let transport = SSHTransport(configuration: configuration)
         _ = transport.receiveStream()
@@ -86,10 +104,11 @@ struct SSHTransportDescriptorOwnershipTests {
         // Forces `connect()`, which spawns the child and latches its three pipe duplicates.
         try await transport.send(data: Data("probe".utf8))
 
-        let ours = openPipeInodes().subtracting(before)
+        let ours = try await transportPipeHandles(childPIDFile: pidFile)
+        let held = openPipeHandles().intersection(ours)
         #expect(
-            ours.count >= 3,
-            "connect() must open the three child pipes, otherwise this test proves nothing (saw \(ours.count))"
+            ours.count == 3 && held == ours,
+            "connect() must hold the three child pipes, otherwise this test proves nothing (held \(held.count) of \(ours.count))"
         )
 
         // The stub never exits on its own: if `close()` depended on the child closing the pipes,
@@ -108,15 +127,16 @@ struct SSHTransportDescriptorOwnershipTests {
         let tempDir = try TestFixtureDirectory.make(prefix: "srui-fd")
         defer { TestFixtureDirectory.release(tempDir) }
 
-        let configuration = try stubConfiguration(in: tempDir)
+        let pidFile = tempDir.appendingPathComponent("stub.pid").path
+        let configuration = try stubConfiguration(in: tempDir, pidFile: pidFile)
 
         for cycle in 0..<4 {
-            let before = openPipeInodes()
-
+            try? FileManager.default.removeItem(atPath: pidFile)
             let transport = SSHTransport(configuration: configuration)
             _ = transport.receiveStream()
             try await transport.send(data: Data("probe".utf8))
-            let ours = openPipeInodes().subtracting(before)
+            let ours = try await transportPipeHandles(childPIDFile: pidFile)
+            #expect(ours.count == 3, "cycle \(cycle): the stub's three pipes were found")
             await transport.close()
 
             let leaked = try await waitForRelease(of: ours)

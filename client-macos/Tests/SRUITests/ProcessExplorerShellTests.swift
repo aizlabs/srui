@@ -31,8 +31,9 @@ struct ProcessExplorerShellTests {
         let controller = SessionController(transport: transport, applier: applier,
                                            renderer: renderer, sessionId: "srtop")
         controller.attachRenderer(renderer)
+        let renders = RenderWaiter(controller)
         try await controller.start()
-        try await AsyncTestSupport.eventually(timeout: .seconds(10), description: "native empty shell over SSH") {
+        try await renders.until("native empty shell over SSH") {
             applier.lastAppliedRevision == Revision(1) && renderer.registry.handle(for: NodeId(5)) != nil
         }
 
@@ -307,8 +308,9 @@ struct ProcessExplorerShellTests {
         _ = NSApplication.shared
         let transport = RecordingTransport(inner: SSHTransport(configuration: harness.configuration))
         let (controller, applier, renderer) = Self.genericClient(transport)
+        let renders = RenderWaiter(controller)
         try await controller.start()
-        try await AsyncTestSupport.eventually(timeout: .seconds(10), description: "synchronized fake shell over SSH") {
+        try await renders.until("synchronized fake shell over SSH") {
             applier.lastAppliedRevision == Revision(1) && renderer.registry.handle(for: NodeId(5)) != nil
         }
         let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
@@ -4030,5 +4032,41 @@ struct ProcessExplorerDevboxScenarioTests {
     private static func isMeasuredOverallCPU(_ text: String) -> Bool {
         text.range(of: #"^Overall CPU \(100% = all [0-9]+ logical CPUs\): [0-9]+\.[0-9]%$"#,
                    options: .regularExpression) != nil
+    }
+}
+
+/// Waits for a condition on what the client has rendered by re-evaluating it after every render
+/// the session reports (`rendererDidRenderInterceptorForTesting`), not against a deadline.
+///
+/// The first render over SSH comes after an sshd fork, key exchange, the bridge's start-up and a
+/// main-actor render, and in a full parallel run that main actor is held for seconds at a time by
+/// synchronous AppKit suites: `shellOverSSHRetainsNativeHandlesAfterTitleFixture` timed out on a
+/// 10 s poll for "native empty shell over SSH" under load. The render is the event the condition
+/// waits for; the test's `.timeLimit` bounds a hang, and its cancellation ends this wait.
+@MainActor
+private final class RenderWaiter {
+    private let renders = AsyncTestSignal()
+
+    /// Install before `start()`, so no render can precede it.
+    init(_ controller: SessionController) {
+        let renders = renders
+        controller.rendererDidRenderInterceptorForTesting = { renders.signal() }
+    }
+
+    func until(_ description: String, _ condition: @MainActor () -> Bool) async throws {
+        let renders = renders
+        while true {
+            // Read before the condition, so a render between the two still wakes the wait.
+            let seen = renders.signalCount
+            if condition() { return }
+            if Task.isCancelled {
+                throw AsyncTestTimeout(description: "Cancelled while waiting for \(description)")
+            }
+            await withTaskCancellationHandler {
+                await renders.wait(until: seen + 1)
+            } onCancel: {
+                renders.signal()
+            }
+        }
     }
 }

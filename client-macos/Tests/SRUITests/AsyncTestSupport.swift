@@ -72,6 +72,22 @@ enum AsyncTestSupport {
     /// thread idle in `CFRunLoopRun`/`mach_msg`, so that hang is a lost wakeup, not contention.
     static let pollInterval = Duration.milliseconds(10)
 
+    /// The most one poll may charge against `timeout`, however long it actually took.
+    ///
+    /// The budget is spent in the poller's own turns, not in wall-clock time. A poll that took
+    /// seconds did so because its executor was not free: in a full parallel run synchronous AppKit
+    /// suites hold the main actor for seconds at a time (sampled at ~93% busy over the first 8 s
+    /// locally; on the 3-core CI runner 400+ unrelated tests all finish together at 12–20 s). The
+    /// work being awaited queues behind the same executor, so charging that stall to it made a
+    /// fixed deadline a coin toss whatever its length — `ConnectionManagerTests` timed out at 10 s
+    /// waiting for an in-memory harness. On an idle machine each poll costs ~`pollInterval`, so
+    /// a genuine hang is still reported after about `timeout`.
+    static let maxChargePerPoll = Duration.milliseconds(50)
+
+    /// Wall-clock ceiling, as a multiple of `timeout`, so a machine that stays saturated still
+    /// ends the wait; a suite's `.timeLimit` usually ends it sooner.
+    static let starvationAllowance = 6
+
     static func eventuallyAsync(
         isolation: isolated (any Actor)? = #isolation,
         timeout: Duration = .seconds(2),
@@ -79,10 +95,15 @@ enum AsyncTestSupport {
         condition: () async -> Bool
     ) async throws {
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
+        let wallDeadline = clock.now.advanced(by: timeout * starvationAllowance)
+        var charged = Duration.zero
+        var lastTurn = clock.now
 
         while await condition() == false {
-            guard clock.now < deadline else {
+            let now = clock.now
+            charged += min(now - lastTurn, maxChargePerPoll)
+            lastTurn = now
+            guard charged < timeout, now < wallDeadline else {
                 throw AsyncTestTimeout(description: "Timed out waiting for \(description)")
             }
             try await Task.sleep(for: pollInterval)

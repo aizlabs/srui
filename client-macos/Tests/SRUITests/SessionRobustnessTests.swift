@@ -65,16 +65,22 @@ struct SessionRobustnessTests {
     /// several of these conditions are satisfied by a *different task* making progress, and a
     /// deadline is only an upper bound, so raising it weakens no assertion and costs no wall time
     /// on a healthy run. See the constant for the failure that justified it.
+    ///
+    /// Delegates to `AsyncTestSupport.eventuallyAsync`, so the budget is charged in the poller's
+    /// own turns rather than wall-clock time (see `AsyncTestSupport.maxChargePerPoll`).
     private static func waitUntil(
+        isolation: isolated (any Actor)? = #isolation,
         timeout: TimeInterval = AsyncTestSupport.roundTripSeconds,
         _ condition: @Sendable () async -> Bool
     ) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if await condition() { return true }
-            try? await Task.sleep(nanoseconds: 10_000_000)
+        do {
+            try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(timeout), description: "condition") {
+                await condition()
+            }
+            return true
+        } catch {
+            return await condition()
         }
-        return await condition()
     }
 
     /// Raised instead of waiting forever when an expected outbound event never arrives.

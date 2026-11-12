@@ -54,23 +54,17 @@ struct SSHTransportDescriptorOwnershipTests {
     ///
     /// `exec sleep` rather than a polling loop: the stub must be idle, because these tests run
     /// alongside suites whose deadlines are measured on a shared executor.
-    private func writeStubSSH(at path: String, pidFile: String) throws {
-        let script = """
-        #!/bin/sh
+    private func writeStubSSH(at path: String, pidFile: String) async throws {
+        try await SSHTestSupport.writeAssessedStub(at: path, body: """
         echo "stub ssh started" >&2
         echo $$ > "\(pidFile)"
         exec sleep 3600
-        """
-        try script.write(to: URL(fileURLWithPath: path), atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o755],
-            ofItemAtPath: path
-        )
+        """)
     }
 
-    private func stubConfiguration(in tempDir: URL, pidFile: String) throws -> SSHConfiguration {
+    private func stubConfiguration(in tempDir: URL, pidFile: String) async throws -> SSHConfiguration {
         let stubPath = tempDir.appendingPathComponent("ssh-stub").path
-        try writeStubSSH(at: stubPath, pidFile: pidFile)
+        try await writeStubSSH(at: stubPath, pidFile: pidFile)
         return SSHConfiguration(
             host: "127.0.0.1",
             subsystem: "srui",
@@ -96,7 +90,7 @@ struct SSHTransportDescriptorOwnershipTests {
         defer { TestFixtureDirectory.release(tempDir) }
 
         let pidFile = tempDir.appendingPathComponent("stub.pid").path
-        let configuration = try stubConfiguration(in: tempDir, pidFile: pidFile)
+        let configuration = try await stubConfiguration(in: tempDir, pidFile: pidFile)
 
         let transport = SSHTransport(configuration: configuration)
         _ = transport.receiveStream()
@@ -128,7 +122,7 @@ struct SSHTransportDescriptorOwnershipTests {
         defer { TestFixtureDirectory.release(tempDir) }
 
         let pidFile = tempDir.appendingPathComponent("stub.pid").path
-        let configuration = try stubConfiguration(in: tempDir, pidFile: pidFile)
+        let configuration = try await stubConfiguration(in: tempDir, pidFile: pidFile)
 
         for cycle in 0..<4 {
             try? FileManager.default.removeItem(atPath: pidFile)

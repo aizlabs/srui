@@ -20,25 +20,22 @@ struct SSHTransportChildExitTests {
 
     /// A stand-in for `ssh` that closes its stdin, says so through `marker`, then runs `tail`.
     /// No polling loop: the stubs must stay idle while other suites run against deadlines.
-    private func writeStub(at path: String, marker: String, tail: String) throws {
-        let script = """
-        #!/bin/sh
+    private func writeStub(at path: String, marker: String, tail: String) async throws {
+        try await SSHTestSupport.writeAssessedStub(at: path, body: """
         exec 0<&-
         : > "\(marker)"
         \(tail)
-        """
-        try script.write(to: URL(fileURLWithPath: path), atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+        """)
     }
 
     private func transport(
         in directory: URL,
         tail: String,
         classificationBound: Duration = SSHTransport.defaultChildExitClassificationBound
-    ) throws -> (SSHTransport, marker: String) {
+    ) async throws -> (SSHTransport, marker: String) {
         let stub = directory.appendingPathComponent("ssh-stub").path
         let marker = directory.appendingPathComponent("stdin-closed").path
-        try writeStub(at: stub, marker: marker, tail: tail)
+        try await writeStub(at: stub, marker: marker, tail: tail)
         let configuration = SSHConfiguration(
             host: "127.0.0.1",
             subsystem: "srui",
@@ -72,7 +69,7 @@ struct SSHTransportChildExitTests {
         let directory = try TestFixtureDirectory.make(prefix: "srui-exit")
         defer { TestFixtureDirectory.release(directory) }
         // Still running when the write fails, exiting the way `ssh` exits on a host-key rejection.
-        let (transport, marker) = try transport(
+        let (transport, marker) = try await transport(
             in: directory,
             tail: "sleep 1\necho 'Host key verification failed.' >&2\nexit 255"
         )
@@ -90,7 +87,7 @@ struct SSHTransportChildExitTests {
     func sendAfterExitReportsTheExit() async throws {
         let directory = try TestFixtureDirectory.make(prefix: "srui-exit")
         defer { TestFixtureDirectory.release(directory) }
-        let (transport, marker) = try transport(in: directory, tail: "exit 255")
+        let (transport, marker) = try await transport(in: directory, tail: "exit 255")
         let stream = try await connectUntilStdinClosed(transport, marker: marker)
         // The stream ends only after the reader has seen the child reaped, and its termination
         // closes the transport: the send below finds it closed by the child's failure.
@@ -116,7 +113,7 @@ struct SSHTransportChildExitTests {
         // A short bound: the child's pipes stay open while it runs, and suites that count the
         // process's pipes run alongside this one.
         let bound = Duration.milliseconds(500)
-        let (transport, marker) = try transport(in: directory, tail: "exec sleep 3600", classificationBound: bound)
+        let (transport, marker) = try await transport(in: directory, tail: "exec sleep 3600", classificationBound: bound)
         _ = try await connectUntilStdinClosed(transport, marker: marker)
 
         let clock = ContinuousClock()

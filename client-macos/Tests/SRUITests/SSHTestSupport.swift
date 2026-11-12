@@ -160,6 +160,38 @@ enum SSHTestSupport {
         SSHDRegistry.shared.remove(pid)
     }
 
+    /// Writes an executable `/bin/sh` stand-in at `path` and runs it once, outside every test
+    /// deadline, before returning.
+    ///
+    /// macOS assesses a newly written executable on its first exec, before it runs a line: right
+    /// after a loaded run, a fresh two-line script took 6-13 s to start and 0.03 s the next time.
+    /// A stub's first real run sits inside a test's wait, so that assessment failed
+    /// `SSHTransportDescriptorOwnershipTests` ("Timed out waiting for stub wrote its pid") with
+    /// nothing wrong. The warm-up run passes `--srui-warm-up`, which the prologue added here
+    /// answers by exiting; no `ssh` argument vector starts with it.
+    static func writeAssessedStub(at path: String, body: String) async throws {
+        let script = "#!/bin/sh\n[ \"$1\" = \"--srui-warm-up\" ] && exit 0\n" + body + "\n"
+        try script.write(to: URL(fileURLWithPath: path), atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+        let warmUp = Process()
+        warmUp.executableURL = URL(fileURLWithPath: path)
+        warmUp.arguments = ["--srui-warm-up"]
+        warmUp.standardInput = FileHandle.nullDevice
+        warmUp.standardOutput = FileHandle.nullDevice
+        warmUp.standardError = FileHandle.nullDevice
+        // Awaited through the termination handler, not `waitUntilExit()`, which would service the
+        // main run loop of a main-actor caller.
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            warmUp.terminationHandler = { _ in continuation.resume() }
+            do {
+                try warmUp.run()
+            } catch {
+                warmUp.terminationHandler = nil
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
     static func generateEd25519Key(at path: String) throws {
         let gen = Process()
         gen.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")

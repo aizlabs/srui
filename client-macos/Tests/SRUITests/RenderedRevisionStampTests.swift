@@ -207,8 +207,16 @@ struct RenderedRevisionStampTests {
             try await second.relabel(to: "three", base: 2)
             #expect(gap.renderedAtGap == Revision(2))
             second.fixture.selectChild()
-            let all = try await second.events(count: 4)
+            // This server never acknowledges, so the resumed outbox's replay loop resends every
+            // unsettled event from 1 s on (`PendingEventReplayLoop`), and a slow run sees those
+            // resends here: [2, 1, 1, 2, 3] under CPU load. Count each event once, at its first
+            // send, and require every resend to keep the revision it was made at.
+            let all = try await second.firstSends(count: 4)
             #expect(all.dropFirst(2).map(\.observedRevision) == [Revision(2), Revision(3)])
+            let firstRevision = Dictionary(uniqueKeysWithValues: all.map { ($0.eventId, $0.observedRevision) })
+            for sent in await second.transport.recordedEvents() {
+                #expect(firstRevision[sent.eventId] == sent.observedRevision, "a resend keeps its revision")
+            }
         } catch {
             await second.stop()
             throw error
@@ -566,6 +574,21 @@ private final class RenderedRevisionSession {
             await transport.recordedEvents().count >= count
         }
         return await transport.recordedEvents()
+    }
+
+    /// Waits for `count` distinct events and returns each at its first send, in send order: a
+    /// replay-loop resend of an unacknowledged event repeats an event already counted.
+    func firstSends(count: Int) async throws -> [Event] {
+        let transport = transport
+        try await AsyncTestSupport.eventuallyAsync(timeout: .roundTrip, description: "\(count) distinct events sent") {
+            Self.firstSends(of: await transport.recordedEvents()).count >= count
+        }
+        return Self.firstSends(of: await transport.recordedEvents())
+    }
+
+    private static func firstSends(of events: [Event]) -> [Event] {
+        var seen = Set<EventId>()
+        return events.filter { seen.insert($0.eventId).inserted }
     }
 
     func stop() async {

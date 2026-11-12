@@ -691,13 +691,23 @@ struct SessionRobustnessTests {
         let controller = SessionController(transport: transport)
 
         let startTask = Task {
-            try await controller.start()
+            _ = try? await controller.start()
+            await transport.noteStartReturned()
         }
 
-        #expect(await Self.waitUntil { await transport.isSendBlocked })
+        // Awaited, not polled against a deadline. `start()` reaches `send` only after several
+        // main-actor hops, and in a full parallel run synchronous AppKit suites keep the main
+        // actor busy for seconds at a time (sampled locally: ~93% busy over the first 8 s; longer
+        // on the 3-core CI runner), so the 10 s poll expired with `start()` still queued behind
+        // them. The suite's `.timeLimit` bounds a genuine hang, and a `start()` that returns
+        // without ever sending resolves the wait as `false` instead of parking the test.
+        #expect(
+            await transport.waitForBlockedSendOrStartReturn(),
+            "start() must park in the handshake send"
+        )
 
         await controller.stop()
-        _ = try? await startTask.value
+        await startTask.value
 
         #expect(await transport.isClosed)
 
@@ -912,6 +922,10 @@ private actor BlockingTransport: Transport {
     private var sendBlocked = false
     private var closed = false
     private var sendWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Parked in `waitForBlockedSendOrStartReturn()`: resumed with `true` when a `send` parks
+    /// here, or with `false` when the test reports that `start()` returned first.
+    private var blockedSendWaiters: [CheckedContinuation<Bool, Never>] = []
+    private var startReturned = false
     private let stream: AsyncThrowingStream<Data, Error>
     private let continuation: AsyncThrowingStream<Data, Error>.Continuation
 
@@ -924,9 +938,36 @@ private actor BlockingTransport: Transport {
     var isSendBlocked: Bool { sendBlocked }
     var isClosed: Bool { closed }
 
+    /// Suspends until a `send` is parked here (`true`) or `noteStartReturned()` comes first
+    /// (`false`). Event-driven, with no deadline for a saturated main actor to overrun; the
+    /// suite's `.timeLimit` cancels it (`false`) if neither ever happens.
+    func waitForBlockedSendOrStartReturn() async -> Bool {
+        if sendBlocked { return true }
+        if startReturned || Task.isCancelled { return false }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { blockedSendWaiters.append($0) }
+        } onCancel: {
+            Task { await self.resumeBlockedSendWaiters(false) }
+        }
+    }
+
+    func noteStartReturned() {
+        startReturned = true
+        resumeBlockedSendWaiters(false)
+    }
+
+    private func resumeBlockedSendWaiters(_ outcome: Bool) {
+        let waiters = blockedSendWaiters
+        blockedSendWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume(returning: outcome)
+        }
+    }
+
     func send(data: Data, logicalClass _: LogicalChannelClass) async throws {
         guard !closed else { throw TransportError.closed }
         sendBlocked = true
+        resumeBlockedSendWaiters(true)
         await withCheckedContinuation { sendWaiters.append($0) }
         sendBlocked = false
         guard !closed else { throw TransportError.closed }

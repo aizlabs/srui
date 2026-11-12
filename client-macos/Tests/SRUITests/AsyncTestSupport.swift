@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 import Protocol
 import Session
 
@@ -85,6 +86,47 @@ enum AsyncTestSupport {
                 throw AsyncTestTimeout(description: "Timed out waiting for \(description)")
             }
             try await Task.sleep(for: pollInterval)
+        }
+    }
+}
+
+extension AsyncTestSupport {
+    /// Suspends until `condition` holds, re-evaluating it only when an `@Observable` property it
+    /// read changes: no poll and no wall-clock deadline.
+    ///
+    /// Why not `eventually(timeout: .roundTrip)`: the state these conditions wait for is written
+    /// by a main-actor task, and in a full parallel run the main actor is not ours to schedule.
+    /// Synchronous AppKit suites (`KeepVisibleRenderingTests`, `CollectionSelectionPromotionTests`
+    /// and friends) hold it for seconds at a time — sampled locally at ~93% busy over the first
+    /// 8 s of the run, and the 3-core CI runner finishes 400+ unrelated in-memory tests together
+    /// at 12–20 s. A 10-second deadline that starts counting while the writer is still queued
+    /// behind them is a coin toss, whatever its length: `ConnectionManagerTests` "a failed first
+    /// connection discards its session context" and "first ready event saves the entry and
+    /// authoritative revision" both timed out on CI that way. A hang is still bounded, by the
+    /// suite's `.timeLimit`, whose cancellation ends this wait with an error naming it.
+    ///
+    /// Only for conditions that read nothing but observation-tracked state: a change to anything
+    /// else wakes nothing here.
+    @MainActor
+    static func observed(
+        _ description: String,
+        condition: @MainActor () -> Bool
+    ) async throws {
+        while !condition() {
+            let changed = AsyncTestSignal()
+            _ = withObservationTracking {
+                condition()
+            } onChange: {
+                changed.signal()
+            }
+            await withTaskCancellationHandler {
+                await changed.wait()
+            } onCancel: {
+                changed.signal()
+            }
+            if Task.isCancelled {
+                throw AsyncTestTimeout(description: "Cancelled while waiting for \(description)")
+            }
         }
     }
 }

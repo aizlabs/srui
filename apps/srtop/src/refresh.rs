@@ -2888,14 +2888,17 @@ pub fn selection_changed(
     event: &srui_protocol::Event,
 ) {
     let client = event.client_instance_id.as_slice();
-    let Ok(event) = srui_semantic_tree::Event::try_from(event.clone()) else {
-        return;
-    };
     // The table's and the tree's selections both reach here (PX-018); only
     // the shown collection's is the user's, and it is the reporting client's.
-    let node = event.node_id;
+    let node = NodeId::new(event.node_id);
+    // A report whose arguments do not decode names no row and is refused,
+    // like one whose `value` is not an `ItemId`; it is never a clear
+    // (PX-013, PX-017-G02).
+    let change = srui_semantic_tree::Event::try_from(event.clone())
+        .ok()
+        .and_then(|event| event.selection_change());
     let mut view = lock_view(view);
-    let published = match event.selection_change() {
+    let published = match change {
         Some(srui_sdk::SelectionChange::Cleared) => view.clear_selection_in(session, client, node),
         Some(srui_sdk::SelectionChange::Item(item)) => {
             view.select_item_in(session, client, node, Some(item))
@@ -7144,17 +7147,40 @@ mod disclosure_commit_tests {
         let mut source = Family::new(&[(10, "alpha", 0, 10), (11, "beta", 10, 11)]);
         let (session, mut view) = tree(&mut source);
         let alpha = item(&view, 10);
+        let beta = item(&view, 11);
         let client = |index: usize| format!("client-{index}").into_bytes();
-        for index in 0..=MAX_DISCLOSURE_CLIENTS {
+        for index in 0..MAX_DISCLOSURE_CLIENTS {
             view.expansion_changed(&session, &client(index), TREE, alpha, false)
                 .unwrap();
         }
+        assert_eq!(
+            view.disclosure_clients(),
+            MAX_DISCLOSURE_CLIENTS,
+            "none evicted at the bound"
+        );
+        // The first client reports again, so the second is now the least
+        // recently reporting one, and the next new client evicts it.
+        view.expansion_changed(&session, &client(0), TREE, beta, false)
+            .unwrap();
+        view.expansion_changed(
+            &session,
+            &client(MAX_DISCLOSURE_CLIENTS),
+            TREE,
+            alpha,
+            false,
+        )
+        .unwrap();
         assert_eq!(view.disclosure_clients(), MAX_DISCLOSURE_CLIENTS);
         assert!(
-            view.collapsed_by(&client(0)).is_empty(),
-            "the oldest evicted"
+            view.collapsed_by(&client(1)).is_empty(),
+            "the least recently reporting evicted"
         );
-        assert!(view.collapsed_by(&client(1)).contains(&alpha));
+        assert_eq!(
+            view.collapsed_by(&client(0)),
+            HashSet::from([alpha, beta]),
+            "a client that reported again is kept"
+        );
+        assert!(view.collapsed_by(&client(2)).contains(&alpha));
         let last = client(MAX_DISCLOSURE_CLIENTS);
         assert!(view.collapsed_by(&last).contains(&alpha));
         // Expanding its last collapsed item drops the client's entry.

@@ -1952,3 +1952,126 @@ fn a_user_deselect_in_the_tree_stops_follow_and_one_from_the_hidden_table_is_ign
     assert_eq!(h.view().follow().following(), None);
     assert_eq!(h.text(FOLLOW_STATUS), SELECTION_CLEARED_FOLLOW_STATUS);
 }
+
+/// Verification of Codex review round 4 (V4-F1, V4-F3): a Go to PID one
+/// client clicks is applied by every client, and each expands the collapsed
+/// parents above the match before it reports them. Every client's mirror
+/// expands them at once, so the other client's selection of the match right
+/// afterwards is described rather than taken for a hidden row, and the
+/// emptied entry is dropped.
+#[test]
+fn a_promotion_by_one_client_reveals_the_match_in_every_clients_mirror() {
+    let mut source = family(&[
+        (10, "alpha", 0, 10),
+        (11, "beta", 10, 11),
+        (30, "xray", 0, 60),
+    ]);
+    let mut h = harness(&mut source);
+    h.show_tree(true);
+    let alpha = h.item_of(10);
+    let beta = h.item_of(11);
+    h.disclose(alpha, false);
+    assert_eq!(h.view().disclosure_clients(), 1);
+    h.view().set_pid_input(&h.session, "11").unwrap();
+    h.sync();
+    h.send_from(OTHER, PID_GO, TypeRef::EVENT_ACTIVATE, vec![]);
+    assert_eq!(h.item_property(TREE, VALUE), Some(beta), "promoted");
+    assert!(
+        h.view().collapsed_by(CLIENT).is_empty(),
+        "this client revealed beta too"
+    );
+    assert_eq!(
+        h.view().disclosure_clients(),
+        0,
+        "the emptied entry is dropped"
+    );
+    // Before this client's `EXPANSION_CHANGED(true)` arrives, it selects beta.
+    h.select(TREE, beta);
+    assert!(h
+        .text(INSPECTOR_STATUS)
+        .starts_with("Selected process: PID 11 · beta"));
+}
+
+/// Verification of Codex review round 4 (V4-F3): a client's entry closes
+/// when its last collapsed item leaves the tree, and only that client's.
+#[test]
+fn a_clients_entry_closes_when_its_collapsed_items_leave_the_tree() {
+    let mut source = family(&[
+        (10, "alpha", 0, 10),
+        (11, "beta", 10, 11),
+        (30, "xray", 0, 60),
+        (31, "yankee", 30, 61),
+    ]);
+    let mut h = harness(&mut source);
+    h.show_tree(true);
+    let alpha = h.item_of(10);
+    let xray = h.item_of(30);
+    h.disclose(alpha, false);
+    h.disclose_from(OTHER, xray, false);
+    assert_eq!(h.view().disclosure_clients(), 2);
+    // `alpha` and its child end.
+    source
+        .records
+        .retain(|record| !matches!(record.key.pid, Observed::Known(10) | Observed::Known(11)));
+    h.sample(&mut source);
+    assert_eq!(
+        h.view().disclosure_clients(),
+        1,
+        "only the other client's entry is left"
+    );
+    assert!(h.view().collapsed_by(CLIENT).is_empty());
+    assert!(h.view().collapsed_by(OTHER).contains(&xray));
+}
+
+/// A `SELECTION_CHANGED` whose arguments do not decode names no row. The
+/// session already rejects one before any handler runs; handed to srtop's
+/// handler directly, it is refused on the shown tree, as one whose `value`
+/// is not an `ItemId` is (PX-013, as on `origin/main`), never read as a clear
+/// (PX-017-G02); one on the hidden table is ignored like any report from it
+/// (PX-018).
+#[test]
+fn an_undecodable_selection_is_refused_on_the_shown_tree_and_ignored_from_the_hidden_table() {
+    let mut source = family(&[
+        (10, "alpha", 0, 10),
+        (11, "beta", 10, 11),
+        (30, "xray", 0, 60),
+    ]);
+    let mut h = harness(&mut source);
+    h.show_tree(true);
+    let beta = h.item_of(11);
+    h.select(TREE, beta);
+    h.follow(true);
+    let undecodable = |h: &mut Harness, node: NodeId| {
+        let seq = h.next_seq(CLIENT);
+        let mut wire = DomainEvent::selection_changed(
+            seq,
+            format!("tree-undecodable-{seq}"),
+            h.revision(),
+            node,
+            beta,
+        )
+        .with_client_instance_id(CLIENT.to_vec())
+        .to_wire();
+        // A `Value` with no kind: `Event::try_from` fails on it.
+        wire.arguments[0].value = Some(srui_protocol::Value::default());
+        assert!(srui_semantic_tree::Event::try_from(wire.clone()).is_err());
+        let outcome = h.session.process_event(&wire).expect("event answered");
+        assert!(
+            matches!(outcome, EventOutcome::Rejected { .. }),
+            "{outcome:?}"
+        );
+        srui_process_explorer::refresh::selection_changed(&h.view, &h.session, &wire);
+        h.sync();
+    };
+    undecodable(&mut h, TABLE);
+    assert!(h
+        .text(INSPECTOR_STATUS)
+        .starts_with("Selected process: PID 11 · beta"));
+    undecodable(&mut h, TREE);
+    assert_eq!(
+        h.text(INSPECTOR_STATUS),
+        "Selected process: none · the selection named no row; nothing was read"
+    );
+    assert_ne!(h.text(INSPECTOR_STATUS), CLEARED_SELECTION_STATUS);
+    assert_ne!(h.text(FOLLOW_STATUS), SELECTION_CLEARED_FOLLOW_STATUS);
+}

@@ -2657,16 +2657,32 @@ impl ProcessView {
         self.expansion_changed_at(session, client, node, item, expanded, observed)
     }
 
-    /// [`Self::expansion_changed`], made while the client held revision
-    /// `observed` (Codex review round 5). A collapse the client made before
-    /// it applied the latest revealing promotion, of an item whose subtree
-    /// holds that promotion's match, is undone on the client when it applies
-    /// the promotion: it expands the collapsed items above the match, selects
-    /// the match with selection events suppressed
+    /// [`Self::expansion_changed`], stamped by the client with revision
+    /// `observed` (Codex review round 5). A collapse stamped at or before the
+    /// revision every client held before the latest revealing promotion, of
+    /// an item whose subtree holds that promotion's match, was made before
+    /// the client applied the promotion, and the client undoes it then: it
+    /// expands the collapsed items above the match, selects the match with
+    /// selection events suppressed
     /// (`OutlineCollectionAdapter.resolvePendingPromotion`,
     /// `expandCollapsedAncestors`) and reports the expand. Such a collapse
     /// therefore leaves the mirror and the inspector as they are, so the
     /// newer selection the promotion made is kept.
+    ///
+    /// The converse does not hold (verification V6-F1, a known limitation):
+    /// a report stamped at the promotion's revision or later was not
+    /// necessarily made after the outline applied the promotion. The client
+    /// stamps it with the applier's published snapshot
+    /// (`SessionController.enqueueNativeSemanticAction`,
+    /// `client-macos/Session/SessionController.swift:1201-1206`, through
+    /// `semanticInspectionSourceSnapshot`), which advances before the
+    /// main-actor render that calls `applyPromotion`. A collapse made in that
+    /// gap carries the promotion's own revision, is taken as fresh and clears
+    /// the inspector, while the render then expands the parent and selects
+    /// the match. No server-side boundary separates it from a collapse made
+    /// after the render, which does deselect the row; closing the gap needs
+    /// the client to stamp disclosure and selection events with the revision
+    /// its renderer has applied.
     pub fn expansion_changed_at(
         &mut self,
         session: &Session,
@@ -7235,6 +7251,90 @@ mod disclosure_commit_tests {
         view.go_to_pid_from(&session, CLIENT).unwrap();
         assert_eq!(view.inspector().selected(), Some(item(&view, 11)));
         assert!(view.collapsed_by(CLIENT).is_empty());
+    }
+
+    /// Another client instance, for the tests that need two.
+    const OTHER: &[u8] = b"disclosure-other-client";
+
+    /// Verification V6-L1 (N9): a promotion that does not commit records no
+    /// reveal, so a delayed collapse above its match, which the client keeps
+    /// because it never received the promotion, is mirrored.
+    #[test]
+    fn a_failed_promotion_records_no_reveal() {
+        let mut source = Family::new(&[
+            (10, "alpha", 0, 10),
+            (11, "beta", 10, 11),
+            (30, "xray", 0, 60),
+        ]);
+        let (session, mut view) = tree(&mut source);
+        let alpha = item(&view, 10);
+        let xray = item(&view, 30);
+        view.select_item_in(&session, CLIENT, TREE, Some(xray))
+            .unwrap();
+        view.set_pid_input(&session, "11").unwrap();
+        let before = session.current_revision();
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.go_to_pid_from(&session, CLIENT).is_err());
+        }
+        view.expansion_changed_at(&session, CLIENT, TREE, alpha, false, before)
+            .unwrap();
+        assert!(
+            view.collapsed_by(CLIENT).contains(&alpha),
+            "the client keeps alpha collapsed"
+        );
+    }
+
+    /// Verification V6-L1 (N12): a promotion that does not commit puts back
+    /// the selection's holder too, so the requester's collapse cannot hide
+    /// the other client's selection the inspector still describes.
+    #[test]
+    fn a_failed_promotion_restores_the_holder() {
+        let mut source = Family::new(&[
+            (10, "alpha", 0, 10),
+            (11, "beta", 10, 11),
+            (12, "gamma", 10, 12),
+        ]);
+        let (session, mut view) = tree(&mut source);
+        let gamma = item(&view, 12);
+        view.select_item_in(&session, OTHER, TREE, Some(gamma))
+            .unwrap();
+        view.set_pid_input(&session, "11").unwrap();
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.go_to_pid_from(&session, CLIENT).is_err());
+        }
+        assert_eq!(view.inspector().selected(), Some(gamma));
+        collapse(&session, &mut view, 10);
+        assert_eq!(
+            view.inspector().selected(),
+            Some(gamma),
+            "this client's collapse never hides the other client's selection"
+        );
+    }
+
+    /// Verification V6-L1 (N14): only an item whose subtree holds the match
+    /// is undone; a delayed collapse of an unrelated parent that comes before
+    /// the match in preorder is mirrored.
+    #[test]
+    fn a_delayed_collapse_of_a_parent_before_the_match_is_mirrored() {
+        let mut source = Family::new(&[
+            (10, "alpha", 0, 10),
+            (11, "beta", 10, 11),
+            (20, "delta", 0, 20),
+            (21, "echo", 20, 21),
+        ]);
+        let (session, mut view) = tree(&mut source);
+        let alpha = item(&view, 10);
+        view.set_pid_input(&session, "21").unwrap();
+        let before = session.current_revision();
+        view.go_to_pid_from(&session, CLIENT).unwrap();
+        view.expansion_changed_at(&session, CLIENT, TREE, alpha, false, before)
+            .unwrap();
+        assert!(
+            view.collapsed_by(CLIENT).contains(&alpha),
+            "alpha does not hold echo"
+        );
     }
 
     /// Codex review round 4: the per-client mirror is bounded. A client with

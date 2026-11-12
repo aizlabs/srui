@@ -989,17 +989,22 @@ impl ProcessView {
     /// established an exit, so it is `no longer observed`, whatever else the
     /// scan says (merge with main: PX-013's review round never calls an
     /// evicted row ended), unless the inspector's detail read found it gone.
+    ///
+    /// Returns the keys of the historical tags it recorded, so a tag whose
+    /// record a bound dropped at once is not counted forgotten twice.
     fn record_departures(
         &mut self,
         kept: impl Fn(ItemId) -> bool,
         evicted: &HashSet<ItemId>,
         evidence: &Evidence<'_>,
         sampled_at: SystemTime,
-    ) {
+    ) -> HashSet<ProcessKey> {
         let now = self.clock.now();
         let (inspected, followed) = self.watched_keys();
-        let watched =
-            |key: &ProcessKey| inspected.as_ref() == Some(key) || followed.as_ref() == Some(key);
+        let tags = &self.tags;
+        let watched = |key: &ProcessKey| {
+            inspected.as_ref() == Some(key) || followed.as_ref() == Some(key) || tags.is_tagged(key)
+        };
         let mut left = Vec::new();
         for row in &self.unfiltered_rows {
             if kept(row.item_id) {
@@ -1030,10 +1035,16 @@ impl ProcessView {
             tombstone.tagged = tagged;
             left.push(tombstone);
         }
+        let recorded_tags: HashSet<ProcessKey> = left
+            .iter()
+            .filter(|tombstone| tombstone.tagged)
+            .map(|tombstone| tombstone.key().clone())
+            .collect();
         for tombstone in left {
             self.last_seen.record(tombstone);
         }
         self.last_seen.expire(now, watched);
+        recorded_tags
     }
 
     /// The inspector's target and the followed process (PX-021).
@@ -1051,12 +1062,18 @@ impl ProcessView {
     ///
     /// The followed process watches its record too: follow can be turned on
     /// for a row a failed commit left on the client after its process left,
-    /// and stays on it when a collapse clears the inspector.
+    /// and stays on it when a collapse clears the inspector. So does a live
+    /// tag: one put back because the sample that retired it never committed
+    /// its tags status watches its record until a committed sample retires
+    /// it, or the tag is removed (Codex review of PR #107). The age, count
+    /// and byte bounds still apply; a record they drop meanwhile makes the
+    /// retired tag forgotten.
     fn expire_tombstones(&mut self) {
         let now = self.clock.now();
         let (inspected, followed) = self.watched_keys();
+        let tags = &self.tags;
         self.last_seen.expire(now, |key| {
-            inspected.as_ref() == Some(key) || followed.as_ref() == Some(key)
+            inspected.as_ref() == Some(key) || followed.as_ref() == Some(key) || tags.is_tagged(key)
         });
     }
 
@@ -1362,7 +1379,7 @@ impl ProcessView {
         // dropped it unconfirmed, say) turns `exited` once this scan is
         // entitled to account for its instance and no longer lists it: the
         // PX-013 review round's rule, under PX-021's identity rule.
-        {
+        let recorded_tags = {
             let evidence = Evidence::new(snapshot, &retention, &thread_retention, &live_processes);
             self.last_seen.establish_exits(|key| {
                 if retains(key) {
@@ -1378,8 +1395,8 @@ impl ProcessView {
                 &evicted_ids,
                 &evidence,
                 snapshot.sampled_at.0,
-            );
-        }
+            )
+        };
         // A tagged process this generation no longer holds keeps a
         // historical tag (PX-020): its tombstone. The set before is held
         // until the tags status commits.
@@ -1388,9 +1405,15 @@ impl ProcessView {
             .departed(&self.unfiltered_rows, &unfiltered_target);
         let held_tags = held_retag.or_else(|| (!departed.is_empty()).then(|| self.tags.clone()));
         for (key, _) in &departed {
-            // A sample that never committed put this tag back; its tombstone
-            // is still kept, and is historical again.
-            self.last_seen.tag(key);
+            // A sample that never committed put this tag back; its tombstone,
+            // which the live tag kept watched, is historical again. Had a
+            // bound dropped that record meanwhile, the tag is forgotten, and
+            // counted, rather than silently lost (Codex review of PR #107). A
+            // record this sample made and a bound dropped at once was counted
+            // when it was dropped.
+            if !self.last_seen.tag(key) && !recorded_tags.contains(key) {
+                self.last_seen.forget_tags(1);
+            }
         }
         self.tags.retire(&departed);
         // When each row this scan did not confirm was last observed.
@@ -9611,5 +9634,157 @@ mod tag_counts_commit_tests {
         let status = view.tags_status().to_string();
         assert!(status.contains(BEYOND), "{status}");
         assert_eq!(unreadable_scan(&session, &mut view, &mut source), status);
+    }
+}
+
+/// Codex review of PR #107, `PRRT_kwDOUG_6uM620bez`: a tagged process that
+/// is neither selected nor followed leaves in a sample whose tags status never
+/// commits. The tag is put back live and its record is no longer a
+/// historical tag, but the live tag still watches that record until a
+/// committed sample retires it; the retry then keeps the historical tag. If
+/// a bound dropped the record meanwhile, the retired tag is counted
+/// forgotten, never silently lost.
+#[cfg(test)]
+mod failed_retire_tests {
+    use super::*;
+    use crate::lastseen::MAX_TOMBSTONE_AGE;
+    use crate::source::{
+        BootId, CappedRecords, Completeness, CpuUsage, CreationToken, DisplayName,
+        FakeProcessSource, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+        SnapshotTime, SourceId, OWNER_NOT_COLLECTED,
+    };
+    use std::sync::Mutex;
+
+    const CLIENT: &[u8] = b"failed-retire-client";
+
+    fn record(pid: u32, name: &str) -> ProcessRecord {
+        ProcessRecord {
+            lineage: Lineage::new(if pid == 1 { 0 } else { 1 }, u64::from(pid)),
+            owner: OWNER_NOT_COLLECTED,
+            key: ProcessKey {
+                source: SourceId("failed-retire".into()),
+                host: Observed::Known(HostId("h".into())),
+                boot: Observed::Known(BootId("b".into())),
+                pid_namespace: Observed::Known(PidNamespaceId(1)),
+                pid: Observed::Known(pid),
+                creation: CreationToken::Opaque(name.into()),
+                thread: None,
+            },
+            kind: crate::source::KIND_NOT_COLLECTED,
+            display_name: DisplayName::from(name),
+            resident: Observed::Known(4096),
+            cpu: CpuUsage::WarmingUp,
+        }
+    }
+
+    struct Steps(Vec<Vec<ProcessRecord>>, usize);
+
+    impl ProcessSource for Steps {
+        fn status_text(&self) -> &str {
+            "Read-only · Failed-retire fixture"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            let records = self.0[self.1.min(self.0.len() - 1)].clone();
+            self.1 += 1;
+            ProcessSnapshot {
+                source: SourceId("failed-retire".into()),
+                sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH),
+                records,
+                vanished: 0,
+                capped: CappedRecords::none(),
+                completeness: Completeness::Complete,
+                system: FakeProcessSource::system(),
+                threads: crate::source::ThreadScan::NotProvided,
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Clock(Mutex<Duration>);
+
+    impl MonotonicClock for Clock {
+        fn now(&self) -> Duration {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    /// `worker` (300) tagged, `init` selected, follow off; then a sample in
+    /// which 300 exited fails before its tags status commits.
+    fn failed_retirement(clock: Arc<Clock>) -> (Session, ProcessView, Steps) {
+        let mut source = Steps(
+            vec![
+                vec![record(1, "init"), record(300, "worker")],
+                vec![record(1, "init")],
+            ],
+            0,
+        );
+        let session = Session::mint();
+        let (view, _) = ProcessView::start(&session, &mut source).unwrap();
+        let mut view = view.with_clock(clock);
+        let item = |view: &ProcessView, pid: u32| {
+            view.rows
+                .iter()
+                .find(|row| row.key.pid == Observed::Known(pid))
+                .map(|row| row.item_id)
+        };
+        view.select_item(&session, CLIENT, item(&view, 300))
+            .unwrap();
+        view.request_tags(&session, TagRequest::Toggle).unwrap();
+        view.select_item(&session, CLIENT, item(&view, 1)).unwrap();
+        assert!(view.follow().following().is_none());
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.refresh(&session, &mut source).is_err());
+        }
+        assert_eq!(view.tags().tagged(), 1, "the live tag was put back");
+        assert!(view.historical_tags().is_empty());
+        (session, view, source)
+    }
+
+    #[test]
+    fn a_failed_retirement_of_an_unwatched_tag_keeps_its_record_for_the_retry() {
+        let (session, mut view, mut source) = failed_retirement(Arc::new(Clock::default()));
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.tags().tagged(), 0);
+        assert_eq!(view.historical_tags(), ["PID 300 · worker"]);
+        assert_eq!(view.last_seen().forgotten_tags(), 0);
+        assert!(
+            view.tags_status()
+                .starts_with("Tags: 0 tagged · 1 historical: PID 300 · worker exited"),
+            "{}",
+            view.tags_status()
+        );
+    }
+
+    /// Bounded: a restored live tag that is cleared watches nothing, so its
+    /// record goes at the next sample, and nothing is historical.
+    #[test]
+    fn a_cleared_restored_tag_releases_its_record() {
+        let (session, mut view, mut source) = failed_retirement(Arc::new(Clock::default()));
+        assert_eq!(view.last_seen().len(), 1);
+        view.request_tags(&session, TagRequest::Clear).unwrap();
+        assert_eq!(view.tags().tagged(), 0);
+        view.refresh(&session, &mut source).unwrap();
+        assert!(view.last_seen().is_empty(), "nothing watches the record");
+        assert!(view.historical_tags().is_empty());
+        assert_eq!(view.last_seen().forgotten_tags(), 0);
+    }
+
+    #[test]
+    fn a_record_that_ages_out_before_its_retirement_commits_counts_the_tag_forgotten() {
+        let clock = Arc::new(Clock::default());
+        let (session, mut view, mut source) = failed_retirement(clock.clone());
+        *clock.0.lock().unwrap() = MAX_TOMBSTONE_AGE;
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.tags().tagged(), 0);
+        assert!(view.last_seen().is_empty(), "the age bound still applies");
+        assert_eq!(view.last_seen().forgotten_tags(), 1);
+        assert!(
+            view.tags_status()
+                .starts_with("Tags: 0 tagged · 1 historical, forgotten"),
+            "{}",
+            view.tags_status()
+        );
     }
 }

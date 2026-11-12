@@ -3384,7 +3384,10 @@ struct ProcessExplorerShellTests {
                 server.standardError = FileHandle.nullDevice
             }
             try server.run()
-            try await AsyncTestSupport.eventually(timeout: .seconds(5), description: "srtop private socket") {
+            // Real process start-up, under whatever else the machine is doing: `apps/srtop/test.sh`
+            // timed out here at 5 s right after its own cargo rebuild of the bridge and counter,
+            // with nothing wrong in srtop. The shared budget for a real process.
+            try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "srtop private socket") {
                 FileManager.default.fileExists(atPath: socket)
             }
             let sshd = try SSHTestSupport.launchSSHD(configPath: config.path, hostKeyPath: hostKey, port: port)

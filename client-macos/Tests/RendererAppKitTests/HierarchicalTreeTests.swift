@@ -31,8 +31,12 @@ struct HierarchicalTreeTests {
         var expansions: [Expansion] = []
         var requests: [CollectionRangeRequest] = []
         var collapsed: [Set<ItemId>] = []
+        var selections: [ItemId] = []
+        var cleared = 0
 
         func attach(to adapter: OutlineCollectionAdapter) {
+            adapter.onSelectionChanged = { [weak self] _, itemID in self?.selections.append(itemID) }
+            adapter.onSelectionCleared = { [weak self] _ in self?.cleared += 1 }
             adapter.onExpansionChanged = { [weak self] _, itemID, expanded in
                 self?.expansions.append(Expansion(itemID: itemID, expanded: expanded))
             }
@@ -321,6 +325,57 @@ struct HierarchicalTreeTests {
         #expect(outlineView.selectedRowIndexes == IndexSet(integer: 3))
         #expect(notifications == [.selectedRowsChanged])
         #expect(recorder.requests.isEmpty)
+    }
+
+    // MARK: - Cleared selection (PX-017-G02)
+
+    /// A user deselect leaves the tree with nothing selected and is reported once with no item
+    /// (spec/registries.md §4.4). A promotion, its withdrawal and a commit removing the selected
+    /// item are server-driven and never reported. A user collapse that hides the selection is a
+    /// disclosure change: it reports EXPANSION_CHANGED only, never a clear, and the server learns
+    /// of it from that event (PX-018 mirrors the collapsed set).
+    @Test
+    func aUserDeselectReportsOneClearAndCollapsesAndServerDeselectionsNone() throws {
+        var store = try Self.store(Self.forest)
+        let recorder = Recorder()
+        let (adapter, outlineView) = try Self.outline(for: store, selectionMode: .single, recorder: recorder)
+
+        outlineView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        #expect(recorder.selections == [Self.b])
+        outlineView.deselectAll(nil)
+        #expect(recorder.cleared == 1)
+        outlineView.deselectAll(nil)
+        #expect(recorder.cleared == 1, "nothing to deselect reports nothing")
+
+        adapter.applyPromotion(Self.e, reveal: false, outlineView: outlineView)
+        #expect(outlineView.selectedRowIndexes == IndexSet(integer: 4))
+        adapter.applyPromotion(nil, reveal: false, outlineView: outlineView)
+        #expect(outlineView.selectedRowIndexes.isEmpty)
+        #expect(recorder.cleared == 1, "a promotion withdrawal is server-driven")
+
+        // Collapsing B hides the selected D (row 3): EXPANSION_CHANGED only, no clear.
+        outlineView.selectRowIndexes(IndexSet(integer: 3), byExtendingSelection: false)
+        #expect(adapter.setExpanded(false, itemID: Self.b, outlineView: outlineView))
+        #expect(outlineView.selectedRowIndexes.isEmpty)
+        #expect(recorder.expansions == [Expansion(itemID: Self.b, expanded: false)])
+        #expect(recorder.cleared == 1, "a collapse that hides the selection is not a deselection")
+
+        // Rows are now A B E F G. Collapsing F keeps the selected A shown: no clear.
+        outlineView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        #expect(adapter.setExpanded(false, itemID: Self.f, outlineView: outlineView))
+        #expect(outlineView.selectedRowIndexes == IndexSet(integer: 0))
+        #expect(recorder.cleared == 1)
+
+        // A commit that removes the selected E deselects it without a report.
+        outlineView.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
+        #expect(recorder.selections == [Self.b, Self.d, Self.a, Self.e])
+        try store.apply([
+            .modelDeleteItems(id: Self.modelID, itemIds: [Self.e]),
+            .modelUpdate(id: Self.modelID, index: nil, items: [Self.item(1, depth: 0, descendants: 3)]),
+        ])
+        adapter.update(model: store.getModel(Self.modelID), modelID: Self.modelID, outlineView: outlineView)
+        #expect(outlineView.selectedRowIndexes.isEmpty)
+        #expect(recorder.cleared == 1, "a commit's deselection is server-driven")
     }
 
     // MARK: - Model updates keep disclosure by ItemId (§22.5)

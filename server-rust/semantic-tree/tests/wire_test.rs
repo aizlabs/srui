@@ -473,6 +473,8 @@ fn test_standard_and_custom_events_wire_byte_roundtrip() {
         Event::value_changed(3, "val-2", 100, 12, 0.72f64),
         // 4. SELECTION_CHANGED (ItemId)
         Event::selection_changed(4, "sel-1", 100, 13, ItemId::new(500)),
+        // 4b. SELECTION_CHANGED with no value (a user-cleared selection)
+        Event::selection_cleared(4, "sel-2", 100, 13),
         // 5. TEXT_EDIT
         Event::text_edit(
             5,

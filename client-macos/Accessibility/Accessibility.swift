@@ -53,6 +53,9 @@ public enum SemanticAction: Equatable, Sendable {
     case activate
     case valueChanged(Value)
     case selectionChanged(ItemId)
+    /// A user-cleared collection selection: `SELECTION_CHANGED` with no `value` (§7.6;
+    /// `spec/registries.md` §4.4).
+    case selectionCleared
     /// A Tree item's disclosure (§7.6, §22.5): the ItemId and whether it is now expanded.
     case expansionChanged(ItemId, expanded: Bool)
 
@@ -62,7 +65,7 @@ public enum SemanticAction: Equatable, Sendable {
             return .EVENT_ACTIVATE
         case .valueChanged:
             return .EVENT_VALUE_CHANGED
-        case .selectionChanged:
+        case .selectionChanged, .selectionCleared:
             return .EVENT_SELECTION_CHANGED
         case .expansionChanged:
             return .EVENT_EXPANSION_CHANGED
@@ -333,6 +336,13 @@ public struct SemanticNodeHandle: Sendable {
     @discardableResult
     public func select(_ itemID: ItemId) async throws -> Event {
         try await perform(.selectionChanged(itemID))
+    }
+
+    /// Reports that nothing is selected now, as a user deselection would (§7.6;
+    /// `spec/registries.md` §4.4).
+    @discardableResult
+    public func clearSelection() async throws -> Event {
+        try await perform(.selectionCleared)
     }
 
     /// Reports a Tree item's disclosure through the normal event path (§7.6, §22.5).

@@ -5038,7 +5038,8 @@ mod live {
         let mut source = ProcFsSource::live();
         let (mut view, _) = start_from_source(&session, &mut source).unwrap();
         let (item, _) = row_for(&session, me).expect("this test process is shown");
-        view.select_item(&session, Some(item)).unwrap();
+        view.select_item(&session, b"live-tags-client", Some(item))
+            .unwrap();
         view.request_tags(&session, TagRequest::Descendants)
             .unwrap();
         let tagged = tagged_pids(&session);

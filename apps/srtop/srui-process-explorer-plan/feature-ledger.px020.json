@@ -15,7 +15,7 @@
     {
       "feature_id": "SRUI-PX020-001",
       "feature": "Explicit tags by process instance, independent of the selection: a server-side tag set keyed by the whole ProcessKey (source, host, boot, PID namespace, PID, creation token), never by PID, row or name; tags survive sorting, filtering, the column chooser, the view switch and pausing; a newer process reusing a tagged PID is never tagged; tagging, untagging and clearing never select, deselect, promote, withdraw, scroll or follow anything",
-      "scope": "PX-020/tags (src/tags.rs) Tags, is_tagged, toggle, clear; refresh (src/refresh.rs) visible_in tag marking, request_tags, tag_target; tests/tags_test.rs tags_survive_sorting_the_column_chooser_and_the_view_switch_and_clearing_keeps_the_selection, descendant_tags_are_frozen_survive_filters_and_turn_historical_when_a_process_ends, a_paused_view_tags_its_frozen_rows; client-macos ProcessExplorerShellTests tagsMarkProcessInstancesIndependentlyOfTheSelectionAndSurviveSortFilterTreeAndExit",
+      "scope": "PX-020/tags (src/tags.rs) Tags, is_tagged, toggle, clear; refresh (src/refresh.rs) visible_in tag marking, request_tags, tag_target; tests/tags_test.rs tags_survive_sorting_the_column_chooser_and_the_view_switch_and_clearing_keeps_the_selection, descendant_tags_are_frozen_survive_filters_and_turn_historical_when_a_process_ends, a_paused_view_tags_its_frozen_rows, a_cleared_selection_tags_nothing_and_clearing_tags_keeps_it_cleared (merge with main, PX-017-G02); client-macos ProcessExplorerShellTests tagsMarkProcessInstancesIndependentlyOfTheSelectionAndSurviveSortFilterTreeAndExit",
       "source_refs": [
         "D1",
         "D2",
@@ -75,7 +75,7 @@
     {
       "feature_id": "SRUI-PX020-005",
       "feature": "Exit: a tagged process that leaves the collection (it ended, or no scan lists it) keeps a historical tag, named by PID and name as last shown, listed in the tags status and never put back on a row; at most MAX_HISTORICAL_TAGS = 64 are kept, oldest forgotten first and counted; Clear tags removes live and historical tags",
-      "scope": "PX-020/tags (src/tags.rs) departed, retire, history, status, MAX_HISTORICAL_TAGS; refresh (src/refresh.rs) apply; tests/tags_test.rs descendant_tags_are_frozen_survive_filters_and_turn_historical_when_a_process_ends, historical_tags_are_bounded_newest_kept_and_cleared; tests/procfs_test.rs live::a_live_tagged_family_keeps_its_frozen_membership_and_an_ended_worker_turns_historical",
+      "scope": "PX-020/tags (src/tags.rs) departed, retire, history, status, MAX_HISTORICAL_TAGS; refresh (src/refresh.rs) apply; tests/tags_test.rs descendant_tags_are_frozen_survive_filters_and_turn_historical_when_a_process_ends, historical_tags_are_bounded_newest_kept_and_cleared, a_tagged_process_the_row_limit_drops_turns_historical_and_is_never_called_ended (merge with main, PX-013 review round); tests/procfs_test.rs live::a_live_tagged_family_keeps_its_frozen_membership_and_an_ended_worker_turns_historical",
       "source_refs": [
         "D1",
         "D2",
@@ -89,8 +89,8 @@
     },
     {
       "feature_id": "SRUI-PX020-006",
-      "feature": "Hidden tags counted: the tags status says how many tagged processes the filters hide, how many are kernel threads hidden by Show kernel threads, and how many are beyond the publishable size limit; a row hidden under a collapsed tree parent is not counted and, unselectable, cannot be tagged",
-      "scope": "PX-020/refresh (src/refresh.rs) visible_in, Visible::tags, tags_effects; tags (src/tags.rs) TagCounts, status; tests/tags_test.rs threads_are_never_tagged_and_a_hidden_kernel_thread_tag_is_counted, a_row_hidden_under_a_collapsed_parent_cannot_be_tagged_and_is_not_counted_hidden, descendant_tags_are_frozen_survive_filters_and_turn_historical_when_a_process_ends",
+      "feature": "Hidden tags counted: the tags status says how many tagged processes the filters hide, how many are kernel threads hidden by Show kernel threads, and how many are beyond the publishable size limit; a row hidden under a collapsed tree parent is not counted; once the selecting client collapses a parent above its selected row, that selection is gone and nothing is tagged, while another client's collapse leaves it taggable",
+      "scope": "PX-020/refresh (src/refresh.rs) visible_in, Visible::tags, tags_effects; tags (src/tags.rs) TagCounts, status; tests/tags_test.rs threads_are_never_tagged_and_a_hidden_kernel_thread_tag_is_counted, a_row_hidden_under_a_collapsed_parent_cannot_be_tagged_and_is_not_counted_hidden, only_the_selecting_clients_collapse_takes_the_tag_target (merge with main, PX-018 per-client disclosure), descendant_tags_are_frozen_survive_filters_and_turn_historical_when_a_process_ends",
       "source_refs": [
         "D1",
         "D2",

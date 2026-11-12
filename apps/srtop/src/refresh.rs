@@ -1153,6 +1153,7 @@ impl ProcessView {
         // This sample ends a resume: the sampling status says live again.
         self.sampling.published_sample();
         // Tombstones age on every accepted sample, a failed one too (PX-021).
+        self.last_seen.begin_sample();
         self.expire_tombstones();
         // A snapshot this app cannot identify is not evidence that any process
         // ended. It is published as an error over the last-known rows, exactly
@@ -1328,7 +1329,9 @@ impl ProcessView {
             // No room under the tag limit: their records are no longer true,
             // so they go, and their tags are counted as forgotten.
             let beyond = retagged.split_off(room);
-            self.last_seen.forget_tags(beyond.len() as u64);
+            for tombstone in &beyond {
+                self.last_seen.forget_tag(tombstone.key());
+            }
             forgotten = Some(match beyond.as_slice() {
                 [one] => format!(
                     "{} listed again, but the tag limit of {} is reached: its historical tag is forgotten",
@@ -1412,7 +1415,7 @@ impl ProcessView {
             // record this sample made and a bound dropped at once was counted
             // when it was dropped.
             if !self.last_seen.tag(key) && !recorded_tags.contains(key) {
-                self.last_seen.forget_tags(1);
+                self.last_seen.forget_tag(key);
             }
         }
         self.tags.retire(&departed);
@@ -1531,9 +1534,14 @@ impl ProcessView {
         result.transactions = transactions;
         self.settle_disclosure(held, reached >= rows_end);
         self.settle_tag_counts(tag_counts, reached >= counts_end);
-        if self.settle_tags(held_tags) {
+        let put_back = self.settle_tags(held_tags);
+        if put_back {
             self.unretag(retagged);
         }
+        // A tag put back live is not forgotten yet (codex4 verification).
+        let tags = &self.tags;
+        self.last_seen
+            .settle_forgotten(put_back, |key| tags.is_tagged(key));
         // Order values never reach the wire, so every published row takes this
         // sample's whatever committed: a later click sorts by current values,
         // never by the ones a row was first published with.
@@ -9786,5 +9794,341 @@ mod failed_retire_tests {
             "{}",
             view.tags_status()
         );
+    }
+}
+
+/// Verification of `PRRT_kwDOUG_6uM620bez`'s fix (codex4, F1 and F2): every
+/// historical tag is counted exactly once, kept or forgotten, across any
+/// sequence of failed and committed samples. A forgotten count made in a
+/// sample whose tags status never commits is undone with the tag set it
+/// belonged to, so the committed retry counts it once.
+#[cfg(test)]
+mod forgotten_once_tests {
+    use super::*;
+    use crate::lastseen::{MAX_TOMBSTONES, MAX_TOMBSTONE_AGE};
+    use crate::source::{
+        BootId, CappedRecords, Completeness, CpuUsage, CreationToken, DisplayName,
+        FakeProcessSource, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+        SnapshotTime, SourceId, OWNER_NOT_COLLECTED,
+    };
+    use std::sync::Mutex;
+
+    const CLIENT: &[u8] = b"forgotten-once-client";
+
+    fn record(pid: u32, parent: u32, name: &str) -> ProcessRecord {
+        ProcessRecord {
+            lineage: Lineage::new(parent, u64::from(pid)),
+            owner: OWNER_NOT_COLLECTED,
+            key: ProcessKey {
+                source: SourceId("forgotten-once".into()),
+                host: Observed::Known(HostId("h".into())),
+                boot: Observed::Known(BootId("b".into())),
+                pid_namespace: Observed::Known(PidNamespaceId(1)),
+                pid: Observed::Known(pid),
+                creation: CreationToken::Opaque(name.into()),
+                thread: None,
+            },
+            kind: crate::source::KIND_NOT_COLLECTED,
+            display_name: DisplayName::from(name),
+            resident: Observed::Known(4096),
+            cpu: CpuUsage::WarmingUp,
+        }
+    }
+
+    struct Source {
+        records: Vec<ProcessRecord>,
+        scans: u64,
+    }
+
+    impl ProcessSource for Source {
+        fn status_text(&self) -> &str {
+            "Read-only · Forgotten-once fixture"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            self.scans += 1;
+            ProcessSnapshot {
+                source: SourceId("forgotten-once".into()),
+                sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH + Duration::from_secs(self.scans)),
+                records: self.records.clone(),
+                vanished: 0,
+                capped: CappedRecords::none(),
+                completeness: Completeness::Complete,
+                system: FakeProcessSource::system(),
+                threads: crate::source::ThreadScan::NotProvided,
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Clock(Mutex<Duration>);
+
+    impl MonotonicClock for Clock {
+        fn now(&self) -> Duration {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    impl Clock {
+        fn set(&self, at: Duration) {
+            *self.0.lock().unwrap() = at;
+        }
+    }
+
+    fn start(records: Vec<ProcessRecord>) -> (Session, ProcessView, Source, Arc<Clock>) {
+        let session = Session::mint();
+        let mut source = Source { records, scans: 0 };
+        let clock = Arc::new(Clock::default());
+        let (view, _) = ProcessView::start(&session, &mut source).unwrap();
+        let mut view = view.with_published_limit(200).with_clock(clock.clone());
+        view.refresh(&session, &mut source).unwrap();
+        (session, view, source, clock)
+    }
+
+    fn select(view: &mut ProcessView, session: &Session, pid: u32) {
+        let item = view
+            .rows
+            .iter()
+            .find(|row| row.key.pid == Observed::Known(pid))
+            .map(|row| row.item_id);
+        assert!(item.is_some(), "{pid} is shown");
+        view.select_item(session, CLIENT, item).unwrap();
+    }
+
+    /// Every tag made and not removed, counted once: live, kept historical
+    /// or forgotten.
+    fn total(view: &ProcessView) -> u64 {
+        view.tags().tagged() as u64
+            + view.last_seen().tagged().count() as u64
+            + view.last_seen().forgotten_tags()
+    }
+
+    fn state(view: &ProcessView) -> String {
+        format!(
+            "live={} kept={} forgotten={} records={} status={:?}",
+            view.tags().tagged(),
+            view.last_seen().tagged().count(),
+            view.last_seen().forgotten_tags(),
+            view.last_seen().len(),
+            view.tags_status()
+        )
+    }
+
+    fn failing(view: &mut ProcessView, session: &Session, source: &mut Source) {
+        let _armed = commit_fault::arm(0);
+        assert!(
+            view.refresh(session, source).is_err(),
+            "the sample was to fail"
+        );
+    }
+
+    /// `workers` tagged (300, 301, …), `init` selected, follow off; then all
+    /// of them leave.
+    fn tagged_workers(workers: u32) -> (Session, ProcessView, Source, Arc<Clock>) {
+        let mut records = vec![record(1, 0, "init")];
+        records.extend((0..workers).map(|n| record(300 + n, 1, &format!("worker{n}"))));
+        let (session, mut view, mut source, clock) = start(records);
+        for n in 0..workers {
+            select(&mut view, &session, 300 + n);
+            view.request_tags(&session, TagRequest::Toggle).unwrap();
+        }
+        select(&mut view, &session, 1);
+        source.records.truncate(1);
+        (session, view, source, clock)
+    }
+
+    /// Two failed samples straddle the age bound, then one commits: the tag
+    /// is lost to the age bound once and counted once.
+    #[test]
+    fn a_record_aged_out_across_two_failed_samples_is_counted_once() {
+        let (session, mut view, mut source, clock) = tagged_workers(1);
+        failing(&mut view, &session, &mut source);
+        assert_eq!(total(&view), 1, "{}", state(&view));
+        clock.set(MAX_TOMBSTONE_AGE);
+        failing(&mut view, &session, &mut source);
+        assert_eq!(total(&view), 1, "{}", state(&view));
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.tags().tagged(), 0);
+        assert_eq!(view.last_seen().forgotten_tags(), 1, "{}", state(&view));
+        assert!(
+            view.tags_status()
+                .starts_with("Tags: 0 tagged · 1 historical, forgotten"),
+            "{}",
+            view.tags_status()
+        );
+    }
+
+    /// 65 tags leave in one failed sample, and the count bound drops one
+    /// record at once; the committed retry keeps 64 and counts one forgotten.
+    #[test]
+    fn a_record_the_count_bound_drops_in_a_failed_sample_is_counted_once() {
+        let mut records = vec![record(1, 0, "init"), record(10, 1, "p")];
+        records.extend((0..64).map(|n| record(1000 + n, 10, &format!("k{n}"))));
+        let (session, mut view, mut source, _) = start(records);
+        select(&mut view, &session, 10);
+        view.request_tags(&session, TagRequest::Descendants)
+            .unwrap();
+        assert_eq!(view.tags().tagged(), 65);
+        select(&mut view, &session, 1);
+        source.records.truncate(1);
+        failing(&mut view, &session, &mut source);
+        assert_eq!(total(&view), 65, "{}", state(&view));
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.tags().tagged(), 0);
+        assert_eq!(view.last_seen().tagged().count(), MAX_TOMBSTONES);
+        assert_eq!(view.last_seen().forgotten_tags(), 1, "{}", state(&view));
+        assert!(
+            view.tags_status()
+                .starts_with("Tags: 0 tagged · 65 historical: "),
+            "{}",
+            view.tags_status()
+        );
+        assert!(
+            view.tags_status().contains("(1 forgotten)"),
+            "{}",
+            view.tags_status()
+        );
+    }
+
+    /// A tag already historical that a failed sample forgets (the age
+    /// bound) stays counted when that sample's live tags are put back; a
+    /// tag still live whose record is missing is counted once however many
+    /// samples fail before one commits.
+    #[test]
+    fn only_tags_put_back_live_lose_a_forgotten_count_and_only_once() {
+        let (session, mut view, mut source, clock) = tagged_workers(2);
+        // Only worker0 (300) leaves at first, in a committed sample.
+        source.records = vec![record(1, 0, "init"), record(301, 1, "worker1")];
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.historical_tags(), ["PID 300 · worker0"]);
+        source.records.truncate(1);
+        // worker0's record ages out in a sample in which worker1 leaves and
+        // that never commits: worker0 stays forgotten, worker1 is live.
+        clock.set(MAX_TOMBSTONE_AGE);
+        failing(&mut view, &session, &mut source);
+        assert_eq!(view.tags().tagged(), 1, "{}", state(&view));
+        assert_eq!(view.last_seen().forgotten_tags(), 1, "{}", state(&view));
+        assert_eq!(total(&view), 2, "{}", state(&view));
+        // worker1's record ages out too, across three more failed samples.
+        clock.set(MAX_TOMBSTONE_AGE * 2);
+        for failed in 0..3 {
+            failing(&mut view, &session, &mut source);
+            assert_eq!(
+                view.last_seen().forgotten_tags(),
+                1,
+                "{failed}: {}",
+                state(&view)
+            );
+            assert_eq!(total(&view), 2, "{failed}: {}", state(&view));
+        }
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.tags().tagged(), 0);
+        assert_eq!(view.last_seen().forgotten_tags(), 2, "{}", state(&view));
+        assert!(
+            view.tags_status()
+                .starts_with("Tags: 0 tagged · 2 historical, all forgotten"),
+            "{}",
+            view.tags_status()
+        );
+    }
+
+    /// The count bound pushes out a tag that was already historical when a
+    /// tag still live leaves in a sample that never commits: the historical
+    /// one stays counted forgotten, and the live one is put back.
+    #[test]
+    fn a_historical_tag_the_count_bound_pushes_out_in_a_failed_sample_stays_counted() {
+        let mut records = vec![record(1, 0, "init"), record(10, 1, "p")];
+        records.extend((0..63).map(|n| record(1000 + n, 10, &format!("k{n}"))));
+        records.push(record(900, 1, "later"));
+        let (session, mut view, mut source, _) = start(records);
+        select(&mut view, &session, 10);
+        view.request_tags(&session, TagRequest::Descendants)
+            .unwrap();
+        select(&mut view, &session, 900);
+        view.request_tags(&session, TagRequest::Toggle).unwrap();
+        assert_eq!(view.tags().tagged(), 65);
+        select(&mut view, &session, 1);
+        source
+            .records
+            .retain(|record| matches!(record.key.pid, Observed::Known(1) | Observed::Known(900)));
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.last_seen().tagged().count(), MAX_TOMBSTONES);
+        assert_eq!(total(&view), 65, "{}", state(&view));
+        source.records.truncate(1);
+        failing(&mut view, &session, &mut source);
+        assert_eq!(view.tags().tagged(), 1, "{}", state(&view));
+        assert_eq!(view.last_seen().forgotten_tags(), 1, "{}", state(&view));
+        assert_eq!(total(&view), 65, "{}", state(&view));
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.tags().tagged(), 0);
+        assert_eq!(total(&view), 65, "{}", state(&view));
+    }
+
+    /// Exactly once over every pattern of four samples, each failed or
+    /// committed, with the clock passing the age bound before any one of
+    /// them or never: after every sample each of three tags is counted once,
+    /// and after a final committed sample none is live.
+    #[test]
+    fn every_historical_tag_is_counted_once_across_failed_and_committed_samples() {
+        for failures in 0u32..16 {
+            for aged_at in 0..5 {
+                let (session, mut view, mut source, clock) = tagged_workers(3);
+                for sample in 0..4 {
+                    if sample == aged_at {
+                        clock.set(MAX_TOMBSTONE_AGE);
+                    }
+                    if failures & (1 << sample) != 0 {
+                        failing(&mut view, &session, &mut source);
+                    } else {
+                        view.refresh(&session, &mut source).unwrap();
+                    }
+                    assert_eq!(
+                        total(&view),
+                        3,
+                        "failures={failures:04b} aged_at={aged_at} sample={sample}: {}",
+                        state(&view)
+                    );
+                }
+                view.refresh(&session, &mut source).unwrap();
+                assert_eq!(view.tags().tagged(), 0, "{}", state(&view));
+                assert_eq!(
+                    total(&view),
+                    3,
+                    "failures={failures:04b} aged_at={aged_at}: {}",
+                    state(&view)
+                );
+            }
+        }
+    }
+
+    /// F2 (kills W5): a record released between samples (the selection was
+    /// cleared) takes no slot under the count bound when the next sample
+    /// records: 63 historical tags and the inspector's record are kept; the
+    /// selection is cleared; a 64th tagged process leaves. All 64 historical
+    /// tags are kept and none is forgotten.
+    #[test]
+    fn a_released_record_takes_no_slot_under_the_count_bound() {
+        let mut records = vec![record(1, 0, "init"), record(10, 1, "p")];
+        records.extend((0..62).map(|n| record(1000 + n, 10, &format!("k{n}"))));
+        records.push(record(900, 1, "inspected"));
+        records.push(record(901, 1, "later"));
+        let (session, mut view, mut source, _) = start(records);
+        select(&mut view, &session, 10);
+        view.request_tags(&session, TagRequest::Descendants)
+            .unwrap();
+        select(&mut view, &session, 901);
+        view.request_tags(&session, TagRequest::Toggle).unwrap();
+        assert_eq!(view.tags().tagged(), 64);
+        select(&mut view, &session, 900);
+        source
+            .records
+            .retain(|record| matches!(record.key.pid, Observed::Known(1) | Observed::Known(901)));
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.last_seen().len(), 64, "{}", state(&view));
+        view.clear_selection(&session).unwrap();
+        source.records.truncate(1);
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.last_seen().tagged().count(), 64, "{}", state(&view));
+        assert_eq!(view.last_seen().forgotten_tags(), 0, "{}", state(&view));
     }
 }

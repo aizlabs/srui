@@ -408,6 +408,17 @@ pub struct LastSeen {
     bytes: usize,
     /// Historical tags dropped by a bound since tags were last cleared.
     forgotten_tags: u64,
+    /// The keys whose tags the sample being applied counted in
+    /// `forgotten_tags` while their tags were still live: a record the count
+    /// or byte bound dropped as it was made, or a missing record of a tag
+    /// being retired; one entry per count (PX-021, codex4 verification). A
+    /// sample whose tags status never commits puts those tags back live, and
+    /// [`Self::settle_forgotten`] takes their counts back, so the committed
+    /// retry counts each once. The age bound never appears here: a tagged
+    /// record at the start of a sample is a tag an earlier sample retired,
+    /// never one a put-back set holds live. Emptied at the start of every
+    /// sample, so it holds one sample's counts at most.
+    forgotten_now: Vec<ProcessKey>,
     /// Tombstones dropped by a bound, ever.
     dropped: u64,
 }
@@ -477,6 +488,7 @@ impl LastSeen {
             self.dropped += 1;
             if oldest.tagged {
                 self.forgotten_tags += 1;
+                self.forgotten_now.push(oldest.row.key);
             }
         }
     }
@@ -541,10 +553,31 @@ impl LastSeen {
         }
     }
 
-    /// Counts `count` historical tags forgotten without a bound dropping
-    /// their records: their records were dropped for another reason.
-    pub(crate) fn forget_tags(&mut self, count: u64) {
-        self.forgotten_tags += count;
+    /// Counts the historical tag of `key` forgotten without a bound dropping
+    /// its record now: the record was dropped for another reason, or earlier.
+    pub(crate) fn forget_tag(&mut self, key: &ProcessKey) {
+        self.forgotten_tags += 1;
+        self.forgotten_now.push(key.clone());
+    }
+
+    /// Starts a sample: no tag is counted forgotten by it yet.
+    pub(crate) fn begin_sample(&mut self) {
+        self.forgotten_now.clear();
+    }
+
+    /// Ends a sample. When its tags status never committed, the tag set was
+    /// put back, and `live` says which tags are live again: their forgotten
+    /// counts from this sample are taken back, since the tag is not
+    /// historical yet. A committed retry counts each such tag once, from its
+    /// missing record. Counts of tags that were already historical stand.
+    pub(crate) fn settle_forgotten(&mut self, put_back: bool, live: impl Fn(&ProcessKey) -> bool) {
+        if put_back {
+            for key in &self.forgotten_now {
+                if live(key) {
+                    self.forgotten_tags = self.forgotten_tags.saturating_sub(1);
+                }
+            }
+        }
     }
 
     /// Makes the tombstone of `key` a historical tag, if one is kept, and

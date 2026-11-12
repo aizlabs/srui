@@ -1008,8 +1008,12 @@ impl ProcessView {
         // published-row ceiling leaves once this scan's own rows are counted.
         let evicted_ids =
             evict_unconfirmed_beyond(&mut unfiltered_target, &confirmed_ids, self.published_limit);
-        // Eviction can take a process and leave its kept thread (PX-019): the
-        // thread leaves with it, evicted as well, never ended.
+        // A guard, not a case that occurs: every thread row follows its
+        // process, a thread of an unconfirmed process is itself unconfirmed,
+        // and eviction works from the end, so it takes a process's threads
+        // before the process and this regrouping drops nothing. Were it ever
+        // to drop a thread, that thread would be evicted, never ended
+        // (PX-019).
         let mut evicted_ids = evicted_ids;
         let (unfiltered_target, evicted_threads) = threads::group_dropping(unfiltered_target);
         evicted_ids.extend(evicted_threads);
@@ -1018,13 +1022,17 @@ impl ProcessView {
         // before anything is planned (PX-013 review round): its latest row, or
         // that retention dropped it unconfirmed, which is not an exit, or that
         // a scan entitled to say so found it gone. A thread's absence is
-        // accounted for only by a scan that read threads and could read that
-        // process's threads (PX-019).
+        // left unaccounted for, beyond the record retention, only while its
+        // own process instance is confirmed by this scan and the scan read no
+        // threads or could not read that process's threads (PX-019): the same
+        // whole-key rule the row retention above keeps thread rows by.
         let threads_read = snapshot.threads.read().is_some();
         self.inspector
             .observe_scan(&unfiltered_target, &evicted_ids, |key| {
                 retention.keeps(key)
-                    || (key.is_thread() && (!threads_read || thread_retention.covers(&key.pid)))
+                    || (key.is_thread()
+                        && live_processes.contains(&key.process_key())
+                        && (!threads_read || thread_retention.covers(&key.pid)))
             });
         // The rows this scan did not confirm, which a PID jump never selects
         // (PX-011) and the tree never takes a parent from (PX-018): bounded by
@@ -2830,6 +2838,11 @@ impl ProcessView {
             return self.publish_controls(session, plan);
         };
         let before = self.threads;
+        // A sample already being taken was taken under the other setting: it
+        // is discarded when it returns, so a scan that read no threads never
+        // lands after they are shown again, nor one that read them after they
+        // are hidden (PX-019, merge verification F3).
+        self.sampling.invalidate();
         let held = self.inspector.hold();
         let selected_thread = self
             .inspector
@@ -5602,7 +5615,13 @@ pub async fn poll<S>(
             _ = wake.notified() => false,
             _ = ticker.tick(), if !paused => true,
         };
-        let request = lock_view(&view).sampling.take_request();
+        // The request's epoch and the thread setting are read together, so a
+        // sample is always taken under the setting of the epoch it is
+        // applied under (PX-019).
+        let (request, threads) = {
+            let mut held = lock_view(&view);
+            (held.sampling.take_request(), held.threads_requested())
+        };
         paused = request.paused;
         if request.retime || request.interval != interval {
             interval = request.interval;
@@ -5620,7 +5639,6 @@ pub async fn poll<S>(
             ticker = ticker_every(interval);
         }
         // User threads are read only while they are shown (PX-019).
-        let threads = lock_view(&view).threads_requested();
         // Reading a host's process filesystem blocks; keep it off the runtime.
         let sampled = tokio::task::spawn_blocking(move || {
             source.collect_threads(threads);

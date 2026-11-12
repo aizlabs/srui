@@ -21,7 +21,7 @@
 use srui_process_explorer::catalogue::ProcessField;
 use srui_process_explorer::inspector::DetailRead;
 use srui_process_explorer::procfs::ProcFsSource;
-use srui_process_explorer::refresh::{lock_view, ProcessView, SharedView};
+use srui_process_explorer::refresh::{lock_view, ProcessView, Refreshed, SharedView};
 use srui_process_explorer::source::*;
 use srui_process_explorer::summary::PROCESSES_TEXT;
 use srui_process_explorer::{
@@ -2238,5 +2238,175 @@ fn an_evicted_thread_is_ended_only_by_a_scan_that_could_read_its_threads() {
     assert_eq!(
         h.text(INSPECTOR_STATUS),
         format!("{head} · this thread has ended; select another row")
+    );
+}
+
+/// `ThreadsSource`'s step-0 records with one more confirmed process, PID 400.
+fn records_with_newcomer(keep: impl Fn(&ProcessRecord) -> bool) -> Vec<ProcessRecord> {
+    let mut newcomer = ThreadsSource::records(0)[4].clone();
+    newcomer.key.pid = Observed::Known(400);
+    newcomer.key.creation = CreationToken::Opaque("newcomer-400".into());
+    newcomer.display_name = DisplayName::from("newcomer");
+    let mut records: Vec<ProcessRecord> = ThreadsSource::records(0)
+        .into_iter()
+        .filter(|record| keep(record))
+        .collect();
+    records.push(newcomer);
+    records
+}
+
+fn is_server(record: &ProcessRecord) -> bool {
+    record.key.pid == Observed::Known(200)
+}
+
+/// A scan that read threads but not PID 200's record, under `skipped`.
+fn server_record_unread(skipped: SkippedRecords) -> ProcessSnapshot {
+    let mut threads = ThreadsSource::threads(0);
+    threads.records.retain(|record| !is_server(record));
+    let mut snapshot =
+        threads_snapshot(records_with_newcomer(|record| !is_server(record)), threads);
+    snapshot.completeness = Completeness::from_scan(
+        skipped,
+        vec![EnumerationIssue {
+            scope: IssueScope::Entry,
+            reason: MissingReason::Denied,
+            detail: "scripted unreadable entry".into(),
+        }],
+    );
+    snapshot
+}
+
+const EVICTED_HEAD: &str = "Selected thread: TID 202 of PID 200 · worker-2";
+
+fn evicted_not_shown() -> String {
+    format!("{EVICTED_HEAD} · not confirmed by the latest scan; not shown (dropped under the row limit)")
+}
+
+fn evicted_ended() -> String {
+    format!("{EVICTED_HEAD} · this thread has ended; select another row")
+}
+
+/// TID 202 of `server` selected, then dropped unconfirmed under the row
+/// ceiling by a scan that could not read `server`'s record.
+fn evicted_thread() -> Harness {
+    let mut source = ThreadsSource::default();
+    let mut h = harness_with(&mut source, |view| view.with_published_limit(8));
+    h.toggle(USER_THREADS_TOGGLE, true);
+    h.sample(&mut source);
+    h.select(TABLE, h.item(SERVER_THREADS[2]));
+    h.sample(&mut Fixed(server_record_unread(
+        SkippedRecords::unenumerable(),
+    )));
+    assert_eq!(h.text(INSPECTOR_STATUS), evicted_not_shown());
+    h
+}
+
+/// Merge verification F1: an evicted thread whose process record a scan
+/// that read threads could not read is not ended. Neither a scan that cannot
+/// enumerate what it missed nor one that names PID 200 accounts for it; a
+/// complete one does.
+#[test]
+fn an_evicted_thread_is_not_ended_by_a_scan_that_could_not_read_its_process() {
+    let mut h = evicted_thread();
+    h.sample(&mut Fixed(server_record_unread(
+        SkippedRecords::unenumerable(),
+    )));
+    assert_eq!(
+        h.text(INSPECTOR_STATUS),
+        evicted_not_shown(),
+        "unenumerable"
+    );
+    let mut named = SkippedRecords::with_limit(8);
+    named.record(200);
+    h.sample(&mut Fixed(server_record_unread(named)));
+    assert_eq!(
+        h.text(INSPECTOR_STATUS),
+        evicted_not_shown(),
+        "PID 200 named"
+    );
+    h.sample(&mut Fixed(server_record_unread(SkippedRecords::none())));
+    assert_eq!(h.text(INSPECTOR_STATUS), evicted_ended(), "complete");
+}
+
+/// Merge verification F2: the thread retention protects an evicted thread
+/// only beside its own process instance. A complete scan that no longer
+/// lists `server` ends it even though it read no threads, and so does one
+/// whose PID 200 is a new instance with unreadable threads.
+#[test]
+fn an_evicted_thread_of_an_ended_process_instance_is_ended() {
+    let mut h = evicted_thread();
+    let mut gone = threads_snapshot(
+        records_with_newcomer(|record| !is_server(record)),
+        ThreadsSource::threads(0),
+    );
+    gone.threads = ThreadScan::NotRequested;
+    h.sample(&mut Fixed(gone));
+    assert_eq!(h.text(INSPECTOR_STATUS), evicted_ended(), "no threads read");
+
+    let mut h = evicted_thread();
+    let records = records_with_newcomer(|_| true)
+        .into_iter()
+        .map(|mut record| {
+            if is_server(&record) {
+                record.key.creation = CreationToken::Opaque("server-200-reused".into());
+            }
+            record
+        })
+        .collect();
+    let mut unreadable = ThreadsSource::threads(0);
+    unreadable.records.clear();
+    unreadable.unreadable.record(200);
+    unreadable.denied = 2;
+    h.sample(&mut Fixed(threads_snapshot(records, unreadable)));
+    assert_eq!(h.text(INSPECTOR_STATUS), evicted_ended(), "PID 200 reused");
+}
+
+/// Merge verification F3: a sample taken while user threads were hidden
+/// that returns after they are shown again, and a thread selected, is
+/// discarded: it would drop every thread row and call a live thread ended.
+/// A sample under the current setting is applied, and the thread keeps its
+/// row and item ID.
+#[test]
+fn a_sample_taken_under_the_other_thread_setting_is_discarded() {
+    let mut source = ThreadsSource::default();
+    let mut h = harness(&mut source);
+    h.toggle(USER_THREADS_TOGGLE, true);
+    h.sample(&mut source);
+    let full = || threads_snapshot(ThreadsSource::records(0), ThreadsSource::threads(0));
+    h.toggle(USER_THREADS_TOGGLE, false);
+    let hidden = h.view().sampling().epoch();
+    h.toggle(USER_THREADS_TOGGLE, true);
+    let shown = h.view().sampling().epoch();
+    assert_ne!(hidden, shown);
+    // The view republished the thread rows it holds; select one.
+    let worker = h.item(SERVER_THREADS[1]);
+    h.select(TABLE, worker);
+    let selected = h.text(INSPECTOR_STATUS);
+    assert!(
+        selected.starts_with("Selected thread: TID 201 of PID 200"),
+        "{selected}"
+    );
+    let discarded = h.view().sampling().discarded();
+    let mut stale = full();
+    stale.threads = ThreadScan::NotRequested;
+    let refreshed = h
+        .view()
+        .apply_sampled(&h.session, hidden, THREADS_STATUS_TEXT, &stale)
+        .unwrap();
+    h.sync();
+    assert_eq!(refreshed, Refreshed::default(), "nothing published");
+    assert_eq!(h.view().sampling().discarded(), discarded + 1);
+    assert_eq!(h.item(SERVER_THREADS[1]), worker);
+    assert_eq!(h.text(INSPECTOR_STATUS), selected);
+    // A sample under the current setting lands, and keeps the thread's row.
+    h.view()
+        .apply_sampled(&h.session, shown, THREADS_STATUS_TEXT, &full())
+        .unwrap();
+    h.sync();
+    assert_eq!(h.item(SERVER_THREADS[1]), worker);
+    assert!(
+        !h.text(INSPECTOR_STATUS).contains("has ended"),
+        "{}",
+        h.text(INSPECTOR_STATUS)
     );
 }

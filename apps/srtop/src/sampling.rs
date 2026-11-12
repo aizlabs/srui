@@ -286,6 +286,13 @@ impl Sampling {
         self.wake();
     }
 
+    /// Moves to a new epoch, so a sample already being taken is discarded
+    /// when it returns: it was taken under a setting that no longer holds
+    /// (PX-019's "Show user threads").
+    pub(crate) fn invalidate(&mut self) {
+        self.epoch += 1;
+    }
+
     /// One Refresh now press: one sample, coalesced with any other press the
     /// loop has not taken yet. Refused while paused.
     pub(crate) fn refresh_now(&mut self) -> bool {

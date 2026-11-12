@@ -1077,3 +1077,80 @@ fn a_newcomer_beside_a_kept_earlier_instance_of_its_pid_is_not_tagged() {
         )
     );
 }
+
+/// Verification of the Codex review round (PR #107), F1: a scan that could
+/// not read the process list republishes no row, so the tags status it
+/// reconciles counts the rows the client holds. In the tree at the row limit
+/// the status of a shown and of a left-out tagged process stays true across
+/// alternating unreadable and readable scans, and none of those scans
+/// commits a tags status operation (each unchanged; the summary's "last
+/// successful sample" line may still change). The table is checked the same
+/// way.
+#[test]
+fn an_unreadable_scan_keeps_the_tags_status_of_the_rows_the_client_holds() {
+    let full = vec![
+        record(1, "init", 0, 1),
+        record(10, "a", 1, 10),
+        record(20, "b", 1, 20),
+        record(30, "c", 10, 30),
+        record(40, "solo", 0, 40),
+        record(50, "solo2", 0, 50),
+    ];
+    for tree in [true, false] {
+        for target in [30, 20] {
+            let mut source = Steps::new(vec![
+                full.clone(),
+                full.clone(),
+                Vec::new(),
+                Vec::new(),
+                full.clone(),
+                Vec::new(),
+            ]);
+            for unreadable in [2, 3, 5] {
+                source.unenumerable.insert(unreadable);
+            }
+            let mut h = harness_limited(&mut source, 3);
+            // Tag in the table, where both are shown, then choose the view.
+            h.select(target);
+            h.click(TAG_TOGGLE);
+            h.show_tree(tree);
+            h.sample(&mut source);
+            let rows: Vec<u64> = h.rows().iter().map(|row| row.1).collect();
+            let status = h.status();
+            let shown = rows.contains(&target);
+            assert_eq!(
+                status.contains("1 beyond the publishable size limit"),
+                !shown,
+                "tree={tree} tag={target} rows={rows:?}: {status}"
+            );
+            for scan in [
+                "unreadable",
+                "unreadable again",
+                "readable",
+                "unreadable",
+                "unreadable again",
+            ] {
+                let revision = h.revision();
+                h.sample(&mut source);
+                let now: Vec<u64> = h.rows().iter().map(|row| row.1).collect();
+                assert_eq!(now, rows, "tree={tree} tag={target} {scan}: rows");
+                assert_eq!(
+                    h.status(),
+                    status,
+                    "tree={tree} tag={target} {scan}: the tags status"
+                );
+                let republished = h
+                    .operations_since(revision)
+                    .into_iter()
+                    .filter(|operation| {
+                        matches!(operation, Operation::SetProperty { id, .. } if *id == TAGS_STATUS)
+                    })
+                    .count();
+                assert_eq!(
+                    republished, 0,
+                    "tree={tree} tag={target} {scan}: the tags status was republished"
+                );
+            }
+        }
+    }
+}

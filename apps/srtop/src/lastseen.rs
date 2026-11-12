@@ -661,6 +661,50 @@ mod tests {
         )
     }
 
+    /// Verification of the Codex review round (PR #107), F3: a late detail
+    /// read upgrades only the record of its own whole key, never another
+    /// instance under the same PID, and never replaces an established exit.
+    #[test]
+    fn a_detail_exit_upgrades_only_the_record_of_its_exact_key() {
+        let earlier = rows(vec![record(300, "earlier")]).remove(0);
+        let later = rows(vec![record(300, "later")]).remove(0);
+        assert_eq!(earlier.key.pid, later.key.pid);
+        let unobserved = |row: &Row| {
+            Tombstone::new(
+                row.clone(),
+                None,
+                Some(SystemTime::UNIX_EPOCH),
+                SystemTime::UNIX_EPOCH,
+                Duration::ZERO,
+                Departure::NotObserved(Unobserved::Evicted),
+            )
+        };
+        let mut seen = LastSeen::default();
+        seen.record(unobserved(&earlier));
+        seen.record(unobserved(&later));
+        let departure = |seen: &LastSeen, row: &Row| seen.get(&row.key).map(Tombstone::departure);
+        assert!(seen.establish_detail_exit(&later.key));
+        assert_eq!(
+            departure(&seen, &later),
+            Some(Departure::Exited(Exit::DetailRead))
+        );
+        assert_eq!(
+            departure(&seen, &earlier),
+            Some(Departure::NotObserved(Unobserved::Evicted)),
+            "another instance under the PID"
+        );
+        let mut absent = earlier.key.clone();
+        absent.creation = CreationToken::Opaque("absent".into());
+        assert!(
+            !seen.establish_detail_exit(&absent),
+            "no record of that key"
+        );
+        assert_eq!(
+            departure(&seen, &earlier),
+            Some(Departure::NotObserved(Unobserved::Evicted))
+        );
+    }
+
     #[test]
     fn the_count_bound_keeps_the_newest_and_counts_forgotten_tags() {
         let all = rows(

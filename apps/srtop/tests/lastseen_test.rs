@@ -1975,3 +1975,101 @@ fn a_late_detail_read_never_replaces_an_established_exit() {
         h.status()
     );
 }
+
+/// Verification of the Codex review round (PR #107), F2: an accepted read
+/// that found details, or could not read them, is not an exit; only `Ended`
+/// turns the record `exited`.
+#[test]
+fn an_accepted_read_that_is_not_ended_never_establishes_an_exit() {
+    let mut h = Harness::with(
+        vec![
+            complete(vec![
+                record(1, "init", "init"),
+                record(300, "w", "worker"),
+                record(301, "o", "other"),
+            ]),
+            unenumerable(vec![
+                record(1, "init", "init"),
+                record(400, "n", "new"),
+                record(401, "m", "newer"),
+            ]),
+        ],
+        |view| view.with_published_limit(3),
+    );
+    h.select(300, "worker");
+    let generation = h.view.inspector().generation();
+    h.refresh();
+    let request = DetailRequest {
+        key: key(300, "w", host()),
+        generation,
+    };
+    let departure = |h: &Harness| {
+        h.view
+            .last_seen()
+            .get(&key(300, "w", host()))
+            .map(|tombstone| tombstone.departure())
+    };
+    for read in [
+        DetailRead::Unreadable(MissingReason::Denied),
+        DetailRead::Unreadable(MissingReason::Unavailable),
+    ] {
+        h.view.details_read(&h.session, &request, read).unwrap();
+        assert_eq!(
+            departure(&h),
+            Some(Departure::NotObserved(Unobserved::Evicted))
+        );
+        assert!(h.status().contains("no longer observed"), "{}", h.status());
+    }
+    h.view
+        .details_read(&h.session, &request, DetailRead::Ended)
+        .unwrap();
+    assert_eq!(departure(&h), Some(Departure::Exited(Exit::DetailRead)));
+}
+
+/// Verification of the Codex review round (PR #107), optional C12: a read
+/// that completes while the view is paused is dropped, even under the
+/// target's current generation, so it establishes nothing and the frozen
+/// inspector does not change.
+#[test]
+fn a_detail_read_completed_while_paused_establishes_nothing() {
+    let mut h = Harness::with(
+        vec![
+            complete(vec![
+                record(1, "init", "init"),
+                record(300, "w", "worker"),
+                record(301, "o", "other"),
+            ]),
+            unenumerable(vec![
+                record(1, "init", "init"),
+                record(400, "n", "new"),
+                record(401, "m", "newer"),
+            ]),
+        ],
+        |view| view.with_published_limit(3),
+    );
+    h.select(300, "worker");
+    h.refresh();
+    h.view.pause_view(&h.session).unwrap();
+    // Pausing moves the target to a new generation (PX-015), so this is the
+    // pause guard itself, not a stale generation, refusing the read.
+    let generation = h.view.inspector().generation();
+    let before = h.inspector();
+    h.view
+        .details_read(
+            &h.session,
+            &DetailRequest {
+                key: key(300, "w", host()),
+                generation,
+            },
+            DetailRead::Ended,
+        )
+        .unwrap();
+    assert_eq!(
+        h.view
+            .last_seen()
+            .get(&key(300, "w", host()))
+            .map(|tombstone| tombstone.departure()),
+        Some(Departure::NotObserved(Unobserved::Evicted))
+    );
+    assert_eq!(h.inspector(), before);
+}

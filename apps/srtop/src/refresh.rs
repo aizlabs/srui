@@ -638,6 +638,13 @@ pub struct ProcessView {
     /// The tags status as the client holds it, with the generation it states
     /// (PX-020).
     tags_published: TagsView,
+    /// Where the tagged processes were among the rows the last row
+    /// publication planned (PX-020): what a change that republishes no row
+    /// (a scan that could not read the process list, a late detail read)
+    /// states the tags status with. Re-deriving it then would arrange the
+    /// tree from a generation whose every row is unconfirmed, which is not
+    /// the one the client holds (PX-021, verification of PR #107's review).
+    tag_counts: TagCounts,
     /// The tombstones of watched processes that left the collection (PX-021),
     /// bounded by count, age and bytes.
     last_seen: LastSeen,
@@ -917,6 +924,7 @@ impl ProcessView {
                 thread_report,
                 tags,
                 tags_published,
+                tag_counts: TagCounts::default(),
                 last_seen,
                 clock: Arc::new(SystemMonotonicClock::default()),
                 confirmed_at: snapshot.sampled_at.0,
@@ -1434,6 +1442,7 @@ impl ProcessView {
         // The tags status after the rows whose tag cells it describes
         // (PX-020).
         plan.extend(self.tags_effects(tag_counts));
+        self.tag_counts = tag_counts;
         // Last, the search re-counted against the rows this plan publishes, so
         // it commits with the final rows rather than ahead of them (PX-011),
         // and the inspector, whose metrics and state follow them (PX-013).
@@ -2213,6 +2222,7 @@ impl ProcessView {
         // The tags status after the rows whose tag cells it describes
         // (PX-020).
         plan.extend(self.tags_effects(tag_counts));
+        self.tag_counts = tag_counts;
         // The search counts the newly filtered rows; a target a filter hid is
         // reported as no longer shown, never replaced (PX-011). So is the
         // inspector's (PX-013), and a row these rows put under a parent the
@@ -3324,19 +3334,12 @@ impl ProcessView {
         &self.tags_published.status
     }
 
-    /// The tags status's change for the collection as it stands (PX-020,
-    /// PX-021): for a change that touches no row, such as a record that
-    /// aged out or turned `exited`.
+    /// The tags status's change for a change that touches no row, such as
+    /// a record that aged out or turned `exited` (PX-021): counted among the
+    /// rows the last row publication planned, which are the ones the client
+    /// holds.
     fn current_tags_effects(&self) -> Vec<Planned> {
-        let counts = self
-            .visible_in(
-                self.mode,
-                &self.unfiltered_rows,
-                &self.unconfirmed,
-                &self.gaps,
-            )
-            .tags;
-        self.tags_effects(counts)
+        self.tags_effects(self.tag_counts)
     }
 
     /// The tags status's change for tag counts `counts` (PX-020): planned

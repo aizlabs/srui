@@ -14,7 +14,7 @@
   "entries": [
     {
       "feature_id": "SRUI-PX021-001",
-      "feature": "A bounded tombstone for each watched process instance that leaves the server-side collection: watched means the inspector's target, the followed process or a tagged process, and nothing else; the record holds the whole ProcessKey, the last row (name, owner, every cell, so the last CPU share and resident memory), the state, parent and start time the inspector last read (never the command line, executable or working directory, which can carry secrets), the sample time of the last scan that listed it (carried across scans that only kept it) and the scan it left with; recorded when the sample is applied, whatever its commits do",
+      "feature": "A bounded tombstone for each watched process instance that leaves the server-side collection: watched means the inspector's target, the followed process or a tagged process, and nothing else; the record holds the whole ProcessKey, the last row (name, owner, every cell, so the last CPU share and resident memory), the state, parent and start time the inspector last read (never the command line, executable or working directory, which can carry secrets), the sample time of the last scan that listed it (carried across scans that only kept it) and the scan it left with; recorded when the sample is applied, whatever its commits do; the followed process keeps watching its record until follow stops",
       "scope": "PX-021/lastseen (src/lastseen.rs) Tombstone, LastSeen.record; refresh (src/refresh.rs) record_departures, last_observed, unconfirmed_since, confirmed_at; tests/lastseen_test.rs an_exiting_worker_leaves_an_inspectable_tombstone_that_no_request_takes; tests/procfs_test.rs live::a_live_worker_that_exits_leaves_a_tombstone_and_a_degraded_scan_claims_no_exit",
       "source_refs": [
         "D1",
@@ -74,7 +74,7 @@
     },
     {
       "feature_id": "SRUI-PX021-005",
-      "feature": "Retention bounded by count (MAX_TOMBSTONES 64), age (MAX_TOMBSTONE_AGE 600 s after it left, by the view's injected MonotonicClock, at each sample) and estimated bytes (MAX_TOMBSTONE_BYTES 32 KiB), oldest first; a record no longer watched goes at the next sample; tested at and past each bound under a fake clock",
+      "feature": "Retention bounded by count (MAX_TOMBSTONES 64), age (MAX_TOMBSTONE_AGE 600 s after it left, by the view's injected MonotonicClock, at every accepted sample, including one that could not read the process list) and estimated bytes (MAX_TOMBSTONE_BYTES 32 KiB), oldest first; a record no longer watched goes at the next sample; tested at and past each bound under a fake clock",
       "scope": "PX-021/lastseen (src/lastseen.rs) LastSeen.expire, record, drop_oldest, Tombstone.bytes; refresh (src/refresh.rs) ProcessView::with_clock; src/lastseen.rs tests; tests/lastseen_test.rs retention_expires_deterministically_under_a_fake_clock, the_count_bound_keeps_the_newest_tombstones; tests/tags_test.rs historical_tags_are_bounded_newest_kept_and_cleared",
       "source_refs": [
         "D1",
@@ -106,6 +106,21 @@
       "feature_id": "SRUI-PX021-007",
       "feature": "Interactions: filters, the tree and its collapsed mirror, threads (a selected thread gets a tombstone; a hidden one is deselected first and gets none), tags, follow, pause (a paused view records and expires nothing) and failed commits (a failed sample still records; a failed Clear tags keeps the historical tags)",
       "scope": "PX-021/tests/lastseen_test.rs a_filtered_out_target_is_not_historical_until_it_leaves, the_tree_shows_the_same_tombstone, a_selected_thread_gets_a_tombstone_and_a_hidden_one_does_not, a_paused_view_records_nothing_until_it_resumes; src/refresh.rs tag_commit_tests a_failed_sample_records_the_tombstone_and_the_next_publication_shows_it, a_failed_clear_keeps_the_historical_tags, a_failed_sample_keeps_an_ended_process_tagged_until_one_commits; tests/no_process_control_test.rs",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-021",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-021.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX021-008",
+      "feature": "Relisting and retagging: a record that said only 'no longer observed' is dropped when a scan lists the same instance (the same whole ProcessKey; for a thread, the thread itself) again, and the inspector, still on its old row, says it is listed again; a later departure records afresh; an 'exited' record is final. A dropped record that was a historical tag becomes a live tag again on its row ('Tagged again: …'), held until the tags status commits (a failed sample keeps it historical); beyond MAX_TAGGED it is counted forgotten and the status says which and why. This amends PX-020's 'never put back on a row' for exactly that case; PID reuse never inherits a tag",
+      "scope": "PX-021/lastseen (src/lastseen.rs) LastSeen.drop_relisted, record, forget_tags; refresh (src/refresh.rs) apply relisting before visible_in, unretag, settle_tags; tags (src/tags.rs) Tags.retag; tests/lastseen_test.rs a_tag_whose_process_is_listed_again_is_live_again, an_exited_tag_stays_historical_when_its_key_is_listed_again, a_relisted_tag_beyond_the_tag_limit_is_counted_forgotten, relisted_tags_partly_beyond_the_tag_limit_say_which_was_forgotten, an_instance_listed_again_after_eviction_gets_a_fresh_record_when_it_exits, a_newer_process_under_the_pid_never_drops_the_old_record, a_thread_listed_again_drops_its_no_longer_observed_record, a_thread_whose_process_alone_is_listed_keeps_its_record; src/refresh.rs retag_commit_tests",
       "source_refs": [
         "D1",
         "D2",

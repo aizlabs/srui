@@ -826,6 +826,13 @@ fn an_instance_listed_again_after_eviction_gets_a_fresh_record_when_it_exits() {
     let again = h.item(300, "worker").expect("listed again");
     assert_ne!(again, first);
     assert!(h.view.last_seen().is_empty());
+    // Its record was the inspector's, never a tag: nothing is tagged (F6).
+    assert_eq!(
+        h.view.tags().tagged(),
+        0,
+        "a record nobody tagged is never a tag"
+    );
+    assert_eq!(h.tag_cell(300, "worker").as_deref(), Some(""));
     assert_eq!(
         h.status(),
         "Selected process: PID 300 · worker · listed again after it was no longer observed, under a new row; select that row to inspect it"
@@ -1359,6 +1366,113 @@ fn a_relisted_tag_beyond_the_tag_limit_is_counted_forgotten() {
     assert_eq!(h.tag_cell(300, "worker").as_deref(), Some(""));
     assert_eq!(
         h.view.tags_status(),
-        format!("Tags: {max} tagged · 1 historical, forgotten · PID 300 · worker listed again, but {max} processes are already tagged, the limit: its historical tag is forgotten")
+        format!("Tags: {max} tagged · 1 historical, forgotten · PID 300 · worker listed again, but the tag limit of {max} is reached: its historical tag is forgotten")
+    );
+}
+
+// ---- Correction round 3 ----
+
+/// G4: when only some relisted tags fit under the tag limit, the status says
+/// both which one is tagged again and which one was forgotten, and why.
+#[test]
+fn relisted_tags_partly_beyond_the_tag_limit_say_which_was_forgotten() {
+    let max = srui_process_explorer::tags::MAX_TAGGED as u32;
+    let unknown = || Observed::Missing(MissingReason::Denied);
+    let children = |host: &dyn Fn() -> Observed<HostId>| -> Vec<ProcessRecord> {
+        (0..max - 2)
+            .map(|n| record_on(10_000 + n, &format!("c{n}"), &format!("c{n}"), host()))
+            .collect()
+    };
+    let mut first = vec![
+        record(1, "init", "init"),
+        record(300, "w", "worker"),
+        record(301, "o", "other"),
+    ];
+    first.extend(children(&host));
+    // The host identity unread and PIDs 300 and 301 absent: no longer
+    // observed.
+    let mut second = vec![record_on(1, "init", "init", unknown())];
+    second.extend(children(&unknown));
+    let mut h = Harness::new(vec![
+        complete(first.clone()),
+        complete(second),
+        complete(first),
+    ]);
+    for (pid, name) in [(300, "worker"), (301, "other")] {
+        h.select(pid, name);
+        h.view.request_tags(&h.session, TagRequest::Toggle).unwrap();
+    }
+    h.select(1, "init");
+    h.refresh();
+    assert_eq!(
+        h.view.historical_tags(),
+        ["PID 300 · worker", "PID 301 · other"]
+    );
+    // init and its children leave room for one.
+    h.select(1, "init");
+    h.view
+        .request_tags(&h.session, TagRequest::Descendants)
+        .unwrap();
+    assert_eq!(h.view.tags().tagged(), max as usize - 1);
+    h.refresh();
+    assert_eq!(h.view.tags().tagged(), max as usize);
+    assert_eq!(h.tag_cell(300, "worker").as_deref(), Some("tagged"));
+    assert_eq!(h.tag_cell(301, "other").as_deref(), Some(""));
+    assert!(h.view.historical_tags().is_empty());
+    assert_eq!(h.view.last_seen().forgotten_tags(), 1);
+    assert_eq!(
+        h.view.tags_status(),
+        format!(
+            "Tags: {max} tagged · 1 historical, forgotten · Tagged again: PID 300 · worker is listed again after it was no longer observed · PID 301 · other listed again, but the tag limit of {max} is reached: its historical tag is forgotten"
+        )
+    );
+}
+
+/// G1 (kills R8b): a thread is listed again only when the scan lists the
+/// thread itself; its process listed with other threads leaves the thread's
+/// "no longer observed" record standing.
+#[test]
+fn a_thread_whose_process_alone_is_listed_keeps_its_record() {
+    let mut h = threads_shown(
+        vec![
+            (
+                complete(vec![record(1, "init", "init"), server()]),
+                threads_read(vec![t200(), t201()], &[]),
+            ),
+            (
+                complete(vec![record(1, "init", "init"), server()]),
+                threads_read(vec![t200(), t201()], &[]),
+            ),
+            (
+                complete(vec![
+                    record(1, "init", "init"),
+                    server(),
+                    record(400, "n", "new"),
+                ]),
+                threads_read(vec![t200()], &[200]),
+            ),
+            (
+                complete(vec![record(1, "init", "init"), server()]),
+                threads_read(vec![t200()], &[]),
+            ),
+        ],
+        |view| view.with_published_limit(4),
+    );
+    h.refresh();
+    assert_eq!(
+        thread_departure(&h),
+        Some(Departure::NotObserved(Unobserved::Evicted))
+    );
+    h.refresh();
+    assert_eq!(
+        thread_departure(&h),
+        Some(Departure::NotObserved(Unobserved::Evicted)),
+        "its process is listed, the thread is not: the record stands"
+    );
+    assert!(
+        h.status()
+            .starts_with("Selected thread: TID 201 of PID 200 · worker-1 · no longer observed: "),
+        "{}",
+        h.status()
     );
 }

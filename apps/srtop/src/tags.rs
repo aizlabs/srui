@@ -239,15 +239,19 @@ impl Tags {
     /// Makes the tags of `rows` live again (PX-021): each was a historical
     /// tag whose record said only "no longer observed", and a scan lists the
     /// same instance, under the same whole key, again. The caller keeps the
-    /// set within [`MAX_TAGGED`].
-    pub(crate) fn retag(&mut self, rows: &[&Row]) {
+    /// set within [`MAX_TAGGED`]; `forgotten` says which relisted ones it
+    /// could not tag again, and is stated with the ones it did.
+    pub(crate) fn retag(&mut self, rows: &[&Row], forgotten: Option<String>) {
         if rows.is_empty() {
+            if let Some(forgotten) = forgotten {
+                self.changed(forgotten);
+            }
             return;
         }
         for row in rows {
             self.live.insert(row.key.clone(), who(row));
         }
-        let outcome = match rows {
+        let mut outcome = match rows {
             [row] => format!(
                 "Tagged again: {} is listed again after it was no longer observed",
                 who(row)
@@ -257,6 +261,10 @@ impl Tags {
                 rows.len()
             ),
         };
+        if let Some(forgotten) = forgotten {
+            outcome.push_str(" · ");
+            outcome.push_str(&forgotten);
+        }
         self.changed(outcome);
     }
 

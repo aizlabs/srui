@@ -1009,16 +1009,17 @@ impl ProcessView {
     /// the scan could read: age is time, not a scan outcome. Says whether a
     /// historical tag went.
     ///
-    /// Between samples only the inspector's target and the tags watch a
-    /// record: follow stops in the very sample its process leaves
-    /// ([`Follow::track`]), so the followed process is never a recorded one
-    /// by the next sample.
+    ///
+    /// The followed process watches its record too: follow can be turned on
+    /// for a row a failed commit left on the client after its process left,
+    /// and stays on it when a collapse clears the inspector.
     fn expire_tombstones(&mut self) -> bool {
         let now = self.clock.now();
-        let inspected = self.inspector.selected_row().map(|row| row.key.clone());
+        let (inspected, followed) = self.watched_keys();
         let before = self.last_seen.forgotten_tags();
-        self.last_seen
-            .expire(now, |key| inspected.as_ref() == Some(key));
+        self.last_seen.expire(now, |key| {
+            inspected.as_ref() == Some(key) || followed.as_ref() == Some(key)
+        });
         self.last_seen.forgotten_tags() != before
     }
 
@@ -1216,28 +1217,35 @@ impl ProcessView {
         let mut retagged: Vec<Tombstone> =
             relisted.into_iter().filter(Tombstone::is_tagged).collect();
         let held_retag = (!retagged.is_empty()).then(|| self.tags.clone());
+        // The room is counted before this sample's departed tags retire, so
+        // a tag that leaves in the same sample frees its place only from the
+        // next one.
         let room = crate::tags::MAX_TAGGED.saturating_sub(self.tags.tagged());
+        let mut forgotten = None;
         if retagged.len() > room {
             // No room under the tag limit: their records are no longer true,
             // so they go, and their tags are counted as forgotten.
             let beyond = retagged.split_off(room);
             self.last_seen.forget_tags(beyond.len() as u64);
-            self.tags.refuse(format!(
-                "{} listed again, but {} processes are already tagged, the limit: {} forgotten",
-                beyond.first().map(Tombstone::subject).unwrap_or_default(),
-                crate::tags::MAX_TAGGED,
-                if beyond.len() == 1 {
-                    "its historical tag is".to_string()
-                } else {
-                    format!("{} historical tags are", beyond.len())
-                },
-            ));
+            forgotten = Some(match beyond.as_slice() {
+                [one] => format!(
+                    "{} listed again, but the tag limit of {} is reached: its historical tag is forgotten",
+                    one.subject(),
+                    crate::tags::MAX_TAGGED
+                ),
+                _ => format!(
+                    "{} processes listed again, but the tag limit of {} is reached: their historical tags are forgotten",
+                    beyond.len(),
+                    crate::tags::MAX_TAGGED
+                ),
+            });
         }
         self.tags.retag(
             &retagged
                 .iter()
                 .map(|tombstone| &tombstone.row)
                 .collect::<Vec<_>>(),
+            forgotten,
         );
         let visible = self.visible_in(self.mode, &unfiltered_target, &unconfirmed, &gaps);
         let forest = visible.forest;
@@ -1389,9 +1397,14 @@ impl ProcessView {
             self.gaps = gaps;
             self.search.observe(&self.rows);
             self.inspector.reread(&self.rows, &confirmed_ids);
-            if self.settle_tags(held_tags) {
-                self.unretag(retagged);
-            }
+            // Nothing was planned, so no tag change waited on a commit: a
+            // retag or a retire takes a new generation, whose tags status is
+            // always planned.
+            let put_back = self.settle_tags(held_tags);
+            debug_assert!(
+                !put_back && retagged.is_empty(),
+                "a tag change planned nothing"
+            );
             return Ok(result);
         }
 
@@ -3168,12 +3181,11 @@ impl ProcessView {
 
     /// Keeps `retagged` historical again (PX-021): the sample that made their
     /// tags live never committed its tags status, so the set was put back
-    /// without them, and the next committed sample makes them live.
+    /// without them (it was held before they were tagged again, so none of
+    /// them is live in it), and the next committed sample makes them live.
     fn unretag(&mut self, retagged: Vec<Tombstone>) {
         for tombstone in retagged {
-            if !self.tags.is_tagged(tombstone.key()) {
-                self.last_seen.record(tombstone);
-            }
+            self.last_seen.record(tombstone);
         }
     }
 
@@ -8395,5 +8407,111 @@ mod retag_commit_tests {
         assert!(view
             .tags_status()
             .starts_with("Tags: 1 tagged · Tagged again: PID 300 · worker"));
+    }
+}
+
+/// PX-021 correction round 3 (G2): follow watches a record. Turned on for a
+/// row a failed commit left on the client after its process left, it stays
+/// on it when a collapse clears the inspector; the next sample keeps the
+/// record, and follow stops saying the process exited.
+#[cfg(test)]
+mod follow_watch_tests {
+    use super::*;
+    use crate::source::{
+        BootId, CappedRecords, Completeness, CpuUsage, CreationToken, DisplayName,
+        FakeProcessSource, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+        SnapshotTime, SourceId, OWNER_NOT_COLLECTED,
+    };
+
+    fn record(pid: u32, parent: u32, name: &str) -> ProcessRecord {
+        ProcessRecord {
+            lineage: Lineage::new(parent, u64::from(pid)),
+            owner: OWNER_NOT_COLLECTED,
+            key: ProcessKey {
+                source: SourceId("follow-watch".into()),
+                host: Observed::Known(HostId("h".into())),
+                boot: Observed::Known(BootId("b".into())),
+                pid_namespace: Observed::Known(PidNamespaceId(1)),
+                pid: Observed::Known(pid),
+                creation: CreationToken::Opaque(name.into()),
+                thread: None,
+            },
+            kind: crate::source::KIND_NOT_COLLECTED,
+            display_name: DisplayName::from(name),
+            resident: Observed::Known(4096),
+            cpu: CpuUsage::WarmingUp,
+        }
+    }
+
+    struct Steps(Vec<Vec<ProcessRecord>>, usize);
+
+    impl ProcessSource for Steps {
+        fn status_text(&self) -> &str {
+            "Read-only · Follow-watch fixture"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            let records = self.0[self.1.min(self.0.len() - 1)].clone();
+            self.1 += 1;
+            ProcessSnapshot {
+                source: SourceId("follow-watch".into()),
+                sampled_at: SnapshotTime(
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(self.1 as u64),
+                ),
+                records,
+                vanished: 0,
+                capped: CappedRecords::none(),
+                completeness: Completeness::Complete,
+                system: FakeProcessSource::system(),
+                threads: crate::source::ThreadScan::NotProvided,
+            }
+        }
+    }
+
+    #[test]
+    fn a_record_only_follow_watches_survives_the_next_sample() {
+        let all = vec![
+            record(1, 0, "init"),
+            record(200, 1, "parent"),
+            record(300, 200, "worker"),
+        ];
+        let after = vec![record(1, 0, "init"), record(200, 1, "parent")];
+        let mut source = Steps(vec![all, after], 0);
+        let session = Session::mint();
+        let (mut view, _) = ProcessView::start(&session, &mut source).unwrap();
+        view.set_view(&session, Some(true)).unwrap();
+        let item = |view: &ProcessView, pid: u32| {
+            view.rows
+                .iter()
+                .find(|row| row.key.pid == Observed::Known(pid))
+                .map(|row| row.item_id)
+        };
+        let worker = item(&view, 300).unwrap();
+        let parent = item(&view, 200).unwrap();
+        view.select_item(&session, Some(worker)).unwrap();
+        // The sample in which 300 exits never reaches the client.
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.refresh(&session, &mut source).is_err());
+        }
+        assert_eq!(item(&view, 300), Some(worker), "the client still shows it");
+        assert_eq!(view.last_seen().len(), 1);
+        view.select_item(&session, Some(worker)).unwrap();
+        view.set_follow(&session, Some(true)).unwrap();
+        assert_eq!(view.follow().following(), Some(worker));
+        // A collapse hides it: the inspector is cleared, follow stays on it.
+        view.expansion_changed(&session, TREE, parent, false)
+            .unwrap();
+        assert!(view.inspector().selected().is_none());
+        assert_eq!(view.follow().following(), Some(worker));
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.last_seen().len(), 1, "follow watched the record");
+        assert!(
+            view.follow_view()
+                .status
+                .starts_with("Follow stopped: PID 300 · worker exited · "),
+            "{}",
+            view.follow_view().status
+        );
     }
 }

@@ -17,6 +17,10 @@
 //   `WELCOME.initial_revision > 0`) replace the replica; incremental transactions never do.
 // - §18.2 Event settlement: server event frontiers raise `last_acked_event_seq`, while
 //   per-event acknowledgements selectively drain the outbox's retry set.
+// - §12.2 / §22.5 Observed revision of collection interactions: a List/Table/Tree
+//   `SELECTION_CHANGED` and a Tree `EXPANSION_CHANGED` carry the revision the native tree
+//   shows, which advances in the main-actor turn that renders a commit (PX-018-G02); every
+//   other event keeps the applier's published revision.
 // - §18.3 / §22.6 Native text editing: local drafts are claimed on MainActor, assigned a
 //   monotonic `edit_seq`, and reconciled against `RESUME_OK` / `RESYNC_REQUIRED` discard lists
 //   before any native mutation runs.
@@ -541,6 +545,18 @@ public final class SessionController: @unchecked Sendable {
     private var snapshotAssembler: SnapshotAssembler?
     /// Highest revision whose committed value has finished applying to the native renderer.
     private var lastRenderedRevision: UInt64 = 0
+    /// The revision of the committed state the native tree shows, for the `observed_revision` of
+    /// collection selection and Tree disclosure events (PX-018-G02; §12.2, §22.5).
+    ///
+    /// Unlike `lastRenderedRevision`, which the transaction lane records several suspensions after
+    /// the render, this advances on the main actor in the same synchronous turn that mounts or
+    /// applies the committed snapshot (`updateRenderer`), the catch-up snapshot and a resume
+    /// remount included, and goes back if that render throws. So a user callback that runs before
+    /// that turn acted on the earlier state, one that runs after it on this one, and a report the
+    /// render itself makes describes this commit. It only ever takes a revision the applier has
+    /// published, and returns to `.initial` with the native tree when the replica is reset;
+    /// `renderedObservedRevision` also clamps it to the published snapshot.
+    @MainActor private var nativeRenderedRevision: Revision = .initial
     private var currentSessionId: String?
     /// Identifies this controller/transport attempt inside the shared outbox.
     private var outboxConnectionBinding: EventOutboxConnectionBinding?
@@ -1199,10 +1215,23 @@ public final class SessionController: @unchecked Sendable {
         }
 
         let source = semanticInspectionSourceSnapshot()
+        // PX-018-G02: a collection selection or disclosure says which rows the user saw, so it
+        // carries the revision the native tree shows. The applier publishes a commit before the
+        // main-actor render that applies it, and a click in between acted on the earlier rows.
+        // Every other action keeps the published revision it has always carried.
+        let observedRevision = Self.stampsRenderedRevision(
+            action,
+            on: source.transaction.store.getNode(nodeID)?.nodeType
+        )
+            ? Self.renderedObservedRevision(
+                rendered: nativeRenderedRevision,
+                published: source.transaction.revision
+            )
+            : source.transaction.revision
         let request = SemanticActionRequest(
             nodeID: nodeID,
             expectedEpoch: source.epoch,
-            observedRevision: source.transaction.revision,
+            observedRevision: observedRevision,
             action: action
         )
         do {
@@ -1218,6 +1247,31 @@ public final class SessionController: @unchecked Sendable {
             SessionDiagnostics.error("Interaction dispatch failed: \(error)")
         }
     }
+
+    /// Whether a native `action` on a node of `nodeType` is stamped with the rendered revision
+    /// (PX-018-G02): `SELECTION_CHANGED`, both forms, on a `List`, `Table` or `Tree`, and a Tree's
+    /// `EXPANSION_CHANGED`. `ACTIVATE`, `VALUE_CHANGED`, `TEXT_EDIT` (§18.3) and the selection of
+    /// a `Select`, `ChoiceGroup` or `Tabs` keep the applier's published revision.
+    static func stampsRenderedRevision(_ action: SemanticAction, on nodeType: TypeRef?) -> Bool {
+        switch action {
+        case .selectionChanged, .selectionCleared:
+            return nodeType == .list || nodeType == .table || nodeType == .tree
+        case .expansionChanged:
+            return nodeType == .tree
+        case .activate, .valueChanged:
+            return false
+        }
+    }
+
+    /// The `observed_revision` of a rendered-revision stamp: what the native tree shows, and
+    /// never ahead of the published snapshot the action is validated against, so the server's
+    /// future-revision rejection (§18.2) cannot fire on it.
+    static func renderedObservedRevision(rendered: Revision, published: Revision) -> Revision {
+        min(rendered, published)
+    }
+
+    /// The revision the native tree shows (PX-018-G02), for tests.
+    @MainActor var nativeRenderedRevisionForTesting: Revision { nativeRenderedRevision }
 
     @MainActor
     private func enqueueNativeTextEdit(
@@ -4262,6 +4316,7 @@ public final class SessionController: @unchecked Sendable {
             }
             self.hasMountedInitialTree = false
             self.lastRenderedRevision = 0
+            self.nativeRenderedRevision = .initial
         }
         SessionDiagnostics.log("Discarded state from the abandoned session before fresh negotiation")
         return true
@@ -4297,6 +4352,7 @@ public final class SessionController: @unchecked Sendable {
             try? self.renderer?.attach(store: emptyStore)
             self.hasMountedInitialTree = false
             self.withStateLock { self.lastRenderedRevision = 0 }
+            self.nativeRenderedRevision = .initial
         }
         return true
     }
@@ -5592,6 +5648,11 @@ public final class SessionController: @unchecked Sendable {
                         renderer.textEditingSession.finishResyncTextBoundary()
                     }
                 }
+                // PX-018-G02: the revision the native tree shows moves to this commit inside the
+                // render itself. A report the render makes (a revealing promotion's expand)
+                // describes this commit; a user callback can only run before or after this
+                // synchronous turn. A failed render restores the earlier value.
+                let previouslyRendered = self.nativeRenderedRevision
                 do {
                     try self.rendererUpdateInterceptorForTesting?()
                     if forceRemount || !self.hasMountedInitialTree {
@@ -5607,6 +5668,7 @@ public final class SessionController: @unchecked Sendable {
                         if let rewireOwnershipAtMount {
                             self.ensureActionHandlerWired(ownership: rewireOwnershipAtMount)
                         }
+                        self.nativeRenderedRevision = snapshot.revision
                         if preserveLocalTextForRemount {
                             try renderer.layoutRenderer.mount(
                                 store: snapshot.store,
@@ -5618,6 +5680,7 @@ public final class SessionController: @unchecked Sendable {
                         renderer.showWindows()
                         self.hasMountedInitialTree = true
                     } else if let transaction {
+                        self.nativeRenderedRevision = snapshot.revision
                         try renderer.apply(transaction: transaction, newStore: snapshot.store)
                     }
                     return RendererUpdateResult(didRender: true, resyncLaneEpoch: epoch)
@@ -5629,6 +5692,7 @@ public final class SessionController: @unchecked Sendable {
                     // committed store on the next transaction rather than mutating a tree we no
                     // longer trust.
                     self.hasMountedInitialTree = false
+                    self.nativeRenderedRevision = previouslyRendered
                     return RendererUpdateResult(
                         didRender: false,
                         resyncLaneEpoch: epoch,

@@ -144,6 +144,38 @@ struct WidgetSemanticsConformanceTests {
             "\(nodeType) must report the selected item's identity, not its row index (§7.6, §8)")
     }
 
+    /// §7.6, spec/registries.md §4.4 (PX-017-G02): a user deselect through the native selection
+    /// path originates `.selectionCleared`, which the session sends as `SELECTION_CHANGED` with no
+    /// `value`.
+    @Test(arguments: [TypeRef.list, TypeRef.table])
+    func collectionsEmitSelectionClearedWhenTheUserLeavesNothingSelected(nodeType: TypeRef) throws {
+        let factory = ControlFactory()
+        var emitted: [SemanticInteraction] = []
+        factory.onInteraction = { emitted.append($0) }
+
+        let node = Node(
+            id: 21,
+            nodeType: nodeType,
+            properties: [.selectionMode: .enumToken(.selectionModeSingle)])
+        let handle = try factory.makeHandle(for: node)
+        let table = try #require((handle.view as? NSScrollView)?.documentView as? NSTableView)
+        let adapter = try #require(handle.modelAdapter as? TableCollectionAdapter)
+        adapter.update(
+            rows: [
+                TableCollectionAdapter.TableRow(itemID: ItemId(1), cells: ["Alpha"]),
+                TableCollectionAdapter.TableRow(itemID: ItemId(2), cells: ["Beta"]),
+            ],
+            tableView: table
+        )
+        table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        table.deselectAll(nil)
+
+        #expect(emitted == [
+            .selectionChanged(nodeID: 21, itemID: ItemId(1)),
+            .selectionCleared(nodeID: 21),
+        ])
+    }
+
     /// §7.6 / §18.3: text controls originate `TEXT_EDIT` carrying the edited text and a positive
     /// `edit_seq`, driven through the real native editing adapter.
     @Test(arguments: [TypeRef.textInput, TypeRef.textArea])
@@ -190,6 +222,7 @@ struct WidgetSemanticsConformanceTests {
             .activate(nodeID: 1),
             .valueChanged(nodeID: 1, value: .bool(true)),
             .selectionChanged(nodeID: 1, itemID: 1),
+            .selectionCleared(nodeID: 1),
             .expansionChanged(nodeID: 1, itemID: 1, expanded: false),
             .textEdit(nodeID: 1, text: "", editSeq: EditSeq(1)!, laneEpoch: 0),
         ]
@@ -198,7 +231,8 @@ struct WidgetSemanticsConformanceTests {
         // coordinate case is ever added, this stops compiling — which is the intent.
         for interaction in carried {
             switch interaction {
-            case .activate, .valueChanged, .selectionChanged, .expansionChanged, .textEdit:
+            case .activate, .valueChanged, .selectionChanged, .selectionCleared, .expansionChanged,
+                 .textEdit:
                 break
             }
         }

@@ -207,6 +207,88 @@ struct EventOutboxTests {
         await server.close()
     }
 
+    @Test("EventOutbox sends a cleared selection as SELECTION_CHANGED with no value")
+    func selectionClearedEventSerialization() async throws {
+        // PX-017-G02: a user action left the collection with nothing selected (spec/registries.md
+        // §4.4). The event names the collection and carries no argument at all.
+        let clientInstanceId = ClientInstanceId(string: "client-test-cleared")
+        let outbox = EventOutbox(clientInstanceId: clientInstanceId)
+        let (client, server) = await PipeTransport.createPair()
+        let binding = await activeBinding(for: outbox)
+
+        let event = try await outbox.sendSelectionCleared(
+            nodeId: NodeId(301),
+            observedRevision: Revision(76),
+            binding: binding,
+            via: client
+        )
+        #expect(event.eventSeq == 1)
+        #expect(event.nodeId == NodeId(301))
+        #expect(event.observedRevision == Revision(76))
+        #expect(event.eventType == .EVENT_SELECTION_CHANGED)
+        #expect(event.arguments.isEmpty)
+        #expect(event.itemIdArg == nil)
+        #expect(event.clientInstanceId == clientInstanceId)
+        #expect(await outbox.pendingCount == 1, "retained for replay like any event")
+
+        var msg = SRUIMessage()
+        msg.event = event.toWire()
+        #expect(msg.event.arguments.isEmpty)
+        let decodedMsg = try decodeFramedMessage(from: SRUIFraming.encodeFramed(msg))
+        guard case .event(let wireEvent) = decodedMsg.msg else {
+            Issue.record("Expected event message payload")
+            return
+        }
+        let decodedEvent = try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent)
+        #expect(decodedEvent == event)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("Same-session resume replays a cleared selection with its identity and no value")
+    func sameSessionResumeReplaysAClearedSelection() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        let initialBinding = await activeBinding(for: outbox)
+        let selected = try await outbox.sendSelectionChanged(nodeId: NodeId(3), observedRevision: Revision(1), itemId: ItemId(42), binding: initialBinding, via: client)
+        let cleared = try await outbox.sendSelectionCleared(nodeId: NodeId(3), observedRevision: Revision(1), binding: initialBinding, via: client)
+        await client.close()
+        await server.close()
+
+        let (client2, server2) = await PipeTransport.createPair()
+        let resumedBinding = await outbox.beginConnectionBinding()
+        let generation = try #require(await outbox.beginResumeAttempt(binding: resumedBinding))
+        let serverStream2 = server2.receiveStream()
+        let accepted = try await resumeSameSession(
+            outbox,
+            id: "session-cleared",
+            lastProcessedEventSeq: 0,
+            generation: generation,
+            binding: resumedBinding,
+            via: client2,
+            enableNewEventsAfterReplay: true
+        )
+        #expect(accepted)
+
+        var streamDecoder = SRUIMessageStreamDecoder()
+        var replayed: [Event] = []
+        for try await chunk in serverStream2 {
+            for msg in try streamDecoder.appendAndExtract(incoming: chunk) {
+                if case .event(let wireEvent) = msg.msg {
+                    replayed.append(try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent))
+                }
+            }
+            if replayed.count >= 2 { break }
+        }
+        #expect(replayed == [selected, cleared], "the clear replays after the selection, unchanged")
+        #expect(replayed.last?.arguments.isEmpty == true)
+
+        await outbox.stopResumeWork(generation: generation)
+        await client2.close()
+        await server2.close()
+    }
+
     @Test("EventOutbox creates and serializes EXPANSION_CHANGED with value=bool and items=[ItemId]")
     func expansionChangedEventSerialization() async throws {
         // PX-018-G01: Tree disclosure is local; the event reports it (§7.6, §22.5).

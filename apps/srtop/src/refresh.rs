@@ -2240,7 +2240,7 @@ impl ProcessView {
             .as_ref()
             .is_some_and(|row| self.hidden_under(&self.rows, row.item_id).is_some());
         if hidden {
-            self.inspector.clear();
+            self.inspector.clear_hidden();
         } else {
             match &row {
                 Some(row) => self.inspector.select(row),
@@ -2248,6 +2248,42 @@ impl ProcessView {
             }
             self.follow.selected(row.as_ref());
         }
+        self.publish_selection(session)
+    }
+
+    /// Applies a user-cleared selection (PX-017-G02): a `SELECTION_CHANGED`
+    /// with no `value`, sent when the user left the shown collection with
+    /// nothing selected. The inspector says the selection was cleared under a
+    /// new generation and reads nothing; follow, if on, stops with that reason
+    /// and clears its hint, and turning it on again is refused until a row is
+    /// selected.
+    pub fn clear_selection(&mut self, session: &Session) -> Result<Refreshed, SessionError> {
+        self.clear_selection_in(session, &[], self.mode.node())
+    }
+
+    /// [`Self::clear_selection`], reported by `client` on the collection
+    /// `node` (PX-018): a clear from the hidden collection, sent before a
+    /// switch reached that client, is ignored like a selection from it. A
+    /// clear is that client's selection, as a selection is. A collapse is
+    /// not a clear: it sends only `EXPANSION_CHANGED`
+    /// ([`Self::expansion_changed`]).
+    pub fn clear_selection_in(
+        &mut self,
+        session: &Session,
+        client: &[u8],
+        node: NodeId,
+    ) -> Result<Refreshed, SessionError> {
+        if node != self.mode.node() {
+            return Ok(Refreshed::default());
+        }
+        self.holder = Holder::Client(client.to_vec());
+        self.inspector.clear();
+        self.follow.cleared();
+        self.publish_selection(session)
+    }
+
+    /// Publishes the inspector and follow after a selection or a clear.
+    fn publish_selection(&mut self, session: &Session) -> Result<Refreshed, SessionError> {
         let mut plan = self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
         let follow = self.follow_table_effects(&plan);
         plan.extend(follow);
@@ -2433,7 +2469,7 @@ impl ProcessView {
             .and_then(|selected| self.hidden_under(target, selected))
             .is_some();
         if hidden {
-            self.inspector.clear();
+            self.inspector.clear_hidden();
         }
         held
     }
@@ -2620,7 +2656,7 @@ impl ProcessView {
                 .and_then(|selected| self.hidden_under(&self.rows, selected))
                 .is_some();
             if hidden {
-                self.inspector.clear();
+                self.inspector.clear_hidden();
             }
         }
         let mut plan = self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
@@ -2843,8 +2879,9 @@ impl ProcessView {
 }
 
 /// Dispatches one `SELECTION_CHANGED` on the table to the shared view
-/// (PX-013). Only the event's `ItemId` argument is read; an event without
-/// one, or with any other value, names no row.
+/// (PX-013). Only the event's `ItemId` argument is read. An event with no
+/// `value` is the user clearing the selection (PX-017-G02); any other value
+/// names no row.
 pub fn selection_changed(
     view: &std::sync::Mutex<ProcessView>,
     session: &Session,
@@ -2854,10 +2891,18 @@ pub fn selection_changed(
     let Ok(event) = srui_semantic_tree::Event::try_from(event.clone()) else {
         return;
     };
-    let item = event.item_id_arg();
     // The table's and the tree's selections both reach here (PX-018); only
     // the shown collection's is the user's, and it is the reporting client's.
-    if let Err(error) = lock_view(view).select_item_in(session, client, event.node_id, item) {
+    let node = event.node_id;
+    let mut view = lock_view(view);
+    let published = match event.selection_change() {
+        Some(srui_sdk::SelectionChange::Cleared) => view.clear_selection_in(session, client, node),
+        Some(srui_sdk::SelectionChange::Item(item)) => {
+            view.select_item_in(session, client, node, Some(item))
+        }
+        None => view.select_item_in(session, client, node, None),
+    };
+    if let Err(error) = published {
         eprintln!("srtop: inspector not published: {error}");
     }
 }

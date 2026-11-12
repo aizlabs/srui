@@ -4,7 +4,8 @@ mod common;
 
 use common::{base_fixture, base_processes, model_rows, MIB, OTHER_UID, UID};
 use srui_example_process_monitor::testing::{
-    argumentless_event, record, selection_event, snapshot, toggle_event, TEST_CLIENT_INSTANCE_ID,
+    argumentless_event, record, selection_cleared_event, selection_event, snapshot, toggle_event,
+    TEST_CLIENT_INSTANCE_ID,
 };
 use srui_example_process_monitor::*;
 use srui_sdk::{ItemId, Toggle, Value, SELECTION_CHANGED, VALUE, VALUE_CHANGED};
@@ -115,17 +116,74 @@ fn an_unknown_selection_is_ignored() {
     assert_eq!(fixture.session.current_revision(), revision);
 }
 
+/// A value that is not an item id is malformed: it is ignored, and never read as a clear.
 #[test]
 fn a_malformed_selection_argument_is_ignored() {
     let fixture = base_fixture();
     let revision = fixture.session.current_revision();
+    let item = fixture
+        .monitor
+        .with_state(|state| state.visible()[1].item_id);
+    fixture
+        .session
+        .process_event(&selection_event(1, revision, item))
+        .expect("event accepted");
 
-    let bare = argumentless_event(1, revision, PROCESS_TABLE_ID, SELECTION_CHANGED);
+    let malformed = srui_protocol::Event::from(
+        &srui_semantic_tree::Event::try_from(selection_cleared_event(2, revision))
+            .expect("decodes")
+            .with_argument(VALUE, Value::String("20".to_string())),
+    );
+    fixture
+        .session
+        .process_event(&malformed)
+        .expect("event accepted");
+
+    assert_eq!(test_client_selection(&fixture.monitor), Some(item));
+}
+
+/// `SELECTION_CHANGED` with no `value` is the user clearing the selection (spec/registries.md
+/// §4.4): only that client's selection is forgotten.
+#[test]
+fn a_cleared_selection_forgets_only_that_clients_selection() {
+    let fixture = base_fixture();
+    let revision = fixture.session.current_revision();
+    let item = fixture
+        .monitor
+        .with_state(|state| state.visible()[1].item_id);
+    fixture
+        .session
+        .process_event(&selection_event(1, revision, item))
+        .expect("event accepted");
+    let mut other = selection_event(2, revision, item);
+    other.client_instance_id = b"other-client".to_vec();
+    fixture
+        .session
+        .process_event(&other)
+        .expect("event accepted");
+    assert_eq!(test_client_selection(&fixture.monitor), Some(item));
+
+    let bare = argumentless_event(3, revision, PROCESS_TABLE_ID, SELECTION_CHANGED);
     fixture
         .session
         .process_event(&bare)
         .expect("event accepted");
 
+    assert_eq!(test_client_selection(&fixture.monitor), None);
+    assert_eq!(
+        fixture
+            .monitor
+            .with_state(|s| s.selected_item_for_client(b"other-client")),
+        Some(item),
+        "another client's selection is its own"
+    );
+    assert_eq!(fixture.session.current_revision(), revision);
+
+    // Clearing again, with nothing held, is harmless.
+    fixture
+        .session
+        .process_event(&selection_cleared_event(4, revision))
+        .expect("event accepted");
     assert_eq!(test_client_selection(&fixture.monitor), None);
 }
 

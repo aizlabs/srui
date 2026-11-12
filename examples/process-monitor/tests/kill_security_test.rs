@@ -4,7 +4,8 @@ mod common;
 
 use common::{base_processes, fixture, Fixture, MIB, UID};
 use srui_example_process_monitor::testing::{
-    activate_event, record, selection_event, snapshot, TEST_CLIENT_INSTANCE_ID,
+    activate_event, record, selection_cleared_event, selection_event, snapshot,
+    TEST_CLIENT_INSTANCE_ID,
 };
 use srui_example_process_monitor::*;
 use srui_sdk::{ItemId, Text};
@@ -48,6 +49,36 @@ fn no_selection_performs_no_termination() {
     let fixture = common::base_fixture();
     assert_eq!(kill(&fixture), KillOutcome::NoSelection);
     assert!(fixture.terminator.calls().is_empty());
+}
+
+/// Select, then deselect: "Kill Selected" must not reach the process the user deselected
+/// (spec/registries.md §4.4), neither directly nor through the button's ACTIVATE.
+#[test]
+fn a_cleared_selection_performs_no_termination() {
+    let fixture = common::base_fixture();
+    select(&fixture, 30);
+    fixture
+        .session
+        .process_event(&selection_cleared_event(
+            2,
+            fixture.session.current_revision(),
+        ))
+        .expect("clear accepted");
+
+    assert_eq!(kill(&fixture), KillOutcome::NoSelection);
+    fixture
+        .session
+        .process_event(&activate_event(
+            3,
+            fixture.session.current_revision(),
+            KILL_BUTTON_ID,
+        ))
+        .expect("activation accepted");
+    assert!(fixture.terminator.calls().is_empty());
+    assert_eq!(
+        kill_status(&fixture).as_deref(),
+        Some("Select a process first")
+    );
 }
 
 #[test]

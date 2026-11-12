@@ -265,8 +265,10 @@ fn the_selected_processs_arguments_show_as_inert_lines_and_every_other_target_ha
 
     explorer.select(ItemId::new(9_999));
     assert_eq!(explorer.command(), "Command line: nothing was read");
+    // No value at all is the user clearing the selection (PX-017-G02):
+    // nothing is selected, and nothing is read.
     explorer.select_with(vec![]);
-    assert_eq!(explorer.command(), "Command line: nothing was read");
+    assert_eq!(explorer.command(), "Command line: no process selected");
 
     // Re-selecting and refreshing re-reads the target and publishes nothing
     // new while its arguments are unchanged.

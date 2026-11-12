@@ -11,6 +11,9 @@
 //!   publish — unknown, stale, or not an item at all — is refused with a
 //!   defined state, and nothing is read for it. An item is never turned into a
 //!   PID: the process instance is the published row's own [`ProcessKey`].
+//!   A `SELECTION_CHANGED` with no `value` is the user leaving the table with
+//!   nothing selected (PX-017-G02): the inspector says the selection was
+//!   cleared, and nothing is read.
 //! * **One current target, one generation.** Each accepted selection — a
 //!   user's click, or a search promotion (PX-011, PX-011-G01) — and each
 //!   refusal advances a monotonic [`SelectionGeneration`]. The latest one wins,
@@ -67,6 +70,10 @@ use std::time::{Duration, Instant, SystemTime};
 pub const MAX_INSPECTOR_LINE_BYTES: usize = 1024;
 /// The status of an inspector with nothing selected.
 pub const NO_SELECTION_STATUS: &str = "Selected process: none · select a row to inspect it";
+/// The status after the user left the table with nothing selected
+/// (PX-017-G02).
+pub const CLEARED_SELECTION_STATUS: &str =
+    "Selected process: none · the selection was cleared; select a row to inspect it";
 /// The status of the uncollected shell's inspector.
 pub const UNCOLLECTED_INSPECTOR_STATUS: &str = "Inspector disabled: process collection not started";
 
@@ -420,6 +427,8 @@ enum Selection {
     /// A selection that resolved to no published row: the item it named, if
     /// it named one at all.
     Refused(Option<ItemId>),
+    /// The user left the table with nothing selected (PX-017-G02).
+    Cleared,
     Process(Box<Selected>),
 }
 
@@ -630,13 +639,22 @@ impl Inspector {
         self.selection = held.selection;
     }
 
-    /// Describes nothing again, under a new generation (PX-018): the client
-    /// no longer shows a selection, because collapsing a parent in the tree
-    /// hid the selected row. Nothing is read, and a read still loading is
-    /// dropped when it returns.
-    pub(crate) fn clear(&mut self) {
+    /// Describes nothing again, under a new generation (PX-018): the
+    /// selecting client no longer shows a selection, because a parent it
+    /// keeps collapsed in the tree hides the selected row. Unlike
+    /// [`Self::clear`], the user did not deselect, so follow stays on.
+    /// Nothing is read, and a read still loading is dropped when it returns.
+    pub(crate) fn clear_hidden(&mut self) {
         self.generation = self.generation.next();
         self.selection = Selection::None;
+    }
+
+    /// Records that the user left the table with nothing selected, under a
+    /// new generation, so no earlier read can land (PX-017-G02). Nothing is
+    /// read.
+    pub(crate) fn clear(&mut self) {
+        self.generation = self.generation.next();
+        self.selection = Selection::Cleared;
     }
 
     /// The view is paused (PX-015): a read still loading is deferred, and
@@ -772,6 +790,15 @@ impl Inspector {
     ) -> InspectorView {
         let selected = match &self.selection {
             Selection::None => return InspectorView::initial(true),
+            Selection::Cleared => {
+                return InspectorView::bounded(
+                    CLEARED_SELECTION_STATUS.to_string(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    NO_SELECTION_COMMAND.to_string(),
+                );
+            }
             Selection::Refused(item) => {
                 let status = match item {
                     Some(item) => format!(

@@ -1197,6 +1197,97 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
+    /// PX-017-G02 (Codex review of PR #101): a user deselect is reported as `SELECTION_CHANGED`
+    /// with no `value`. `deselectAll(nil)` goes through the table's delegate exactly as a click in
+    /// empty space does. While following, the deselect stops follow with its reason and clears the
+    /// hint, and the inspector says the selection was cleared; turning follow on afterwards is
+    /// refused rather than following the deselected process. The same holds for select, deselect,
+    /// then follow on, with follow never on before.
+    @Test(.timeLimit(.minutes(1)))
+    @MainActor
+    func deselectingStopsFollowClearsTheInspectorAndFollowOnIsRefused() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-follow", "--refresh-interval-ms", "300000"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer over SSH with its follow controls") {
+            applier.lastAppliedRevision.value >= 1
+                && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(Self.followStatusID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        SurfacePresentation.forHostApplication().present(window)
+        window.contentView?.layoutSubtreeIfNeeded()
+        let router = renderer.layoutRenderer.shortcutRouter
+        router.isWindowKey = { $0 === window }
+        func view<T>(_ id: UInt64, as _: T.Type = T.self) throws -> T {
+            try #require(renderer.registry.handle(for: NodeId(id))?.view as? T, "node \(id)")
+        }
+        let table = try #require((renderer.registry.handle(for: NodeId(5))?.view as? NSScrollView)?.documentView as? NSTableView)
+        let toggle: NSButton = try view(Self.followToggleID)
+        let status: NSTextField = try view(Self.followStatusID)
+        let inspectorStatus: NSTextField = try view(Self.inspectorLineIDs[0])
+        let followKey = try Self.keyEvent("f", [.command, .shift], keyCode: 3, in: window)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "all 60 rows") {
+            table.numberOfRows == 60
+        }
+        let cleared = "Selected process: none · the selection was cleared; select a row to inspect it"
+        let refused = "Follow: off · nothing is selected; select a row, then turn follow on"
+
+        // Follow on, then deselect: follow stops with its reason and its hint is cleared.
+        table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        let first = Self.nativeRows(table)[0][0]
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on row 1") {
+            inspectorStatus.stringValue.hasPrefix("Selected process: PID \(first) · ")
+        }
+        #expect(window.performKeyEquivalent(with: followKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "following row 1") {
+            toggle.state == .on && status.stringValue.hasPrefix("Following PID \(first) · ")
+                && applier.store.getNode(NodeId(5))?.keepVisible != nil
+        }
+        table.deselectAll(nil)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "follow stopped by the deselect") {
+            status.stringValue == "Follow stopped: the selection was cleared; select a row and turn follow on again"
+                && toggle.state == .off
+                && applier.store.getNode(NodeId(5))?.keepVisible == nil
+                && inspectorStatus.stringValue == cleared
+        }
+        #expect(table.selectedRowIndexes.isEmpty, "the server selected nothing back")
+        #expect(applier.store.getNode(NodeId(5))?.promotedSelection == nil)
+
+        // Turning follow on now is refused: nothing is selected.
+        #expect(window.performKeyEquivalent(with: followKey))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "follow on refused after the clear") {
+            status.stringValue == refused && toggle.state == .off
+        }
+        #expect(applier.store.getNode(NodeId(5))?.keepVisible == nil)
+
+        // Select, deselect, then follow on, with follow off throughout: refused, never the old row.
+        table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        let second = Self.nativeRows(table)[1][0]
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on row 2") {
+            inspectorStatus.stringValue.hasPrefix("Selected process: PID \(second) · ")
+        }
+        table.deselectAll(nil)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector cleared") {
+            inspectorStatus.stringValue == cleared
+        }
+        let beforeToggle = applier.lastAppliedRevision.value
+        #expect(window.performKeyEquivalent(with: followKey))
+        // The refusal text is already shown, so wait for the server's answer to this press: it
+        // always states the toggle's value, in a new revision.
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "follow on refused again") {
+            applier.lastAppliedRevision.value > beforeToggle && status.stringValue == refused && toggle.state == .off
+        }
+        #expect(applier.store.getNode(NodeId(5))?.keepVisible == nil, "the deselected process is not followed")
+        #expect(table.selectedRowIndexes.isEmpty)
+        print("PX-017-G02 native SSH evidence: window \(window.windowNumber); first=\(first); second=\(second); follow=\(status.stringValue); inspector=\(inspectorStatus.stringValue); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
     /// PX-018: the process tree over real SSH. Switching from the table to the tree with ⌘T keeps
     /// the selection by item ID and carries follow over; the tree is one native `NSOutlineView`
     /// whose rows are indented from the server's `tree_depth`, under a visible header with the

@@ -184,6 +184,16 @@ pub fn selection_event(event_seq: u64, observed_revision: u64, item: ItemId) -> 
     ))
 }
 
+/// Builds a wire `SELECTION_CHANGED` event with no `value`: the user cleared the selection.
+pub fn selection_cleared_event(event_seq: u64, observed_revision: u64) -> WireEvent {
+    wire(SemanticEvent::selection_cleared(
+        event_seq,
+        format!("selection-{event_seq}"),
+        observed_revision,
+        PROCESS_TABLE_ID,
+    ))
+}
+
 /// Builds a wire `VALUE_CHANGED` event for the toggle with an arbitrary argument value.
 pub fn toggle_event(event_seq: u64, observed_revision: u64, value: Value) -> WireEvent {
     wire(SemanticEvent::value_changed(

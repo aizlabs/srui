@@ -19,7 +19,8 @@
 //!   applying the journal accepts revision by revision.
 
 use srui_process_explorer::catalogue::ProcessField;
-use srui_process_explorer::inspector::NO_SELECTION_STATUS;
+use srui_process_explorer::follow::SELECTION_CLEARED_FOLLOW_STATUS;
+use srui_process_explorer::inspector::{CLEARED_SELECTION_STATUS, NO_SELECTION_STATUS};
 use srui_process_explorer::refresh::{lock_view, ProcessView, SharedView, ViewMode};
 use srui_process_explorer::source::*;
 use srui_process_explorer::{
@@ -1912,4 +1913,42 @@ fn a_promotion_is_the_selection_of_the_client_that_asked_for_it() {
     assert!(h
         .text(INSPECTOR_STATUS)
         .starts_with("Selected process: PID 11 · beta"));
+}
+
+/// PX-017-G02 merged with PX-018: a user deselect (`SELECTION_CHANGED` with
+/// no `value`) in the shown tree clears the inspector and stops follow, as
+/// in the table; one from the hidden table, sent before the switch reached
+/// that client, is ignored like a selection from it. A collapse is not a
+/// deselect: follow stays on and says where the process is hidden.
+#[test]
+fn a_user_deselect_in_the_tree_stops_follow_and_one_from_the_hidden_table_is_ignored() {
+    let mut source = family(&[
+        (10, "alpha", 0, 10),
+        (11, "beta", 10, 11),
+        (30, "xray", 0, 60),
+    ]);
+    let mut h = harness(&mut source);
+    h.show_tree(true);
+    let alpha = h.item_of(10);
+    let beta = h.item_of(11);
+    h.select(TREE, beta);
+    h.follow(true);
+    h.disclose(alpha, false);
+    assert_eq!(h.text(INSPECTOR_STATUS), NO_SELECTION_STATUS);
+    assert_eq!(
+        h.view().follow().following(),
+        Some(beta),
+        "a collapse is not a deselect"
+    );
+    h.disclose(alpha, true);
+    h.select(TREE, beta);
+    h.send(TABLE, TypeRef::EVENT_SELECTION_CHANGED, vec![]);
+    assert!(h
+        .text(INSPECTOR_STATUS)
+        .starts_with("Selected process: PID 11 · beta"));
+    assert_eq!(h.view().follow().following(), Some(beta));
+    h.send(TREE, TypeRef::EVENT_SELECTION_CHANGED, vec![]);
+    assert_eq!(h.text(INSPECTOR_STATUS), CLEARED_SELECTION_STATUS);
+    assert_eq!(h.view().follow().following(), None);
+    assert_eq!(h.text(FOLLOW_STATUS), SELECTION_CLEARED_FOLLOW_STATUS);
 }

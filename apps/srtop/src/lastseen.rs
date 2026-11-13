@@ -178,6 +178,42 @@ impl Departure {
     }
 }
 
+/// The thread instances one scan read, each as its TID under the process
+/// instance it was read under, by the keys the scan was projected to: anchored
+/// to the session's identity ([`crate::projection`]), so a scan that could not
+/// read the host, boot or PID namespace still names the instances it read
+/// under the keys their rows have (PX-019, PX-021).
+///
+/// The one place that says a thread row was superseded: the row retention
+/// never keeps a superseded instance, and a departure's evidence calls it
+/// replaced (Codex review of PR #107: a raw snapshot key, unanchored, missed
+/// the replacement).
+pub(crate) struct ReadThreads(HashSet<(ProcessKey, u32)>);
+
+impl ReadThreads {
+    /// The thread rows `confirmed`, this scan's projected rows, hold.
+    pub(crate) fn of(confirmed: &[Row]) -> Self {
+        Self(
+            confirmed
+                .iter()
+                .filter_map(|row| {
+                    let thread = row.key.thread.as_ref()?;
+                    Some((row.key.process_key(), thread.tid))
+                })
+                .collect(),
+        )
+    }
+
+    /// Whether `key`, a thread row this scan did not confirm, is an earlier
+    /// instance of a TID this scan read under the same process instance: a
+    /// newer thread replaced it.
+    pub(crate) fn supersedes(&self, key: &ProcessKey) -> bool {
+        key.thread
+            .as_ref()
+            .is_some_and(|thread| self.0.contains(&(key.process_key(), thread.tid)))
+    }
+}
+
 /// What one scan establishes about the instances that left the collection
 /// with it (PX-021).
 pub(crate) struct Evidence<'a> {
@@ -186,6 +222,8 @@ pub(crate) struct Evidence<'a> {
     pub(crate) thread_retention: &'a ThreadRetention,
     /// The process instances this scan confirmed.
     pub(crate) confirmed: &'a HashSet<ProcessKey>,
+    /// The thread instances this scan read, by their projected keys.
+    pub(crate) read_threads: &'a ReadThreads,
     /// The PIDs this scan listed, built once, and only if something left.
     listed: OnceCell<HashSet<u32>>,
 }
@@ -196,21 +234,23 @@ impl<'a> Evidence<'a> {
         retention: &'a Retention,
         thread_retention: &'a ThreadRetention,
         confirmed: &'a HashSet<ProcessKey>,
+        read_threads: &'a ReadThreads,
     ) -> Self {
         Self {
             snapshot,
             retention,
             thread_retention,
             confirmed,
+            read_threads,
             listed: OnceCell::new(),
         }
     }
 
     /// Why `key`, a row this scan neither confirmed nor kept, left.
     pub(crate) fn departure(&self, key: &ProcessKey) -> Departure {
-        let Some(thread) = &key.thread else {
+        if key.thread.is_none() {
             return self.process(key);
-        };
+        }
         let process = key.process_key();
         if !self.confirmed.contains(&process) {
             return match self.process(&process) {
@@ -224,16 +264,9 @@ impl<'a> Evidence<'a> {
         // A TID this scan read under the same process instance names a newer
         // thread: the earlier one is gone, whatever else of that process's
         // threads the scan could not read (merge with main: PX-019's
-        // superseded-TID rule, which never retains such a row).
-        let replaced = self.snapshot.threads.records().iter().any(|record| {
-            record.key.is_thread_of(&process)
-                && record
-                    .key
-                    .thread
-                    .as_ref()
-                    .is_some_and(|other| other.tid == thread.tid)
-        });
-        if replaced {
+        // superseded-TID rule, which never retains such a row), decided by
+        // the same anchored identities as that rule.
+        if self.read_threads.supersedes(key) {
             return Departure::Exited(Exit::Replaced);
         }
         if self.thread_retention.covers(&key.pid) {

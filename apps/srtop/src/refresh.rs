@@ -136,7 +136,7 @@ use crate::inspector::{
     DetailRead, DetailReads, DetailReadsIdle, DetailRequest, DetailSource, HeldSelection,
     Inspector, InspectorView,
 };
-use crate::lastseen::{Departure, Evidence, Exit, LastSeen, Tombstone, Unobserved};
+use crate::lastseen::{Departure, Evidence, Exit, LastSeen, ReadThreads, Tombstone, Unobserved};
 use crate::owner::{OwnerChoice, OwnerFilter, OwnerView};
 use crate::procfs::{MonotonicClock, SystemMonotonicClock};
 use crate::projection::{Row, SessionItemIds};
@@ -1203,18 +1203,8 @@ impl ProcessView {
         // under. A thread row this scan did not confirm under a TID it read
         // there is an earlier instance the new one replaced: it has ended,
         // whatever else the scan could not read (PX-019, Codex review).
-        let read_tids: HashSet<(crate::source::ProcessKey, u32)> = confirmed
-            .iter()
-            .filter_map(|row| {
-                let thread = row.key.thread.as_ref()?;
-                Some((row.key.process_key(), thread.tid))
-            })
-            .collect();
-        let superseded = |key: &crate::source::ProcessKey| {
-            key.thread
-                .as_ref()
-                .is_some_and(|thread| read_tids.contains(&(key.process_key(), thread.tid)))
-        };
+        let read_threads = ReadThreads::of(&confirmed);
+        let superseded = |key: &crate::source::ProcessKey| read_threads.supersedes(key);
         let mut unfiltered_target =
             retain_unconfirmed_by(&self.unfiltered_rows, confirmed, |row| {
                 !superseded(&row.key)
@@ -1395,7 +1385,13 @@ impl ProcessView {
         // entitled to account for its instance and no longer lists it: the
         // PX-013 review round's rule, under PX-021's identity rule.
         let recorded_tags = {
-            let evidence = Evidence::new(snapshot, &retention, &thread_retention, &live_processes);
+            let evidence = Evidence::new(
+                snapshot,
+                &retention,
+                &thread_retention,
+                &live_processes,
+                &read_threads,
+            );
             self.last_seen.establish_exits(|key| {
                 if retains(key) {
                     return None;

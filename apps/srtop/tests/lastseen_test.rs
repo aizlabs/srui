@@ -2073,3 +2073,59 @@ fn a_detail_read_completed_while_paused_establishes_nothing() {
     );
     assert_eq!(h.inspector(), before);
 }
+
+// ---- Codex review of PR #107 (`PRRT_kwDOUG_6uM63KTbK`) ----
+
+/// A scan that could not read the host identity is keyed with the session's
+/// anchored identity (PX-003), so the selected thread's process is confirmed
+/// and its TID 201 is read under a new start time while that process's other
+/// threads are partly unreadable. The row of the earlier instance goes as
+/// superseded, by the anchored keys; its record must use the same anchored
+/// identities and say it exited, replaced, never "whether it exited is
+/// unknown".
+#[test]
+fn a_replacement_thread_read_by_a_scan_without_host_identity_is_an_exit() {
+    let unknown = || Observed::Missing(MissingReason::Denied);
+    let base = || complete(vec![record(1, "init", "init"), server()]);
+    let mut server_unknown = record_on(200, "srv", "server", unknown());
+    server_unknown.kind = server().kind;
+    let thread_on = |tid: u32, token: &str, name: &str| {
+        let mut thread = thread_record(200, "srv", tid, token, name);
+        thread.key.host = unknown();
+        thread
+    };
+    let mut h = threads_shown(
+        vec![
+            (base(), threads_read(vec![t200(), t201()], &[])),
+            (base(), threads_read(vec![t200(), t201()], &[])),
+            (
+                complete(vec![
+                    record_on(1, "init", "init", unknown()),
+                    server_unknown,
+                ]),
+                threads_read(
+                    vec![
+                        thread_on(200, "t200", "server"),
+                        thread_on(201, "t201-new", "worker-1"),
+                    ],
+                    &[200],
+                ),
+            ),
+        ],
+        |view| view,
+    );
+    h.refresh();
+    assert_eq!(
+        thread_departure(&h),
+        Some(Departure::Exited(Exit::Replaced)),
+        "{}",
+        h.status()
+    );
+    assert!(
+        h.status().starts_with(
+            "Selected thread: TID 201 of PID 200 · worker-1 · exited: its TID now names a newer thread · last observed "
+        ),
+        "{}",
+        h.status()
+    );
+}

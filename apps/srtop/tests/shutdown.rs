@@ -64,13 +64,15 @@ fn absorb_first_launch_assessment() {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        // Bounded so a launch that never completes still fails rather than hangs the run.
+        // Bounded so a launch that never completes still fails rather than hangs the run, and
+        // killed then so it cannot outlive the test.
         let deadline = Instant::now() + LAUNCH_ASSESSMENT_BOUND;
         while probe.try_wait().unwrap().is_none() {
-            assert!(
-                Instant::now() < deadline,
-                "the first exec of srtop did not finish within {LAUNCH_ASSESSMENT_BOUND:?}"
-            );
+            if Instant::now() >= deadline {
+                let _ = probe.kill();
+                let _ = probe.wait();
+                panic!("the first exec of srtop did not finish within {LAUNCH_ASSESSMENT_BOUND:?}");
+            }
             thread::sleep(Duration::from_millis(50));
         }
     });

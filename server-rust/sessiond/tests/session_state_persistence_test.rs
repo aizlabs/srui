@@ -218,6 +218,51 @@ fn test_mint_session_id_produces_unique_tokens_in_process() {
     assert_eq!(ids.len(), ITERATIONS);
 }
 
+/// Runs `srui-sessiond` once, outside the readiness deadline of
+/// `test_sessiond_process_restart_mints_unique_session_ids`.
+///
+/// macOS assesses a newly linked executable on its first exec, before `main`; the first exec of a
+/// just-relinked binary took 12-19 s on a busy machine and the next 0.02 s. A relink of
+/// `srui-sessiond` followed at once by that test failed it 2 of 5 times on its 5 s socket
+/// deadline, with nothing wrong in the daemon. `--socket` with no path makes it refuse and exit
+/// before it binds anything, so this run does nothing else.
+fn absorb_first_launch_assessment() {
+    static ASSESSED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ASSESSED.get_or_init(|| {
+        let mut probe = std::process::Command::new(env!("CARGO_BIN_EXE_srui-sessiond"))
+            .arg("--socket")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the srui-sessiond warm-up");
+        // Bounded so a launch that never completes still fails rather than hangs the run, and
+        // killed then so it cannot outlive the test.
+        let deadline = std::time::Instant::now() + LAUNCH_ASSESSMENT_BOUND;
+        while probe.try_wait().expect("poll the srui-sessiond warm-up").is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = probe.kill();
+                let _ = probe.wait();
+                panic!("the first exec of srui-sessiond did not finish within {LAUNCH_ASSESSMENT_BOUND:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+}
+
+/// Far above the 12-19 s measured for a first exec on a busy machine.
+const LAUNCH_ASSESSMENT_BOUND: Duration = Duration::from_secs(120);
+
+/// Removes the restart test's runtime directory however the test ends, so a failed run leaves no
+/// `/tmp/srui-*` behind.
+struct RuntimeDirectory(std::path::PathBuf);
+
+impl Drop for RuntimeDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Spawns the real daemon, which refuses effective UID 0 (§27). Containerized runners commonly
 /// execute as root, where every child would exit before binding and this test would block waiting
 /// for a socket that never appears. Skip explicitly rather than hang.
@@ -241,6 +286,8 @@ async fn test_sessiond_process_restart_mints_unique_session_ids() {
     std::fs::create_dir(&runtime_dir).expect("create private test runtime directory");
     std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
         .expect("secure test runtime directory");
+    let _cleanup = RuntimeDirectory(runtime_dir.clone());
+    absorb_first_launch_assessment();
 
     for iteration in 0..ITERATIONS {
         let socket_path = runtime_dir.join(format!("{iteration}.sock"));
@@ -252,6 +299,9 @@ async fn test_sessiond_process_restart_mints_unique_session_ids() {
             .arg("counter")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::inherit())
+            // A failed assertion below must not orphan the daemon: it holds the test harness's
+            // stderr and its socket directory (a failed run left both behind).
+            .kill_on_drop(true)
             .spawn()
             .expect("spawn srui-sessiond");
 

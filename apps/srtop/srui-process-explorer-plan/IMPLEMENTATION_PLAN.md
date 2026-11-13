@@ -118,7 +118,7 @@ Before using an unqualified full-coverage claim, the release report must name th
 
 ### C. Prove the SRUI advantages
 
-**PX-022–PX-027 plus PX-026-G01 · 7 tickets · mainline.** Connection UX, continuity, latency demo, in-process automation.
+**PX-022–PX-027 plus PX-022-G01 and PX-026-G01 · 8 tickets · mainline.** Connection UX, continuity, latency demo, in-process automation.
 
 ### D. Add safe process controls
 
@@ -1036,10 +1036,34 @@ Apply the standing completion contract. Record evidence in `docs/process-explore
 
 ### Phase C — Prove the SRUI advantages
 
+#### PX-022-G01 — Client-owned session-window connection status
+
+**Phase:** C · **Scope size:** M · **Status:** planned · **Gate:** R1-prerequisite
+**Dependencies:** PX-021
+**Read:** D1 §§17–18.3, 22.3, 22.8; D2 T22–T24, T29, T38
+
+##### Build
+
+The generic macOS client shows the transport state of a session on every window of that session, as client-owned chrome that no server can set or clear. Today the only trusted indicator is the row status in the separate Connections window (`ConnectionStatus.displayText`, `client-macos/ConnectionManager/ConnectionManager.swift`); the session window's title is server-owned (`ControlFactory.apply(property:value:to:store:)` writes a Surface `label` to `NSWindow.title`, `client-macos/RendererAppKit/ControlFactory.swift:403`), and `ConnectionManager` reaches the session windows only through `context.renderer.showWindows()`. Add a public `AppKitRenderer` API that sets one client-owned status line on every Surface window of the session as `NSWindow.subtitle`, which AppKit draws under the title and which no Surface property writes, so the status and the server title never overwrite each other. The renderer keeps the status and applies it to every Surface window it creates, so it survives a structural remount (which closes and rebuilds the windows) and reaches windows created later. It also sets each window's accessibility help to the same text, so VoiceOver reaches it whether or not the macOS release folds the subtitle into the window's accessibility title (§22.8). `ConnectionManager` drives it on the session context's renderer from the same transitions that set `ConnectionStatus` (D2 T38): connecting and disconnected say the window shows stale data from the last applied revision (`connecting — showing data from revision N (stale)`, `disconnected — showing data from revision N (stale)`; §17 DETACHED), resynchronizing says `resynchronizing — showing data from revision N (stale)` until the catch-up that follows the continuity decision is ready (§18), a REPLACED decision says `session replaced — rebuilding` (§18), and ready clears it. Only the current resume generation changes it: an outcome from a superseded attempt is dropped by the token check that already guards `ConnectionStatus` (§18, generation-bound resume attempts). The status is cleared before `ConnectionManager` drops a session context (a failed first connection, a removed entry, a draft that never connected at shutdown). No application-specific client path.
+
+##### Out of scope
+
+No change to session continuity, resume, replay or retry (no new retry protocol), to the `ConnectionStatus` values or the Connections window, to the server-owned window title or any Surface property, or to T29 pending-text handling. No SDK attach/detach notice (not approved), no server, SDK, protocol, registry, proto or framing change, no srtop change (PX-022 consumes this API), no edit of the read-only design document, and no spoken announcement of status changes.
+
+##### Verification / acceptance criteria
+
+Each new test fails with the behaviour reverted. `RendererAppKitTests`: setting, changing and clearing the status updates every Surface window of a two-Surface store; the server title stays intact when the status is set, and the status stays when a commit changes the Surface `label`; a status set before the first mount reaches the first windows, and a window created by a later structural commit and every window a remount rebuilds carry it; each window's accessibility help carries the status and clearing removes it. `ConnectionManagerTests` with fake attempts: every `ConnectionStatus` transition maps to its chrome on the context's renderer (connecting and disconnected name the last applied revision as stale, resynchronizing, REPLACED, ready clears), including on a mounted real `NSWindow`; REPLACED followed by ready clears it; a late failure from a superseded attempt cannot overwrite the newer attempt's status; a failed first connection clears the status before its context is dropped. Native evidence: a real `NSWindow` in the AppKit test host shows the status as its subtitle beside the unchanged server title, recorded in the completion note. `bash scripts/run-swift-tests.sh` passes twice, with `scripts/check-test-process-stdio.sh`, `scripts/check-test-main-runloop-nesting.sh` and `scripts/parse-changed-swift.sh`.
+
+##### Handoff and completion
+
+Apply the standing completion contract. Record evidence in `docs/process-explorer/completions/PX-022-G01.md`, update the individual feature ledger, and commit only this bounded change after required checks pass. A gate remains open if a required behavior or native test is missing.
+
+---
+
 #### PX-022 — Expose disconnect, catch-up, and replacement correctly
 
 **Phase:** C · **Scope size:** M · **Status:** planned · **Gate:** none
-**Dependencies:** PX-021
+**Dependencies:** PX-021, PX-022-G01
 **Read:** D1 §§17–18.3; D2 T22–T24, T29
 
 ##### Build

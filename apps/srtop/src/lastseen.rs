@@ -464,8 +464,9 @@ impl LastSeen {
     /// Keeps `tombstone`, the newest, replacing any earlier record of the
     /// same instance: a second departure means the collection held it again
     /// in between, so only the latest departure's sample, time and verdict
-    /// are true. Then drops the oldest beyond the count and byte bounds.
-    pub(crate) fn record(&mut self, tombstone: Tombstone) {
+    /// are true. An earlier record's historical tag is kept. Then drops the
+    /// oldest beyond the count and byte bounds.
+    pub(crate) fn record(&mut self, mut tombstone: Tombstone) {
         if let Some(at) = self
             .entries
             .iter()
@@ -473,6 +474,11 @@ impl LastSeen {
         {
             if let Some(earlier) = self.entries.remove(at) {
                 self.bytes -= earlier.bytes;
+                // A historical tag stays one: a later departure of the same
+                // instance renews what was last observed of it, never its tag
+                // (codex5 verification: a failed retag leaves the instance in
+                // the collection while its record is a historical tag).
+                tombstone.tagged |= earlier.tagged;
             }
         }
         self.bytes += tombstone.bytes;
@@ -973,7 +979,7 @@ mod tests {
     }
 
     #[test]
-    fn a_second_departure_of_the_same_instance_replaces_the_first_record() {
+    fn a_second_departure_of_the_same_instance_replaces_the_first_record_and_keeps_its_tag() {
         let all = rows(vec![record(1, "a"), record(2, "b")]);
         let mut seen = LastSeen::default();
         let mut first = tombstone(all[0].clone(), Duration::ZERO);
@@ -996,7 +1002,9 @@ mod tests {
             kept.last_observed(),
             Some(SystemTime::UNIX_EPOCH + Duration::from_secs(9))
         );
-        assert!(!kept.is_tagged(), "the latest departure's own watch");
+        // The earlier record's historical tag is kept: a later departure
+        // renews what was last observed, never the tag (codex5 verification).
+        assert!(kept.is_tagged(), "the historical tag stays one");
         assert_eq!(
             seen.iter().last().map(|t| t.key().clone()),
             Some(all[0].key.clone()),

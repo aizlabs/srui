@@ -69,6 +69,8 @@ struct SSHTransportPersistenceIntegrationTests {
         try sshdConfigContent.write(to: URL(fileURLWithPath: sshdConfigPath), atomically: true, encoding: .utf8)
 
         // 1. Launch persistent srui-sessiond daemon hosting the counter application (§20.2)
+        try await FixtureBinaries.absorbFirstLaunchAssessment(sessiondBinary.path, arguments: FixtureBinaries.sessiondRefusal)
+        try await FixtureBinaries.absorbFirstLaunchAssessment(bridgeBinary.path, arguments: FixtureBinaries.bridgeRefusal)
         let sessiond = Process()
         sessiond.executableURL = sessiondBinary
         sessiond.arguments = ["--socket", socketPath, "--app", "counter"]
@@ -227,6 +229,7 @@ struct SSHTransportPersistenceIntegrationTests {
         let tempDir = try TestFixtureDirectory.make(prefix: "srui-restarts")
         defer { TestFixtureDirectory.release(tempDir) }
 
+        try await FixtureBinaries.absorbFirstLaunchAssessment(sessiondBinary.path, arguments: FixtureBinaries.sessiondRefusal)
         var seenSessionIds = Set<String>()
         constRestartLoop: for iteration in 1...5 {
             let socketPath = tempDir.appendingPathComponent("sessiond-\(iteration).sock").path
@@ -237,6 +240,14 @@ struct SSHTransportPersistenceIntegrationTests {
             sessiond.standardOutput = FileHandle.nullDevice
             sessiond.standardError = FileHandle.nullDevice
             try sessiond.run()
+            // A failed wait below must not leave this iteration's daemon running and holding its
+            // socket directory (it did: an orphaned sessiond plus a leftover /tmp/srui-restarts-*).
+            defer {
+                if sessiond.isRunning {
+                    sessiond.terminate()
+                }
+                sessiond.waitUntilExit()
+            }
 
             try await Self.waitForSocket(at: socketPath, timeoutSeconds: 5)
 
@@ -265,8 +276,6 @@ struct SSHTransportPersistenceIntegrationTests {
             seenSessionIds.insert(sid)
 
             await controller.stop()
-            sessiond.terminate()
-            sessiond.waitUntilExit()
         }
 
         #expect(seenSessionIds.count == 5)

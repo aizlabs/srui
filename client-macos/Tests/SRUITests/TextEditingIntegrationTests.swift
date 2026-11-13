@@ -724,7 +724,10 @@ struct TextEditingIntegrationTests {
         await serverTransport.close()
     }
 
-    @Test("Stopping cancels a blocked writer and retains the newer buffered text callback")
+    @Test(
+        "Stopping cancels a blocked writer and retains the newer buffered text callback",
+        .timeLimit(.minutes(1))
+    )
     @MainActor
     func stopCancelsBlockedWriterAndRetainsBufferedText() async throws {
         let (clientPipe, serverTransport) = await PipeTransport.createPair()
@@ -766,10 +769,16 @@ struct TextEditingIntegrationTests {
             flushImmediately: true
         )
 
+        // The parked send is released only by the transport's close() or by cancelling the
+        // send's task, so stop() returning at all proves it did one of them rather than wait for
+        // the writer; a stop that waits hangs into the time limit. The bound catches a stop that
+        // releases the writer only after a delay: it was 2 s, which failed under load at 2.15 s
+        // with nothing wrong, so it is 4 s, still under a 5 s stall before close().
         let clock = ContinuousClock()
         let started = clock.now
         await controller.stop()
-        #expect(started.duration(to: clock.now) < .seconds(2))
+        #expect(started.duration(to: clock.now) < .seconds(4))
+        #expect(await delayed.isClosed, "stop() closed the transport")
         #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID))
         #expect(renderer.textEditingSession.localValue(for: editorID) == "second")
         #expect(renderer.textEditingSession.nextEditSeqValue(for: editorID) == 3)
@@ -2413,7 +2422,7 @@ struct TextEditingIntegrationTests {
 
     @MainActor
     private func waitUntil(
-        timeout: Double = 2.0,
+        timeout: Double = AsyncTestSupport.roundTripSeconds,
         description: String,
         condition: @MainActor () async -> Bool
     ) async throws {
@@ -2426,7 +2435,7 @@ struct TextEditingIntegrationTests {
 
     private func waitForTextEvent(
         _ collector: EventCollector,
-        timeout: Double = 2.0,
+        timeout: Double = AsyncTestSupport.roundTripSeconds,
         matching predicate: @Sendable (Event) -> Bool = { $0.eventType == .EVENT_TEXT_EDIT }
     ) async throws -> Event {
         try await AsyncTestSupport.eventuallyAsync(
@@ -2501,7 +2510,10 @@ private actor DelayedInputTransport: Transport {
         stream
     }
 
+    private(set) var isClosed = false
+
     func close() async {
+        isClosed = true
         inputSuspensionContinuation?.finish()
         await inner.close()
     }

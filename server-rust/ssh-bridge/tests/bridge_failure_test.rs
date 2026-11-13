@@ -264,6 +264,40 @@ async fn backpressure_preserves_message_order() {
     assert!(bridge_task.await.expect("bridge join").is_ok());
 }
 
+/// Runs `srui-ssh-bridge` once, outside the readiness deadline of `binary_stderr_contains_no_protocol_bytes`.
+///
+/// macOS assesses a newly linked executable on its first exec, before `main`; the first exec of a
+/// just-relinked binary took 12-19 s on a busy machine and the next 0.02 s. A relink of `srui-ssh-bridge`
+/// followed at once by this test failed it 2 of 5 times on its 5 s deadline, with nothing wrong
+/// in the binary. `--socket` with no path makes it refuse and exit before it connects or binds
+/// anything, so this run does nothing else.
+fn absorb_first_launch_assessment() {
+    static ASSESSED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ASSESSED.get_or_init(|| {
+        let mut probe = std::process::Command::new(env!("CARGO_BIN_EXE_srui-ssh-bridge"))
+            .arg("--socket")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the srui-ssh-bridge warm-up");
+        // Bounded so a launch that never completes still fails rather than hangs the run, and
+        // killed then so it cannot outlive the test.
+        let deadline = std::time::Instant::now() + LAUNCH_ASSESSMENT_BOUND;
+        while probe.try_wait().expect("poll the srui-ssh-bridge warm-up").is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = probe.kill();
+                let _ = probe.wait();
+                panic!("the first exec of srui-ssh-bridge did not finish within {LAUNCH_ASSESSMENT_BOUND:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+}
+
+/// Far above the 12-19 s measured for a first exec on a busy machine.
+const LAUNCH_ASSESSMENT_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// The binary routes tracing to stderr so stdout stays a pure protocol stream (§19.1, §20.1).
 ///
 /// Spawns the real binary, which refuses effective UID 0 (§27). Containerized runners commonly
@@ -302,6 +336,7 @@ fn binary_stderr_contains_no_protocol_bytes() {
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
         .expect("secure bridge test socket");
     let (accept_tx, accept_rx) = mpsc::channel();
+    absorb_first_launch_assessment();
 
     let accept_handle = thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept bridge connection");
@@ -316,9 +351,17 @@ fn binary_stderr_contains_no_protocol_bytes() {
         .spawn()
         .expect("spawn srui-ssh-bridge");
 
-    let mut session_stream = accept_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("bridge should connect to session socket");
+    let mut session_stream = match accept_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(stream) => stream,
+        Err(error) => {
+            // Leave nothing behind: a failed run used to orphan the bridge and its socket
+            // directory.
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&runtime_dir);
+            panic!("bridge should connect to session socket: {error:?}");
+        }
+    };
     accept_handle.join().expect("accept thread join");
 
     let frame = encode_framed(&sample_hello()).expect("encode hello");

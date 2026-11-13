@@ -65,16 +65,22 @@ struct SessionRobustnessTests {
     /// several of these conditions are satisfied by a *different task* making progress, and a
     /// deadline is only an upper bound, so raising it weakens no assertion and costs no wall time
     /// on a healthy run. See the constant for the failure that justified it.
+    ///
+    /// Delegates to `AsyncTestSupport.eventuallyAsync`, so the budget is charged in the poller's
+    /// own turns rather than wall-clock time (see `AsyncTestSupport.maxChargePerPoll`).
     private static func waitUntil(
+        isolation: isolated (any Actor)? = #isolation,
         timeout: TimeInterval = AsyncTestSupport.roundTripSeconds,
         _ condition: @Sendable () async -> Bool
     ) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if await condition() { return true }
-            try? await Task.sleep(nanoseconds: 10_000_000)
+        do {
+            try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(timeout), description: "condition") {
+                await condition()
+            }
+            return true
+        } catch {
+            return await condition()
         }
-        return await condition()
     }
 
     /// Raised instead of waiting forever when an expected outbound event never arrives.
@@ -95,7 +101,7 @@ struct SessionRobustnessTests {
     /// fail loudly instead.
     private static func firstEventObservedRevision(
         in stream: AsyncThrowingStream<Data, Error>,
-        timeout: Double = 5.0
+        timeout: Double = AsyncTestSupport.roundTripSeconds
     ) async throws -> Revision {
         try await withThrowingTaskGroup(of: Revision?.self) { group in
             group.addTask {
@@ -691,13 +697,23 @@ struct SessionRobustnessTests {
         let controller = SessionController(transport: transport)
 
         let startTask = Task {
-            try await controller.start()
+            _ = try? await controller.start()
+            await transport.noteStartReturned()
         }
 
-        #expect(await Self.waitUntil { await transport.isSendBlocked })
+        // Awaited, not polled against a deadline. `start()` reaches `send` only after several
+        // main-actor hops, and in a full parallel run synchronous AppKit suites keep the main
+        // actor busy for seconds at a time (sampled locally: ~93% busy over the first 8 s; longer
+        // on the 3-core CI runner), so the 10 s poll expired with `start()` still queued behind
+        // them. The suite's `.timeLimit` bounds a genuine hang, and a `start()` that returns
+        // without ever sending resolves the wait as `false` instead of parking the test.
+        #expect(
+            await transport.waitForBlockedSendOrStartReturn(),
+            "start() must park in the handshake send"
+        )
 
         await controller.stop()
-        _ = try? await startTask.value
+        await startTask.value
 
         #expect(await transport.isClosed)
 
@@ -895,6 +911,13 @@ struct SessionRobustnessTests {
         #expect(weakServer != nil)
         pair = nil
 
+        // Released, not necessarily released yet: the thread that ran `createPair`'s last actor
+        // hop can still hold its transient reference to that actor when `createPair` returns, and
+        // under load it did (`weakServer` non-nil right after `pair = nil`). A peer cycle never
+        // clears, so waiting for the release still fails on the leak this test is for.
+        try? await AsyncTestSupport.eventuallyAsync(description: "the released pair deallocated") {
+            weakClient == nil && weakServer == nil
+        }
         #expect(weakClient == nil, "PipeTransport pair retains itself through a peer cycle")
         #expect(weakServer == nil, "PipeTransport pair retains itself through a peer cycle")
     }
@@ -912,6 +935,10 @@ private actor BlockingTransport: Transport {
     private var sendBlocked = false
     private var closed = false
     private var sendWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Parked in `waitForBlockedSendOrStartReturn()`: resumed with `true` when a `send` parks
+    /// here, or with `false` when the test reports that `start()` returned first.
+    private var blockedSendWaiters: [CheckedContinuation<Bool, Never>] = []
+    private var startReturned = false
     private let stream: AsyncThrowingStream<Data, Error>
     private let continuation: AsyncThrowingStream<Data, Error>.Continuation
 
@@ -924,9 +951,36 @@ private actor BlockingTransport: Transport {
     var isSendBlocked: Bool { sendBlocked }
     var isClosed: Bool { closed }
 
+    /// Suspends until a `send` is parked here (`true`) or `noteStartReturned()` comes first
+    /// (`false`). Event-driven, with no deadline for a saturated main actor to overrun; the
+    /// suite's `.timeLimit` cancels it (`false`) if neither ever happens.
+    func waitForBlockedSendOrStartReturn() async -> Bool {
+        if sendBlocked { return true }
+        if startReturned || Task.isCancelled { return false }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { blockedSendWaiters.append($0) }
+        } onCancel: {
+            Task { await self.resumeBlockedSendWaiters(false) }
+        }
+    }
+
+    func noteStartReturned() {
+        startReturned = true
+        resumeBlockedSendWaiters(false)
+    }
+
+    private func resumeBlockedSendWaiters(_ outcome: Bool) {
+        let waiters = blockedSendWaiters
+        blockedSendWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume(returning: outcome)
+        }
+    }
+
     func send(data: Data, logicalClass _: LogicalChannelClass) async throws {
         guard !closed else { throw TransportError.closed }
         sendBlocked = true
+        resumeBlockedSendWaiters(true)
         await withCheckedContinuation { sendWaiters.append($0) }
         sendBlocked = false
         guard !closed else { throw TransportError.closed }

@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 import Protocol
 import Session
 
@@ -12,10 +13,13 @@ extension Duration {
     /// session's reader task, negotiated, applied on the `TransactionApplier`, and rendered on the
     /// main actor.
     ///
-    /// The helper's 2-second default stays as it is on purpose — a short default is what keeps a
-    /// genuinely hung condition from spending the whole suite's time budget — but it is not enough
-    /// for a multi-step round trip on a loaded 3-core CI runner. Observed on GitHub's hosted
-    /// runner: `SessionControllerTerminalTests` "A recreated process cold-resumes Terminal after
+    /// It is also the helpers' default. The default used to be 2 seconds, so that a genuinely hung
+    /// condition would not spend the suite's time budget, but 65 call sites relied on it for
+    /// cross-task progress, and five `TextEditingIntegrationTests` waits for a TEXT_EDIT timed out
+    /// together under full-suite load. The longer default costs time only in a test that is
+    /// already failing. Two seconds is not enough for a multi-step round trip on a loaded 3-core
+    /// CI runner. Observed on GitHub's hosted runner: `SessionControllerTerminalTests` "A
+    /// recreated process cold-resumes Terminal after
     /// authoritative negotiation" failed with `Timed out waiting for cold Terminal replay mounted`
     /// while passing locally and on a rerun of the identical tree, i.e. the deadline expired, not
     /// the product.
@@ -52,7 +56,7 @@ enum AsyncTestSupport {
 
     @MainActor
     static func eventually(
-        timeout: Duration = .seconds(2),
+        timeout: Duration = .roundTrip,
         description: String,
         condition: @MainActor () -> Bool
     ) async throws {
@@ -71,20 +75,82 @@ enum AsyncTestSupport {
     /// thread idle in `CFRunLoopRun`/`mach_msg`, so that hang is a lost wakeup, not contention.
     static let pollInterval = Duration.milliseconds(10)
 
+    /// The most one poll may charge against `timeout`, however long it actually took.
+    ///
+    /// The budget is spent in the poller's own turns, not in wall-clock time. A poll that took
+    /// seconds did so because its executor was not free: in a full parallel run synchronous AppKit
+    /// suites hold the main actor for seconds at a time (sampled at ~93% busy over the first 8 s
+    /// locally; on the 3-core CI runner 400+ unrelated tests all finish together at 12–20 s). The
+    /// work being awaited queues behind the same executor, so charging that stall to it made a
+    /// fixed deadline a coin toss whatever its length — `ConnectionManagerTests` timed out at 10 s
+    /// waiting for an in-memory harness. On an idle machine each poll costs ~`pollInterval`, so
+    /// a genuine hang is still reported after about `timeout`.
+    static let maxChargePerPoll = Duration.milliseconds(50)
+
+    /// Wall-clock ceiling, as a multiple of `timeout`, so a machine that stays saturated still
+    /// ends the wait; a suite's `.timeLimit` usually ends it sooner.
+    static let starvationAllowance = 6
+
     static func eventuallyAsync(
         isolation: isolated (any Actor)? = #isolation,
-        timeout: Duration = .seconds(2),
+        timeout: Duration = .roundTrip,
         description: String,
         condition: () async -> Bool
     ) async throws {
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
+        let wallDeadline = clock.now.advanced(by: timeout * starvationAllowance)
+        var charged = Duration.zero
+        var lastTurn = clock.now
 
         while await condition() == false {
-            guard clock.now < deadline else {
+            let now = clock.now
+            charged += min(now - lastTurn, maxChargePerPoll)
+            lastTurn = now
+            guard charged < timeout, now < wallDeadline else {
                 throw AsyncTestTimeout(description: "Timed out waiting for \(description)")
             }
             try await Task.sleep(for: pollInterval)
+        }
+    }
+}
+
+extension AsyncTestSupport {
+    /// Suspends until `condition` holds, re-evaluating it only when an `@Observable` property it
+    /// read changes: no poll and no wall-clock deadline.
+    ///
+    /// Why not `eventually(timeout: .roundTrip)`: the state these conditions wait for is written
+    /// by a main-actor task, and in a full parallel run the main actor is not ours to schedule.
+    /// Synchronous AppKit suites (`KeepVisibleRenderingTests`, `CollectionSelectionPromotionTests`
+    /// and friends) hold it for seconds at a time — sampled locally at ~93% busy over the first
+    /// 8 s of the run, and the 3-core CI runner finishes 400+ unrelated in-memory tests together
+    /// at 12–20 s. A 10-second deadline that starts counting while the writer is still queued
+    /// behind them is a coin toss, whatever its length: `ConnectionManagerTests` "a failed first
+    /// connection discards its session context" and "first ready event saves the entry and
+    /// authoritative revision" both timed out on CI that way. A hang is still bounded, by the
+    /// suite's `.timeLimit`, whose cancellation ends this wait with an error naming it.
+    ///
+    /// Only for conditions that read nothing but observation-tracked state: a change to anything
+    /// else wakes nothing here.
+    @MainActor
+    static func observed(
+        _ description: String,
+        condition: @MainActor () -> Bool
+    ) async throws {
+        while !condition() {
+            let changed = AsyncTestSignal()
+            _ = withObservationTracking {
+                condition()
+            } onChange: {
+                changed.signal()
+            }
+            await withTaskCancellationHandler {
+                await changed.wait()
+            } onCancel: {
+                changed.signal()
+            }
+            if Task.isCancelled {
+                throw AsyncTestTimeout(description: "Cancelled while waiting for \(description)")
+            }
         }
     }
 }
@@ -133,7 +199,7 @@ final class AsyncTestSignal: @unchecked Sendable {
 
     /// Bounded form: suspends until the threshold is reached, and reports whether it was, so a
     /// caller can keep asserting on the outcome the way a `DispatchSemaphore` timeout let it.
-    func waitOrTimeout(until threshold: Int = 1, timeout: Duration = .seconds(5)) async -> Bool {
+    func waitOrTimeout(until threshold: Int = 1, timeout: Duration = .roundTrip) async -> Bool {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
         while signalCount < threshold {

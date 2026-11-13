@@ -1038,10 +1038,11 @@ private actor GatedSendTransport: Transport {
         self.releaseContinuation = releaseContinuation
     }
 
-    func waitForSendCount(_ count: Int, timeout: Double = 2.0) async {
-        let deadline = Date().addingTimeInterval(timeout)
-        while sentFrameCount < count && Date() < deadline {
-            await Task.yield()
+    /// Through the shared poller (`AsyncTestSupport`), not a 2 s busy-yield loop that spun on
+    /// the cooperative pool the awaited sends need. Callers assert the count afterwards.
+    func waitForSendCount(_ count: Int, timeout: Double = AsyncTestSupport.roundTripSeconds) async {
+        try? await AsyncTestSupport.eventuallyAsync(timeout: .seconds(timeout), description: "\(count) sends") {
+            self.sentFrameCount >= count
         }
     }
 

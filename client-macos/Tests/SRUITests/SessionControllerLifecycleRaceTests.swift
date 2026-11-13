@@ -458,7 +458,7 @@ struct SessionControllerLifecycleRaceTests {
         try await controller.start()
         try transport.deliver(Self.welcome(sessionID: "mount-session"))
         try transport.deliver(Self.mountTransaction(text: "before stop"))
-        try await AsyncTestSupport.eventually(description: "initial tree mounted") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "initial tree mounted") {
             applier.lastAppliedRevision == Revision(1)
                 && renderer.registry.handle(for: textID) != nil
         }
@@ -576,9 +576,13 @@ struct SessionControllerLifecycleRaceTests {
         return message
     }
 
+    /// The shared cross-task budget (`Duration.roundTrip`), not a suite-local 2 s: each condition
+    /// here is met by another task that needs main-actor turns, and a full parallel run keeps the
+    /// main actor busy for seconds (`stop quiesces an in-flight handshake send before restart`
+    /// timed out on "replacement handshake remained active" that way under load).
     private static func waitUntil(
         _ description: String,
-        timeout: Duration = .seconds(2),
+        timeout: Duration = .roundTrip,
         condition: @escaping @Sendable () async -> Bool
     ) async throws {
         try await AsyncTestSupport.eventuallyAsync(

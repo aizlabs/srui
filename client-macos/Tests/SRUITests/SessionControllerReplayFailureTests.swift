@@ -67,18 +67,14 @@ private final class ReplayFailureRecorder: @unchecked Sendable {
         failures.append(failure)
     }
 
-    func waitForFirstFailure(timeout: Duration = .seconds(2)) async throws -> SessionFailure {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while true {
-            if let failure = first {
-                return failure
-            }
-            guard clock.now < deadline else {
-                throw AsyncTestTimeout(description: "terminal session failure callback")
-            }
-            await Task.yield()
+    /// Through the shared poller and its cross-task budget: the failure is reported only after
+    /// main-actor work that a full parallel run delays for seconds (a 2 s busy-yield loop timed
+    /// out under load, and its spinning took CPU from the work it waited for).
+    func waitForFirstFailure(timeout: Duration = .roundTrip) async throws -> SessionFailure {
+        try await AsyncTestSupport.eventuallyAsync(timeout: timeout, description: "terminal session failure callback") {
+            self.first != nil
         }
+        return try #require(first)
     }
 }
 
@@ -120,14 +116,10 @@ private actor ScriptedReplayTransport: Transport {
 
     /// Resumes once the transport has been closed, failing the test instead of hanging if the
     /// controller never takes ownership of the teardown.
-    nonisolated func waitForFirstClose(timeout: Duration = .seconds(2)) async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while closeCalls.value == 0 {
-            guard clock.now < deadline else {
-                throw AsyncTestTimeout(description: "transport close after a terminal failure")
-            }
-            await Task.yield()
+    nonisolated func waitForFirstClose(timeout: Duration = .roundTrip) async throws {
+        let closeCalls = closeCalls
+        try await AsyncTestSupport.eventuallyAsync(timeout: timeout, description: "transport close after a terminal failure") {
+            closeCalls.value > 0
         }
     }
 

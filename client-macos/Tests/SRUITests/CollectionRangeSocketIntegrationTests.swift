@@ -37,6 +37,7 @@ struct CollectionRangeSocketIntegrationTests {
             "counter binary lacks --large-collection-fixture; rebuild examples/counter"
         )
 
+        try await FixtureBinaries.absorbFirstLaunchAssessment(counterBinary.path, arguments: FixtureBinaries.counterRefusal)
         let server = Process()
         server.executableURL = counterBinary
         server.arguments = ["--socket", socketPath, "--large-collection-fixture"]

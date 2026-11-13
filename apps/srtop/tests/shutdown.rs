@@ -11,7 +11,10 @@ use std::{
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -44,6 +47,40 @@ impl Drop for SocketDirectory {
     }
 }
 
+/// Runs the binary once, outside the readiness deadline below.
+///
+/// macOS assesses a newly linked executable on its first exec, before `main`, and `cargo test`
+/// and `cargo build` alternately replace `target/debug/srtop` (observed by its mtime). On a
+/// busy machine that first exec took 12-19 s and the next 0.02 s, so the 10 s readiness deadline
+/// was spent on the platform's assessment, not on srtop: this suite failed 4 of 6 tests right
+/// after `apps/srtop/test.sh`'s Swift run, and passed alone. With no arguments srtop only prints
+/// its usage, so this run does nothing else.
+fn absorb_first_launch_assessment() {
+    static ASSESSED: OnceLock<()> = OnceLock::new();
+    ASSESSED.get_or_init(|| {
+        let mut probe = Command::new(env!("CARGO_BIN_EXE_srtop"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // Bounded so a launch that never completes still fails rather than hangs the run, and
+        // killed then so it cannot outlive the test.
+        let deadline = Instant::now() + LAUNCH_ASSESSMENT_BOUND;
+        while probe.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = probe.kill();
+                let _ = probe.wait();
+                panic!("the first exec of srtop did not finish within {LAUNCH_ASSESSMENT_BOUND:?}");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+}
+
+/// Far above the 12-19 s measured for a first exec on a busy machine.
+const LAUNCH_ASSESSMENT_BOUND: Duration = Duration::from_secs(120);
+
 struct Server(Child);
 
 impl Server {
@@ -52,6 +89,7 @@ impl Server {
     }
 
     fn start_with(socket: &Path, options: &[&str]) -> Self {
+        absorb_first_launch_assessment();
         let mut server = Self(
             Command::new(env!("CARGO_BIN_EXE_srtop"))
                 .arg("--socket")

@@ -3232,6 +3232,109 @@ fn the_command_line_is_read_byte_exact_for_the_keys_instance_and_every_empty_sta
     assert_eq!(details.read_details(&key_of(42)), DetailRead::Ended);
 }
 
+/// The item of the shown row whose PID cell is `pid` (PX-021).
+fn shown_item(session: &srui_sessiond::Session, pid: u32) -> Option<srui_sdk::ItemId> {
+    session.with_store(|store| {
+        store
+            .get_model(srui_process_explorer::MODEL)
+            .unwrap()
+            .items
+            .values()
+            .find(|item| {
+                matches!(&item.value, srui_sdk::Value::List(cells)
+                    if cells[0] == srui_sdk::Value::UnsignedInt(u64::from(pid)))
+            })
+            .map(|item| item.item_id)
+    })
+}
+
+/// PX-021, through a procfs tree: a record that is no longer listed, one
+/// whose PID names another start time, and one that vanished between its
+/// listing and its read are exits; a record whose `stat` is denied, and a
+/// root that can no longer be listed, are not, and no tombstone is recorded
+/// for them.
+#[test]
+fn procfs_absences_establish_exits_and_inaccessible_records_never_do() {
+    use srui_process_explorer::lastseen::{Departure, Exit};
+    use srui_process_explorer::refresh::{ProcessView, TagRequest};
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .process(1, b"init", 1)
+        .process(300, b"worker", 300)
+        .process(301, b"other", 301)
+        .process(302, b"locked", 302)
+        .process(303, b"brief", 303);
+    let session = srui_sessiond::Session::mint();
+    let mut source = fixture.source();
+    let (mut view, _) = ProcessView::start(&session, &mut source).unwrap();
+    let base = fixture.source().snapshot().records[0].key.clone();
+    let key_of = |pid: u32, ticks: u64| ProcessKey {
+        creation: CreationToken::LinuxBootTicks(ticks),
+        pid: Observed::Known(pid),
+        ..base.clone()
+    };
+    for pid in [301, 302, 303] {
+        view.select_item(
+            &session,
+            b"lastseen-fixture-client",
+            shown_item(&session, pid),
+        )
+        .unwrap();
+        view.request_tags(&session, TagRequest::Toggle).unwrap();
+    }
+    view.select_item(
+        &session,
+        b"lastseen-fixture-client",
+        shown_item(&session, 300),
+    )
+    .unwrap();
+    assert_eq!(view.tags().tagged(), 3);
+
+    // 302's record is denied: kept, and nothing is recorded.
+    let stat = fixture.0.join("302/stat");
+    fs::set_permissions(&stat, fs::Permissions::from_mode(0o000)).unwrap();
+    view.refresh(&session, &mut source).unwrap();
+    assert!(view.last_seen().is_empty());
+    assert!(shown_item(&session, 302).is_some());
+
+    // The root can no longer be listed: every row is kept, nothing recorded.
+    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o000)).unwrap();
+    view.refresh(&session, &mut source).unwrap();
+    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        view.last_seen().is_empty(),
+        "an unreadable root ends nothing"
+    );
+    assert_eq!(view.tags().tagged(), 3);
+
+    // 300 is reaped, 301's PID now names a newer instance, and 303 vanishes
+    // between the listing and the read.
+    fs::remove_dir_all(fixture.0.join("300")).unwrap();
+    fixture.process(301, b"newer", 9_301);
+    fs::remove_dir_all(fixture.0.join("303")).unwrap();
+    fixture.vanished(303);
+    let other = shown_item(&session, 301);
+    view.refresh(&session, &mut source).unwrap();
+    let seen = view.last_seen();
+    let departure = |pid: u32, ticks: u64| seen.get(&key_of(pid, ticks)).map(|t| t.departure());
+    assert_eq!(departure(300, 300), Some(Departure::Exited(Exit::Unlisted)));
+    assert_eq!(departure(301, 301), Some(Departure::Exited(Exit::Replaced)));
+    assert_eq!(departure(303, 303), Some(Departure::Exited(Exit::Unlisted)));
+    assert_eq!(departure(302, 302), None, "the denied record is still kept");
+    assert_eq!(seen.len(), 3);
+    let newer = shown_item(&session, 301).expect("the newer instance is listed");
+    assert_ne!(Some(newer), other, "a replacement is a distinct live item");
+    assert!(
+        view.inspector_view()
+            .status
+            .starts_with("Selected process: PID 300 · worker · exited: a scan that accounts for its PID no longer lists it · last observed "),
+        "{}",
+        view.inspector_view().status
+    );
+    assert_eq!(view.tags().tagged(), 1, "302 is still tagged");
+}
+
 #[cfg(target_os = "linux")]
 mod live {
     use super::*;
@@ -5093,7 +5196,7 @@ mod live {
             "the reparented child keeps its tag"
         );
         assert!(!tagged.contains(&late.pid()));
-        let history: Vec<String> = view.tags().history().map(str::to_string).collect();
+        let history: Vec<String> = view.historical_tags();
         assert!(
             history.contains(&format!("PID {parent_pid} · srtop-worker")),
             "{history:?}"
@@ -5115,6 +5218,126 @@ mod live {
              late={} tagged={} historical={history:?} status={status:?}",
             late.pid(),
             tagged.len()
+        );
+    }
+
+    /// PX-021, on the real `/proc`: a test-owned worker that exits, and is
+    /// reaped, leaves a tombstone that says it exited, with its last sample.
+    /// A scan that could not list the process filesystem records nothing, and
+    /// a degraded scan — a real sample whose host identity was not read and
+    /// that does not list a second worker — says "no longer observed" of it,
+    /// never "exited". The second worker, listed again by the next real
+    /// scan, is a distinct live item.
+    #[test]
+    fn a_live_worker_that_exits_leaves_a_tombstone_and_a_degraded_scan_claims_no_exit() {
+        use srui_process_explorer::lastseen::{Departure, Exit, Unobserved};
+        use srui_process_explorer::source::SkippedRecords;
+        let worker = Worker::start();
+        let other = Worker::start();
+        let (pid, other_pid) = (worker.pid(), other.pid());
+        let session = Session::mint();
+        let mut source = ProcFsSource::live();
+        let (mut view, _) = start_from_source(&session, &mut source).unwrap();
+        let (item, _) = row_for(&session, pid).expect("the worker is shown");
+        view.select_item(&session, b"live-lastseen-client", Some(item))
+            .unwrap();
+        let live = view.inspector_view().clone();
+        assert!(
+            live.status
+                .starts_with(&format!("Selected process: PID {pid} · srtop-worker")),
+            "{}",
+            live.status
+        );
+        let key = source
+            .snapshot()
+            .records
+            .iter()
+            .find(|record| record.key.pid == Observed::Known(pid))
+            .map(|record| record.key.clone())
+            .expect("the worker's record");
+
+        // A scan that could not list `/proc` keeps every row: nothing is
+        // recorded.
+        let mut unreadable = source.snapshot();
+        unreadable.records.clear();
+        unreadable.completeness = Completeness::from_scan(
+            SkippedRecords::unenumerable(),
+            vec![srui_process_explorer::source::EnumerationIssue {
+                scope: IssueScope::Root,
+                reason: MissingReason::Denied,
+                detail: "simulated: the process list could not be read".into(),
+            }],
+        );
+        view.apply(&session, LIVE_STATUS_TEXT, &unreadable).unwrap();
+        assert!(view.last_seen().is_empty());
+
+        // The worker exits and is reaped.
+        drop(worker);
+        let snapshot = source.snapshot();
+        assert!(snapshot
+            .records
+            .iter()
+            .all(|record| record.key.pid != Observed::Known(pid)));
+        view.apply(&session, LIVE_STATUS_TEXT, &snapshot).unwrap();
+        let tombstone = view.last_seen().get(&key).expect("the worker's tombstone");
+        assert_eq!(tombstone.departure(), Departure::Exited(Exit::Unlisted));
+        let ended = view.inspector_view().clone();
+        assert!(
+            ended.status.starts_with(&format!(
+                "Selected process: PID {pid} · srtop-worker · exited: a scan that accounts for its PID no longer lists it · last observed "
+            )),
+            "{}",
+            ended.status
+        );
+        assert!(
+            ended.metrics.starts_with("Last sampled · CPU: "),
+            "{}",
+            ended.metrics
+        );
+
+        // A degraded real sample: the host identity unread, and the second
+        // worker not listed. Nothing establishes that it exited.
+        let (item, _) = row_for(&session, other_pid).expect("the second worker is shown");
+        view.select_item(&session, b"live-lastseen-client", Some(item))
+            .unwrap();
+        let mut degraded = source.snapshot();
+        degraded
+            .records
+            .retain(|record| record.key.pid != Observed::Known(other_pid));
+        for record in &mut degraded.records {
+            record.key.host = Observed::Missing(MissingReason::Unavailable);
+        }
+        view.apply(&session, LIVE_STATUS_TEXT, &degraded).unwrap();
+        let unobserved = view.inspector_view().clone();
+        assert!(
+            unobserved.status.contains("· no longer observed: the scan could not confirm the host, boot and PID namespace it was listed in; whether it exited is unknown · "),
+            "{}",
+            unobserved.status
+        );
+        assert!(
+            !unobserved.status.contains("exited:"),
+            "{}",
+            unobserved.status
+        );
+        assert!(view
+            .last_seen()
+            .iter()
+            .any(|tombstone| tombstone.departure()
+                == Departure::NotObserved(Unobserved::IdentityUnconfirmed)));
+
+        // The next real scan lists the second worker again: a new live item.
+        let snapshot = source.snapshot();
+        view.apply(&session, LIVE_STATUS_TEXT, &snapshot).unwrap();
+        let (again, _) = row_for(&session, other_pid).expect("listed again");
+        assert_ne!(Some(again), Some(item), "a returning record is a new row");
+        drop(other);
+        println!(
+            "PX-021 live evidence: worker={pid} exited status={:?} metrics={:?}; other={other_pid} degraded status={:?}; returning item {} != {}",
+            ended.status,
+            ended.metrics,
+            unobserved.status,
+            again.get(),
+            item.get()
         );
     }
 

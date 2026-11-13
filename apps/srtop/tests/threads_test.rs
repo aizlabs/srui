@@ -635,7 +635,8 @@ fn the_inspector_and_follow_name_a_thread_and_see_it_end() {
     // newcomer or any other row.
     h.sample(&mut source);
     assert!(
-        h.text(INSPECTOR_STATUS).contains("this thread has ended"),
+        h.text(INSPECTOR_STATUS)
+            .contains("exited: a scan that read its process's threads no longer lists it"),
         "{}",
         h.text(INSPECTOR_STATUS)
     );
@@ -2170,8 +2171,11 @@ fn an_evicted_thread_is_ended_only_by_a_scan_that_could_read_its_threads() {
         h.text(INSPECTOR_STATUS),
         format!("{head} · this source provides no details")
     );
+    // PX-021 (merge with main): the inspector shows the thread's
+    // last-observed record, `no longer observed`, never exited, until a scan
+    // entitled to account for it establishes the exit.
     let not_shown = format!(
-        "{head} · not confirmed by the latest scan; not shown (dropped under the row limit)"
+        "{head} · no longer observed: kept while scans could not account for it, then left out at the row limit; whether it exited is unknown · last observed "
     );
 
     // A process the scan confirms takes the eighth place; `server` and its
@@ -2207,7 +2211,11 @@ fn an_evicted_thread_is_ended_only_by_a_scan_that_could_read_its_threads() {
     );
     h.sample(&mut Fixed(without_server));
     assert!(!h.pids().iter().any(|pid| pid == SERVER_THREADS[2]));
-    assert_eq!(h.text(INSPECTOR_STATUS), not_shown);
+    assert!(
+        h.text(INSPECTOR_STATUS).starts_with(&not_shown),
+        "{}",
+        h.text(INSPECTOR_STATUS)
+    );
 
     // A scan that read no threads says nothing about any thread.
     let mut no_threads = threads_snapshot(
@@ -2217,7 +2225,11 @@ fn an_evicted_thread_is_ended_only_by_a_scan_that_could_read_its_threads() {
     no_threads.threads = ThreadScan::NotRequested;
     h.sample(&mut Fixed(no_threads));
     assert!(h.pids().iter().all(|pid| !pid.contains("thread")));
-    assert_eq!(h.text(INSPECTOR_STATUS), not_shown);
+    assert!(
+        h.text(INSPECTOR_STATUS).starts_with(&not_shown),
+        "{}",
+        h.text(INSPECTOR_STATUS)
+    );
 
     // Neither does one that could not read `server`'s threads.
     let mut unreadable = ThreadsSource::threads(0);
@@ -2228,16 +2240,23 @@ fn an_evicted_thread_is_ended_only_by_a_scan_that_could_read_its_threads() {
         with_newcomer(ThreadsSource::records(0)),
         unreadable,
     )));
-    assert_eq!(h.text(INSPECTOR_STATUS), not_shown);
+    assert!(
+        h.text(INSPECTOR_STATUS).starts_with(&not_shown),
+        "{}",
+        h.text(INSPECTOR_STATUS)
+    );
 
     // One that read them and no longer lists TID 202's instance ends it.
     h.sample(&mut Fixed(threads_snapshot(
         with_newcomer(ThreadsSource::records(0)),
         ThreadsSource::threads(ThreadsSource::CHURN_STEP),
     )));
-    assert_eq!(
-        h.text(INSPECTOR_STATUS),
-        format!("{head} · this thread has ended; select another row")
+    assert!(
+        h.text(INSPECTOR_STATUS).starts_with(&format!(
+            "{head} · exited: its TID now names a newer thread · last observed "
+        )),
+        "{}",
+        h.text(INSPECTOR_STATUS)
     );
 }
 
@@ -2278,12 +2297,21 @@ fn server_record_unread(skipped: SkippedRecords) -> ProcessSnapshot {
 
 const EVICTED_HEAD: &str = "Selected thread: TID 202 of PID 200 · worker-2";
 
+/// The start of the inspector's status for the evicted thread's
+/// last-observed record (PX-021): no longer observed, never exited.
 fn evicted_not_shown() -> String {
-    format!("{EVICTED_HEAD} · not confirmed by the latest scan; not shown (dropped under the row limit)")
+    format!("{EVICTED_HEAD} · no longer observed: kept while scans could not account for it, then left out at the row limit; whether it exited is unknown · last observed ")
 }
 
+/// The start of that status once a later scan established the exit.
 fn evicted_ended() -> String {
-    format!("{EVICTED_HEAD} · this thread has ended; select another row")
+    format!("{EVICTED_HEAD} · exited: ")
+}
+
+/// Asserts the inspector's status starts with `expected`.
+fn assert_status_starts(h: &Harness, expected: &str, case: &str) {
+    let status = h.text(INSPECTOR_STATUS);
+    assert!(status.starts_with(expected), "{case}: {status}");
 }
 
 /// TID 202 of `server` selected, then dropped unconfirmed under the row
@@ -2297,7 +2325,7 @@ fn evicted_thread() -> Harness {
     h.sample(&mut Fixed(server_record_unread(
         SkippedRecords::unenumerable(),
     )));
-    assert_eq!(h.text(INSPECTOR_STATUS), evicted_not_shown());
+    assert_status_starts(&h, &evicted_not_shown(), "evicted");
     h
 }
 
@@ -2311,21 +2339,17 @@ fn an_evicted_thread_is_not_ended_by_a_scan_that_could_not_read_its_process() {
     h.sample(&mut Fixed(server_record_unread(
         SkippedRecords::unenumerable(),
     )));
-    assert_eq!(
-        h.text(INSPECTOR_STATUS),
-        evicted_not_shown(),
-        "unenumerable"
-    );
+    assert_status_starts(&h, &evicted_not_shown(), "unenumerable");
     let mut named = SkippedRecords::with_limit(8);
     named.record(200);
     h.sample(&mut Fixed(server_record_unread(named)));
-    assert_eq!(
-        h.text(INSPECTOR_STATUS),
-        evicted_not_shown(),
-        "PID 200 named"
-    );
+    assert_status_starts(&h, &evicted_not_shown(), "PID 200 named");
     h.sample(&mut Fixed(server_record_unread(SkippedRecords::none())));
-    assert_eq!(h.text(INSPECTOR_STATUS), evicted_ended(), "complete");
+    assert_status_starts(
+        &h,
+        &format!("{}its process exited", evicted_ended()),
+        "complete",
+    );
 }
 
 /// Merge verification F2: the thread retention protects an evicted thread
@@ -2341,7 +2365,11 @@ fn an_evicted_thread_of_an_ended_process_instance_is_ended() {
     );
     gone.threads = ThreadScan::NotRequested;
     h.sample(&mut Fixed(gone));
-    assert_eq!(h.text(INSPECTOR_STATUS), evicted_ended(), "no threads read");
+    assert_status_starts(
+        &h,
+        &format!("{}its process exited", evicted_ended()),
+        "no threads read",
+    );
 
     let mut h = evicted_thread();
     let records = records_with_newcomer(|_| true)
@@ -2358,7 +2386,11 @@ fn an_evicted_thread_of_an_ended_process_instance_is_ended() {
     unreadable.unreadable.record(200);
     unreadable.denied = 2;
     h.sample(&mut Fixed(threads_snapshot(records, unreadable)));
-    assert_eq!(h.text(INSPECTOR_STATUS), evicted_ended(), "PID 200 reused");
+    assert_status_starts(
+        &h,
+        &format!("{}its process exited", evicted_ended()),
+        "PID 200 reused",
+    );
 }
 
 /// Merge verification F3: a sample taken while user threads were hidden
@@ -2714,7 +2746,11 @@ fn an_evicted_thread_whose_tid_a_new_instance_took_is_ended() {
         records_with_newcomer(|_| true),
         threads,
     )));
-    assert_eq!(h.text(INSPECTOR_STATUS), evicted_ended());
+    assert_status_starts(
+        &h,
+        &format!("{}its TID now names a newer thread", evicted_ended()),
+        "TID reused",
+    );
 }
 
 /// Thread `PRRT_kwDOUG_6uM62joAd`: thread CPU baselines taken under another

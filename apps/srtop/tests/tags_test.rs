@@ -496,16 +496,14 @@ fn descendant_tags_are_frozen_survive_filters_and_turn_historical_when_a_process
     assert_ne!(newcomer, cc, "a reused PID is another process instance");
     assert_eq!(h.tagged(), set(&[10, 12, 13]));
     assert!(
-        h.status()
-            .starts_with("Tags: 3 tagged · 1 no longer listed: PID 11 · cc · "),
+        h.status().starts_with(
+            "Tags: 3 tagged · 1 historical: PID 11 · cc exited, last observed 2027-01-15 08:00:0"
+        ),
         "{}",
         h.status()
     );
     assert_eq!(h.view().tags().tagged(), 3);
-    assert_eq!(
-        h.view().tags().history().collect::<Vec<_>>(),
-        ["PID 11 · cc"]
-    );
+    assert_eq!(h.view().historical_tags(), ["PID 11 · cc"]);
 
     // Tagging the newcomer tags it alone, under its own identity.
     h.select(11);
@@ -526,7 +524,7 @@ fn descendant_tags_are_frozen_survive_filters_and_turn_historical_when_a_process
         h.status(),
         "Tags: none · a tag marks a process instance on this server and changes no process · Cleared 4 tags and 1 historical; the selection is unchanged"
     );
-    assert_eq!(h.view().tags().historical(), 0);
+    assert_eq!(h.view().historical_tags().len(), 0);
     assert_only_tag_cells_and_status(&h.operations_since(revision));
     assert_eq!(h.text(INSPECTOR_STATUS), inspector);
 }
@@ -698,7 +696,7 @@ fn threads_are_never_tagged_and_a_hidden_kernel_thread_tag_is_counted() {
         "{}",
         h.status()
     );
-    assert_eq!(h.view().tags().historical(), 0, "hiding is not ending");
+    assert_eq!(h.view().historical_tags().len(), 0, "hiding is not ending");
     // Hiding user threads drops thread rows only; no tag changes.
     h.with_view(|view, session| {
         view.set_user_threads(session, Some(false)).unwrap();
@@ -708,7 +706,7 @@ fn threads_are_never_tagged_and_a_hidden_kernel_thread_tag_is_counted() {
         view.set_kernel_threads(session, Some(true)).unwrap();
     });
     assert_eq!(h.view().tags().tagged(), 2);
-    assert_eq!(h.view().tags().historical(), 0);
+    assert_eq!(h.view().historical_tags().len(), 0);
     assert_eq!(h.tagged(), set(&[2, 200]));
 }
 
@@ -839,13 +837,13 @@ fn a_cleared_selection_tags_nothing_and_clearing_tags_keeps_it_cleared() {
     assert_eq!(h.property(node, VALUE), promoted);
 }
 
-/// Merge with main (PX-013 review round, PX-019 × PX-020): a tagged process
-/// that retention kept unconfirmed and the row ceiling then dropped is no
-/// longer listed, so its tag turns historical, worded as not listed, while
-/// the inspector says it was dropped under the row limit, never ended. A
-/// request on it names it as no longer shown. When a later scan lists the
-/// same instance again, under a new item ID, the historical tag is not put
-/// back on it.
+/// Merge with main (PX-013 review round, PX-019 × PX-020), as amended by
+/// PX-021: a tagged process that retention kept unconfirmed and the row
+/// ceiling then dropped turns historical, worded `no longer observed`, never
+/// "exited", and the inspector says the same. A request on it refuses the
+/// historical record. When a later complete scan lists the same instance
+/// again, under a new item ID, the tag is live again on that row (PX-021
+/// correction round 2, F4): "no longer observed" never claimed it ended.
 #[test]
 fn a_tagged_process_the_row_limit_drops_turns_historical_and_is_never_called_ended() {
     let first = vec![
@@ -876,39 +874,50 @@ fn a_tagged_process_the_row_limit_drops_turns_historical_and_is_never_called_end
         "the ceiling dropped b"
     );
     assert_eq!(h.view().tags().tagged(), 0);
-    assert_eq!(h.view().tags().historical(), 1);
+    assert_eq!(h.view().historical_tags(), ["PID 20 · b"]);
     assert!(
-        h.status()
-            .starts_with("Tags: 0 tagged · 1 no longer listed: PID 20 · b"),
+        h.status().starts_with(
+            "Tags: 0 tagged · 1 historical: PID 20 · b no longer observed, last observed "
+        ),
         "{}",
         h.status()
     );
     let inspector = h.text(INSPECTOR_STATUS);
     assert!(
-        inspector.ends_with("not shown (dropped under the row limit)"),
+        inspector.starts_with(
+            "Selected process: PID 20 · b · no longer observed: kept while scans could not account for it, then left out at the row limit; whether it exited is unknown"
+        ),
         "{inspector}"
     );
     h.click(TAG_TOGGLE);
     assert!(
-        h.status()
-            .ends_with("Nothing tagged: PID 20 · b is no longer shown"),
+        h.status().ends_with(
+            "Nothing tagged: PID 20 · b is no longer observed: a historical record is never tagged"
+        ),
         "{}",
         h.status()
     );
     assert_eq!(h.view().tags().tagged(), 0);
-
-    // A complete scan lists `b` again, as a new row: untagged.
-    h.sample(&mut source);
-    let again = h.item_of(20);
-    assert_ne!(again, b);
-    assert!(h.tagged().is_empty(), "{:?}", h.tagged());
-    assert_eq!(h.view().tags().historical(), 1);
     for text in [h.text(INSPECTOR_STATUS), h.status()] {
         assert!(
-            !text.contains("ended"),
+            !text.contains("· exited") && !text.contains("b exited"),
             "an eviction was called an exit: {text}"
         );
     }
+
+    // A complete scan lists `b` again, as a new row: the same instance, so
+    // its tag is live again, on that row.
+    h.sample(&mut source);
+    let again = h.item_of(20);
+    assert_ne!(again, b);
+    assert_eq!(h.tagged(), set(&[20]));
+    assert!(h.view().historical_tags().is_empty());
+    assert!(
+        h.status()
+            .contains("Tagged again: PID 20 · b is listed again after it was no longer observed"),
+        "{}",
+        h.status()
+    );
 }
 
 /// `root` (1000) and `children` processes under it, then a step in which
@@ -930,17 +939,17 @@ fn historical_tags_are_bounded_newest_kept_and_cleared() {
     assert_eq!(h.view().tags().tagged(), children as usize + 1);
     h.sample(&mut source);
     assert_eq!(h.view().tags().tagged(), 1);
-    assert_eq!(h.view().tags().historical(), MAX_HISTORICAL_TAGS);
+    assert_eq!(h.view().historical_tags().len(), MAX_HISTORICAL_TAGS);
     // The oldest six were forgotten; the newest are named.
-    let history: Vec<String> = h.view().tags().history().map(str::to_string).collect();
+    let history: Vec<String> = h.view().historical_tags();
     assert_eq!(history.first().map(String::as_str), Some("PID 1007 · c7"));
     assert_eq!(history.last().map(String::as_str), Some("PID 1070 · c70"));
     assert_eq!(
         h.status(),
-        "Tags: 1 tagged · 70 no longer listed: PID 1070 · c70, PID 1069 · c69, PID 1068 · c68 and 67 more (6 forgotten) · Tagged PID 1000 · root and 70 sampled descendants; processes started later are not added"
+        "Tags: 1 tagged · 70 historical: PID 1070 · c70 exited, last observed 2027-01-15 08:00:01 UTC; PID 1069 · c69 exited, last observed 2027-01-15 08:00:01 UTC; PID 1068 · c68 exited, last observed 2027-01-15 08:00:01 UTC and 67 more (6 forgotten) · Tagged PID 1000 · root and 70 sampled descendants; processes started later are not added"
     );
     h.click(TAGS_CLEAR);
-    assert_eq!(h.view().tags().historical(), 0);
+    assert_eq!(h.view().historical_tags().len(), 0);
     assert!(h
         .status()
         .ends_with("Cleared 1 tag and 70 historical; the selection is unchanged"));
@@ -1049,10 +1058,99 @@ fn a_newcomer_beside_a_kept_earlier_instance_of_its_pid_is_not_tagged() {
     );
     h.sample(&mut source);
     assert!(h.tagged().is_empty());
+    // The complete scan lists PID 11 under the newcomer only, so `cc`
+    // exited (PX-021), last observed by the first scan: the unenumerable
+    // one only kept it.
     assert!(
-        h.status()
-            .starts_with("Tags: 0 tagged · 1 no longer listed: PID 11 · cc"),
+        h.status().starts_with(
+            "Tags: 0 tagged · 1 historical: PID 11 · cc exited, last observed 2027-01-15 08:00:01 UTC"
+        ),
         "{}",
         h.status()
     );
+    let view = h.view();
+    let tombstone = view.last_seen().tagged().next().expect("cc's tombstone");
+    assert_eq!(
+        tombstone.departure(),
+        srui_process_explorer::lastseen::Departure::Exited(
+            srui_process_explorer::lastseen::Exit::Replaced
+        )
+    );
+}
+
+/// Verification of the Codex review round (PR #107), F1: a scan that could
+/// not read the process list republishes no row, so the tags status it
+/// reconciles counts the rows the client holds. In the tree at the row limit
+/// the status of a shown and of a left-out tagged process stays true across
+/// alternating unreadable and readable scans, and none of those scans
+/// commits a tags status operation (each unchanged; the summary's "last
+/// successful sample" line may still change). The table is checked the same
+/// way.
+#[test]
+fn an_unreadable_scan_keeps_the_tags_status_of_the_rows_the_client_holds() {
+    let full = vec![
+        record(1, "init", 0, 1),
+        record(10, "a", 1, 10),
+        record(20, "b", 1, 20),
+        record(30, "c", 10, 30),
+        record(40, "solo", 0, 40),
+        record(50, "solo2", 0, 50),
+    ];
+    for tree in [true, false] {
+        for target in [30, 20] {
+            let mut source = Steps::new(vec![
+                full.clone(),
+                full.clone(),
+                Vec::new(),
+                Vec::new(),
+                full.clone(),
+                Vec::new(),
+            ]);
+            for unreadable in [2, 3, 5] {
+                source.unenumerable.insert(unreadable);
+            }
+            let mut h = harness_limited(&mut source, 3);
+            // Tag in the table, where both are shown, then choose the view.
+            h.select(target);
+            h.click(TAG_TOGGLE);
+            h.show_tree(tree);
+            h.sample(&mut source);
+            let rows: Vec<u64> = h.rows().iter().map(|row| row.1).collect();
+            let status = h.status();
+            let shown = rows.contains(&target);
+            assert_eq!(
+                status.contains("1 beyond the publishable size limit"),
+                !shown,
+                "tree={tree} tag={target} rows={rows:?}: {status}"
+            );
+            for scan in [
+                "unreadable",
+                "unreadable again",
+                "readable",
+                "unreadable",
+                "unreadable again",
+            ] {
+                let revision = h.revision();
+                h.sample(&mut source);
+                let now: Vec<u64> = h.rows().iter().map(|row| row.1).collect();
+                assert_eq!(now, rows, "tree={tree} tag={target} {scan}: rows");
+                assert_eq!(
+                    h.status(),
+                    status,
+                    "tree={tree} tag={target} {scan}: the tags status"
+                );
+                let republished = h
+                    .operations_since(revision)
+                    .into_iter()
+                    .filter(|operation| {
+                        matches!(operation, Operation::SetProperty { id, .. } if *id == TAGS_STATUS)
+                    })
+                    .count();
+                assert_eq!(
+                    republished, 0,
+                    "tree={tree} tag={target} {scan}: the tags status was republished"
+                );
+            }
+        }
+    }
 }

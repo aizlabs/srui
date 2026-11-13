@@ -30,16 +30,19 @@
 //!   names another process (PX-011-G01 keeps the user's later local
 //!   selection), so a client that attaches later never restores a selection
 //!   of a process follow is not on.
-//! - **Stops.** When the followed process ends, or is no longer shown (a
-//!   filter hid it, or the row limit left it out), follow turns itself off,
-//!   its hint is cleared, and the status says which and why. It never moves
-//!   to another row. A user who deselects the followed row (a
-//!   `SELECTION_CHANGED` with no `value`, PX-017-G02) stops follow the same
-//!   way, and turning follow on with nothing selected is refused.
+//! - **Stops.** When the followed process leaves the collection, or is no
+//!   longer shown (a filter hid it, or the row limit left it out), follow
+//!   turns itself off, its hint is cleared, and the status says which and why:
+//!   `exited` only when a scan established it, `is no longer observed`
+//!   otherwise ([`crate::lastseen`], PX-021). It never moves to another row.
+//!   A user who deselects the followed row (a `SELECTION_CHANGED` with no
+//!   `value`, PX-017-G02) stops follow the same way, and turning follow on
+//!   with nothing selected is refused.
 //! - **Off.** No hint is held, and follow promotes nothing. Only an explicit
 //!   search promotes, as before (PX-011).
 
 use crate::bounded;
+use crate::lastseen::LastSeen;
 use crate::projection::Row;
 use crate::source::Observed;
 use srui_sdk::ItemId;
@@ -119,6 +122,17 @@ fn who(row: &Row) -> String {
     )
 }
 
+/// How `row`, which left the collection, left: `exited` only when its
+/// tombstone says an exit was established, and otherwise `is no longer
+/// observed` (PX-021).
+fn predicate(last_seen: &LastSeen, row: &Row) -> &'static str {
+    last_seen
+        .get(&row.key)
+        .map_or("is no longer observed", |tombstone| {
+            tombstone.departure().predicate()
+        })
+}
+
 fn position(rows: &[Row], item: ItemId) -> Option<usize> {
     rows.iter().position(|row| row.item_id == item)
 }
@@ -140,7 +154,13 @@ impl Follow {
     /// Turns follow on for `selected`, the inspector's process: the user's own
     /// selection as the server resolved it. A selection that is not a shown
     /// row is refused with its reason, and follow stays off.
-    pub(crate) fn turn_on(&mut self, selected: Option<&Row>, rows: &[Row], unfiltered: &[Row]) {
+    pub(crate) fn turn_on(
+        &mut self,
+        selected: Option<&Row>,
+        rows: &[Row],
+        unfiltered: &[Row],
+        last_seen: &LastSeen,
+    ) {
         let Some(selected) = selected else {
             self.state = State::Stopped(
                 "Follow: off · nothing is selected; select a row, then turn follow on".into(),
@@ -157,8 +177,9 @@ impl Follow {
                 who(selected)
             ),
             None => format!(
-                "Follow: off · {} has ended; select a running process first",
-                who(selected)
+                "Follow: off · {} {}: a historical record is never followed; select a listed process first",
+                who(selected),
+                predicate(last_seen, selected)
             ),
         });
     }
@@ -171,7 +192,15 @@ impl Follow {
     /// server-side collection `unfiltered`. Stops follow, never retargets it,
     /// when the process is not among `rows`. `user_threads` is whether user
     /// threads are shown (PX-019): a followed thread hidden with them says so.
-    pub(crate) fn track(&mut self, rows: &[Row], unfiltered: &[Row], user_threads: bool) {
+    /// A followed process that left the collection says how, from its
+    /// tombstone in `last_seen` (PX-021).
+    pub(crate) fn track(
+        &mut self,
+        rows: &[Row],
+        unfiltered: &[Row],
+        user_threads: bool,
+        last_seen: &LastSeen,
+    ) {
         let State::On(followed) = &mut self.state else {
             return;
         };
@@ -190,8 +219,9 @@ impl Follow {
                 who(followed)
             ),
             None => format!(
-                "Follow stopped: {} has ended · a new process that reuses its PID is not followed; select a row and turn follow on again",
-                who(followed)
+                "Follow stopped: {} {} · a new process that reuses its PID is not followed; select a row and turn follow on again",
+                who(followed),
+                predicate(last_seen, followed)
             ),
         };
         self.state = State::Stopped(why);

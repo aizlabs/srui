@@ -74,7 +74,7 @@
     },
     {
       "feature_id": "SRUI-PX020-005",
-      "feature": "Exit: a tagged process that leaves the collection (it ended, or no scan lists it) keeps a historical tag, named by PID and name as last shown, listed in the tags status and never put back on a row; at most MAX_HISTORICAL_TAGS = 64 are kept, oldest forgotten first and counted; Clear tags removes live and historical tags",
+      "feature": "Exit: a tagged process that leaves the collection (it ended, or no scan lists it) keeps a historical tag, named by PID and name as last shown, listed in the tags status and never put back on a row; at most MAX_HISTORICAL_TAGS = 64 are kept, oldest forgotten first and counted; Clear tags removes live and historical tags. Amended by PX-021 (SRUI-PX021-008): a historical tag is a tombstone, worded 'exited' or 'no longer observed'; one that said only 'no longer observed' is live again when a scan lists the same whole ProcessKey again; one that says 'exited' never is, and PID reuse never inherits a tag",
       "scope": "PX-020/tags (src/tags.rs) departed, retire, history, status, MAX_HISTORICAL_TAGS; refresh (src/refresh.rs) apply; tests/tags_test.rs descendant_tags_are_frozen_survive_filters_and_turn_historical_when_a_process_ends, historical_tags_are_bounded_newest_kept_and_cleared, a_tagged_process_the_row_limit_drops_turns_historical_and_is_never_called_ended (merge with main, PX-013 review round); tests/procfs_test.rs live::a_live_tagged_family_keeps_its_frozen_membership_and_an_ended_worker_turns_historical",
       "source_refs": [
         "D1",

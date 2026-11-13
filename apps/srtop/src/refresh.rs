@@ -45,6 +45,13 @@
 //! publishes from the view's tag set, kept by process instance, and publishes
 //! the tags status after the rows, carrying the set's generation; a request
 //! or a sample whose tags status never committed puts the previous set back.
+//! Since PX-021 a watched process that leaves the collection — the
+//! inspector's target, the followed process, a tagged process — leaves a
+//! bounded tombstone ([`crate::lastseen`]): what was last observed of it and
+//! whether the scan it left with established that it exited, or only that it
+//! is no longer observed. Tombstones are server-side knowledge, recorded when
+//! the sample is applied whatever its commits do, and every view of them is
+//! re-planned from them.
 //!
 //! Four rules shape this module:
 //!
@@ -129,12 +136,14 @@ use crate::inspector::{
     DetailRead, DetailReads, DetailReadsIdle, DetailRequest, DetailSource, HeldSelection,
     Inspector, InspectorView,
 };
+use crate::lastseen::{Departure, Evidence, Exit, LastSeen, Tombstone, Unobserved};
 use crate::owner::{OwnerChoice, OwnerFilter, OwnerView};
+use crate::procfs::{MonotonicClock, SystemMonotonicClock};
 use crate::projection::{Row, SessionItemIds};
 use crate::sampling::{relabel_freshness, Frozen, IntervalError, Sampling, SamplingView};
 use crate::search::{Search, SearchStep, SearchView};
 use crate::sort::{self, SortOrder};
-use crate::source::{ProcessSnapshot, ProcessSource, Retention};
+use crate::source::{ProcessKey, ProcessSnapshot, ProcessSource, Retention};
 use crate::summary::{self, CollectorError, Sample};
 use crate::tags::{TagCounts, Tags, TagsView};
 use crate::threads::{self, ThreadCounts, ThreadReport, ThreadSettings, ThreadsView};
@@ -463,7 +472,7 @@ fn value_wire_bytes(value: &Value) -> usize {
 
 /// An upper bound on the bytes one row occupies inside a `MODEL_INSERT` or
 /// `MODEL_UPDATE` operation.
-fn row_wire_bytes(row: &Row) -> usize {
+pub(crate) fn row_wire_bytes(row: &Row) -> usize {
     MODEL_ITEM_FRAMING_BYTES
         + value_wire_bytes(&row.value)
         + row.tree.as_ref().map_or(0, |_| TREE_ITEM_PROPERTIES_BYTES)
@@ -629,6 +638,29 @@ pub struct ProcessView {
     /// The tags status as the client holds it, with the generation it states
     /// (PX-020).
     tags_published: TagsView,
+    /// The counts the tags status the client holds states (PX-020): those of
+    /// the last row publication whose plan committed through its tags status,
+    /// its rows and view before it. A plan that committed its rows but not
+    /// its tags status leaves the earlier counts, which match the status the
+    /// client still shows rather than its rows; the next accepted sample or
+    /// republish restates both. What a change that republishes no row (a
+    /// scan that could not read the process list, a late detail read) states
+    /// the tags status with. Re-deriving it then would arrange the
+    /// tree from a generation whose every row is unconfirmed, which is not
+    /// the one the client holds (PX-021, verification of PR #107's review).
+    tag_counts: TagCounts,
+    /// The tombstones of watched processes that left the collection (PX-021),
+    /// bounded by count, age and bytes.
+    last_seen: LastSeen,
+    /// The monotonic clock tombstones age by (PX-021): injected, so a test
+    /// drives their expiry exactly.
+    clock: Arc<dyn MonotonicClock>,
+    /// The sample time of the scan whose confirmations `unconfirmed` is the
+    /// complement of: when every confirmed row was last observed (PX-021).
+    confirmed_at: SystemTime,
+    /// For each row in `unconfirmed`, the sample time of the last scan that
+    /// listed it (PX-021). Bounded by `unconfirmed`; replaced with it.
+    unconfirmed_since: HashMap<ItemId, SystemTime>,
 }
 
 /// The rows every active filter keeps, and what the filters' controls say
@@ -821,8 +853,9 @@ impl ProcessView {
         };
         // Nothing starts tagged (PX-020).
         let tags = Tags::default();
+        let last_seen = LastSeen::default();
         let tags_published = TagsView {
-            status: tags.status(TagCounts::default()),
+            status: tags.status(TagCounts::default(), &last_seen),
             generation: tags.generation(),
         };
         initialize_rows(
@@ -895,6 +928,11 @@ impl ProcessView {
                 thread_report,
                 tags,
                 tags_published,
+                tag_counts: TagCounts::default(),
+                last_seen,
+                clock: Arc::new(SystemMonotonicClock::default()),
+                confirmed_at: snapshot.sampled_at.0,
+                unconfirmed_since: HashMap::new(),
             },
             snapshot,
         ))
@@ -910,6 +948,133 @@ impl ProcessView {
     pub fn with_published_limit(mut self, limit: usize) -> Self {
         self.published_limit = self.published_limit.min(limit.max(1));
         self
+    }
+
+    /// Replaces the monotonic clock tombstones age by (PX-021), so a test can
+    /// drive their expiry exactly.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn MonotonicClock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The tombstones of watched processes that left the collection (PX-021).
+    pub fn last_seen(&self) -> &LastSeen {
+        &self.last_seen
+    }
+
+    /// The historical tags kept, oldest first: each the PID and name the
+    /// process was last shown with (PX-020, PX-021).
+    pub fn historical_tags(&self) -> Vec<String> {
+        self.last_seen.tagged().map(Tombstone::subject).collect()
+    }
+
+    /// The sample time of the last scan that listed `item`, a row of the
+    /// collection (PX-021).
+    fn last_observed(&self, item: ItemId) -> Option<SystemTime> {
+        if self.unconfirmed.contains(&item) {
+            self.unconfirmed_since.get(&item).copied()
+        } else {
+            Some(self.confirmed_at)
+        }
+    }
+
+    /// Records a tombstone for every watched row of the collection that is
+    /// not in the next one, `kept` (PX-021), and drops the tombstones that
+    /// are too old or no longer watched. Watched means the inspector's
+    /// target, the followed process, or a tagged process.
+    ///
+    /// A row in `evicted` was kept unconfirmed because scans could not
+    /// account for it, and the row ceiling then dropped it: nothing
+    /// established an exit, so it is `no longer observed`, whatever else the
+    /// scan says (merge with main: PX-013's review round never calls an
+    /// evicted row ended), unless the inspector's detail read found it gone.
+    ///
+    /// Returns the keys of the historical tags it recorded, so a tag whose
+    /// record a bound dropped at once is not counted forgotten twice.
+    fn record_departures(
+        &mut self,
+        kept: impl Fn(ItemId) -> bool,
+        evicted: &HashSet<ItemId>,
+        evidence: &Evidence<'_>,
+        sampled_at: SystemTime,
+    ) -> HashSet<ProcessKey> {
+        let now = self.clock.now();
+        let (inspected, followed) = self.watched_keys();
+        let tags = &self.tags;
+        let watched = |key: &ProcessKey| {
+            inspected.as_ref() == Some(key) || followed.as_ref() == Some(key) || tags.is_tagged(key)
+        };
+        let mut left = Vec::new();
+        for row in &self.unfiltered_rows {
+            if kept(row.item_id) {
+                continue;
+            }
+            let tagged = self.tags.is_tagged(&row.key);
+            if !tagged && !watched(&row.key) {
+                continue;
+            }
+            let mut departure = if evicted.contains(&row.item_id) {
+                Departure::NotObserved(Unobserved::Evicted)
+            } else {
+                evidence.departure(&row.key)
+            };
+            // A detail read that found the record gone established the
+            // exit, whatever this scan can say.
+            if !departure.exited() && self.inspector.read_exit(&row.key) {
+                departure = Departure::Exited(Exit::DetailRead);
+            }
+            let mut tombstone = Tombstone::new(
+                row.clone(),
+                self.inspector.read_details(&row.key).cloned(),
+                self.last_observed(row.item_id),
+                sampled_at,
+                now,
+                departure,
+            );
+            tombstone.tagged = tagged;
+            left.push(tombstone);
+        }
+        let recorded_tags: HashSet<ProcessKey> = left
+            .iter()
+            .filter(|tombstone| tombstone.tagged)
+            .map(|tombstone| tombstone.key().clone())
+            .collect();
+        for tombstone in left {
+            self.last_seen.record(tombstone);
+        }
+        self.last_seen.expire(now, watched);
+        recorded_tags
+    }
+
+    /// The inspector's target and the followed process (PX-021).
+    fn watched_keys(&self) -> (Option<ProcessKey>, Option<ProcessKey>) {
+        (
+            self.inspector.selected_row().map(|row| row.key.clone()),
+            self.follow.followed().map(|row| row.key.clone()),
+        )
+    }
+
+    /// Drops the tombstones that are too old by the injected clock, or no
+    /// longer watched (PX-021), on every sample the view accepts, whatever
+    /// the scan could read: age is time, not a scan outcome.
+    ///
+    ///
+    /// The followed process watches its record too: follow can be turned on
+    /// for a row a failed commit left on the client after its process left,
+    /// and stays on it when a collapse clears the inspector. So does a live
+    /// tag: one put back because the sample that retired it never committed
+    /// its tags status watches its record until a committed sample retires
+    /// it, or the tag is removed (Codex review of PR #107). The age, count
+    /// and byte bounds still apply; a record they drop meanwhile makes the
+    /// retired tag forgotten.
+    fn expire_tombstones(&mut self) {
+        let now = self.clock.now();
+        let (inspected, followed) = self.watched_keys();
+        let tags = &self.tags;
+        self.last_seen.expire(now, |key| {
+            inspected.as_ref() == Some(key) || followed.as_ref() == Some(key) || tags.is_tagged(key)
+        });
     }
 
     /// The most rows this view will publish.
@@ -978,6 +1143,18 @@ impl ProcessView {
         source_status: &str,
         snapshot: &ProcessSnapshot,
     ) -> Result<Refreshed, SessionError> {
+        let applied = self.apply_sample(session, source_status, snapshot);
+        self.debug_check_tag_accounting();
+        applied
+    }
+
+    /// [`Self::apply`], before the tag accounting is checked.
+    fn apply_sample(
+        &mut self,
+        session: &Session,
+        source_status: &str,
+        snapshot: &ProcessSnapshot,
+    ) -> Result<Refreshed, SessionError> {
         // A paused view publishes no sample: its rows, cells and summary stay
         // those of the revision it was paused at (PX-015). The loop takes no
         // sample while paused; this refuses one that reaches it all the same.
@@ -987,6 +1164,9 @@ impl ProcessView {
         }
         // This sample ends a resume: the sampling status says live again.
         self.sampling.published_sample();
+        // Tombstones age on every accepted sample, a failed one too (PX-021).
+        self.last_seen.begin_sample();
+        self.expire_tombstones();
         // A snapshot this app cannot identify is not evidence that any process
         // ended. It is published as an error over the last-known rows, exactly
         // like a scan that could not list the process filesystem at all.
@@ -1078,31 +1258,25 @@ impl ProcessView {
         let (unfiltered_target, evicted_threads) = threads::group_dropping(unfiltered_target);
         evicted_ids.extend(evicted_threads);
         let evicted = evicted_ids.len() + orphaned;
-        // The inspector learns what this scan established about its target
-        // before anything is planned (PX-013 review round): its latest row, or
-        // that retention dropped it unconfirmed, which is not an exit, or that
-        // a scan entitled to say so found it gone. A thread's absence is
-        // left unaccounted for, beyond the record retention, only while its
-        // own process instance is confirmed by this scan and the scan read no
+        // The absences this scan cannot account for (PX-013 review round): a
+        // key it would have kept unconfirmed. A thread's absence is left
+        // unaccounted for, beyond the record retention, only while its own
+        // process instance is confirmed by this scan and the scan read no
         // threads or could not read that process's threads (PX-019): the same
-        // whole-key rule the row retention above keeps thread rows by.
+        // whole-key rule the row retention above keeps thread rows by. A TID
+        // this scan read under another instance is accounted for.
         let threads_read = snapshot.threads.read().is_some();
-        self.inspector
-            .observe_scan(&unfiltered_target, &evicted_ids, |key| {
-                !superseded(key)
-                    && (retention.keeps(key)
-                        || (key.is_thread()
-                            && live_processes.contains(&key.process_key())
-                            && (!threads_read || thread_retention.covers(&key.pid))))
-            });
-        // A tagged process this generation no longer holds — it ended, or no
-        // scan lists it any more — keeps a historical tag (PX-020). The set
-        // before is held until the tags status commits.
-        let departed = self
-            .tags
-            .departed(&self.unfiltered_rows, &unfiltered_target);
-        let held_tags = (!departed.is_empty()).then(|| self.tags.clone());
-        self.tags.retire(departed);
+        let retains = |key: &ProcessKey| {
+            !superseded(key)
+                && (retention.keeps(key)
+                    || (key.is_thread()
+                        && live_processes.contains(&key.process_key())
+                        && (!threads_read || thread_retention.covers(&key.pid))))
+        };
+        // The inspector's target takes this scan's projection of it before
+        // anything is planned (PX-013 review round). Whether a target that
+        // left exited is its tombstone's verdict (PX-021, below).
+        self.inspector.observe_scan(&unfiltered_target);
         // The rows this scan did not confirm, which a PID jump never selects
         // (PX-011) and the tree never takes a parent from (PX-018): bounded by
         // the collection, and replaced on every refresh.
@@ -1125,6 +1299,71 @@ impl ProcessView {
             // What this sample said about threads (PX-019).
             self.thread_report = ThreadReport::of(&snapshot.threads);
         }
+        // A record that said only "no longer observed" of an instance this
+        // scan lists again is dropped: it was observed after all, so its
+        // last-observed time is no longer true (PX-021). An established exit
+        // is final and stays. A historical tag dropped so is the same
+        // instance's tag, under the same whole key, and is live again, before
+        // the rows are chosen so that its row carries its tag cell; the set
+        // before is held until the tags status commits.
+        let relisted = {
+            // The thread instances this collection holds, built only if a
+            // thread record asks. A recorded instance had left the collection,
+            // and rows carried forward are only rows it already held, so one
+            // it holds again is one this scan listed.
+            let listed_threads: std::cell::OnceCell<HashSet<&ProcessKey>> =
+                std::cell::OnceCell::new();
+            self.last_seen.drop_relisted(|key: &ProcessKey| {
+                if key.is_thread() {
+                    listed_threads
+                        .get_or_init(|| {
+                            unfiltered_target
+                                .iter()
+                                .filter(|row| row.key.is_thread())
+                                .map(|row| &row.key)
+                                .collect()
+                        })
+                        .contains(key)
+                } else {
+                    live_processes.contains(key)
+                }
+            })
+        };
+        let mut retagged: Vec<Tombstone> =
+            relisted.into_iter().filter(Tombstone::is_tagged).collect();
+        let held_retag = (!retagged.is_empty()).then(|| self.tags.clone());
+        // The room is counted before this sample's departed tags retire, so
+        // a tag that leaves in the same sample frees its place only from the
+        // next one.
+        let room = crate::tags::MAX_TAGGED.saturating_sub(self.tags.tagged());
+        let mut forgotten = None;
+        if retagged.len() > room {
+            // No room under the tag limit: their records are no longer true,
+            // so they go, and their tags are counted as forgotten.
+            let beyond = retagged.split_off(room);
+            for tombstone in &beyond {
+                self.last_seen.forget_tag(tombstone.key());
+            }
+            forgotten = Some(match beyond.as_slice() {
+                [one] => format!(
+                    "{} listed again, but the tag limit of {} is reached: its historical tag is forgotten",
+                    one.subject(),
+                    crate::tags::MAX_TAGGED
+                ),
+                _ => format!(
+                    "{} processes listed again, but the tag limit of {} is reached: their historical tags are forgotten",
+                    beyond.len(),
+                    crate::tags::MAX_TAGGED
+                ),
+            });
+        }
+        self.tags.retag(
+            &retagged
+                .iter()
+                .map(|tombstone| &tombstone.row)
+                .collect::<Vec<_>>(),
+            forgotten,
+        );
         let visible = self.visible_in(self.mode, &unfiltered_target, &unconfirmed, &gaps);
         let forest = visible.forest;
         let total = visible.total;
@@ -1144,13 +1383,59 @@ impl ProcessView {
         // this app emits cannot cost a row — there is no row budget, no diff and
         // no eviction on this path to cost one.
         if confirmed_empty && retention.is_global() {
-            // Every row is kept on this path, so no tag has departed; a held
-            // set is put back all the same rather than run ahead (PX-020).
-            if let Some(held) = held_tags {
-                self.tags = held;
-            }
+            // Every row is kept on this path, so nothing has left: no tag is
+            // retired and no tombstone recorded (PX-020, PX-021).
             return self.publish_status_only(session, source_status, snapshot, rejected, summary);
         }
+        // A watched process this generation no longer holds leaves a
+        // tombstone that says how it left (PX-021), recorded now whatever the
+        // commits do: it is what the server knows, not what a client holds.
+        // First, a record that said only "no longer observed" (the row limit
+        // dropped it unconfirmed, say) turns `exited` once this scan is
+        // entitled to account for its instance and no longer lists it: the
+        // PX-013 review round's rule, under PX-021's identity rule.
+        let recorded_tags = {
+            let evidence = Evidence::new(snapshot, &retention, &thread_retention, &live_processes);
+            self.last_seen.establish_exits(|key| {
+                if retains(key) {
+                    return None;
+                }
+                match evidence.departure(key) {
+                    Departure::Exited(exit) => Some(exit),
+                    Departure::NotObserved(_) => None,
+                }
+            });
+            self.record_departures(
+                |item| confirmed_ids.contains(&item) || unconfirmed.contains(&item),
+                &evicted_ids,
+                &evidence,
+                snapshot.sampled_at.0,
+            )
+        };
+        // A tagged process this generation no longer holds keeps a
+        // historical tag (PX-020): its tombstone. The set before is held
+        // until the tags status commits.
+        let departed = self
+            .tags
+            .departed(&self.unfiltered_rows, &unfiltered_target);
+        let held_tags = held_retag.or_else(|| (!departed.is_empty()).then(|| self.tags.clone()));
+        for (key, _) in &departed {
+            // A sample that never committed put this tag back; its tombstone,
+            // which the live tag kept watched, is historical again. Had a
+            // bound dropped that record meanwhile, the tag is forgotten, and
+            // counted, rather than silently lost (Codex review of PR #107). A
+            // record this sample made and a bound dropped at once was counted
+            // when it was dropped.
+            if !self.last_seen.tag(key) && !recorded_tags.contains(key) {
+                self.last_seen.forget_tag(key);
+            }
+        }
+        self.tags.retire(&departed);
+        // When each row this scan did not confirm was last observed.
+        let unconfirmed_since: HashMap<ItemId, SystemTime> = unconfirmed
+            .iter()
+            .filter_map(|item| self.last_observed(*item).map(|at| (*item, at)))
+            .collect();
         // A client receives the status and the rows in the same catch-up
         // snapshot, so the status is charged against the frame before the rows
         // are — at its fixed reserve, never at this tick's length, so no clause a
@@ -1195,10 +1480,15 @@ impl ProcessView {
         plan.extend(self.plan_rows(&target, batch, max_ops, max_bytes));
         // The rows reach the client once every entry before this one has.
         let rows_end = plan.len();
+        #[cfg(test)]
+        commit_fault::note_rows_end(rows_end);
         plan.extend(self.view_effects(self.mode, forest.as_ref()));
         // The tags status after the rows whose tag cells it describes
         // (PX-020).
         plan.extend(self.tags_effects(tag_counts));
+        // The client holds these rows, in this view, under this tag set and
+        // its status, once every entry up to here has committed.
+        let counts_end = plan.len();
         // Last, the search re-counted against the rows this plan publishes, so
         // it commits with the final rows rather than ahead of them (PX-011),
         // and the inspector, whose metrics and state follow them (PX-013).
@@ -1210,8 +1500,12 @@ impl ProcessView {
         // Follow last of all (PX-017): it stops when this plan hides or ends
         // the followed process, and a hint it sets names the row's final
         // place, after every row operation of this plan.
-        self.follow
-            .track(&target, &unfiltered_target, self.threads.user);
+        self.follow.track(
+            &target,
+            &unfiltered_target,
+            self.threads.user,
+            &self.last_seen,
+        );
         let follow = self.follow_after(self.mode, &target, false, &plan);
         plan.extend(follow);
 
@@ -1233,10 +1527,19 @@ impl ProcessView {
             self.unfiltered_rows = unfiltered_target;
             self.ids.retain(&self.unfiltered_rows);
             self.unconfirmed = unconfirmed;
+            self.unconfirmed_since = unconfirmed_since;
+            self.confirmed_at = snapshot.sampled_at.0;
             self.gaps = gaps;
             self.search.observe(&self.rows);
             self.inspector.reread(&self.rows, &confirmed_ids);
-            self.settle_tags(held_tags);
+            // Nothing was planned, so no tag change waited on a commit: a
+            // retag or a retire takes a new generation, whose tags status is
+            // always planned.
+            let put_back = self.settle_tags(held_tags);
+            debug_assert!(
+                !put_back && retagged.is_empty(),
+                "a tag change planned nothing"
+            );
             return Ok(result);
         }
 
@@ -1244,7 +1547,15 @@ impl ProcessView {
             commit_reaching(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
         self.settle_disclosure(held, reached >= rows_end);
-        self.settle_tags(held_tags);
+        self.settle_tag_counts(tag_counts, reached >= counts_end);
+        let put_back = self.settle_tags(held_tags);
+        if put_back {
+            self.unretag(retagged);
+        }
+        // A tag put back live is not forgotten yet (codex4 verification).
+        let tags = &self.tags;
+        self.last_seen
+            .settle_forgotten(put_back, |key| tags.is_tagged(key));
         // Order values never reach the wire, so every published row takes this
         // sample's whatever committed: a later click sorts by current values,
         // never by the ones a row was first published with.
@@ -1253,6 +1564,8 @@ impl ProcessView {
         self.unfiltered_rows = unfiltered_target;
         self.ids.retain(&self.unfiltered_rows);
         self.unconfirmed = unconfirmed;
+        self.unconfirmed_since = unconfirmed_since;
+        self.confirmed_at = snapshot.sampled_at.0;
         self.gaps = gaps;
         self.prune_collapsed();
         self.search.observe(&self.rows);
@@ -1547,6 +1860,12 @@ impl ProcessView {
         plan.extend(sampling);
         // This scan confirmed no row, so none is the currently observed
         // instance a PID jump may select (PX-011). The rows themselves stand.
+        // Each row was last observed when it was before (PX-021).
+        self.unconfirmed_since = self
+            .unfiltered_rows
+            .iter()
+            .filter_map(|row| self.last_observed(row.item_id).map(|at| (row.item_id, at)))
+            .collect();
         self.unconfirmed = self.unfiltered_rows.iter().map(|row| row.item_id).collect();
         let search = self.search_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
         result.controls += search.len();
@@ -1555,6 +1874,14 @@ impl ProcessView {
             self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
         result.controls += inspector.len();
         plan.extend(inspector);
+        // A historical tag that aged out leaves the tags status now, not at
+        // the next readable scan (PX-021). The status is reconciled with the
+        // one the client holds on every such scan, not only the one that
+        // expired it, so a status that one could not publish is published by
+        // the next (Codex review of PR #107).
+        let tags = self.current_tags_effects();
+        result.controls += tags.len();
+        plan.extend(tags);
         if plan.is_empty() {
             // An identical failure republishes nothing at all.
             self.ids.retain(&self.unfiltered_rows);
@@ -1896,6 +2223,18 @@ impl ProcessView {
     fn republish_in(
         &mut self,
         session: &Session,
+        plan: Vec<Planned>,
+        switch: Option<ViewMode>,
+    ) -> Result<Refreshed, SessionError> {
+        let published = self.republish_rows(session, plan, switch);
+        self.debug_check_tag_accounting();
+        published
+    }
+
+    /// [`Self::republish_in`], before the tag accounting is checked.
+    fn republish_rows(
+        &mut self,
+        session: &Session,
         mut plan: Vec<Planned>,
         switch: Option<ViewMode>,
     ) -> Result<Refreshed, SessionError> {
@@ -1943,10 +2282,15 @@ impl ProcessView {
         };
         // The rows reach the client once every entry before this one has.
         let rows_end = plan.len();
+        #[cfg(test)]
+        commit_fault::note_rows_end(rows_end);
         plan.extend(self.view_effects(mode, forest.as_ref()));
         // The tags status after the rows whose tag cells it describes
         // (PX-020).
         plan.extend(self.tags_effects(tag_counts));
+        // The client holds these rows, in this view, under this tag set and
+        // its status, once every entry up to here has committed.
+        let counts_end = plan.len();
         // The search counts the newly filtered rows; a target a filter hid is
         // reported as no longer shown, never replaced (PX-011). So is the
         // inspector's (PX-013), and a row these rows put under a parent the
@@ -1982,8 +2326,12 @@ impl ProcessView {
         // client reveals the hinted item wherever it moves. A switch carries
         // it into the shown view: the new collection holds no hint yet
         // (PX-018).
-        self.follow
-            .track(&target, &self.unfiltered_rows, self.threads.user);
+        self.follow.track(
+            &target,
+            &self.unfiltered_rows,
+            self.threads.user,
+            &self.last_seen,
+        );
         let follow = self.follow_after(mode, &target, switched, &plan);
         plan.extend(follow);
         if switched {
@@ -2013,6 +2361,7 @@ impl ProcessView {
             commit_reaching(session, &plan, max_ops, max_bytes, &mut self.published());
         result.transactions = transactions;
         self.settle_disclosure(held, reached >= rows_end);
+        self.settle_tag_counts(tag_counts, reached >= counts_end);
         refresh_sort_values(&mut self.rows, &target);
         self.ids.retain(&self.unfiltered_rows);
         self.prune_collapsed();
@@ -2430,9 +2779,13 @@ impl ProcessView {
         unfiltered: &[Row],
         unconfirmed: &HashSet<ItemId>,
     ) -> Vec<Planned> {
-        let target = self
-            .inspector
-            .view(rows, unfiltered, unconfirmed, self.owner.names());
+        let target = self.inspector.view(
+            rows,
+            unfiltered,
+            unconfirmed,
+            self.owner.names(),
+            &self.last_seen,
+        );
         let published = &self.inspector_published;
         [
             (INSPECTOR_STATUS, target.status, &published.status),
@@ -2588,8 +2941,12 @@ impl ProcessView {
         match on {
             Some(true) => {
                 let selected = self.inspector.selected_row().cloned();
-                self.follow
-                    .turn_on(selected.as_ref(), &self.rows, &self.unfiltered_rows);
+                self.follow.turn_on(
+                    selected.as_ref(),
+                    &self.rows,
+                    &self.unfiltered_rows,
+                    &self.last_seen,
+                );
             }
             Some(false) => self.follow.turn_off(),
             None => {}
@@ -3046,11 +3403,18 @@ impl ProcessView {
         &self.tags_published.status
     }
 
+    /// The tags status's change for a change that touches no row, such as
+    /// a record that aged out or turned `exited` (PX-021): counted among the
+    /// rows the client holds ([`Self::settle_tag_counts`]).
+    fn current_tags_effects(&self) -> Vec<Planned> {
+        self.tags_effects(self.tag_counts)
+    }
+
     /// The tags status's change for tag counts `counts` (PX-020): planned
     /// when its text or the set's generation changed, so a change that keeps
     /// the same words still records the generation the client now holds.
     fn tags_effects(&self, counts: TagCounts) -> Vec<Planned> {
-        let status = self.tags.status(counts);
+        let status = self.tags.status(counts, &self.last_seen);
         if status == self.tags_published.status
             && self.tags.generation() == self.tags_published.generation
         {
@@ -3062,16 +3426,77 @@ impl ProcessView {
         })]
     }
 
+    /// Takes `counts`, those of the rows and the tag set a plan published, as
+    /// the counts the client holds once that plan's rows, view and tags
+    /// status `reached` it. A plan that failed before then leaves the client,
+    /// and so the counts, as they were, as [`Self::settle_tags`] leaves the
+    /// set (verification of PR #107's review, G1).
+    fn settle_tag_counts(&mut self, counts: TagCounts, reached: bool) {
+        if reached {
+            self.tag_counts = counts;
+        }
+    }
+
+    /// Keeps the tag accounting invariant after the live set grows (PX-021,
+    /// codex5 verification): every tagged process instance is exactly one of
+    /// live (in the tag set; any record of it is not a historical tag),
+    /// historical (a record that is a historical tag, not in the tag set) or
+    /// forgotten (counted once). A record whose instance's tag is live is
+    /// therefore no historical tag: its tag is live again, and the live tag
+    /// watches the record until a committed sample retires it.
+    fn promote_live_tags(&mut self) {
+        let live: Vec<ProcessKey> = self
+            .last_seen
+            .tagged()
+            .filter(|tombstone| self.tags.is_tagged(tombstone.key()))
+            .map(|tombstone| tombstone.key().clone())
+            .collect();
+        for key in &live {
+            self.last_seen.untag(key);
+        }
+    }
+
+    /// Asserts the invariant [`Self::promote_live_tags`] keeps: no instance
+    /// is a live and a historical tag at once. Every sample, republish and
+    /// tag request ends with it, in debug builds and tests.
+    fn debug_check_tag_accounting(&self) {
+        debug_assert!(
+            self.last_seen
+                .tagged()
+                .all(|tombstone| !self.tags.is_tagged(tombstone.key())),
+            "an instance is a live and a historical tag at once"
+        );
+    }
+
     /// Puts back `held`, the tag set before a request or a sample changed it,
     /// when the tags status stating the change never committed (PX-020): the
     /// client then still shows the rows and status of the set before, and the
     /// set may not run ahead of them. A plan that committed its rows in part
     /// leaves cells the next publication restates from the set put back.
-    fn settle_tags(&mut self, held: Option<Tags>) {
+    ///
+    /// Says whether it put the set back.
+    fn settle_tags(&mut self, held: Option<Tags>) -> bool {
+        let mut put_back = false;
         if let Some(held) = held {
             if self.tags_published.generation != self.tags.generation() {
+                put_back = true;
                 self.tags = held;
+                // A tag put back is live again, not historical (PX-021); its
+                // tombstone is kept, and is historical again when a sample
+                // that commits retires it.
+                self.promote_live_tags();
             }
+        }
+        put_back
+    }
+
+    /// Keeps `retagged` historical again (PX-021): the sample that made their
+    /// tags live never committed its tags status, so the set was put back
+    /// without them (it was held before they were tagged again, so none of
+    /// them is live in it), and the next committed sample makes them live.
+    fn unretag(&mut self, retagged: Vec<Tombstone>) {
+        for tombstone in retagged {
+            self.last_seen.record(tombstone);
         }
     }
 
@@ -3082,13 +3507,25 @@ impl ProcessView {
         let Some(selected) = self.inspector.selected_row() else {
             return Err("Nothing tagged: select a process row first".to_string());
         };
-        match self.rows.iter().find(|row| row.item_id == selected.item_id) {
-            Some(row) => Ok(row.clone()),
-            None => Err(format!(
+        if let Some(row) = self.rows.iter().find(|row| row.item_id == selected.item_id) {
+            return Ok(row.clone());
+        }
+        let listed = self
+            .unfiltered_rows
+            .iter()
+            .any(|row| row.item_id == selected.item_id);
+        Err(match self.last_seen.get(&selected.key) {
+            // A tombstone is never a target (PX-021).
+            Some(tombstone) if !listed => format!(
+                "Nothing tagged: {} {}: a historical record is never tagged",
+                crate::tags::who(selected),
+                tombstone.departure().predicate()
+            ),
+            _ => format!(
                 "Nothing tagged: {} is no longer shown",
                 crate::tags::who(selected)
-            )),
-        }
+            ),
+        })
     }
 
     /// Applies one tag request (PX-020) and republishes: the rows whose tag
@@ -3112,8 +3549,12 @@ impl ProcessView {
         request: TagRequest,
     ) -> Result<Refreshed, SessionError> {
         let held = self.tags.clone();
+        let held_last_seen = self.last_seen.clone();
         match request {
-            TagRequest::Clear => self.tags.clear(),
+            TagRequest::Clear => {
+                let historical = self.last_seen.untag_all();
+                self.tags.clear(historical);
+            }
             TagRequest::Toggle => match self.tag_target() {
                 Ok(row) => self.tags.toggle(&row),
                 Err(why) => self.tags.refuse(why),
@@ -3135,8 +3576,17 @@ impl ProcessView {
                 Err(why) => self.tags.refuse(why),
             },
         }
+        // An instance this request tags whose record is still a historical
+        // tag (a sample relisted it, and its tags status never committed)
+        // is now one live tag, not a second one (codex5 verification).
+        self.promote_live_tags();
         let published = self.republish(session, Vec::new());
+        if self.tags_published.generation != self.tags.generation() {
+            // The historical tags a clear removed come back with it.
+            self.last_seen = held_last_seen;
+        }
         self.settle_tags(Some(held));
+        self.debug_check_tag_accounting();
         published
     }
 
@@ -3253,7 +3703,16 @@ impl ProcessView {
         if !self.inspector.completed(request, read) {
             return Ok(Refreshed::default());
         }
-        let plan = self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
+        // A read that was loading when a scan recorded the target's
+        // departure establishes that record's exit now (PX-021, Codex review
+        // of PR #107): the inspector accepted it only for the target's exact
+        // instance and generation, and the tags status names the record too.
+        let exited = self.inspector.read_exit(&request.key)
+            && self.last_seen.establish_detail_exit(&request.key);
+        let mut plan = self.inspector_effects(&self.rows, &self.unfiltered_rows, &self.unconfirmed);
+        if exited {
+            plan.extend(self.current_tags_effects());
+        }
         self.publish_controls(session, plan)
     }
 
@@ -4227,6 +4686,12 @@ fn commit_reaching(
                 }
             }
         }
+        #[cfg(test)]
+        if let Some(split) = commit_fault::split_at() {
+            if start < split && split < end {
+                end = split;
+            }
+        }
         let chunk = &plan[start..end];
         match session.transaction(|ui| {
             // Test-only: a failed session commit, injected here so tests can
@@ -4308,6 +4773,33 @@ mod commit_fault {
     pub(super) fn arm(after: usize) -> Armed {
         FAIL_IN.with(|slot| slot.set(Some(after)));
         Armed
+    }
+
+    thread_local! {
+        static SPLIT_ARMED: Cell<bool> = const { Cell::new(false) };
+        static SPLIT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Splits the next plan's commit at its rows' end, so its rows commit in
+    /// one transaction and what follows in another (a test of a commit that
+    /// reaches the rows and not the tags status).
+    pub(super) fn arm_split_at_rows_end() {
+        SPLIT_ARMED.with(|armed| armed.set(true));
+    }
+
+    pub(super) fn disarm_split() {
+        SPLIT_ARMED.with(|armed| armed.set(false));
+        SPLIT.with(|split| split.set(None));
+    }
+
+    pub(super) fn note_rows_end(rows_end: usize) {
+        if SPLIT_ARMED.with(|armed| armed.get()) {
+            SPLIT.with(|split| split.set(Some(rows_end)));
+        }
+    }
+
+    pub(super) fn split_at() -> Option<usize> {
+        SPLIT.with(|split| split.get())
     }
 
     /// Whether this transaction attempt must fail.
@@ -8514,6 +9006,71 @@ mod tag_commit_tests {
         assert!(tagged_pids(&view).is_empty());
     }
 
+    /// PX-021: a sample in which the selected process exited records its
+    /// tombstone even when nothing commits, since that is what the server
+    /// knows; the client keeps the lines it holds, and the next publication
+    /// shows the tombstone, with the last-observed time of the scan that last
+    /// listed it.
+    #[test]
+    fn a_failed_sample_records_the_tombstone_and_the_next_publication_shows_it() {
+        let mut source = family();
+        let session = Session::mint();
+        let (mut view, _) = ProcessView::start(&session, &mut source).unwrap();
+        select(&session, &mut view, 11);
+        let live = view.inspector_view().status.clone();
+        source
+            .0
+            .retain(|record| record.key.pid != Observed::Known(11));
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.refresh(&session, &mut source).is_err());
+        }
+        assert_eq!(view.last_seen().len(), 1);
+        assert_eq!(
+            view.inspector_view().status,
+            live,
+            "nothing reached the client"
+        );
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(
+            view.inspector_view().status,
+            "Selected process: PID 11 · cc · exited: a scan that accounts for its PID no longer lists it · last observed 1970-01-01 00:00:00 UTC; a historical record: no action applies to it"
+        );
+        assert_eq!(view.last_seen().len(), 1);
+    }
+
+    /// PX-021: a Clear tags that did not commit keeps the historical tags,
+    /// which are tombstones, as well as the live ones.
+    #[test]
+    fn a_failed_clear_keeps_the_historical_tags() {
+        let mut source = family();
+        let session = Session::mint();
+        let (mut view, _) = ProcessView::start(&session, &mut source).unwrap();
+        select(&session, &mut view, 11);
+        view.request_tags(&session, TagRequest::Toggle).unwrap();
+        select(&session, &mut view, 1);
+        source
+            .0
+            .retain(|record| record.key.pid != Observed::Known(11));
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.historical_tags(), ["PID 11 · cc"]);
+        let status = view.tags_status().to_string();
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.request_tags(&session, TagRequest::Clear).is_err());
+        }
+        assert_eq!(view.historical_tags(), ["PID 11 · cc"]);
+        assert_eq!(view.tags_status(), status);
+        view.request_tags(&session, TagRequest::Clear).unwrap();
+        assert!(view.historical_tags().is_empty());
+        assert!(view
+            .tags_status()
+            .ends_with("Cleared 0 tags and 1 historical; the selection is unchanged"));
+        // No longer tagged, selected or followed: the next sample drops it.
+        view.refresh(&session, &mut source).unwrap();
+        assert!(view.last_seen().is_empty());
+    }
+
     /// A sample in which a tagged process ended and that did not commit
     /// leaves the tag live: the client still shows the row, tagged. The next
     /// sample that commits makes it historical.
@@ -8533,18 +9090,2000 @@ mod tag_commit_tests {
             assert!(view.refresh(&session, &mut source).is_err());
         }
         assert_eq!(view.tags().tagged(), 1, "the set did not run ahead");
-        assert_eq!(view.tags().historical(), 0);
+        assert_eq!(view.historical_tags().len(), 0);
         assert_eq!(view.tags_status(), status);
         assert_eq!(tagged_pids(&view), [11], "the client still shows it tagged");
         view.refresh(&session, &mut source).unwrap();
         assert_eq!(view.tags().tagged(), 0);
-        assert_eq!(view.tags().history().collect::<Vec<_>>(), ["PID 11 · cc"]);
+        assert_eq!(view.historical_tags(), ["PID 11 · cc"]);
         assert!(
             view.tags_status()
-                .starts_with("Tags: 0 tagged · 1 no longer listed: PID 11 · cc"),
+                .starts_with("Tags: 0 tagged · 1 historical: PID 11 · cc exited, last observed 1970-01-01 00:00:00 UTC"),
             "{}",
             view.tags_status()
         );
         assert!(tagged_pids(&view).is_empty());
+    }
+}
+
+/// PX-021 correction round 2: a historical tag made live again by a sample
+/// that never committed its tags status is historical again, and the next
+/// committed sample makes it live.
+#[cfg(test)]
+mod retag_commit_tests {
+    use super::*;
+    use crate::source::{
+        BootId, CappedRecords, Completeness, CpuUsage, CreationToken, DisplayName,
+        FakeProcessSource, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+        SkippedRecords, SnapshotTime, SourceId, OWNER_NOT_COLLECTED,
+    };
+
+    const CLIENT: &[u8] = b"retag-client";
+
+    fn record(pid: u32, name: &str) -> ProcessRecord {
+        ProcessRecord {
+            lineage: Lineage::new(if pid == 1 { 0 } else { 1 }, u64::from(pid)),
+            owner: OWNER_NOT_COLLECTED,
+            key: ProcessKey {
+                source: SourceId("retag-fixture".into()),
+                host: Observed::Known(HostId("h".into())),
+                boot: Observed::Known(BootId("b".into())),
+                pid_namespace: Observed::Known(PidNamespaceId(1)),
+                pid: Observed::Known(pid),
+                creation: CreationToken::Opaque(name.into()),
+                thread: None,
+            },
+            kind: crate::source::KIND_NOT_COLLECTED,
+            display_name: DisplayName::from(name),
+            resident: Observed::Known(4096),
+            cpu: CpuUsage::WarmingUp,
+        }
+    }
+
+    /// Steps of (records, unenumerable), the last repeated.
+    struct Steps(Vec<(Vec<ProcessRecord>, bool)>, usize);
+
+    impl ProcessSource for Steps {
+        fn status_text(&self) -> &str {
+            "Read-only · Retag fixture"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            let (records, unenumerable) = self.0[self.1.min(self.0.len() - 1)].clone();
+            self.1 += 1;
+            ProcessSnapshot {
+                source: SourceId("retag-fixture".into()),
+                sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH),
+                records,
+                vanished: 0,
+                capped: CappedRecords::none(),
+                completeness: if unenumerable {
+                    Completeness::from_scan(SkippedRecords::unenumerable(), Vec::new())
+                } else {
+                    Completeness::Complete
+                },
+                system: FakeProcessSource::system(),
+                threads: crate::source::ThreadScan::NotProvided,
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_sample_that_would_retag_keeps_the_tag_historical_until_one_commits() {
+        let all = || {
+            vec![
+                record(1, "init"),
+                record(300, "worker"),
+                record(301, "other"),
+            ]
+        };
+        let mut source = Steps(
+            vec![
+                (all(), false),
+                (
+                    vec![record(1, "init"), record(400, "new"), record(401, "newer")],
+                    true,
+                ),
+                (all(), false),
+            ],
+            0,
+        );
+        let session = Session::mint();
+        let (view, _) = ProcessView::start(&session, &mut source).unwrap();
+        let mut view = view.with_published_limit(3);
+        let item = |view: &ProcessView, pid: u32| {
+            view.rows
+                .iter()
+                .find(|row| row.key.pid == Observed::Known(pid))
+                .map(|row| row.item_id)
+        };
+        view.select_item(&session, CLIENT, item(&view, 300))
+            .unwrap();
+        view.request_tags(&session, TagRequest::Toggle).unwrap();
+        view.select_item(&session, CLIENT, item(&view, 1)).unwrap();
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.historical_tags(), ["PID 300 · worker"]);
+        let status = view.tags_status().to_string();
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.refresh(&session, &mut source).is_err());
+        }
+        assert_eq!(view.tags().tagged(), 0, "the set did not run ahead");
+        assert_eq!(
+            view.historical_tags(),
+            ["PID 300 · worker"],
+            "historical again"
+        );
+        assert_eq!(view.tags_status(), status);
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.tags().tagged(), 1);
+        assert!(view.historical_tags().is_empty());
+        assert!(view
+            .rows
+            .iter()
+            .any(|row| row.tagged && row.key.pid == Observed::Known(300)));
+        assert!(view
+            .tags_status()
+            .starts_with("Tags: 1 tagged · Tagged again: PID 300 · worker"));
+    }
+}
+
+/// PX-021 correction round 3 (G2): follow watches a record. Turned on for a
+/// row a failed commit left on the client after its process left, it stays
+/// on it when a collapse clears the inspector; the next sample keeps the
+/// record, and follow stops saying the process exited.
+#[cfg(test)]
+mod follow_watch_tests {
+    use super::*;
+    use crate::source::{
+        BootId, CappedRecords, Completeness, CpuUsage, CreationToken, DisplayName,
+        FakeProcessSource, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+        SnapshotTime, SourceId, OWNER_NOT_COLLECTED,
+    };
+
+    const CLIENT: &[u8] = b"follow-watch-client";
+
+    fn record(pid: u32, parent: u32, name: &str) -> ProcessRecord {
+        ProcessRecord {
+            lineage: Lineage::new(parent, u64::from(pid)),
+            owner: OWNER_NOT_COLLECTED,
+            key: ProcessKey {
+                source: SourceId("follow-watch".into()),
+                host: Observed::Known(HostId("h".into())),
+                boot: Observed::Known(BootId("b".into())),
+                pid_namespace: Observed::Known(PidNamespaceId(1)),
+                pid: Observed::Known(pid),
+                creation: CreationToken::Opaque(name.into()),
+                thread: None,
+            },
+            kind: crate::source::KIND_NOT_COLLECTED,
+            display_name: DisplayName::from(name),
+            resident: Observed::Known(4096),
+            cpu: CpuUsage::WarmingUp,
+        }
+    }
+
+    struct Steps(Vec<Vec<ProcessRecord>>, usize);
+
+    impl ProcessSource for Steps {
+        fn status_text(&self) -> &str {
+            "Read-only · Follow-watch fixture"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            let records = self.0[self.1.min(self.0.len() - 1)].clone();
+            self.1 += 1;
+            ProcessSnapshot {
+                source: SourceId("follow-watch".into()),
+                sampled_at: SnapshotTime(
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(self.1 as u64),
+                ),
+                records,
+                vanished: 0,
+                capped: CappedRecords::none(),
+                completeness: Completeness::Complete,
+                system: FakeProcessSource::system(),
+                threads: crate::source::ThreadScan::NotProvided,
+            }
+        }
+    }
+
+    #[test]
+    fn a_record_only_follow_watches_survives_the_next_sample() {
+        let all = vec![
+            record(1, 0, "init"),
+            record(200, 1, "parent"),
+            record(300, 200, "worker"),
+        ];
+        let after = vec![record(1, 0, "init"), record(200, 1, "parent")];
+        let mut source = Steps(vec![all, after], 0);
+        let session = Session::mint();
+        let (mut view, _) = ProcessView::start(&session, &mut source).unwrap();
+        view.set_view(&session, Some(true)).unwrap();
+        let item = |view: &ProcessView, pid: u32| {
+            view.rows
+                .iter()
+                .find(|row| row.key.pid == Observed::Known(pid))
+                .map(|row| row.item_id)
+        };
+        let worker = item(&view, 300).unwrap();
+        let parent = item(&view, 200).unwrap();
+        view.select_item(&session, CLIENT, Some(worker)).unwrap();
+        // The sample in which 300 exits never reaches the client.
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.refresh(&session, &mut source).is_err());
+        }
+        assert_eq!(item(&view, 300), Some(worker), "the client still shows it");
+        assert_eq!(view.last_seen().len(), 1);
+        view.select_item(&session, CLIENT, Some(worker)).unwrap();
+        view.set_follow(&session, Some(true)).unwrap();
+        assert_eq!(view.follow().following(), Some(worker));
+        // A collapse hides it: the inspector is cleared, follow stays on it.
+        view.expansion_changed(&session, CLIENT, TREE, parent, false)
+            .unwrap();
+        assert!(view.inspector().selected().is_none());
+        assert_eq!(view.follow().following(), Some(worker));
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.last_seen().len(), 1, "follow watched the record");
+        assert!(
+            view.follow_view()
+                .status
+                .starts_with("Follow stopped: PID 300 · worker exited · "),
+            "{}",
+            view.follow_view().status
+        );
+    }
+
+    /// Merge with main (PX-017-G02): a user deselect is not a collapse. It
+    /// stops follow, so the record follow alone watched goes at the next
+    /// sample.
+    #[test]
+    fn a_user_deselect_releases_a_record_only_follow_watches() {
+        let all = vec![
+            record(1, 0, "init"),
+            record(200, 1, "parent"),
+            record(300, 200, "worker"),
+        ];
+        let after = vec![record(1, 0, "init"), record(200, 1, "parent")];
+        let mut source = Steps(vec![all, after], 0);
+        let session = Session::mint();
+        let (mut view, _) = ProcessView::start(&session, &mut source).unwrap();
+        let worker = view
+            .rows
+            .iter()
+            .find(|row| row.key.pid == Observed::Known(300))
+            .map(|row| row.item_id)
+            .unwrap();
+        view.select_item(&session, CLIENT, Some(worker)).unwrap();
+        // The sample in which 300 exits never reaches the client.
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.refresh(&session, &mut source).is_err());
+        }
+        assert_eq!(view.last_seen().len(), 1);
+        view.select_item(&session, CLIENT, Some(worker)).unwrap();
+        view.set_follow(&session, Some(true)).unwrap();
+        assert_eq!(view.follow().following(), Some(worker));
+        view.clear_selection_in(&session, CLIENT, crate::TABLE)
+            .unwrap();
+        assert!(view.inspector().selected().is_none());
+        assert_eq!(view.follow().following(), None);
+        assert_eq!(
+            view.follow_view().status,
+            crate::follow::SELECTION_CLEARED_FOLLOW_STATUS
+        );
+        view.refresh(&session, &mut source).unwrap();
+        assert!(view.last_seen().is_empty(), "nothing watches the record");
+    }
+}
+
+/// Codex review round (PR #107), `PRRT_kwDOUG_6uM62qN_6`: a tags status that
+/// an unreadable scan could not publish after a historical tag aged out is
+/// published by the next unreadable scan, not left naming a record the
+/// server no longer keeps.
+#[cfg(test)]
+mod expiry_publish_tests {
+    use super::*;
+    use crate::lastseen::MAX_TOMBSTONE_AGE;
+    use crate::source::{
+        BootId, CappedRecords, Completeness, CpuUsage, CreationToken, DisplayName,
+        FakeProcessSource, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+        SkippedRecords, SnapshotTime, SourceId, OWNER_NOT_COLLECTED,
+    };
+    use std::sync::Mutex;
+
+    const CLIENT: &[u8] = b"expiry-publish-client";
+
+    fn record(pid: u32, name: &str) -> ProcessRecord {
+        ProcessRecord {
+            lineage: Lineage::new(if pid == 1 { 0 } else { 1 }, u64::from(pid)),
+            owner: OWNER_NOT_COLLECTED,
+            key: ProcessKey {
+                source: SourceId("expiry-publish".into()),
+                host: Observed::Known(HostId("h".into())),
+                boot: Observed::Known(BootId("b".into())),
+                pid_namespace: Observed::Known(PidNamespaceId(1)),
+                pid: Observed::Known(pid),
+                creation: CreationToken::Opaque(name.into()),
+                thread: None,
+            },
+            kind: crate::source::KIND_NOT_COLLECTED,
+            display_name: DisplayName::from(name),
+            resident: Observed::Known(4096),
+            cpu: CpuUsage::WarmingUp,
+        }
+    }
+
+    /// Steps of records, the last repeated; an empty step is a scan that
+    /// could not read the process list.
+    struct Steps(Vec<Vec<ProcessRecord>>, usize);
+
+    impl ProcessSource for Steps {
+        fn status_text(&self) -> &str {
+            "Read-only · Expiry-publish fixture"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            let records = self.0[self.1.min(self.0.len() - 1)].clone();
+            self.1 += 1;
+            let unreadable = records.is_empty();
+            ProcessSnapshot {
+                source: SourceId("expiry-publish".into()),
+                sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH),
+                records,
+                vanished: 0,
+                capped: CappedRecords::none(),
+                completeness: if unreadable {
+                    Completeness::from_scan(SkippedRecords::unenumerable(), Vec::new())
+                } else {
+                    Completeness::Complete
+                },
+                system: FakeProcessSource::system(),
+                threads: crate::source::ThreadScan::NotProvided,
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Clock(Mutex<Duration>);
+
+    impl MonotonicClock for Clock {
+        fn now(&self) -> Duration {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    #[test]
+    fn an_unpublished_tag_expiry_is_published_by_the_next_unreadable_scan() {
+        let clock = Arc::new(Clock::default());
+        let mut source = Steps(
+            vec![
+                vec![record(1, "init"), record(300, "worker")],
+                vec![record(1, "init")],
+                Vec::new(),
+            ],
+            0,
+        );
+        let session = Session::mint();
+        let (view, _) = ProcessView::start(&session, &mut source).unwrap();
+        let mut view = view.with_clock(clock.clone());
+        let item = |view: &ProcessView, pid: u32| {
+            view.rows
+                .iter()
+                .find(|row| row.key.pid == Observed::Known(pid))
+                .map(|row| row.item_id)
+        };
+        view.select_item(&session, CLIENT, item(&view, 300))
+            .unwrap();
+        view.request_tags(&session, TagRequest::Toggle).unwrap();
+        view.select_item(&session, CLIENT, item(&view, 1)).unwrap();
+        view.refresh(&session, &mut source).unwrap();
+        assert!(
+            view.tags_status()
+                .starts_with("Tags: 0 tagged · 1 historical: PID 300 · worker exited"),
+            "{}",
+            view.tags_status()
+        );
+        *clock.0.lock().unwrap() = MAX_TOMBSTONE_AGE;
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.refresh(&session, &mut source).is_err());
+        }
+        assert!(view.last_seen().is_empty(), "the record aged out");
+        assert!(
+            view.tags_status().contains("PID 300 · worker exited"),
+            "the client still holds the old status: {}",
+            view.tags_status()
+        );
+        view.refresh(&session, &mut source).unwrap();
+        assert!(
+            view.tags_status()
+                .starts_with("Tags: 0 tagged · 1 historical, forgotten"),
+            "{}",
+            view.tags_status()
+        );
+    }
+}
+
+/// Verification of the Codex review round (PR #107), G1 and G2: the tag
+/// counts a change that republishes no row states the tags status with are
+/// those of the rows the client holds. They follow a sample or a republish
+/// whose rows reached the client, and never one whose commit failed.
+#[cfg(test)]
+mod tag_counts_commit_tests {
+    use super::*;
+    use crate::catalogue::ProcessField;
+    use crate::source::{
+        BootId, CappedRecords, Completeness, CpuUsage, CreationToken, DisplayName,
+        FakeProcessSource, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+        SkippedRecords, SnapshotTime, SourceId, OWNER_NOT_COLLECTED,
+    };
+
+    const CLIENT: &[u8] = b"tag-counts-client";
+    const BEYOND: &str = "1 beyond the publishable size limit";
+
+    fn record(pid: u32, parent: u32, name: &str) -> ProcessRecord {
+        ProcessRecord {
+            lineage: Lineage::new(parent, u64::from(pid)),
+            owner: OWNER_NOT_COLLECTED,
+            key: ProcessKey {
+                source: SourceId("tag-counts".into()),
+                host: Observed::Known(HostId("h".into())),
+                boot: Observed::Known(BootId("b".into())),
+                pid_namespace: Observed::Known(PidNamespaceId(1)),
+                pid: Observed::Known(pid),
+                creation: CreationToken::Opaque(name.into()),
+                thread: None,
+            },
+            kind: crate::source::KIND_NOT_COLLECTED,
+            display_name: DisplayName::from(name),
+            resident: Observed::Known(4096),
+            cpu: CpuUsage::WarmingUp,
+        }
+    }
+
+    fn usual() -> Vec<ProcessRecord> {
+        vec![
+            record(1, 0, "init"),
+            record(10, 1, "a"),
+            record(20, 1, "b"),
+            record(30, 10, "c"),
+            record(40, 0, "solo"),
+            record(50, 0, "solo2"),
+        ]
+    }
+
+    /// `records` while readable; an unreadable scan reads no process list.
+    struct Source {
+        records: Vec<ProcessRecord>,
+        unreadable: bool,
+        scans: u64,
+    }
+
+    impl ProcessSource for Source {
+        fn status_text(&self) -> &str {
+            "Read-only · Tag-counts fixture"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            self.scans += 1;
+            ProcessSnapshot {
+                source: SourceId("tag-counts".into()),
+                sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH + Duration::from_secs(self.scans)),
+                records: if self.unreadable {
+                    Vec::new()
+                } else {
+                    self.records.clone()
+                },
+                vanished: 0,
+                capped: CappedRecords::none(),
+                completeness: if self.unreadable {
+                    Completeness::from_scan(SkippedRecords::unenumerable(), Vec::new())
+                } else {
+                    Completeness::Complete
+                },
+                system: FakeProcessSource::system(),
+                threads: crate::source::ThreadScan::NotProvided,
+            }
+        }
+    }
+
+    fn pids(view: &ProcessView) -> Vec<u32> {
+        view.rows
+            .iter()
+            .filter_map(|row| match row.key.pid {
+                Observed::Known(pid) => Some(pid),
+                Observed::Missing(_) => None,
+            })
+            .collect()
+    }
+
+    /// A view at row limit 3 over `usual()`, with PID 20 tagged.
+    fn start() -> (Session, ProcessView, Source) {
+        let session = Session::mint();
+        let mut source = Source {
+            records: usual(),
+            unreadable: false,
+            scans: 0,
+        };
+        let (view, _) = ProcessView::start(&session, &mut source).unwrap();
+        let mut view = view.with_published_limit(3);
+        view.refresh(&session, &mut source).unwrap();
+        let item = view
+            .rows
+            .iter()
+            .find(|row| row.key.pid == Observed::Known(20))
+            .map(|row| row.item_id);
+        assert!(item.is_some(), "20 is shown in {:?}", pids(&view));
+        view.select_item(&session, CLIENT, item).unwrap();
+        view.request_tags(&session, TagRequest::Toggle).unwrap();
+        assert_eq!(view.tags().tagged(), 1);
+        (session, view, source)
+    }
+
+    /// An unreadable scan, then the tags status the client holds.
+    fn unreadable_scan(session: &Session, view: &mut ProcessView, source: &mut Source) -> String {
+        source.unreadable = true;
+        view.refresh(session, source).unwrap();
+        source.unreadable = false;
+        view.tags_status().to_string()
+    }
+
+    /// Sorts by PID descending, so 20 is beyond the limit of 3.
+    fn sort_20_out(session: &Session, view: &mut ProcessView) {
+        view.click_sort(session, ProcessField::Pid).unwrap();
+        if pids(view).contains(&20) {
+            view.click_sort(session, ProcessField::Pid).unwrap();
+        }
+        assert!(!pids(view).contains(&20), "{:?}", pids(view));
+    }
+
+    /// G1 (a): a Clear whose commit fails puts the set back, and the client
+    /// keeps its rows and status; the next unreadable scan states that status.
+    #[test]
+    fn a_failed_clear_leaves_the_counts_of_the_rows_the_client_holds() {
+        let (session, mut view, mut source) = start();
+        sort_20_out(&session, &mut view);
+        let before = view.tags_status().to_string();
+        assert!(before.contains(BEYOND), "{before}");
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.request_tags(&session, TagRequest::Clear).is_err());
+        }
+        assert_eq!(view.tags().tagged(), 1, "the set was put back");
+        assert_eq!(view.tags_status(), before);
+        assert_eq!(unreadable_scan(&session, &mut view, &mut source), before);
+    }
+
+    /// G1 (b): a switch to the tree whose commit fails leaves the table
+    /// shown; the next unreadable scan states the table's tags status.
+    #[test]
+    fn a_failed_view_switch_leaves_the_counts_of_the_rows_the_client_holds() {
+        let (session, mut view, mut source) = start();
+        let rows = pids(&view);
+        let before = view.tags_status().to_string();
+        assert!(!before.contains(BEYOND), "{before}");
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.set_view(&session, Some(true)).is_err());
+        }
+        assert_eq!(view.mode, ViewMode::Table);
+        assert_eq!(pids(&view), rows);
+        assert_eq!(unreadable_scan(&session, &mut view, &mut source), before);
+    }
+
+    /// G2 (the sample's write): a readable scan in which a newcomer pushes
+    /// the tagged row beyond the limit; the next unreadable scan keeps saying
+    /// so.
+    #[test]
+    fn a_sample_that_moves_a_tag_beyond_the_limit_sets_the_counts() {
+        let (session, mut view, mut source) = start();
+        assert!(!view.tags_status().contains(BEYOND));
+        source.records.insert(1, record(5, 1, "newcomer"));
+        view.refresh(&session, &mut source).unwrap();
+        assert!(!pids(&view).contains(&20), "{:?}", pids(&view));
+        let status = view.tags_status().to_string();
+        assert!(status.contains(BEYOND), "{status}");
+        assert_eq!(unreadable_scan(&session, &mut view, &mut source), status);
+    }
+
+    /// H1: a readable sample whose commit fails leaves the client with its
+    /// rows and status; the next unreadable scan states that status, not the
+    /// failed sample's counts.
+    #[test]
+    fn a_failed_sample_leaves_the_counts_of_the_rows_the_client_holds() {
+        let (session, mut view, mut source) = start();
+        let rows = pids(&view);
+        let before = view.tags_status().to_string();
+        assert!(!before.contains(BEYOND), "{before}");
+        source.records.insert(1, record(5, 1, "newcomer"));
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.refresh(&session, &mut source).is_err());
+        }
+        assert_eq!(view.tags_status(), before);
+        assert_eq!(pids(&view), rows, "the client still shows 20");
+        assert_eq!(unreadable_scan(&session, &mut view, &mut source), before);
+    }
+
+    /// H2: with nothing selected, a sort's plan ends with the tags status, so
+    /// the counts follow a plan that committed exactly through its last
+    /// entry.
+    #[test]
+    fn a_sort_whose_plan_ends_at_the_tags_status_sets_the_counts() {
+        let (session, mut view, mut source) = start();
+        view.clear_selection(&session).unwrap();
+        assert!(view.inspector().selected().is_none());
+        sort_20_out(&session, &mut view);
+        let status = view.tags_status().to_string();
+        assert!(status.contains(BEYOND), "{status}");
+        assert_eq!(unreadable_scan(&session, &mut view, &mut source), status);
+    }
+
+    /// G2 (the republish's write): a sort that moves the tagged row beyond
+    /// the limit; the next unreadable scan keeps saying so.
+    #[test]
+    fn a_sort_that_moves_a_tag_beyond_the_limit_sets_the_counts() {
+        let (session, mut view, mut source) = start();
+        assert!(!view.tags_status().contains(BEYOND));
+        sort_20_out(&session, &mut view);
+        let status = view.tags_status().to_string();
+        assert!(status.contains(BEYOND), "{status}");
+        assert_eq!(unreadable_scan(&session, &mut view, &mut source), status);
+    }
+}
+
+/// Codex review of PR #107, `PRRT_kwDOUG_6uM620bez`: a tagged process that
+/// is neither selected nor followed leaves in a sample whose tags status never
+/// commits. The tag is put back live and its record is no longer a
+/// historical tag, but the live tag still watches that record until a
+/// committed sample retires it; the retry then keeps the historical tag. If
+/// a bound dropped the record meanwhile, the retired tag is counted
+/// forgotten, never silently lost.
+#[cfg(test)]
+mod failed_retire_tests {
+    use super::*;
+    use crate::lastseen::MAX_TOMBSTONE_AGE;
+    use crate::source::{
+        BootId, CappedRecords, Completeness, CpuUsage, CreationToken, DisplayName,
+        FakeProcessSource, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+        SnapshotTime, SourceId, OWNER_NOT_COLLECTED,
+    };
+    use std::sync::Mutex;
+
+    const CLIENT: &[u8] = b"failed-retire-client";
+
+    fn record(pid: u32, name: &str) -> ProcessRecord {
+        ProcessRecord {
+            lineage: Lineage::new(if pid == 1 { 0 } else { 1 }, u64::from(pid)),
+            owner: OWNER_NOT_COLLECTED,
+            key: ProcessKey {
+                source: SourceId("failed-retire".into()),
+                host: Observed::Known(HostId("h".into())),
+                boot: Observed::Known(BootId("b".into())),
+                pid_namespace: Observed::Known(PidNamespaceId(1)),
+                pid: Observed::Known(pid),
+                creation: CreationToken::Opaque(name.into()),
+                thread: None,
+            },
+            kind: crate::source::KIND_NOT_COLLECTED,
+            display_name: DisplayName::from(name),
+            resident: Observed::Known(4096),
+            cpu: CpuUsage::WarmingUp,
+        }
+    }
+
+    struct Steps(Vec<Vec<ProcessRecord>>, usize);
+
+    impl ProcessSource for Steps {
+        fn status_text(&self) -> &str {
+            "Read-only · Failed-retire fixture"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            let records = self.0[self.1.min(self.0.len() - 1)].clone();
+            self.1 += 1;
+            ProcessSnapshot {
+                source: SourceId("failed-retire".into()),
+                sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH),
+                records,
+                vanished: 0,
+                capped: CappedRecords::none(),
+                completeness: Completeness::Complete,
+                system: FakeProcessSource::system(),
+                threads: crate::source::ThreadScan::NotProvided,
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Clock(Mutex<Duration>);
+
+    impl MonotonicClock for Clock {
+        fn now(&self) -> Duration {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    /// `worker` (300) tagged, `init` selected, follow off; then a sample in
+    /// which 300 exited fails before its tags status commits.
+    fn failed_retirement(clock: Arc<Clock>) -> (Session, ProcessView, Steps) {
+        let mut source = Steps(
+            vec![
+                vec![record(1, "init"), record(300, "worker")],
+                vec![record(1, "init")],
+            ],
+            0,
+        );
+        let session = Session::mint();
+        let (view, _) = ProcessView::start(&session, &mut source).unwrap();
+        let mut view = view.with_clock(clock);
+        let item = |view: &ProcessView, pid: u32| {
+            view.rows
+                .iter()
+                .find(|row| row.key.pid == Observed::Known(pid))
+                .map(|row| row.item_id)
+        };
+        view.select_item(&session, CLIENT, item(&view, 300))
+            .unwrap();
+        view.request_tags(&session, TagRequest::Toggle).unwrap();
+        view.select_item(&session, CLIENT, item(&view, 1)).unwrap();
+        assert!(view.follow().following().is_none());
+        {
+            let _armed = commit_fault::arm(0);
+            assert!(view.refresh(&session, &mut source).is_err());
+        }
+        assert_eq!(view.tags().tagged(), 1, "the live tag was put back");
+        assert!(view.historical_tags().is_empty());
+        (session, view, source)
+    }
+
+    #[test]
+    fn a_failed_retirement_of_an_unwatched_tag_keeps_its_record_for_the_retry() {
+        let (session, mut view, mut source) = failed_retirement(Arc::new(Clock::default()));
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.tags().tagged(), 0);
+        assert_eq!(view.historical_tags(), ["PID 300 · worker"]);
+        assert_eq!(view.last_seen().forgotten_tags(), 0);
+        assert!(
+            view.tags_status()
+                .starts_with("Tags: 0 tagged · 1 historical: PID 300 · worker exited"),
+            "{}",
+            view.tags_status()
+        );
+    }
+
+    /// Bounded: a restored live tag that is cleared watches nothing, so its
+    /// record goes at the next sample, and nothing is historical.
+    #[test]
+    fn a_cleared_restored_tag_releases_its_record() {
+        let (session, mut view, mut source) = failed_retirement(Arc::new(Clock::default()));
+        assert_eq!(view.last_seen().len(), 1);
+        view.request_tags(&session, TagRequest::Clear).unwrap();
+        assert_eq!(view.tags().tagged(), 0);
+        view.refresh(&session, &mut source).unwrap();
+        assert!(view.last_seen().is_empty(), "nothing watches the record");
+        assert!(view.historical_tags().is_empty());
+        assert_eq!(view.last_seen().forgotten_tags(), 0);
+    }
+
+    #[test]
+    fn a_record_that_ages_out_before_its_retirement_commits_counts_the_tag_forgotten() {
+        let clock = Arc::new(Clock::default());
+        let (session, mut view, mut source) = failed_retirement(clock.clone());
+        *clock.0.lock().unwrap() = MAX_TOMBSTONE_AGE;
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.tags().tagged(), 0);
+        assert!(view.last_seen().is_empty(), "the age bound still applies");
+        assert_eq!(view.last_seen().forgotten_tags(), 1);
+        assert!(
+            view.tags_status()
+                .starts_with("Tags: 0 tagged · 1 historical, forgotten"),
+            "{}",
+            view.tags_status()
+        );
+    }
+}
+
+/// Verification of `PRRT_kwDOUG_6uM620bez`'s fix (codex4, F1 and F2): every
+/// historical tag is counted exactly once, kept or forgotten, across any
+/// sequence of failed and committed samples. A forgotten count made in a
+/// sample whose tags status never commits is undone with the tag set it
+/// belonged to, so the committed retry counts it once.
+#[cfg(test)]
+mod forgotten_once_tests {
+    use super::*;
+    use crate::lastseen::{MAX_TOMBSTONES, MAX_TOMBSTONE_AGE};
+    use crate::source::{
+        BootId, CappedRecords, Completeness, CpuUsage, CreationToken, DisplayName,
+        FakeProcessSource, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+        SnapshotTime, SourceId, OWNER_NOT_COLLECTED,
+    };
+    use std::sync::Mutex;
+
+    const CLIENT: &[u8] = b"forgotten-once-client";
+
+    fn record(pid: u32, parent: u32, name: &str) -> ProcessRecord {
+        ProcessRecord {
+            lineage: Lineage::new(parent, u64::from(pid)),
+            owner: OWNER_NOT_COLLECTED,
+            key: ProcessKey {
+                source: SourceId("forgotten-once".into()),
+                host: Observed::Known(HostId("h".into())),
+                boot: Observed::Known(BootId("b".into())),
+                pid_namespace: Observed::Known(PidNamespaceId(1)),
+                pid: Observed::Known(pid),
+                creation: CreationToken::Opaque(name.into()),
+                thread: None,
+            },
+            kind: crate::source::KIND_NOT_COLLECTED,
+            display_name: DisplayName::from(name),
+            resident: Observed::Known(4096),
+            cpu: CpuUsage::WarmingUp,
+        }
+    }
+
+    struct Source {
+        records: Vec<ProcessRecord>,
+        scans: u64,
+    }
+
+    impl ProcessSource for Source {
+        fn status_text(&self) -> &str {
+            "Read-only · Forgotten-once fixture"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            self.scans += 1;
+            ProcessSnapshot {
+                source: SourceId("forgotten-once".into()),
+                sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH + Duration::from_secs(self.scans)),
+                records: self.records.clone(),
+                vanished: 0,
+                capped: CappedRecords::none(),
+                completeness: Completeness::Complete,
+                system: FakeProcessSource::system(),
+                threads: crate::source::ThreadScan::NotProvided,
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Clock(Mutex<Duration>);
+
+    impl MonotonicClock for Clock {
+        fn now(&self) -> Duration {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    impl Clock {
+        fn set(&self, at: Duration) {
+            *self.0.lock().unwrap() = at;
+        }
+    }
+
+    fn start(records: Vec<ProcessRecord>) -> (Session, ProcessView, Source, Arc<Clock>) {
+        let session = Session::mint();
+        let mut source = Source { records, scans: 0 };
+        let clock = Arc::new(Clock::default());
+        let (view, _) = ProcessView::start(&session, &mut source).unwrap();
+        let mut view = view.with_published_limit(200).with_clock(clock.clone());
+        view.refresh(&session, &mut source).unwrap();
+        (session, view, source, clock)
+    }
+
+    fn select(view: &mut ProcessView, session: &Session, pid: u32) {
+        let item = view
+            .rows
+            .iter()
+            .find(|row| row.key.pid == Observed::Known(pid))
+            .map(|row| row.item_id);
+        assert!(item.is_some(), "{pid} is shown");
+        view.select_item(session, CLIENT, item).unwrap();
+    }
+
+    /// Every tag made and not removed, counted once: live, kept historical
+    /// or forgotten.
+    fn total(view: &ProcessView) -> u64 {
+        view.tags().tagged() as u64
+            + view.last_seen().tagged().count() as u64
+            + view.last_seen().forgotten_tags()
+    }
+
+    fn state(view: &ProcessView) -> String {
+        format!(
+            "live={} kept={} forgotten={} records={} status={:?}",
+            view.tags().tagged(),
+            view.last_seen().tagged().count(),
+            view.last_seen().forgotten_tags(),
+            view.last_seen().len(),
+            view.tags_status()
+        )
+    }
+
+    fn failing(view: &mut ProcessView, session: &Session, source: &mut Source) {
+        let _armed = commit_fault::arm(0);
+        assert!(
+            view.refresh(session, source).is_err(),
+            "the sample was to fail"
+        );
+    }
+
+    /// `workers` tagged (300, 301, …), `init` selected, follow off; then all
+    /// of them leave.
+    fn tagged_workers(workers: u32) -> (Session, ProcessView, Source, Arc<Clock>) {
+        let mut records = vec![record(1, 0, "init")];
+        records.extend((0..workers).map(|n| record(300 + n, 1, &format!("worker{n}"))));
+        let (session, mut view, mut source, clock) = start(records);
+        for n in 0..workers {
+            select(&mut view, &session, 300 + n);
+            view.request_tags(&session, TagRequest::Toggle).unwrap();
+        }
+        select(&mut view, &session, 1);
+        source.records.truncate(1);
+        (session, view, source, clock)
+    }
+
+    /// Two failed samples straddle the age bound, then one commits: the tag
+    /// is lost to the age bound once and counted once.
+    #[test]
+    fn a_record_aged_out_across_two_failed_samples_is_counted_once() {
+        let (session, mut view, mut source, clock) = tagged_workers(1);
+        failing(&mut view, &session, &mut source);
+        assert_eq!(total(&view), 1, "{}", state(&view));
+        clock.set(MAX_TOMBSTONE_AGE);
+        failing(&mut view, &session, &mut source);
+        assert_eq!(total(&view), 1, "{}", state(&view));
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.tags().tagged(), 0);
+        assert_eq!(view.last_seen().forgotten_tags(), 1, "{}", state(&view));
+        assert!(
+            view.tags_status()
+                .starts_with("Tags: 0 tagged · 1 historical, forgotten"),
+            "{}",
+            view.tags_status()
+        );
+    }
+
+    /// 65 tags leave in one failed sample, and the count bound drops one
+    /// record at once; the committed retry keeps 64 and counts one forgotten.
+    #[test]
+    fn a_record_the_count_bound_drops_in_a_failed_sample_is_counted_once() {
+        let mut records = vec![record(1, 0, "init"), record(10, 1, "p")];
+        records.extend((0..64).map(|n| record(1000 + n, 10, &format!("k{n}"))));
+        let (session, mut view, mut source, _) = start(records);
+        select(&mut view, &session, 10);
+        view.request_tags(&session, TagRequest::Descendants)
+            .unwrap();
+        assert_eq!(view.tags().tagged(), 65);
+        select(&mut view, &session, 1);
+        source.records.truncate(1);
+        failing(&mut view, &session, &mut source);
+        assert_eq!(total(&view), 65, "{}", state(&view));
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.tags().tagged(), 0);
+        assert_eq!(view.last_seen().tagged().count(), MAX_TOMBSTONES);
+        assert_eq!(view.last_seen().forgotten_tags(), 1, "{}", state(&view));
+        assert!(
+            view.tags_status()
+                .starts_with("Tags: 0 tagged · 65 historical: "),
+            "{}",
+            view.tags_status()
+        );
+        assert!(
+            view.tags_status().contains("(1 forgotten)"),
+            "{}",
+            view.tags_status()
+        );
+    }
+
+    /// A tag already historical that a failed sample forgets (the age
+    /// bound) stays counted when that sample's live tags are put back; a
+    /// tag still live whose record is missing is counted once however many
+    /// samples fail before one commits.
+    #[test]
+    fn only_tags_put_back_live_lose_a_forgotten_count_and_only_once() {
+        let (session, mut view, mut source, clock) = tagged_workers(2);
+        // Only worker0 (300) leaves at first, in a committed sample.
+        source.records = vec![record(1, 0, "init"), record(301, 1, "worker1")];
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.historical_tags(), ["PID 300 · worker0"]);
+        source.records.truncate(1);
+        // worker0's record ages out in a sample in which worker1 leaves and
+        // that never commits: worker0 stays forgotten, worker1 is live.
+        clock.set(MAX_TOMBSTONE_AGE);
+        failing(&mut view, &session, &mut source);
+        assert_eq!(view.tags().tagged(), 1, "{}", state(&view));
+        assert_eq!(view.last_seen().forgotten_tags(), 1, "{}", state(&view));
+        assert_eq!(total(&view), 2, "{}", state(&view));
+        // worker1's record ages out too, across three more failed samples.
+        clock.set(MAX_TOMBSTONE_AGE * 2);
+        for failed in 0..3 {
+            failing(&mut view, &session, &mut source);
+            assert_eq!(
+                view.last_seen().forgotten_tags(),
+                1,
+                "{failed}: {}",
+                state(&view)
+            );
+            assert_eq!(total(&view), 2, "{failed}: {}", state(&view));
+        }
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.tags().tagged(), 0);
+        assert_eq!(view.last_seen().forgotten_tags(), 2, "{}", state(&view));
+        assert!(
+            view.tags_status()
+                .starts_with("Tags: 0 tagged · 2 historical, all forgotten"),
+            "{}",
+            view.tags_status()
+        );
+    }
+
+    /// The count bound pushes out a tag that was already historical when a
+    /// tag still live leaves in a sample that never commits: the historical
+    /// one stays counted forgotten, and the live one is put back.
+    #[test]
+    fn a_historical_tag_the_count_bound_pushes_out_in_a_failed_sample_stays_counted() {
+        let mut records = vec![record(1, 0, "init"), record(10, 1, "p")];
+        records.extend((0..63).map(|n| record(1000 + n, 10, &format!("k{n}"))));
+        records.push(record(900, 1, "later"));
+        let (session, mut view, mut source, _) = start(records);
+        select(&mut view, &session, 10);
+        view.request_tags(&session, TagRequest::Descendants)
+            .unwrap();
+        select(&mut view, &session, 900);
+        view.request_tags(&session, TagRequest::Toggle).unwrap();
+        assert_eq!(view.tags().tagged(), 65);
+        select(&mut view, &session, 1);
+        source
+            .records
+            .retain(|record| matches!(record.key.pid, Observed::Known(1) | Observed::Known(900)));
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.last_seen().tagged().count(), MAX_TOMBSTONES);
+        assert_eq!(total(&view), 65, "{}", state(&view));
+        source.records.truncate(1);
+        failing(&mut view, &session, &mut source);
+        assert_eq!(view.tags().tagged(), 1, "{}", state(&view));
+        assert_eq!(view.last_seen().forgotten_tags(), 1, "{}", state(&view));
+        assert_eq!(total(&view), 65, "{}", state(&view));
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.tags().tagged(), 0);
+        assert_eq!(total(&view), 65, "{}", state(&view));
+    }
+
+    /// Exactly once over every pattern of four samples, each failed or
+    /// committed, with the clock passing the age bound before any one of
+    /// them or never: after every sample each of three tags is counted once,
+    /// and after a final committed sample none is live.
+    #[test]
+    fn every_historical_tag_is_counted_once_across_failed_and_committed_samples() {
+        for failures in 0u32..16 {
+            for aged_at in 0..5 {
+                let (session, mut view, mut source, clock) = tagged_workers(3);
+                for sample in 0..4 {
+                    if sample == aged_at {
+                        clock.set(MAX_TOMBSTONE_AGE);
+                    }
+                    if failures & (1 << sample) != 0 {
+                        failing(&mut view, &session, &mut source);
+                    } else {
+                        view.refresh(&session, &mut source).unwrap();
+                    }
+                    assert_eq!(
+                        total(&view),
+                        3,
+                        "failures={failures:04b} aged_at={aged_at} sample={sample}: {}",
+                        state(&view)
+                    );
+                }
+                view.refresh(&session, &mut source).unwrap();
+                assert_eq!(view.tags().tagged(), 0, "{}", state(&view));
+                assert_eq!(
+                    total(&view),
+                    3,
+                    "failures={failures:04b} aged_at={aged_at}: {}",
+                    state(&view)
+                );
+            }
+        }
+    }
+
+    /// F2 (kills W5): a record released between samples (the selection was
+    /// cleared) takes no slot under the count bound when the next sample
+    /// records: 63 historical tags and the inspector's record are kept; the
+    /// selection is cleared; a 64th tagged process leaves. All 64 historical
+    /// tags are kept and none is forgotten.
+    #[test]
+    fn a_released_record_takes_no_slot_under_the_count_bound() {
+        let mut records = vec![record(1, 0, "init"), record(10, 1, "p")];
+        records.extend((0..62).map(|n| record(1000 + n, 10, &format!("k{n}"))));
+        records.push(record(900, 1, "inspected"));
+        records.push(record(901, 1, "later"));
+        let (session, mut view, mut source, _) = start(records);
+        select(&mut view, &session, 10);
+        view.request_tags(&session, TagRequest::Descendants)
+            .unwrap();
+        select(&mut view, &session, 901);
+        view.request_tags(&session, TagRequest::Toggle).unwrap();
+        assert_eq!(view.tags().tagged(), 64);
+        select(&mut view, &session, 900);
+        source
+            .records
+            .retain(|record| matches!(record.key.pid, Observed::Known(1) | Observed::Known(901)));
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.last_seen().len(), 64, "{}", state(&view));
+        view.clear_selection(&session).unwrap();
+        source.records.truncate(1);
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(view.last_seen().tagged().count(), 64, "{}", state(&view));
+        assert_eq!(view.last_seen().forgotten_tags(), 0, "{}", state(&view));
+    }
+}
+
+/// The tag accounting invariant (PX-021, verification of PR #107's review,
+/// codex5): every tagged process instance is exactly one of live (in the tag
+/// set; any record of it is not a historical tag), historical (a record that
+/// is a historical tag, not in the tag set) or forgotten (counted once).
+/// Adapted from the verifier's probes; the randomized test runs `C5_SEEDS`
+/// seeds of `C5_STEPS` steps (120 × 80 by default), and two seeds that
+/// found a loss.
+#[cfg(test)]
+mod tag_accounting_tests {
+    use super::*;
+    use crate::lastseen::{MAX_TOMBSTONES, MAX_TOMBSTONE_AGE};
+    use crate::source::{
+        BootId, CappedRecords, Completeness, CpuUsage, CreationToken, DisplayName,
+        FakeProcessSource, HostId, Lineage, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+        SkippedRecords, SnapshotTime, SourceId, OWNER_NOT_COLLECTED,
+    };
+    use std::sync::Mutex;
+
+    const CLIENT: &[u8] = b"tag-accounting-client";
+
+    fn rec(pid: u32, parent: u32, token: &str, name: &str) -> ProcessRecord {
+        ProcessRecord {
+            lineage: Lineage::new(parent, u64::from(pid)),
+            owner: OWNER_NOT_COLLECTED,
+            key: ProcessKey {
+                source: SourceId("tag-accounting".into()),
+                host: Observed::Known(HostId("h".into())),
+                boot: Observed::Known(BootId("b".into())),
+                pid_namespace: Observed::Known(PidNamespaceId(1)),
+                pid: Observed::Known(pid),
+                creation: CreationToken::Opaque(token.into()),
+                thread: None,
+            },
+            kind: crate::source::KIND_NOT_COLLECTED,
+            display_name: DisplayName::from(name),
+            resident: Observed::Known(4096),
+            cpu: CpuUsage::WarmingUp,
+        }
+    }
+
+    fn r(pid: u32, parent: u32, name: &str) -> ProcessRecord {
+        rec(pid, parent, name, name)
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Mode {
+        Complete,
+        /// The records given, but the scan says it could not enumerate:
+        /// every absent row is retained unconfirmed (then evicted beyond the
+        /// row limit, "no longer observed").
+        Partial,
+        /// No records, unenumerable.
+        Unreadable,
+    }
+
+    struct Src {
+        records: Vec<ProcessRecord>,
+        mode: Mode,
+        n: u64,
+    }
+
+    impl ProcessSource for Src {
+        fn status_text(&self) -> &str {
+            "Read-only · Tag-accounting fixture"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            self.n += 1;
+            ProcessSnapshot {
+                source: SourceId("tag-accounting".into()),
+                sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH + Duration::from_secs(self.n)),
+                records: if self.mode == Mode::Unreadable {
+                    Vec::new()
+                } else {
+                    self.records.clone()
+                },
+                vanished: 0,
+                capped: CappedRecords::none(),
+                completeness: if self.mode == Mode::Complete {
+                    Completeness::Complete
+                } else {
+                    Completeness::from_scan(SkippedRecords::unenumerable(), Vec::new())
+                },
+                system: FakeProcessSource::system(),
+                threads: crate::source::ThreadScan::NotProvided,
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Clock(Mutex<Duration>);
+
+    impl MonotonicClock for Clock {
+        fn now(&self) -> Duration {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    impl Clock {
+        fn set(&self, at: Duration) {
+            *self.0.lock().unwrap() = at;
+        }
+        fn add(&self, by: Duration) {
+            *self.0.lock().unwrap() += by;
+        }
+    }
+
+    fn start(records: Vec<ProcessRecord>, limit: usize) -> (Session, ProcessView, Src, Arc<Clock>) {
+        let session = Session::mint();
+        let mut src = Src {
+            records,
+            mode: Mode::Complete,
+            n: 0,
+        };
+        let clock = Arc::new(Clock::default());
+        let (view, _) = ProcessView::start(&session, &mut src).unwrap();
+        let mut view = view.with_published_limit(limit).with_clock(clock.clone());
+        view.refresh(&session, &mut src).unwrap();
+        (session, view, src, clock)
+    }
+
+    fn item(view: &ProcessView, pid: u32) -> Option<ItemId> {
+        view.rows
+            .iter()
+            .find(|row| row.key.pid == Observed::Known(pid))
+            .map(|row| row.item_id)
+    }
+
+    fn select(view: &mut ProcessView, session: &Session, pid: u32) -> bool {
+        let Some(it) = item(view, pid) else {
+            return false;
+        };
+        view.select_item(session, CLIENT, Some(it)).is_ok()
+    }
+
+    fn pids(view: &ProcessView) -> Vec<u32> {
+        view.rows
+            .iter()
+            .filter_map(|row| match row.key.pid {
+                Observed::Known(pid) => Some(pid),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn total(view: &ProcessView) -> u64 {
+        view.tags().tagged() as u64
+            + view.last_seen().tagged().count() as u64
+            + view.last_seen().forgotten_tags()
+    }
+
+    /// Keys that are a live tag and a historical tag at once (one instance
+    /// counted twice).
+    fn both(view: &ProcessView) -> usize {
+        view.last_seen()
+            .tagged()
+            .filter(|t| view.tags().is_tagged(t.key()))
+            .count()
+    }
+
+    /// Live tags, from every key ever seen.
+    fn live_keys(view: &ProcessView, seen: &HashSet<ProcessKey>) -> HashSet<ProcessKey> {
+        seen.iter()
+            .filter(|k| view.tags().is_tagged(k))
+            .cloned()
+            .collect()
+    }
+
+    /// Each instance counted once: live, or historical and not live, or
+    /// forgotten.
+    fn dedup(view: &ProcessView) -> u64 {
+        total(view) - both(view) as u64
+    }
+
+    fn state(view: &ProcessView) -> String {
+        format!(
+            "live={} kept={} forgotten={} both={} records={} hist={:?} watched={:?} status={:?}",
+            view.tags().tagged(),
+            view.last_seen().tagged().count(),
+            view.last_seen().forgotten_tags(),
+            both(view),
+            view.last_seen().len(),
+            view.historical_tags(),
+            {
+                let (i, f) = view.watched_keys();
+                (i.map(|k| k.pid), f.map(|k| k.pid))
+            },
+            view.tags_status()
+        )
+    }
+
+    fn sample(view: &mut ProcessView, session: &Session, src: &mut Src, mode: Mode) -> bool {
+        src.mode = mode;
+        let ok = view.refresh(session, src).is_ok();
+        src.mode = Mode::Complete;
+        ok
+    }
+
+    fn failing(view: &mut ProcessView, session: &Session, src: &mut Src, mode: Mode) {
+        let _armed = commit_fault::arm(0);
+        assert!(!sample(view, session, src, mode), "the sample was to fail");
+    }
+
+    /// init(1), p(10, under 1), K(300, under 10), row limit 3. 300 is tagged,
+    /// then a partial scan listing [1, 10, 400] evicts 300 at the row limit:
+    /// a committed retire, so 300 is a historical tag "no longer observed".
+    fn evicted_historical(select_k: bool) -> (Session, ProcessView, Src, Arc<Clock>) {
+        let (session, mut view, mut src, clock) = start(
+            vec![r(1, 0, "init"), r(10, 1, "p"), r(300, 10, "worker")],
+            3,
+        );
+        assert!(select(&mut view, &session, 300));
+        view.request_tags(&session, TagRequest::Toggle).unwrap();
+        if !select_k {
+            assert!(select(&mut view, &session, 1));
+        }
+        let all = src.records.clone();
+        src.records = vec![r(1, 0, "init"), r(10, 1, "p"), r(400, 1, "new")];
+        assert!(sample(&mut view, &session, &mut src, Mode::Partial));
+        eprintln!("PROBE C5 setup after eviction: {}", state(&view));
+        assert_eq!(
+            view.historical_tags(),
+            ["PID 300 · worker"],
+            "{}",
+            state(&view)
+        );
+        assert_eq!(total(&view), 1);
+        src.records = all;
+        (session, view, src, clock)
+    }
+
+    /// X4: a failed sample relists 300 (a retag put back: its record is a
+    /// historical tag again while 300 is in the collection); the inspector
+    /// still watches 300; the next committed sample no longer lists it.
+    #[test]
+    fn a_watched_instance_leaving_after_a_failed_retag_keeps_its_historical_tag() {
+        let mut lost = Vec::new();
+        for watch in ["none", "inspector", "follow"] {
+            let (session, mut view, mut src, _) = evicted_historical(watch == "inspector");
+            if watch == "follow" {
+                assert!(select(&mut view, &session, 10));
+            }
+            failing(&mut view, &session, &mut src, Mode::Complete);
+            eprintln!("PROBE X4 {watch} after the failed retag: {}", state(&view));
+            assert_eq!(total(&view), 1, "X4 {watch}: {}", state(&view));
+            if watch == "follow" {
+                // the row of 300 is not on the client (the sample failed);
+                // follow is turned on for the selected row instead
+                let _ = view.set_follow(&session, Some(true));
+            }
+            src.records.retain(|x| x.key.pid != Observed::Known(300));
+            assert!(sample(&mut view, &session, &mut src, Mode::Complete));
+            eprintln!("PROBE X4 {watch} after 300 left again: {}", state(&view));
+            if total(&view) != 1 {
+                lost.push(watch);
+            }
+        }
+        assert!(
+            lost.is_empty(),
+            "X4: the historical tag of 300 was lost with watch {lost:?}"
+        );
+    }
+
+    /// X4b: the same with the failed sample committing its rows but not its
+    /// tags status (300's row reaches the client), then 300 selected.
+    #[test]
+    fn an_instance_selected_after_a_failed_retag_reached_its_row_keeps_its_historical_tag() {
+        let (session, mut view, mut src, _) = evicted_historical(false);
+        {
+            let _armed = commit_fault::arm(1);
+            commit_fault::arm_split_at_rows_end();
+            let ok = sample(&mut view, &session, &mut src, Mode::Complete);
+            commit_fault::disarm_split();
+            assert!(!ok);
+        }
+        eprintln!(
+            "PROBE X4b after rows reached, status not: rows={:?} {}",
+            pids(&view),
+            state(&view)
+        );
+        assert_eq!(total(&view), 1, "{}", state(&view));
+        let selected = select(&mut view, &session, 300);
+        eprintln!("PROBE X4b selected 300: {selected}");
+        src.records.retain(|x| x.key.pid != Observed::Known(300));
+        assert!(sample(&mut view, &session, &mut src, Mode::Complete));
+        eprintln!("PROBE X4b after 300 left again: {}", state(&view));
+        assert_eq!(
+            total(&view),
+            1,
+            "X4b: the historical tag of 300 was lost: {}",
+            state(&view)
+        );
+    }
+
+    /// X1: after a failed retag, Descendants on p(10) tags 300 live while its
+    /// record is still a historical tag: one instance counted twice.
+    #[test]
+    fn descendants_after_a_failed_retag_count_the_instance_once() {
+        let mut bad = Vec::new();
+        for aged in [false, true] {
+            let (session, mut view, mut src, clock) = evicted_historical(false);
+            failing(&mut view, &session, &mut src, Mode::Complete);
+            assert!(select(&mut view, &session, 10), "p is shown");
+            view.request_tags(&session, TagRequest::Descendants)
+                .unwrap();
+            eprintln!("PROBE X1 aged={aged} after Descendants: {}", state(&view));
+            let both_after_request = both(&view);
+            if aged {
+                clock.set(MAX_TOMBSTONE_AGE);
+            }
+            assert!(sample(&mut view, &session, &mut src, Mode::Complete));
+            eprintln!(
+                "PROBE X1 aged={aged} after a committed sample: {}",
+                state(&view)
+            );
+            if both_after_request != 0 || total(&view) != 2 {
+                bad.push(format!("aged={aged}: both after request={both_after_request}, final total={} for 2 tags", total(&view)));
+            }
+        }
+        assert!(bad.is_empty(), "X1: {bad:?}");
+    }
+
+    /// X1-R5: the same, and the age bound drops 300's historical record at the
+    /// start of a sample that also retires another tag and never commits:
+    /// a record tagged at the start of a sample whose key the put-back set
+    /// holds live. Prints the counts so the candidate and mutant R5 can be
+    /// compared.
+    #[test]
+    fn an_age_drop_after_a_failed_retag_and_descendants_counts_each_tag_once() {
+        let (session, mut view, mut src, clock) = {
+            let (session, mut view, mut src, clock) = start(
+                vec![
+                    r(1, 0, "init"),
+                    r(10, 1, "p"),
+                    r(300, 10, "worker"),
+                    r(500, 1, "j"),
+                ],
+                4,
+            );
+            assert!(select(&mut view, &session, 300));
+            view.request_tags(&session, TagRequest::Toggle).unwrap();
+            assert!(select(&mut view, &session, 500));
+            view.request_tags(&session, TagRequest::Toggle).unwrap();
+            assert!(select(&mut view, &session, 1));
+            let all = src.records.clone();
+            src.records = vec![
+                r(1, 0, "init"),
+                r(10, 1, "p"),
+                r(500, 1, "j"),
+                r(400, 1, "new"),
+            ];
+            assert!(sample(&mut view, &session, &mut src, Mode::Partial));
+            assert_eq!(
+                view.historical_tags(),
+                ["PID 300 · worker"],
+                "{}",
+                state(&view)
+            );
+            src.records = all;
+            (session, view, src, clock)
+        };
+        failing(&mut view, &session, &mut src, Mode::Complete);
+        assert!(select(&mut view, &session, 10));
+        view.request_tags(&session, TagRequest::Descendants)
+            .unwrap();
+        eprintln!("PROBE X1R5 after Descendants: {}", state(&view));
+        clock.set(MAX_TOMBSTONE_AGE);
+        src.records.retain(|x| x.key.pid != Observed::Known(500));
+        failing(&mut view, &session, &mut src, Mode::Complete);
+        eprintln!(
+            "PROBE X1R5 after the aged failed sample retiring 500: {}",
+            state(&view)
+        );
+        assert!(sample(&mut view, &session, &mut src, Mode::Complete));
+        eprintln!("PROBE X1R5 after the committed retry: {}", state(&view));
+        assert_eq!(
+            total(&view),
+            3,
+            "X1R5: 3 tags (10, 300 live; 500 historical): {}",
+            state(&view)
+        );
+    }
+
+    /// X5: relisting beyond the tag limit, in a failed sample and a sample
+    /// committing rows but not the tags status, then a committed one.
+    #[test]
+    fn relisting_beyond_the_tag_limit_in_a_failed_sample_counts_once() {
+        for split in [false, true] {
+            let mut records = vec![
+                r(1, 0, "init"),
+                r(300, 1, "ka"),
+                r(301, 1, "kb"),
+                r(10, 1, "p"),
+            ];
+            for i in 0..(crate::tags::MAX_TAGGED as u32 - 2) {
+                records.push(r(10_000 + i, 10, &format!("c{i}")));
+            }
+            let (session, mut view, mut src, _) = start(records, 6);
+            assert!(select(&mut view, &session, 300));
+            view.request_tags(&session, TagRequest::Toggle).unwrap();
+            assert!(select(&mut view, &session, 301));
+            view.request_tags(&session, TagRequest::Toggle).unwrap();
+            assert!(select(&mut view, &session, 1));
+            let all = src.records.clone();
+            // 300 and 301 evicted at the row limit by a partial scan.
+            src.records
+                .retain(|x| !matches!(x.key.pid, Observed::Known(300) | Observed::Known(301)));
+            assert!(sample(&mut view, &session, &mut src, Mode::Partial));
+            assert_eq!(view.last_seen().tagged().count(), 2, "{}", state(&view));
+            assert!(select(&mut view, &session, 10), "{:?}", pids(&view));
+            view.request_tags(&session, TagRequest::Descendants)
+                .unwrap();
+            assert_eq!(
+                view.tags().tagged(),
+                crate::tags::MAX_TAGGED - 1,
+                "{}",
+                view.tags_status()
+            );
+            assert_eq!(total(&view), crate::tags::MAX_TAGGED as u64 + 1);
+            assert!(select(&mut view, &session, 1));
+            src.records = all;
+            {
+                let _armed = commit_fault::arm(if split { 1 } else { 0 });
+                if split {
+                    commit_fault::arm_split_at_rows_end();
+                }
+                let ok = sample(&mut view, &session, &mut src, Mode::Complete);
+                commit_fault::disarm_split();
+                assert!(!ok);
+            }
+            eprintln!(
+                "PROBE X5 split={split} after the failed relisting: {}",
+                state(&view)
+            );
+            assert_eq!(
+                total(&view),
+                crate::tags::MAX_TAGGED as u64 + 1,
+                "X5 split={split} failed"
+            );
+            assert_eq!(both(&view), 0);
+            assert!(sample(&mut view, &session, &mut src, Mode::Complete));
+            eprintln!(
+                "PROBE X5 split={split} after the committed retry: {}",
+                state(&view)
+            );
+            assert_eq!(
+                total(&view),
+                crate::tags::MAX_TAGGED as u64 + 1,
+                "X5 split={split} committed"
+            );
+            assert_eq!(view.tags().tagged(), crate::tags::MAX_TAGGED);
+            assert_eq!(view.last_seen().forgotten_tags(), 1);
+        }
+    }
+
+    /// Randomized, with relisting: partial scans that evict at the row
+    /// limit (records "no longer observed") and later list them again,
+    /// complete and unreadable scans, PID reuse, tags, descendants, clear,
+    /// selection, follow, pause/resume, clock steps across the age bound,
+    /// faults on the first or second transaction and at the rows/tags-status
+    /// split. Invariants: (I1) no sample, failed or committed, changes
+    /// live + kept + forgotten, classed loss / over-count; a failed request
+    /// never changes it; (I4) no instance is a live and a historical tag at
+    /// once; (I5) a committed Toggle or Descendants changes the total by the
+    /// live delta, a committed Clear leaves 0; (I3) bounds.
+    #[test]
+    fn randomized_tags_relisting_faults_and_bounds_count_each_tag_once() {
+        let seeds: u64 = std::env::var("C5_SEEDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(120);
+        let steps: usize = std::env::var("C5_STEPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(80);
+        let mut classes = [0usize; 3];
+        let mut firsts: [Option<String>; 3] = [None, None, None];
+        let (mut i1_req, mut i4, mut i5, mut i3) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut samples, mut failed, mut retags, mut relisted_seen) =
+            (0usize, 0usize, 0usize, 0usize);
+        let mut after_i4 = [0usize; 3];
+        let mut replaced: Vec<String> = Vec::new();
+        // Seeds 2197 and 2737 lost a historical tag before the codex5 fix
+        // (with 80 steps); they always run.
+        for seed in (0..seeds).chain([2197, 2737]) {
+            let mut rng: u64 = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xC5C5_5EED_D1B5_4A32;
+            let mut next = move |m: u64| {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((rng >> 33) % m.max(1)) as usize
+            };
+            let big = next(4) == 0;
+            let mut universe = vec![
+                r(1, 0, "init"),
+                r(10, 1, "a"),
+                r(20, 1, "b"),
+                r(30, 10, "c"),
+                r(40, 1, "d"),
+            ];
+            let kids = if big { 70 } else { 5 };
+            for i in 0..kids {
+                universe.push(r(
+                    2000 + i,
+                    if i % 2 == 0 { 20 } else { 10 },
+                    &format!("k{i}"),
+                ));
+            }
+            let limit = if next(3) == 0 { 300 } else { 3 + next(6) };
+            let (session, mut view, mut src, clock) = start(universe.clone(), limit);
+            let mut log: Vec<String> = vec![format!("big={big} limit={limit}")];
+            let mut gen = 0u32;
+            let mut seen: HashSet<ProcessKey> = HashSet::new();
+            let mut i4_in_seed = false;
+            for _ in 0..steps {
+                let action = next(18);
+                let fault = next(3) == 0;
+                let fault_kind = next(3); // 0: first txn, 1: second txn, 2: split at rows end
+                for x in &src.records {
+                    seen.insert(x.key.clone());
+                }
+                for row in &view.unfiltered_rows {
+                    seen.insert(row.key.clone());
+                }
+                let before = dedup(&view);
+                let live_set_before = live_keys(&view, &seen);
+                let hist_before: HashSet<ProcessKey> =
+                    view.last_seen().tagged().map(|t| t.key().clone()).collect();
+                let mut is_sample = false;
+                let mut request: Option<TagRequest> = None;
+                let res: Result<(), String> = {
+                    let _armed =
+                        fault.then(|| commit_fault::arm(if fault_kind == 0 { 0 } else { 1 }));
+                    if fault && fault_kind == 2 {
+                        commit_fault::arm_split_at_rows_end();
+                    }
+                    let f = if fault {
+                        ["!0", "!1", "!s"][fault_kind]
+                    } else {
+                        ""
+                    };
+                    let res = match action {
+                        0 | 1 => {
+                            let rows = pids(&view);
+                            if !rows.is_empty() {
+                                let p = rows[next(rows.len() as u64)];
+                                log.push(format!("sel {p}"));
+                                select(&mut view, &session, p);
+                            }
+                            Ok(())
+                        }
+                        2 | 3 => {
+                            let req = if action == 3 {
+                                TagRequest::Descendants
+                            } else {
+                                TagRequest::Toggle
+                            };
+                            log.push(format!("{req:?}{f}"));
+                            request = Some(req);
+                            view.request_tags(&session, req)
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        }
+                        4 => {
+                            if next(3) == 0 {
+                                log.push(format!("clear{f}"));
+                                request = Some(TagRequest::Clear);
+                                view.request_tags(&session, TagRequest::Clear)
+                                    .map(|_| ())
+                                    .map_err(|e| e.to_string())
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        5 => {
+                            let on = next(2) == 0;
+                            log.push(format!("follow={on}{f}"));
+                            view.set_follow(&session, Some(on))
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        }
+                        6 => {
+                            log.push("clearsel".into());
+                            view.clear_selection(&session)
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        }
+                        7..=9 => {
+                            is_sample = true;
+                            log.push(format!("complete{f}"));
+                            let ok = sample(&mut view, &session, &mut src, Mode::Complete);
+                            if ok {
+                                Ok(())
+                            } else {
+                                Err("failed".into())
+                            }
+                        }
+                        10 | 11 => {
+                            // a partial scan listing a random subset: what it
+                            // does not list is retained, then evicted
+                            is_sample = true;
+                            let full = src.records.clone();
+                            let keep: Vec<ProcessRecord> = full
+                                .iter()
+                                .filter(|x| x.key.pid == Observed::Known(1) || next(3) != 0)
+                                .cloned()
+                                .collect();
+                            src.records = keep;
+                            log.push(format!("partial{f}"));
+                            let ok = sample(&mut view, &session, &mut src, Mode::Partial);
+                            src.records = full;
+                            if ok {
+                                Ok(())
+                            } else {
+                                Err("failed".into())
+                            }
+                        }
+                        12 => {
+                            is_sample = true;
+                            log.push(format!("unreadable{f}"));
+                            let ok = sample(&mut view, &session, &mut src, Mode::Unreadable);
+                            if ok {
+                                Ok(())
+                            } else {
+                                Err("failed".into())
+                            }
+                        }
+                        13 | 14 => {
+                            let k = next(5);
+                            if k == 0 && src.records.len() > 1 {
+                                let at = 1 + next(src.records.len() as u64 - 1);
+                                let gone = src.records.remove(at);
+                                log.push(format!("-{:?}", gone.key.pid));
+                            } else if k == 1 {
+                                let p = if next(2) == 0 { 20 } else { 10 };
+                                src.records
+                                    .retain(|x| x.lineage.parent != Observed::Known(p));
+                                log.push(format!("-subtree{p}"));
+                            } else if k == 2 && src.records.len() > 1 {
+                                let at = 1 + next(src.records.len() as u64 - 1);
+                                gen += 1;
+                                let old = src.records[at].clone();
+                                let pid = match old.key.pid {
+                                    Observed::Known(p) => p,
+                                    _ => 0,
+                                };
+                                let parent = match old.lineage.parent {
+                                    Observed::Known(p) => p,
+                                    _ => 0,
+                                };
+                                src.records[at] =
+                                    rec(pid, parent, &format!("reuse{gen}"), "reused");
+                                log.push(format!("reuse {pid}"));
+                            } else if k == 3 {
+                                // every original PID that left is used again,
+                                // by a new instance (a source never lists an
+                                // instance that left a complete scan again)
+                                gen += 1;
+                                for u in &universe {
+                                    if !src.records.iter().any(|x| x.key.pid == u.key.pid) {
+                                        let pid = match u.key.pid {
+                                            Observed::Known(p) => p,
+                                            _ => 0,
+                                        };
+                                        let parent = match u.lineage.parent {
+                                            Observed::Known(p) => p,
+                                            _ => 0,
+                                        };
+                                        src.records.push(rec(
+                                            pid,
+                                            parent,
+                                            &format!("back{gen}"),
+                                            "back",
+                                        ));
+                                    }
+                                }
+                                log.push("+back".into());
+                            } else {
+                                gen += 1;
+                                let n = 1 + next(3) as u32;
+                                for i in 0..n {
+                                    src.records.push(rec(
+                                        3000 + gen * 100 + i,
+                                        20,
+                                        &format!("g{gen}-{i}"),
+                                        &format!("n{i}"),
+                                    ));
+                                }
+                                log.push(format!("+{n}"));
+                            }
+                            Ok(())
+                        }
+                        15 => {
+                            let step = [1u64, 60, 300, 599, 600][next(5)];
+                            clock.add(Duration::from_secs(step));
+                            log.push(format!("t+{step}"));
+                            Ok(())
+                        }
+                        16 => {
+                            let paused = view.frozen().is_some();
+                            log.push(format!("{}{f}", if paused { "resume" } else { "pause" }));
+                            if paused {
+                                view.resume_view(&session)
+                            } else {
+                                view.pause_view(&session)
+                            }
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                        }
+                        _ => {
+                            is_sample = true;
+                            log.push(format!("complete{f}"));
+                            let ok = sample(&mut view, &session, &mut src, Mode::Complete);
+                            if ok {
+                                Ok(())
+                            } else {
+                                Err("failed".into())
+                            }
+                        }
+                    };
+                    commit_fault::disarm_split();
+                    res
+                };
+                let now = dedup(&view);
+                for row in &view.unfiltered_rows {
+                    seen.insert(row.key.clone());
+                }
+                // A historical tag whose record is still kept but is no
+                // longer a tag, and is not live (replaced by an untagged
+                // record of the same instance).
+                if is_sample {
+                    for t in view.last_seen().iter() {
+                        if hist_before.contains(t.key())
+                            && !t.is_tagged()
+                            && !view.tags().is_tagged(t.key())
+                            && replaced.len() < 50
+                        {
+                            let s = format!("seed={seed} {}", log.join(","));
+                            let tl: String = s
+                                .chars()
+                                .rev()
+                                .take(900)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect();
+                            replaced.push(format!("{tl}: {:?} {}", t.subject(), state(&view)));
+                        }
+                    }
+                }
+                if view.tags_status().contains("Tagged again") {
+                    retags += 1;
+                }
+                let tag = || {
+                    let s = format!("seed={seed} {}", log.join(","));
+                    let t: String = s
+                        .chars()
+                        .rev()
+                        .take(1400)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    format!(
+                        "{t}: total {before} -> {now} res_ok={} {}",
+                        res.is_ok(),
+                        state(&view)
+                    )
+                };
+                if is_sample {
+                    samples += 1;
+                    if res.is_err() {
+                        failed += 1;
+                    }
+                    if now != before {
+                        let class = match (now > before, res.is_ok()) {
+                            (false, _) => 0,
+                            (true, false) => 1,
+                            (true, true) => 2,
+                        };
+                        if i4_in_seed {
+                            after_i4[class] += 1;
+                        } else {
+                            classes[class] += 1;
+                            if firsts[class].is_none() {
+                                firsts[class] = Some(tag());
+                            }
+                        }
+                    }
+                } else if let Some(req) = request {
+                    if res.is_err() {
+                        if now != before {
+                            i1_req.push(tag());
+                        }
+                    } else {
+                        let live_after = live_keys(&view, &seen);
+                        let added: Vec<&ProcessKey> =
+                            live_after.difference(&live_set_before).collect();
+                        let removed = live_set_before.difference(&live_after).count() as i64;
+                        let made_live =
+                            added.iter().filter(|k| hist_before.contains(**k)).count() as i64;
+                        let expected = added.len() as i64 - made_live - removed;
+                        let ok = match req {
+                            TagRequest::Clear => now == 0,
+                            _ => now as i64 - before as i64 == expected,
+                        };
+                        if !ok {
+                            i5.push(tag());
+                        }
+                    }
+                }
+                if both(&view) > 0 {
+                    i4_in_seed = true;
+                    relisted_seen += 1;
+                    if i4.len() < 50 {
+                        i4.push(tag());
+                    }
+                }
+                if view.last_seen().len() > MAX_TOMBSTONES
+                    || view.last_seen().bytes() > crate::lastseen::MAX_TOMBSTONE_BYTES
+                {
+                    i3.push(tag());
+                }
+            }
+        }
+        eprintln!(
+            "PROBE C5 randomized seeds={seeds} steps={steps} samples={samples} failed-samples={failed} tagged-again-states={retags} I1-loss={} I1-overcount-failed={} I1-overcount-committed={} I1-failed-request={} I4-steps={relisted_seen} I5={} I3={}",
+            classes[0], classes[1], classes[2], i1_req.len(), i5.len(), i3.len()
+        );
+        eprintln!(
+            "PROBE C5 dedup I1 in seeds with no I4 state yet: loss={} overcount-failed={} overcount-committed={}; after an I4 state in the seed: {after_i4:?}; historical tags replaced by an untagged record={}",
+            classes[0], classes[1], classes[2], replaced.len()
+        );
+        for (i, f) in firsts.iter().enumerate() {
+            if let Some(f) = f {
+                eprintln!("PROBE C5 first of I1 class {i}: {f}");
+            }
+        }
+        for v in replaced.iter().take(2) {
+            eprintln!("PROBE C5 replaced: {v}");
+        }
+        for v in i4
+            .iter()
+            .take(2)
+            .chain(i5.iter().take(2))
+            .chain(i1_req.iter().take(2))
+            .chain(i3.iter().take(2))
+        {
+            eprintln!("PROBE C5 {v}");
+        }
+        assert!(
+            classes.iter().all(|c| *c == 0)
+                && after_i4.iter().all(|c| *c == 0)
+                && replaced.is_empty()
+                && i1_req.is_empty()
+                && i4.is_empty()
+                && i5.is_empty()
+                && i3.is_empty(),
+            "C5 violations: I1 {classes:?} req={} I4={relisted_seen} I5={} I3={}",
+            i1_req.len(),
+            i5.len(),
+            i3.len()
+        );
     }
 }

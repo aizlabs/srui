@@ -27,14 +27,16 @@
 //!   dropped unless both still name the current target, so a slow read of an
 //!   earlier selection can never overwrite a later one.
 //! * **Identity, not position.** The inspector follows its item ID wherever a
-//!   sort, filter or refresh moves its row. A process that ended, a row a
-//!   filter hides, and a record whose PID now names another instance each
-//!   publish their own state; a reused PID's new record is never shown.
-//!   "Ended" is said only on evidence of an exit: the detail reader found the
-//!   instance gone, or a scan entitled to account for it no longer listed it.
-//!   A row that retention dropped unconfirmed under the published-row ceiling
-//!   is not shown, and why, never ended. Every field the inspector shows is
-//!   the latest scan's (PX-013 review round).
+//!   sort, filter or refresh moves its row. A process that left the
+//!   collection, a row a filter hides, and a record whose PID now names
+//!   another instance each publish their own state; a reused PID's new record
+//!   is never shown. Every field the inspector shows of a listed row is the
+//!   latest scan's (PX-013 review round). A target that left is described
+//!   from its tombstone (PX-021, below), which says `exited` only on evidence
+//!   of an exit: the detail reader found the instance gone, or a scan entitled
+//!   to account for it no longer listed it. A row that retention dropped
+//!   unconfirmed under the published-row ceiling is `no longer observed`,
+//!   never exited, until such a scan establishes it.
 //! * **Unavailable is not zero.** A field that could not be read says why; a
 //!   parent PID 0 is the kernel's "no parent", never "root"; a state the
 //!   kernel did not document is shown as an unrecognized code.
@@ -54,8 +56,19 @@
 //! pause stay shown: everything the inspector shows is from the frozen view,
 //! never a live read beside frozen rows. Resume view asks for the current
 //! target's details again.
+//!
+//! Since PX-021 a target that leaves the collection is described from its
+//! tombstone ([`crate::lastseen`]): its identity, its last row and the state,
+//! parent and start time last read for it (never its command line, which can
+//! carry secrets), its last CPU share and resident memory, and when it was
+//! last observed, marked as a historical record no action applies to. It says
+//! `exited` only when a scan or a detail read established it, and `no longer
+//! observed` otherwise; once the record is no longer kept, it says so.
 use crate::catalogue::ProcessField;
 use crate::command::{CommandContext, COMMAND_HEAD, NO_SELECTION_COMMAND, UNCOLLECTED_COMMAND};
+use crate::lastseen::{
+    Departure, Exit, LastSeen, Tombstone, MAX_TOMBSTONES, MAX_TOMBSTONE_AGE, MAX_TOMBSTONE_BYTES,
+};
 use crate::metric::format_utc;
 use crate::owner::{AccountName, AccountNames};
 use crate::projection::Row;
@@ -420,10 +433,6 @@ struct Selected {
     row: Row,
     generation: SelectionGeneration,
     details: Details,
-    /// Retention dropped the row unconfirmed under the published-row ceiling
-    /// (`evict_unconfirmed_beyond`): no scan has said the process ended, and
-    /// the row's item ID is gone, so it is not shown, never called ended.
-    evicted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -549,6 +558,76 @@ fn cell_text(row: &Row, field: ProcessField) -> String {
     }
 }
 
+const DETAILS_HEAD: &str = "State, parent and start time";
+const METRICS_HEAD: &str = "CPU and resident memory";
+
+fn metrics_text(row: &Row) -> String {
+    format!(
+        "CPU: {} · Resident: {}",
+        cell_text(row, ProcessField::Cpu),
+        cell_text(row, ProcessField::Resident)
+    )
+}
+
+/// The inspector's lines for a target that left the collection (PX-021):
+/// what its tombstone kept, marked historical, or that it is no longer kept.
+fn historical_view(
+    head: String,
+    process: String,
+    noun: &str,
+    tombstone: Option<&Tombstone>,
+    relisted: bool,
+) -> InspectorView {
+    let Some(tombstone) = tombstone else {
+        if relisted {
+            // A scan listed the instance again after it was no longer
+            // observed: its record was dropped, and the row it is listed
+            // under is a new one the client never selected.
+            return InspectorView::bounded(
+                format!("{head} · listed again after it was no longer observed, under a new row; select that row to inspect it"),
+                process,
+                format!("{DETAILS_HEAD}: none: select its new row"),
+                format!("{METRICS_HEAD}: none: select its new row"),
+                format!("{COMMAND_HEAD}: none: select its new row"),
+            );
+        }
+        return InspectorView::bounded(
+            format!(
+                "{head} · its last-observed record is no longer kept (records are kept at most {} minutes, {MAX_TOMBSTONES} records and {} KiB, the oldest dropped first); select another row",
+                MAX_TOMBSTONE_AGE.as_secs() / 60,
+                MAX_TOMBSTONE_BYTES / 1024
+            ),
+            process,
+            format!("{DETAILS_HEAD}: none: the record is no longer kept"),
+            format!("{METRICS_HEAD}: none: the record is no longer kept"),
+            format!("{COMMAND_HEAD}: none: the record is no longer kept"),
+        );
+    };
+    let observed = tombstone.observed_text();
+    let details = match &tombstone.details {
+        Some(details) => format!("Last read · {}", details_text(details)),
+        None => format!("{DETAILS_HEAD}: none read while it was observed"),
+    };
+    // PX-014 shows arguments only for a listed process: they can carry
+    // secrets, and a tombstone does not keep them.
+    let command = format!(
+        "{COMMAND_HEAD}: not kept once the {noun} left the list: arguments can carry secrets"
+    );
+    InspectorView::bounded(
+        format!(
+            "{head} · {} · {observed}; a historical record: no action applies to it",
+            tombstone.departure.explained(noun)
+        ),
+        process,
+        details,
+        format!(
+            "Last sampled · {} · {observed}",
+            metrics_text(&tombstone.row)
+        ),
+        command,
+    )
+}
+
 fn details_text(details: &ProcessDetails) -> String {
     let state = match &details.state {
         Observed::Known(state) => state.text(),
@@ -565,9 +644,6 @@ fn details_text(details: &ProcessDetails) -> String {
     };
     format!("State: {state} · Parent: {parent} · Started: {started}")
 }
-
-const DETAILS_HEAD: &str = "State, parent and start time";
-const METRICS_HEAD: &str = "CPU and resident memory";
 
 impl Inspector {
     /// Installs the detail worker. Until one is installed, a selected process
@@ -596,6 +672,27 @@ impl Inspector {
         }
     }
 
+    /// The details last read for `key`, while it is the target (PX-021).
+    pub(crate) fn read_details(&self, key: &ProcessKey) -> Option<&ProcessDetails> {
+        match &self.selection {
+            Selection::Process(selected) if &selected.row.key == key => match &selected.details {
+                Details::Read(details) => Some(details),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether a detail read established that `key`, the target, exited
+    /// (PX-021).
+    pub(crate) fn read_exit(&self, key: &ProcessKey) -> bool {
+        matches!(
+            &self.selection,
+            Selection::Process(selected)
+                if &selected.row.key == key && selected.details == Details::Ended
+        )
+    }
+
     /// Detail results dropped because their target was no longer current.
     pub fn stale_results(&self) -> u64 {
         self.stale
@@ -616,7 +713,6 @@ impl Inspector {
             row: row.clone(),
             generation: self.generation,
             details,
-            evicted: false,
         }));
         self.ask();
     }
@@ -729,36 +825,22 @@ impl Inspector {
 
     /// Records what one accepted scan established about the target (PX-013
     /// review round), before its publication is planned: `latest` is the
-    /// server-side collection the scan leaves, `evicted` the unconfirmed rows
-    /// retention dropped under the published-row ceiling, and `retains` the
-    /// absences the scan could not account for (true for a key it would have
-    /// kept unconfirmed: the record retention, and for a thread also the
-    /// thread retention, PX-019).
+    /// server-side collection the scan leaves. A listed target's stored row
+    /// takes the latest projection, so a row shown after it is gone carries
+    /// the newest owner and name, never an older one.
     ///
-    /// * Listed: the stored row takes the latest projection, so a row shown
-    ///   after it is gone carries the newest owner and name, never an older one.
-    /// * Evicted: marked, not ended. Nothing established an exit.
-    /// * Previously evicted and now absent from a scan entitled to account for
-    ///   its instance: that is a confirmed exit, and the target has ended.
-    pub(crate) fn observe_scan(
-        &mut self,
-        latest: &[Row],
-        evicted: &HashSet<ItemId>,
-        retains: impl Fn(&ProcessKey) -> bool,
-    ) {
+    /// Whether a target that left exited, or is only no longer observed (the
+    /// row limit dropped it unconfirmed, say), is its tombstone's verdict
+    /// ([`crate::lastseen`], PX-021): a later scan entitled to account for it
+    /// upgrades that verdict there ([`LastSeen::establish_exits`]), so the
+    /// inspector, follow and the tags status say one thing.
+    pub(crate) fn observe_scan(&mut self, latest: &[Row]) {
         let Selection::Process(selected) = &mut self.selection else {
             return;
         };
         let item = selected.row.item_id;
         if let Some(row) = latest.iter().find(|row| row.item_id == item) {
             selected.row.adopt_sample(row);
-        } else if evicted.contains(&item) {
-            selected.evicted = true;
-        } else if selected.evicted
-            && !retains(&selected.row.key)
-            && !latest.iter().any(|row| row.key == selected.row.key)
-        {
-            selected.details = Details::Ended;
         }
     }
 
@@ -787,13 +869,15 @@ impl Inspector {
     }
 
     /// The four lines for a client that holds `rows`, out of the server-side
-    /// collection `unfiltered`.
+    /// collection `unfiltered`. A target that left the collection is
+    /// described from its tombstone in `last_seen` (PX-021).
     pub(crate) fn view(
         &self,
         rows: &[Row],
         unfiltered: &[Row],
         unconfirmed: &HashSet<ItemId>,
         names: &AccountNames,
+        last_seen: &LastSeen,
     ) -> InspectorView {
         let selected = match &self.selection {
             Selection::None => return InspectorView::initial(true),
@@ -828,7 +912,15 @@ impl Inspector {
         let item = selected.row.item_id;
         let shown = rows.iter().find(|row| row.item_id == item);
         let kept = shown.or_else(|| unfiltered.iter().find(|row| row.item_id == item));
-        let row = kept.unwrap_or(&selected.row);
+        // A target that left the collection is described from its tombstone
+        // (PX-021): the row as the server last held it.
+        let tombstone = match kept {
+            Some(_) => None,
+            None => last_seen.get(&selected.row.key),
+        };
+        let row = kept
+            .or(tombstone.map(|tombstone| &tombstone.row))
+            .unwrap_or(&selected.row);
         // A thread row is described as the thread it is (PX-019): its TID and
         // its process's PID, and its own state and start time.
         let (noun, subject) = match crate::threads::thread_subject(row) {
@@ -841,32 +933,30 @@ impl Inspector {
             row.display_name.as_str(),
             owner_text(&row.owner, names)
         );
-        if kept.is_none() && selected.evicted && selected.details != Details::Ended {
-            // Dropped unconfirmed under the row ceiling: not evidence of an
-            // exit. If a later scan lists the same instance again, it does so
-            // under a new item ID, which this target does not adopt.
-            let listed_again = unfiltered.iter().any(|row| row.key == selected.row.key);
-            let why = if listed_again {
-                "listed again as a new row after the row limit dropped it unconfirmed; select it again"
-            } else {
-                "not confirmed by the latest scan; not shown (dropped under the row limit)"
-            };
-            return InspectorView::bounded(
-                format!("{head} · {why}"),
-                process,
-                format!("{DETAILS_HEAD}: not shown"),
-                format!("{METRICS_HEAD}: not shown"),
-                format!("{COMMAND_HEAD}: not shown"),
-            );
+        if kept.is_none() {
+            // Left the collection (PX-021): described from its tombstone,
+            // which says `exited` only on evidence and is upgraded once a
+            // later scan entitled to account for it establishes the exit; a
+            // row the row limit dropped unconfirmed is `no longer observed`
+            // until then, never ended (PX-013 review round). An instance
+            // listed again is under a new item ID, which this target does not
+            // adopt.
+            let relisted =
+                tombstone.is_none() && unfiltered.iter().any(|row| row.key == selected.row.key);
+            return historical_view(head, process, noun, tombstone, relisted);
         }
-        let ended = kept.is_none() || selected.details == Details::Ended;
-        if ended {
+        if selected.details == Details::Ended {
+            // The detail read established the exit while the row is still
+            // listed (PX-021): the next sample takes it out.
             return InspectorView::bounded(
-                format!("{head} · this {noun} has ended; select another row"),
+                format!(
+                    "{head} · {} · its row leaves with the next sample; a historical record: no action applies to it",
+                    Departure::Exited(Exit::DetailRead).explained(noun)
+                ),
                 process,
-                format!("{DETAILS_HEAD}: none: the {noun} has ended"),
-                format!("{METRICS_HEAD}: none: the {noun} has ended"),
-                format!("{COMMAND_HEAD}: none: the {noun} has ended"),
+                format!("{DETAILS_HEAD}: none: the {noun} exited"),
+                format!("Last sampled · {}", metrics_text(row)),
+                format!("{COMMAND_HEAD}: none: the {noun} exited"),
             );
         }
         let Some(shown) = shown else {
@@ -922,11 +1012,7 @@ impl Inspector {
             format!("{head}{state}{earlier}"),
             process,
             details,
-            format!(
-                "CPU: {} · Resident: {}",
-                cell_text(shown, ProcessField::Cpu),
-                cell_text(shown, ProcessField::Resident)
-            ),
+            metrics_text(shown),
             command,
         )
     }

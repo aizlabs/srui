@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-021",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Last-observed records: a bounded tombstone for a watched process instance (the inspector's target, the followed process, a tagged process) that leaves the collection, holding its identity, last row, last CPU and resident memory, last read details and last-observed time; 'exited' only when a scan or detail read positively establishes it, 'no longer observed' otherwise; bounded by count, age and bytes on an injected monotonic clock; historical tags are tombstones; no process-changing action; no protocol, registry, SDK, renderer or client source change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md",
+      "K1": "https://docs.kernel.org/filesystems/proc.html"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX021-001",
+      "feature": "A bounded tombstone for each watched process instance that leaves the server-side collection: watched means the inspector's target, the followed process or a tagged process, and nothing else; the record holds the whole ProcessKey, the last row (name, owner, every cell, so the last CPU share and resident memory), the state, parent and start time the inspector last read (never the command line, executable or working directory, which can carry secrets), the sample time of the last scan that listed it (carried across scans that only kept it) and the scan it left with; recorded when the sample is applied, whatever its commits do; the followed process keeps watching its record until follow stops",
+      "scope": "PX-021/lastseen (src/lastseen.rs) Tombstone, LastSeen.record; refresh (src/refresh.rs) record_departures, last_observed, unconfirmed_since, confirmed_at; tests/lastseen_test.rs an_exiting_worker_leaves_an_inspectable_tombstone_that_no_request_takes; tests/procfs_test.rs live::a_live_worker_that_exits_leaves_a_tombstone_and_a_degraded_scan_claims_no_exit; src/refresh.rs follow_watch_tests a_record_only_follow_watches_survives_the_next_sample, a_user_deselect_releases_a_record_only_follow_watches (merge with main: a user deselect, PX-017-G02, stops follow and releases the record; a collapse, clear_hidden, does not)",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-021",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-021.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX021-002",
+      "feature": "Exit versus no longer observed: 'exited' only when a scan that accounts for every entry it did not publish (Retention::Skipped without the PID) and that observed the same host, boot and PID namespace no longer lists the PID, lists it with another creation token, or found the record vanished; or when the detail read found the record gone; a thread exited when its process's task listing was read without its TID, or with its process; everything else (eviction of a kept row, an unconfirmed scan identity, a sample that read no threads) says 'no longer observed; whether it exited is unknown'; no exit code, cause or unsampled history. Merge with main (PX-013 review round, PX-019 final): a row retention kept unconfirmed and the row ceiling then evicted is recorded 'no longer observed' (Unobserved::Evicted), never exited, whatever its scan read; a later scan that cannot account for it (the record retention, or for a thread its own confirmed process with no threads read or its threads unread) leaves it so, and the first one that can and also confirms its host, boot and PID namespace upgrades it to exited (LastSeen::establish_exits), keeping its last-observed time; a thread whose TID the scan read under the same process instance with another start time exited, replaced, even while that process's threads are otherwise unread. Codex review of PR #107: a detail read that was still loading when a scan recorded the target's departure and then finds the record gone turns that exact instance's 'no longer observed' record 'exited' through the detail read at once, republishing the inspector and the tags status; an established exit is final and keeps its first reason, whether a later scan or a late read could also establish it. Only an accepted Ended read does this, never one that read details or could not read them, never one completed while paused, and only for the record of the read's own whole key",
+      "scope": "PX-021/lastseen (src/lastseen.rs) Evidence, Departure, Exit, Unobserved; tests/lastseen_test.rs an_inaccessible_scan_never_records_an_exit, a_row_left_out_at_the_row_limit_is_no_longer_observed; tests/procfs_test.rs procfs_absences_establish_exits_and_inaccessible_records_never_do; src/lastseen.rs LastSeen.establish_exits, Evidence.departure (superseded before thread retention); src/refresh.rs apply retains, record_departures evicted; tests/lastseen_test.rs an_evicted_record_turns_exited_only_when_a_later_scan_can_account_for_it, an_evicted_thread_record_stays_unobserved_while_the_scan_cannot_account_for_it, a_superseded_thread_instance_is_recorded_exited_replaced, a_row_kept_unconfirmed_is_never_a_record; tests/inspector_test.rs a_retained_row_the_ceiling_evicts_is_never_called_ended; tests/threads_test.rs an_evicted_thread_is_ended_only_by_a_scan_that_could_read_its_threads, an_evicted_thread_is_not_ended_by_a_scan_that_could_not_read_its_process, an_evicted_thread_of_an_ended_process_instance_is_ended, an_evicted_thread_whose_tid_a_new_instance_took_is_ended; tests/tags_test.rs a_tagged_process_the_row_limit_drops_turns_historical_and_is_never_called_ended; src/lastseen.rs LastSeen.establish_detail_exit; src/refresh.rs details_read; tests/lastseen_test.rs a_late_detail_read_establishes_the_exit_of_its_own_record_and_it_stays, a_late_detail_read_never_replaces_an_established_exit; src/lastseen.rs tests a_detail_exit_upgrades_only_the_record_of_its_exact_key; tests/lastseen_test.rs an_accepted_read_that_is_not_ended_never_establishes_an_exit, a_detail_read_completed_while_paused_establishes_nothing",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-021",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-021.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX021-003",
+      "feature": "An inaccessible scan records no exit: an unreadable or rejected process list keeps every row and records nothing; a denied record is kept; a scan whose host identity was not read names its absences 'no longer observed'",
+      "scope": "PX-021/refresh (src/refresh.rs) apply status-only path before record_departures; tests/lastseen_test.rs an_inaccessible_scan_never_records_an_exit; tests/procfs_test.rs procfs_absences_establish_exits_and_inaccessible_records_never_do and the live test's simulated unreadable and degraded scans",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-021",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-021.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX021-004",
+      "feature": "A PID replacement is a distinct live item: the earlier instance's tombstone says 'exited: its PID now names a newer process' while the newcomer is a new row, item ID and live inspector target",
+      "scope": "PX-021/tests/lastseen_test.rs a_pid_replacement_is_a_distinct_live_item; tests/inspector_test.rs the_inspector_stays_on_its_process_when_sorting_moves_its_row_and_never_shows_a_reused_pid; tests/follow_test.rs a_disappeared_process_never_transfers_follow_to_its_reused_pid",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-021",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-021.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX021-005",
+      "feature": "Retention bounded by count (MAX_TOMBSTONES 64), age (MAX_TOMBSTONE_AGE 600 s after it left, by the view's injected MonotonicClock, at every accepted sample, including one that could not read the process list) and estimated bytes (MAX_TOMBSTONE_BYTES 32 KiB), oldest first; a record no longer watched goes at the next sample; tested at and past each bound under a fake clock. A sample discarded by Sampling::invalidate (merge with main, PX-019) is never applied, so it neither expires nor records anything. Codex review of PR #107: every scan that could not read the process list reconciles the tags status with the one the client holds, so a status a failed commit left naming an aged-out record is published by the next such scan, counting the tagged processes among the rows the client holds (those of the last row publication whose rows, view and tags status committed; a failed tag request, view switch or sample leaves them as they were), never a tree re-arranged from a generation whose every row is unconfirmed, so an unchanged scan republishes no tags status",
+      "scope": "PX-021/lastseen (src/lastseen.rs) LastSeen.expire, record, drop_oldest, Tombstone.bytes; refresh (src/refresh.rs) ProcessView::with_clock; src/lastseen.rs tests; tests/lastseen_test.rs retention_expires_deterministically_under_a_fake_clock, the_count_bound_keeps_the_newest_tombstones; tests/tags_test.rs historical_tags_are_bounded_newest_kept_and_cleared; tests/lastseen_test.rs a_tombstone_expires_while_the_process_list_is_unreadable, a_sample_discarded_by_invalidation_records_and_expires_nothing; src/refresh.rs publish_status_only, current_tags_effects; src/refresh.rs expiry_publish_tests an_unpublished_tag_expiry_is_published_by_the_next_unreadable_scan; src/refresh.rs ProcessView.tag_counts; tests/tags_test.rs an_unreadable_scan_keeps_the_tags_status_of_the_rows_the_client_holds; src/refresh.rs settle_tag_counts, tag_counts_commit_tests a_failed_clear_leaves_the_counts_of_the_rows_the_client_holds, a_failed_view_switch_leaves_the_counts_of_the_rows_the_client_holds, a_sample_that_moves_a_tag_beyond_the_limit_sets_the_counts, a_sort_that_moves_a_tag_beyond_the_limit_sets_the_counts, a_failed_sample_leaves_the_counts_of_the_rows_the_client_holds, a_sort_whose_plan_ends_at_the_tags_status_sets_the_counts",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-021",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-021.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX021-006",
+      "feature": "Historical state shown unmistakably and never acted on: the inspector shows the tombstone with its verdict, last read details, last sampled CPU and resident memory and last-observed time as 'a historical record: no action applies to it', or that the record is no longer kept; follow and tag requests refuse it; the follow status and PX-020's historical tags use the same verdict ('exited' or 'no longer observed'), replacing PX-013's 'has ended' and PX-020's 'no longer listed'",
+      "scope": "PX-021/inspector (src/inspector.rs) historical_view, view; follow (src/follow.rs) track, turn_on; tags (src/tags.rs) status, clear, retire; refresh (src/refresh.rs) tag_target, request_tags, settle_tags; client-macos ProcessExplorerShellTests inspectorReportsASelectedProcessThatEndedAndNeverItsPIDsNextRecord",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-021",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-021.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX021-007",
+      "feature": "Interactions: filters, the tree and its collapsed mirror, threads (a selected thread gets a tombstone; a hidden one is deselected first and gets none), tags, follow, pause (a paused view records and expires nothing) and failed commits (a failed sample still records; a failed Clear tags keeps the historical tags). Merge with main: a user-cleared selection (PX-017-G02) watches nothing, so the inspector's record goes at the next sample while tagged ones stay; a collapse-hidden selection (clear_hidden) keeps follow's watch. Codex review of PR #107: a live tag put back because the sample that retired it never committed its tags status keeps watching its record, so the retry records the historical tag even when the process was neither selected nor followed; the age, count and byte bounds still apply, and a record they drop meanwhile makes the retired tag counted forgotten; a cleared tag releases the record. Every tagged process instance is exactly one of live (in the tag set, any record of it not a historical tag), historical (a record that is a historical tag) or forgotten (counted once), asserted after every sample, republish and tag request (debug builds); a tag request promotes an instance's historical record to live, and a later departure of an instance keeps its record's historical tag; each historical tag is counted once across the failed and committed sample sequences the exhaustive four-sample test and the randomized fault test cover: a forgotten count a sample made for a tag that its failed commit puts back live is taken back with the tag set, and the committed retry counts it once; counts of tags already historical stand",
+      "scope": "PX-021/tests/lastseen_test.rs a_filtered_out_target_is_not_historical_until_it_leaves, the_tree_shows_the_same_tombstone, a_selected_thread_gets_a_tombstone_and_a_hidden_one_does_not, a_paused_view_records_nothing_until_it_resumes; src/refresh.rs tag_commit_tests a_failed_sample_records_the_tombstone_and_the_next_publication_shows_it, a_failed_clear_keeps_the_historical_tags, a_failed_sample_keeps_an_ended_process_tagged_until_one_commits; tests/no_process_control_test.rs; tests/lastseen_test.rs a_cleared_selection_releases_the_inspectors_record_and_keeps_tagged_ones; src/refresh.rs expire_tombstones, record_departures (live tags watch their records), apply departed loop; src/refresh.rs failed_retire_tests a_failed_retirement_of_an_unwatched_tag_keeps_its_record_for_the_retry, a_record_that_ages_out_before_its_retirement_commits_counts_the_tag_forgotten, a_cleared_restored_tag_releases_its_record; src/lastseen.rs LastSeen.forget_tag, begin_sample, settle_forgotten; src/refresh.rs forgotten_once_tests a_record_aged_out_across_two_failed_samples_is_counted_once, a_record_the_count_bound_drops_in_a_failed_sample_is_counted_once, every_historical_tag_is_counted_once_across_failed_and_committed_samples, only_tags_put_back_live_lose_a_forgotten_count_and_only_once, a_historical_tag_the_count_bound_pushes_out_in_a_failed_sample_stays_counted, a_released_record_takes_no_slot_under_the_count_bound; src/refresh.rs promote_live_tags, debug_check_tag_accounting, request_tags; src/lastseen.rs LastSeen.record (keeps an earlier historical tag); src/refresh.rs tag_accounting_tests a_watched_instance_leaving_after_a_failed_retag_keeps_its_historical_tag, an_instance_selected_after_a_failed_retag_reached_its_row_keeps_its_historical_tag, descendants_after_a_failed_retag_count_the_instance_once, an_age_drop_after_a_failed_retag_and_descendants_counts_each_tag_once, relisting_beyond_the_tag_limit_in_a_failed_sample_counts_once, randomized_tags_relisting_faults_and_bounds_count_each_tag_once; src/lastseen.rs tests a_second_departure_of_the_same_instance_replaces_the_first_record_and_keeps_its_tag",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-021",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-021.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX021-008",
+      "feature": "Relisting and retagging: a record that said only 'no longer observed' is dropped when a scan lists the same instance (the same whole ProcessKey; for a thread, the thread itself) again, and the inspector, still on its old row, says it is listed again; a later departure records afresh; an 'exited' record is final. A dropped record that was a historical tag becomes a live tag again on its row ('Tagged again: …'), held until the tags status commits (a failed sample keeps it historical); beyond MAX_TAGGED it is counted forgotten and the status says which and why. This amends PX-020's 'never put back on a row' for exactly that case; PID reuse never inherits a tag",
+      "scope": "PX-021/lastseen (src/lastseen.rs) LastSeen.drop_relisted, record, forget_tags; refresh (src/refresh.rs) apply relisting before visible_in, unretag, settle_tags; tags (src/tags.rs) Tags.retag; tests/lastseen_test.rs a_tag_whose_process_is_listed_again_is_live_again, an_exited_tag_stays_historical_when_its_key_is_listed_again, a_relisted_tag_beyond_the_tag_limit_is_counted_forgotten, relisted_tags_partly_beyond_the_tag_limit_say_which_was_forgotten, an_instance_listed_again_after_eviction_gets_a_fresh_record_when_it_exits, a_newer_process_under_the_pid_never_drops_the_old_record, a_thread_listed_again_drops_its_no_longer_observed_record, a_thread_whose_process_alone_is_listed_keeps_its_record; src/refresh.rs retag_commit_tests; tests/lastseen_test.rs relisted_tags_all_beyond_the_tag_limit_are_counted_in_the_plural (verifier H1)",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-021",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-021.md"
+      ]
+    }
+  ]
+}

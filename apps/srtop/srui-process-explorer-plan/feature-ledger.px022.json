@@ -4,7 +4,7 @@
   "upstream": {
     "project": "SRUI",
     "version": "0.6",
-    "scope": "srtop's displayed state follows the runtime's continuity decisions (RESUME_OK within retention, RESYNC_REQUIRED{SAME_SESSION} outside it, RESYNC_REQUIRED{REPLACED} after a real restart) with no reconnect logic of its own; a detached window is labelled stale by client chrome (PX-022-G01), keeps its cached data readable, and takes no new action or selection; same-session continuity keeps process identities and server-side explorer state; replacement abandons pending intent and inherits no selection, tag or last-observed record; T29 text handling unchanged and verified. Two small shared fixes the ticket needs: the renderer freezes user collection selection while a session window carries a client status, and srui-ssh-bridge ends when its daemon closes the connection",
+    "scope": "srtop's displayed state follows the runtime's continuity decisions (RESUME_OK within retention, RESYNC_REQUIRED{SAME_SESSION} outside it, RESYNC_REQUIRED{REPLACED} after a real restart) with no reconnect logic of its own; a detached window is labelled stale by client chrome (PX-022-G01), keeps its cached data readable, and takes no new action or selection; same-session continuity keeps process identities and server-side explorer state; replacement abandons pending intent and inherits no selection, tag or last-observed record; T29 text handling unchanged and verified; the generic client and bridge fixes it relies on (stale-window selection freeze, bridge exit on daemon close) are PX-022-G02's, and the window status is PX-022-G01's; no shared source change here",
     "references": {
       "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
       "D2": "../../../SRUI_Implementation_Plan.md"
@@ -74,32 +74,6 @@
       "source_refs": [
         "D1",
         "D2"
-      ],
-      "owner": "PX-022",
-      "status": "in_progress",
-      "evidence": [
-        "docs/process-explorer/completions/PX-022.md"
-      ]
-    },
-    {
-      "feature_id": "SRUI-PX022-006",
-      "feature": "Shared renderer fix: while a session window carries a client-owned status (LayoutRenderer.sessionWindowStatus non-nil), List, Table and Tree adapters refuse every user-initiated selection change (selectionShouldChange(in:) via ControlFactory.allowsUserSelectionChange), so no selection the session cannot report is kept locally to disagree with the server after the reconnect; server promotions still apply; the gate follows the status through remounts and clears with it",
-      "scope": "PX-022/client-macos Collections/TableCollectionAdapter.swift, Collections/OutlineCollectionAdapter.swift, RendererAppKit/ControlFactory.swift, RendererAppKit/LayoutRenderer.swift; RendererAppKitTests StaleWindowSelectionTests",
-      "source_refs": [
-        "D1"
-      ],
-      "owner": "PX-022",
-      "status": "in_progress",
-      "evidence": [
-        "docs/process-explorer/completions/PX-022.md"
-      ]
-    },
-    {
-      "feature_id": "SRUI-PX022-007",
-      "feature": "Shared bridge fix: srui-ssh-bridge ends as soon as the session daemon closes its connection, even while the SSH side stays open and idle (bridge_streams no longer waits for both directions), and the binary exits instead of returning into a runtime shutdown blocked on its stdin reader, so the SSH channel closes and an idle client sees its transport end after a daemon stop",
-      "scope": "PX-022/server-rust ssh-bridge src/lib.rs bridge_streams, src/main.rs; tests/bridge_failure_test.rs daemon_eof_ends_the_bridge_while_the_ssh_side_stays_open, binary_exits_when_the_daemon_closes_while_stdin_stays_open",
-      "source_refs": [
-        "D1"
       ],
       "owner": "PX-022",
       "status": "in_progress",

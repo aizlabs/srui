@@ -37,7 +37,7 @@ public final class LayoutRenderer {
     /// is applied to every Surface window `mount(nodeID:from:)` creates, so a remount that rebuilds
     /// the windows, or a later commit that adds one, keeps it.
     ///
-    /// While it is set, users cannot change a collection's selection (PX-022): the status says the
+    /// While it is set, users cannot change a collection's selection (PX-022-G02): the status says the
     /// session is not live, so a selection could not be reported (§18), and kept locally it would
     /// disagree with the server's view of the selection after the reconnect (§22.5). Everything
     /// else the window caches stays readable and scrollable.

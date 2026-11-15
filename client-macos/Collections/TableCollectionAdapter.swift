@@ -47,7 +47,7 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
     /// `onSelectionChanged` this is not a semantic event; the renderer uses it to keep a local
     /// selection across remounts.
     public var onLocalSelection: (@MainActor (NodeId, [ItemId]) -> Void)?
-    /// Whether the user may change the selection now (PX-022). While it says no, a click, an
+    /// Whether the user may change the selection now (PX-022-G02). While it says no, a click, an
     /// arrow key or a deselection leaves the selection where it is: the session cannot report the
     /// change (§18: no new semantic events before a continuity decision), and a local selection
     /// the server never heard of would outlive the reconnect and disagree with every server-side

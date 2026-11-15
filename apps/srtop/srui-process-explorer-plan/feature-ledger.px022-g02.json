@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-022-G02",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Two generic fixes PX-022's native reconnect evidence needed: the macOS renderer takes no user-initiated List/Table/Tree selection change while a session window carries the PX-022-G01 client-owned status (§18, §22.5), and srui-ssh-bridge ends, and its process exits, when its session daemon closes the connection while the SSH side stays open (§17, §20.1); no ConnectionManager, SessionController, protocol, registry, SDK, sessiond or srtop change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX022G02-001",
+      "feature": "While LayoutRenderer.sessionWindowStatus is set, TableCollectionAdapter and OutlineCollectionAdapter answer selectionShouldChange(in:) false, so no click, arrow key or deselection changes a List, Table or Tree selection and nothing unreportable is kept in local selection memory; ControlFactory.allowsUserSelectionChange holds the gate, LayoutRenderer.setSessionWindowStatus(_:) sets it (closed while a status is shown, open when cleared or empty), every adapter a remount builds reads it; server promotions (selectRowIndexes), scrolling and tree disclosure are unaffected",
+      "scope": "PX-022-G02/client-macos Collections/TableCollectionAdapter.swift, Collections/OutlineCollectionAdapter.swift, RendererAppKit/ControlFactory.swift, RendererAppKit/LayoutRenderer.swift; RendererAppKitTests StaleWindowSelectionTests",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-022-G02",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-022-G02.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX022G02-002",
+      "feature": "srui-ssh-bridge ends as soon as the session daemon closes its connection, after flushing what the daemon sent, even while the SSH side stays open and idle (bridge_streams forwards the two directions separately instead of copy_bidirectional; SSH EOF still half-closes towards the daemon and keeps forwarding until it closes), and the binary leaves with std::process::exit rather than returning into a tokio runtime shutdown blocked on its stdin reader, so the SSH channel closes and an idle client sees its transport end",
+      "scope": "PX-022-G02/server-rust ssh-bridge src/lib.rs bridge_streams, src/main.rs main; tests/bridge_failure_test.rs daemon_eof_ends_the_bridge_while_the_ssh_side_stays_open, binary_exits_when_the_daemon_closes_while_stdin_stays_open",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-022-G02",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-022-G02.md"
+      ]
+    }
+  ]
+}

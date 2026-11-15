@@ -67,7 +67,7 @@ public final class ControlFactory {
     /// with `pruneCollectionSelectionMemory(keeping:)`; an empty set removes the entry.
     var collectionDisclosureMemory: [NodeId: (modelID: ModelId?, collapsed: Set<ItemId>)] = [:]
 
-    /// Whether users may change collection selections (PX-022). `LayoutRenderer` clears it while
+    /// Whether users may change collection selections (PX-022-G02). `LayoutRenderer` clears it while
     /// its session windows carry a client-owned status, that is, while the session cannot carry a
     /// new selection report; every List/Table/Tree adapter consults it before a user change.
     public internal(set) var allowsUserSelectionChange = true

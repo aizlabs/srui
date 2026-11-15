@@ -171,7 +171,7 @@ async fn eof_on_session_side_terminates_bridge() {
     assert!(result.is_ok());
 }
 
-/// PX-022: a daemon that stops or drops the connection ends the bridge even while the SSH side
+/// PX-022-G02: a daemon that stops or drops the connection ends the bridge even while the SSH side
 /// stays open and idle, so the client's transport ends and it can say it is disconnected. Before,
 /// the bridge waited for the SSH side to close as well, and an idle client stayed "connected" to
 /// a daemon that no longer existed.
@@ -340,7 +340,7 @@ fn absorb_first_launch_assessment() {
 /// Far above the 12-19 s measured for a first exec on a busy machine.
 const LAUNCH_ASSESSMENT_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// PX-022: the real binary exits when the daemon closes its connection, although the SSH side
+/// PX-022-G02: the real binary exits when the daemon closes its connection, although the SSH side
 /// keeps its standard input open and idle, and its standard output then reads EOF. That is how
 /// an idle client learns a daemon stopped: an open bridge process holds the SSH channel open.
 /// Skipped as root for the reason given at `binary_stderr_contains_no_protocol_bytes`.

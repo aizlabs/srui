@@ -142,7 +142,7 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
     /// User-originated selection changes, including an empty selection (§22.5).
     public var onLocalSelection: (@MainActor (NodeId, [ItemId]) -> Void)?
     /// Whether the user may change the selection now, with the same rules as
-    /// `TableCollectionAdapter.allowsUserSelectionChange` (PX-022). Disclosure stays local and is
+    /// `TableCollectionAdapter.allowsUserSelectionChange` (PX-022-G02). Disclosure stays local and is
     /// not affected.
     public var allowsUserSelectionChange: @MainActor () -> Bool = { true }
     /// Local disclosure change: `(node, item, expanded)`, reported as EXPANSION_CHANGED (§7.6).

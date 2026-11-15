@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Leave the process directly. Tokio reads stdin on a blocking thread that returns only when
     // the SSH side writes or closes, and a runtime shutdown waits for that thread, so returning
     // from `main` after the daemon closed the connection left the process, and with it the SSH
-    // channel, open (PX-022). Everything forwarded has been written and flushed by now.
+    // channel, open (PX-022-G02). Everything forwarded has been written and flushed by now.
     match result {
         Ok(()) => {
             info!("srui-ssh-bridge exited cleanly.");

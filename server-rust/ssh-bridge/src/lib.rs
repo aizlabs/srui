@@ -32,7 +32,7 @@ pub enum BridgeError {
 /// than wait for the SSH side to close. Its process then exits and the SSH channel closes, which
 /// is how the client learns the connection is gone (§17 DETACHED, §18). Waiting for both
 /// directions instead kept an idle client "connected" to a daemon that no longer existed: an
-/// SSH channel's standard output is not closed by shutting down its write half (PX-022).
+/// SSH channel's standard output is not closed by shutting down its write half (PX-022-G02).
 pub async fn bridge_streams<S1, S2>(
     stream1: S1,
     stream2: S2,

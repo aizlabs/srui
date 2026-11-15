@@ -3,7 +3,7 @@
 // RendererAppKitTests
 //
 // A session window that carries a client-owned status (PX-022-G01) takes no user selection change
-// (PX-022; §18, §22.5): while the session cannot report a selection, a click or an arrow key
+// (PX-022-G02; §18, §22.5): while the session cannot report a selection, a click or an arrow key
 // leaves the selection where it is, so no local selection outlives the reconnect unreported.
 // Server-driven selection still applies, and the gate follows the status through remounts.
 //
@@ -15,7 +15,7 @@ import Testing
 @testable import Collections
 
 @MainActor
-@Suite("Stale session windows take no user selection change (PX-022; §18, §22.5)")
+@Suite("Stale session windows take no user selection change (PX-022-G02; §18, §22.5)")
 struct StaleWindowSelectionTests {
     private static let surfaceID = NodeId(1)
     private static let collectionID = NodeId(2)

@@ -4,7 +4,8 @@
 //! column chooser, PX-011 find-next/find-previous and jump to PID, PX-015
 //! sampling interval, Pause view/Resume view and manual refresh, PX-016
 //! keyboard shortcuts, PX-017 follow selected process, PX-018 parent/child
-//! process tree, PX-019 threads, PX-020 tags). No process
+//! process tree, PX-019 threads, PX-020 tags, PX-021 last-observed records).
+//! No process
 //! is ever opened for control: the only client-input handlers are the sort
 //! buttons', the filter input's, the column chooser buttons', the search
 //! controls', the sampling controls', the follow toggle's, the view switch's,
@@ -21,6 +22,7 @@ pub mod command;
 pub mod filter;
 pub mod follow;
 pub mod inspector;
+pub mod lastseen;
 pub mod metric;
 pub mod on_demand;
 pub mod owner;
@@ -197,7 +199,7 @@ pub const THREADS_NODE_COUNT: usize = 4;
 /// collections holding the "Tag or untag selected", "Tag selected and
 /// descendants" and "Clear tags" buttons and the tags status, which counts
 /// the tagged processes, says how many the filters hide, and names the
-/// historical tags of tagged processes no longer listed.
+/// historical tags of tagged processes that left the collection (PX-021).
 pub const TAGS_ROW: NodeId = NodeId::new(78);
 pub const TAG_TOGGLE: NodeId = NodeId::new(79);
 pub const TAG_DESCENDANTS: NodeId = NodeId::new(80);

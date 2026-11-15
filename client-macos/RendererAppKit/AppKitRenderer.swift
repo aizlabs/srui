@@ -88,6 +88,19 @@ public final class AppKitRenderer {
         layoutRenderer.showWindows()
     }
 
+    /// The client-owned status line shown on every Surface window of this session, or `nil`
+    /// (PX-022-G01; see `LayoutRenderer.sessionWindowStatus`).
+    public var sessionWindowStatus: String? {
+        layoutRenderer.sessionWindowStatus
+    }
+
+    /// Sets or clears the client-owned status line on every Surface window of this session, now
+    /// and for every window mounted later. Only the client's own connection state may drive it,
+    /// never a server property (§17, §18; PX-022-G01).
+    public func setSessionWindowStatus(_ status: String?) {
+        layoutRenderer.setSessionWindowStatus(status)
+    }
+
     /// Drops in-flight coverage without emitting. Used by `stop()` so a torn-down
     /// pump cannot record phantom pending windows (§8, §22.7).
     public func clearCollectionRangeTrackers() {

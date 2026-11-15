@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-022-G01",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Generic macOS client: every window of a session shows the connection status as client-owned chrome (NSWindow.subtitle and the window's accessibility help) that no server property writes, driven by ConnectionManager from ConnectionStatus for the current attempt generation only (§17, §18, §22.3, §22.8; D2 T22–T24, T38); no server, SDK, protocol, registry, proto or framing change and no srtop change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX022G01-001",
+      "feature": "AppKitRenderer.setSessionWindowStatus(_:) / sessionWindowStatus: one client-owned status line on every Surface window as NSWindow.subtitle and window accessibility help; never writes or is written by the server-owned title (Surface label -> NSWindow.title); kept by the renderer and applied to every Surface window mount(nodeID:from:) creates, so it survives remounts and reaches windows created later; nil or empty clears it",
+      "scope": "PX-022-G01/client-macos RendererAppKit/AppKitRenderer.swift, RendererAppKit/LayoutRenderer.swift; RendererAppKitTests SessionWindowStatusTests",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-022-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-022-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX022G01-002",
+      "feature": "ConnectionManager drives the session-window status from ConnectionStatus through one writer (setStatus): connecting, resynchronizing and disconnected name the last applied revision as stale, a REPLACED decision says the session is rebuilding, ready clears it; only the current attempt generation reaches it, and it is cleared before a session context is dropped",
+      "scope": "PX-022-G01/client-macos ConnectionManager/ConnectionManager.swift ConnectionStatus.sessionWindowStatus(lastAppliedRevision:), setStatus, discardContext; SRUITests ConnectionManagerTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-022-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-022-G01.md"
+      ]
+    }
+  ]
+}

@@ -8,6 +8,10 @@
 // resumed with a fresh client identity and an empty revision-zero replica. Warm reconnects reuse
 // the in-memory applier, outbox, resource cache, ingress gate, and renderer.
 //
+// Every window of a session shows the connection status as client-owned chrome (PX-022-G01): stale
+// while detached or catching up, rebuilding after a REPLACED decision, and cleared once ready. It is
+// written only with the status, by the current attempt generation (§18), never from a server claim.
+//
 
 import Foundation
 import Observation
@@ -166,6 +170,28 @@ public enum ConnectionStatus: Equatable, Sendable {
             return "disconnected"
         }
     }
+
+    /// Client-owned chrome every window of the session shows for this status, or `nil` for none
+    /// (PX-022-G01). It is derived only from the client's own transport state, never from a server
+    /// property. While the transport is not delivering live state (§17 DETACHED, or the catch-up
+    /// that follows a §18 continuity decision) the window still shows the replica at
+    /// `lastAppliedRevision`, so the text says that data is stale.
+    func sessionWindowStatus(lastAppliedRevision: UInt64) -> String? {
+        switch self {
+        case .unknown, .connected:
+            return nil
+        case .connecting:
+            return "connecting — showing data from revision \(lastAppliedRevision) (stale)"
+        case .resynchronizing:
+            return "resynchronizing — showing data from revision \(lastAppliedRevision) (stale)"
+        case .disconnected:
+            return "disconnected — showing data from revision \(lastAppliedRevision) (stale)"
+        }
+    }
+
+    /// Window chrome from a REPLACED continuity decision until its snapshot is ready (§18): the old
+    /// incarnation's replica is discarded, so there is no revision to call stale.
+    static let sessionReplacedWindowStatus = "session replaced — rebuilding"
 }
 
 public struct ConnectionAlert: Identifiable, Equatable, Sendable {
@@ -525,7 +551,7 @@ public final class ConnectionManager {
         statuses.removeValue(forKey: connectionID)
         pendingFirstSuccess.remove(connectionID)
         if activeTokens[connectionID] == nil {
-            contexts.removeValue(forKey: connectionID)
+            discardContext(for: connectionID)
         }
 
         enqueueSave(entries) { [weak self] errorMessage in
@@ -569,7 +595,7 @@ public final class ConnectionManager {
         entries.removeAll { neverConnected.contains($0.id) }
         for connectionID in neverConnected {
             statuses.removeValue(forKey: connectionID)
-            contexts.removeValue(forKey: connectionID)
+            discardContext(for: connectionID)
         }
 
         for index in entries.indices {
@@ -579,8 +605,9 @@ public final class ConnectionManager {
                ) {
                 entries[index].lastKnownRevision = revision
             }
-            statuses[entries[index].id] = .disconnected(
-                resumeAvailable: entries[index].sessionID != nil
+            setStatus(
+                .disconnected(resumeAvailable: entries[index].sessionID != nil),
+                for: entries[index].id
             )
         }
 
@@ -653,7 +680,7 @@ public final class ConnectionManager {
             tasksByToken[previousToken]?.cancel()
         }
         attemptsByToken[token] = attempt
-        statuses[connection.id] = .connecting
+        setStatus(.connecting, for: connection.id)
         if alert?.kind != .sessionReplaced {
             alert = nil
         }
@@ -720,7 +747,7 @@ public final class ConnectionManager {
         if activeTokens[connectionID] == token {
             activeTokens.removeValue(forKey: connectionID)
             if entries.contains(where: { $0.id == connectionID }) == false {
-                contexts.removeValue(forKey: connectionID)
+                discardContext(for: connectionID)
             }
         }
     }
@@ -742,19 +769,19 @@ public final class ConnectionManager {
 
         switch event {
         case .connecting:
-            statuses[connectionID] = .connecting
+            setStatus(.connecting, for: connectionID)
             return false
 
         case .resynchronizing:
             contexts[connectionID]?.invalidatePersistableRevision()
-            statuses[connectionID] = .resynchronizing
+            setStatus(.resynchronizing, for: connectionID)
             return false
 
         case .replaced(let previousSessionID, let newSessionID):
             contexts[connectionID]?.invalidatePersistableRevision()
             entries[index].sessionID = newSessionID
             entries[index].lastKnownRevision = 0
-            statuses[connectionID] = .resynchronizing
+            setStatus(.resynchronizing, for: connectionID, replaced: true)
             let persistenceError = await save(entries)
             guard activeTokens[connectionID] == token else { return true }
 
@@ -781,7 +808,7 @@ public final class ConnectionManager {
             entries[index].lastKnownRevision = revision
             contexts[connectionID]?.markPersistableRevisionReady(for: sessionID)
             pendingFirstSuccess.remove(connectionID)
-            statuses[connectionID] = .connected
+            setStatus(.connected, for: connectionID)
             let persistenceError = await save(entries)
             guard activeTokens[connectionID] == token else { return true }
             if let persistenceError {
@@ -865,7 +892,7 @@ public final class ConnectionManager {
         if wasPending {
             entries.remove(at: index)
             statuses.removeValue(forKey: connectionID)
-            contexts.removeValue(forKey: connectionID)
+            discardContext(for: connectionID)
         } else {
             if let context = contexts[connectionID],
                let revision = context.persistableRevision(
@@ -873,11 +900,38 @@ public final class ConnectionManager {
                ) {
                 entries[index].lastKnownRevision = revision
             }
-            statuses[connectionID] = .disconnected(
-                resumeAvailable: entries[index].sessionID != nil
+            setStatus(
+                .disconnected(resumeAvailable: entries[index].sessionID != nil),
+                for: connectionID
             )
         }
         return await save(entries)
+    }
+
+    /// Records a connection's status and puts the matching client-owned chrome on every window of
+    /// its session (PX-022-G01). Callers have already established that they speak for the current
+    /// attempt generation (the `activeTokens` checks), so a superseded attempt's late outcome never
+    /// reaches either one (§18, generation-bound resume attempts).
+    private func setStatus(
+        _ status: ConnectionStatus,
+        for connectionID: SavedConnection.ID,
+        replaced: Bool = false
+    ) {
+        statuses[connectionID] = status
+        guard let context = contexts[connectionID] else { return }
+        context.renderer.setSessionWindowStatus(
+            replaced
+                ? ConnectionStatus.sessionReplacedWindowStatus
+                : status.sessionWindowStatus(
+                    lastAppliedRevision: context.applier.lastAppliedRevision.value
+                )
+        )
+    }
+
+    /// Drops a session context, clearing the status its windows show first so no window outlives
+    /// the manager's ownership still claiming a transport state.
+    private func discardContext(for connectionID: SavedConnection.ID) {
+        contexts.removeValue(forKey: connectionID)?.renderer.setSessionWindowStatus(nil)
     }
 
     @discardableResult

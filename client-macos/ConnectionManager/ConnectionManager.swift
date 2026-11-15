@@ -11,6 +11,7 @@
 // Every window of a session shows the connection status as client-owned chrome (PX-022-G01): stale
 // while detached or catching up, rebuilding after a REPLACED decision, and cleared once ready. It is
 // written only with the status, by the current attempt generation (§18), never from a server claim.
+// A dropped session context closes its windows, so none is left on screen without that status.
 //
 
 import Foundation
@@ -759,10 +760,23 @@ public final class ConnectionManager {
     ) async -> Bool {
         guard activeTokens[connectionID] == token else { return true }
         guard let index = entries.firstIndex(where: { $0.id == connectionID }) else {
+            // A removed entry's session keeps running until its transport ends, and its windows
+            // stay open until then, so they keep following the transport (PX-022-G01). When it
+            // ends, `runAttempt` discards the context and closes them.
             switch event {
             case .failed, .stopped:
                 return true
-            case .connecting, .resynchronizing, .replaced, .ready:
+            case .connecting:
+                showWindowStatus(.connecting, for: connectionID)
+                return false
+            case .resynchronizing:
+                showWindowStatus(.resynchronizing, for: connectionID)
+                return false
+            case .replaced:
+                showWindowStatus(.resynchronizing, for: connectionID, replaced: true)
+                return false
+            case .ready:
+                showWindowStatus(.connected, for: connectionID)
                 return false
             }
         }
@@ -907,7 +921,6 @@ public final class ConnectionManager {
         }
         return await save(entries)
     }
-
     /// Records a connection's status and puts the matching client-owned chrome on every window of
     /// its session (PX-022-G01). Callers have already established that they speak for the current
     /// attempt generation (the `activeTokens` checks), so a superseded attempt's late outcome never
@@ -918,6 +931,21 @@ public final class ConnectionManager {
         replaced: Bool = false
     ) {
         statuses[connectionID] = status
+        showWindowStatus(status, for: connectionID, replaced: replaced)
+    }
+
+    /// Puts the chrome for `status` on every window of the connection's session, if it still has
+    /// a context. Used directly only for a removed entry whose attempt is still running: it has no
+    /// row status any more, but its windows are still on screen (PX-022-G01).
+    ///
+    /// N is the applier's `lastAppliedRevision` when the transition happens, not a rendered
+    /// revision: it can briefly lead or trail what the window draws, but every non-live state says
+    /// `(stale)`, so live data is never claimed.
+    private func showWindowStatus(
+        _ status: ConnectionStatus,
+        for connectionID: SavedConnection.ID,
+        replaced: Bool = false
+    ) {
         guard let context = contexts[connectionID] else { return }
         context.renderer.setSessionWindowStatus(
             replaced
@@ -928,10 +956,21 @@ public final class ConnectionManager {
         )
     }
 
-    /// Drops a session context, clearing the status its windows show first so no window outlives
-    /// the manager's ownership still claiming a transport state.
+    /// Drops a session context and closes its windows.
+    ///
+    /// A dropped context is never reconnected or reopened: `connect` mints a fresh one and `open`
+    /// needs one, and removing an entry only forgets it locally (D2 T38; the remote session lives
+    /// on, §17). Its windows must not outlive it. AppKit keeps a shown `NSWindow` alive after its
+    /// renderer is released, and nothing else would close it, so the window would stay on screen
+    /// frozen, and with its status cleared it would read as a live session. Mounting an empty
+    /// store closes every Surface window (`LayoutRenderer.tearDown`), as a REPLACED reset does.
+    /// The status is cleared first so the renderer holds no transport claim either. Pending text
+    /// in those windows belongs to the dropped outbox and is not sent (§18.3 covers resume only).
     private func discardContext(for connectionID: SavedConnection.ID) {
-        contexts.removeValue(forKey: connectionID)?.renderer.setSessionWindowStatus(nil)
+        guard let context = contexts.removeValue(forKey: connectionID) else { return }
+        context.renderer.setSessionWindowStatus(nil)
+        // Mounting a store with no roots registers nothing, so it cannot throw.
+        try? context.renderer.attach(store: SemanticStore())
     }
 
     @discardableResult

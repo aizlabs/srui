@@ -26,8 +26,8 @@
     },
     {
       "feature_id": "SRUI-PX022G01-002",
-      "feature": "ConnectionManager drives the session-window status from ConnectionStatus through one writer (setStatus): connecting, resynchronizing and disconnected name the last applied revision as stale, a REPLACED decision says the session is rebuilding, ready clears it; only the current attempt generation reaches it, and it is cleared before a session context is dropped",
-      "scope": "PX-022-G01/client-macos ConnectionManager/ConnectionManager.swift ConnectionStatus.sessionWindowStatus(lastAppliedRevision:), setStatus, discardContext; SRUITests ConnectionManagerTests",
+      "feature": "ConnectionManager drives the session-window status from ConnectionStatus through one writer (setStatus): connecting, resynchronizing and disconnected name the last applied revision as stale, a REPLACED decision says the session is rebuilding, ready clears it; only the current attempt generation reaches it; a removed entry's still-running session keeps updating its windows; a dropped session context (failed first connection, removed entry, never-connected draft at shutdown) clears the status and closes its windows by mounting an empty store, so no window outlives it without the status",
+      "scope": "PX-022-G01/client-macos ConnectionManager/ConnectionManager.swift ConnectionStatus.sessionWindowStatus(lastAppliedRevision:), setStatus, showWindowStatus, discardContext, handle() missing-entry branch; SRUITests ConnectionManagerTests",
       "source_refs": [
         "D1",
         "D2"

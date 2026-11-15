@@ -1166,8 +1166,12 @@ struct ConnectionManagerTests {
     }
 
     /// Commits revision 1 with one titled Surface to `context`'s replica and mounts it, so the
-    /// status can be read off a real `NSWindow`.
-    private func mountTitledSurface(in context: ConnectionSessionContext) throws -> NSWindow {
+    /// status can be read off a real `NSWindow`. `shown` orders it in, as the session controller
+    /// does after its first mount (concealed in the test host).
+    private func mountTitledSurface(
+        in context: ConnectionSessionContext,
+        shown: Bool = false
+    ) throws -> NSWindow {
         let revision = try context.applier.apply(
             baseRevision: .initial,
             operations: [
@@ -1180,7 +1184,20 @@ struct ConnectionManagerTests {
         ).get()
         #expect(revision == Revision(1))
         try context.renderer.attach(store: context.applier.store)
-        return try #require(context.renderer.registry.handle(for: NodeId(1))?.window)
+        if shown {
+            context.renderer.showWindows()
+        }
+        let window = try #require(context.renderer.registry.handle(for: NodeId(1))?.window)
+        #expect(window.isVisible == shown)
+        return window
+    }
+
+    /// A dropped context's windows are closed, not left on screen without their status.
+    private func expectClosed(_ window: NSWindow, of context: ConnectionSessionContext) {
+        #expect(window.isVisible == false)
+        #expect(NSApplication.shared.windows.contains { $0 === window && $0.isVisible } == false)
+        #expect(context.renderer.registry.surfaceHandles.isEmpty)
+        #expect(context.renderer.sessionWindowStatus == nil)
     }
 
     @Test("every connection status maps to its session-window chrome")
@@ -1372,8 +1389,8 @@ struct ConnectionManagerTests {
         await manager.shutdown()
     }
 
-    @Test("a session context is dropped only after its window status is cleared")
-    func droppedContextClearsSessionWindowStatus() async throws {
+    @Test("a failed first connection closes the windows it had mounted")
+    func failedFirstConnectionClosesItsWindows() async throws {
         let temporary = TemporaryConnectionStore()
         defer { temporary.cleanUp() }
         let harness = ConnectionAttemptHarness()
@@ -1382,21 +1399,24 @@ struct ConnectionManagerTests {
             attemptFactory: { harness.makeAttempt($0) }
         )
 
-        // A failed first connection discards its context.
         let draft = ConnectDraft(id: UUID(), label: "Never", host: "never.example", user: "alice")
         _ = try #require(manager.connect(draft))
-        let draftContext = try #require(harness.requests.first).context
-        let draftWindow = try mountTitledSurface(in: draftContext)
-        #expect(draftWindow.subtitle == stale("connecting", 0))
-        let draftAttempt = try #require(harness.attempts.first)
-        await draftAttempt.emit(.failed("initial failure"))
+        let context = try #require(harness.requests.first).context
+        let window = try mountTitledSurface(in: context, shown: true)
+        #expect(window.subtitle == stale("connecting", 0))
+        let attempt = try #require(harness.attempts.first)
+        await attempt.emit(.failed("initial failure"))
         try await AsyncTestSupport.observed("failed draft removed") {
             manager.entries.isEmpty && manager.alert?.kind == .connectionFailed
         }
-        #expect(draftContext.renderer.sessionWindowStatus == nil)
-        #expect(draftWindow.subtitle.isEmpty)
+        expectClosed(window, of: context)
+        await manager.shutdown()
+    }
 
-        // Removing a disconnected entry discards its context.
+    @Test("removing a disconnected entry closes its windows")
+    func removingDisconnectedEntryClosesItsWindows() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
         let saved = SavedConnection(
             label: "Removed",
             host: "removed.example",
@@ -1404,22 +1424,78 @@ struct ConnectionManagerTests {
             sessionID: "removed-session"
         )
         try await temporary.store.save([saved])
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
         await manager.load()
         manager.connect(id: saved.id)
         let attempt = try #require(harness.attempts.last)
         let context = try #require(harness.requests.last).context
-        let window = try mountTitledSurface(in: context)
+        let window = try mountTitledSurface(in: context, shown: true)
         await attempt.emit(.stopped)
         try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "attempt ownership released") {
             manager.status(for: saved.id) == .disconnected(resumeAvailable: true)
                 && manager.hasActiveAttemptForTesting(saved.id) == false
         }
+        #expect(window.isVisible)
         #expect(window.subtitle == stale("disconnected", 1))
 
         manager.remove(id: saved.id)
-        #expect(context.renderer.sessionWindowStatus == nil)
-        #expect(window.subtitle.isEmpty)
+        expectClosed(window, of: context)
         await manager.waitForPersistenceForTesting()
+        await manager.shutdown()
+    }
+
+    @Test("a removed entry's running session keeps its window status, then closes when it ends")
+    func removedEntryWithRunningAttemptFollowsThenCloses() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Removed While Connecting",
+            host: "removed-connecting.example",
+            user: "alice",
+            sessionID: "removed-connecting-session"
+        )
+        try await temporary.store.save([saved])
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+        manager.connect(id: saved.id)
+        let attempt = try #require(harness.attempts.last)
+        let context = try #require(harness.requests.last).context
+        let window = try mountTitledSurface(in: context, shown: true)
+        try await AsyncTestSupport.eventuallyAsync(timeout: .roundTrip, description: "attempt start") {
+            await attempt.startCount() == 1
+        }
+
+        // Removing the row is local bookkeeping: the session keeps running, and its window stays.
+        manager.remove(id: saved.id)
+        #expect(manager.entries.isEmpty)
+        #expect(window.isVisible)
+        #expect(window.subtitle == stale("connecting", 0))
+
+        await attempt.emit(.resynchronizing)
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "removed entry catching up") {
+            context.renderer.sessionWindowStatus == stale("resynchronizing", 1)
+        }
+        await attempt.emit(.ready(sessionID: "removed-connecting-session", revision: 1))
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "removed entry live") {
+            context.renderer.sessionWindowStatus == nil
+        }
+        #expect(window.isVisible)
+        #expect(window.subtitle.isEmpty)
+
+        await attempt.emit(.stopped)
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "removed session ended") {
+            manager.hasActiveAttemptForTesting(saved.id) == false
+                && context.renderer.registry.surfaceHandles.isEmpty
+        }
+        expectClosed(window, of: context)
         await manager.shutdown()
     }
 }

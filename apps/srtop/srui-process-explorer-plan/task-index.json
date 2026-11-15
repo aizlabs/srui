@@ -685,6 +685,27 @@
       ]
     },
     {
+      "id": "PX-022-G02",
+      "key": "stale-selection-exit",
+      "phase": "C",
+      "title": "Freeze user selection in stale session windows and end the SSH bridge with its daemon",
+      "depends_on": [
+        "PX-022-G01"
+      ],
+      "file": "tickets/PX-022-G02-stale-selection-bridge-exit.md",
+      "refs": "D1 §§17–18.3, 20.1, 22.5, 22.7; D2 T17, T19, T22–T24, T28",
+      "sources": "",
+      "gate": "R1-prerequisite",
+      "build": "Two generic fixes that PX-022's native reconnect evidence showed are missing, each a separate defect in shared code. (1) Renderer: while a session window carries the client-owned status of PX-022-G01 (`LayoutRenderer.sessionWindowStatus` is set), a List, Table or Tree takes no user-initiated selection change. Today a click or arrow key in a detached window moves the native highlight, its `SELECTION_CHANGED` is dropped because no session can carry it (§18: no new semantic events before a continuity decision), and the renderer's local selection memory keeps the unreported row through a `RESUME_OK` replay and through a same-session snapshot remount, so the highlight then disagrees with every server-side view of the selection, such as an inspector and an action that targets the process it describes (§22.5: the selection highlight is local and only semantic outcomes reach the server, so a local selection the server was never told of is a divergence, not a preference). `TableCollectionAdapter` and `OutlineCollectionAdapter` answer `selectionShouldChange(in:)` from a gate that `ControlFactory` holds and `LayoutRenderer.setSessionWindowStatus(_:)` sets: closed while a status is shown, open when it is cleared. Server promotions (`selectRowIndexes`, §22.7), scrolling and tree disclosure are unaffected, and every adapter a remount builds reads the same gate. (2) `srui-ssh-bridge`: the bridge ends as soon as its session daemon closes the connection, even while the SSH side stays open and idle (§20.1: the bridge attaches and detaches a connection and owns no state, so a connection the daemon ended is over). Today `bridge_streams` uses `copy_bidirectional`, which returns only when both directions reach EOF, and daemon EOF only shuts down the write half of tokio's stdout, which does not close the SSH channel; and after `bridge_streams` returns, `main` returns into a tokio runtime shutdown that waits for the blocking thread reading stdin. An idle client of a stopped daemon therefore stays `connected` with frozen data and no stale status (§17: the client must learn its transport is gone), and the Connections window offers Open rather than Connect. Daemon EOF ends the bridge after everything it sent is flushed, and the process exits; the SSH-to-daemon direction keeps its half-close behaviour. No application-specific code.",
+      "verify": "Each new test fails with its fix reverted, and the mutants are recorded in the completion note. `RendererAppKitTests` on a real `NSTableView` and a real `NSOutlineView`: with a status set, the user's Down Arrow leaves the selection where it is and reports nothing, and clearing the status lets the next arrow select and report; a server promotion still selects in a stale window; the gate survives a remount, and an empty status clears it. `srui-ssh-bridge` tests: the library bridge returns when the daemon side closes while the SSH side stays open, after delivering what the daemon sent, and the SSH side then reads EOF; the real binary exits successfully when the daemon closes while its stdin stays open, and its stdout reads to EOF; every existing bridge test still passes. `cargo fmt -p srui-ssh-bridge --check`, `cargo clippy -p srui-ssh-bridge --all-targets -- -D warnings`, the bridge tests on macOS and, as an unprivileged user, on Linux, `bash scripts/run-swift-tests.sh`, `scripts/check-test-process-stdio.sh`, `scripts/check-test-main-runloop-nesting.sh` and `scripts/parse-changed-swift.sh` pass.",
+      "out": "No change to the text or semantics of `setSessionWindowStatus`, to `ConnectionManager`, `SessionController`, the outbox, event dispatch, text editing or tree disclosure. No change to session continuity, resume, replay or retry (no new retry protocol). No SDK attach/detach notice (not approved), no protocol, registry, proto, framing, SDK or `srui-sessiond` change, no srtop change (PX-022 consumes both fixes), and no edit of the read-only design document.",
+      "status": "planned",
+      "size": "S",
+      "deps": [
+        "window-status"
+      ]
+    },
+    {
       "key": "reconnect",
       "phase": "C",
       "title": "Expose disconnect, catch-up, and replacement correctly",
@@ -693,7 +714,8 @@
       "out": "No new retry protocol, secret/key storage, simultaneous fleet administration, or external automation listener.",
       "deps": [
         "lastseen",
-        "window-status"
+        "window-status",
+        "stale-selection-exit"
       ],
       "refs": "D1 §§17–18.3; D2 T22–T24, T29",
       "sources": "",
@@ -702,7 +724,8 @@
       "id": "PX-022",
       "depends_on": [
         "PX-021",
-        "PX-022-G01"
+        "PX-022-G01",
+        "PX-022-G02"
       ],
       "file": "tickets/PX-022-reconnect.md",
       "status": "planned"
@@ -3500,6 +3523,7 @@
     "PX-020",
     "PX-021",
     "PX-022-G01",
+    "PX-022-G02",
     "PX-022",
     "PX-023",
     "PX-024",

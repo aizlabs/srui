@@ -17,20 +17,27 @@
 //! process group and not a promise about later children: a child started
 //! after the request is never added.
 //!
-//! A tagged process that leaves the collection — it ended, or a scan no
-//! longer lists it — keeps a historical tag: its PID and name as last shown,
-//! listed in the status, never on a row and never matched again, even if the
-//! same instance were listed again. At most [`MAX_HISTORICAL_TAGS`] are kept,
-//! the oldest forgotten first and counted; "Clear tags" removes every tag,
-//! live and historical. At most [`MAX_TAGGED`] processes are tagged at once:
+//! A tagged process that leaves the collection keeps a historical tag: its
+//! tombstone in [`crate::lastseen::LastSeen`] (PX-021), which says whether it
+//! exited or is no longer observed and when it was last observed, listed in
+//! the status and never on a row. Historical tags are bounded with every
+//! other tombstone, by count ([`MAX_HISTORICAL_TAGS`]), age and bytes, the
+//! oldest forgotten first and counted; "Clear tags" removes every tag, live
+//! and historical. A historical tag whose record says the process exited is
+//! never matched again. One whose record says only "no longer observed"
+//! (the row limit left the process out, or a scan could not confirm its
+//! identity) is live again when a scan lists the very same instance, under
+//! the same whole key, again: it was observed after all (PX-021); a newer
+//! process under its PID is never tagged. At most [`MAX_TAGGED`] processes are tagged at once:
 //! a request that would tag more is refused whole and says so. Nothing here
 //! touches a process: there is no bulk action, and a tag means nothing
 //! outside this session.
 
 use crate::bounded;
+use crate::lastseen::LastSeen;
 use crate::projection::Row;
 use crate::source::{Observed, ProcessKey};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 /// The heading of the tag column, which follows the chosen columns.
 pub const TAG_HEADING: &str = "Tag";
@@ -44,13 +51,14 @@ pub const TAG_DESCENDANTS_DESCRIPTION: &str =
     "Tags the selected process and every descendant the latest sample shows under it, filtered or not, each as its own tag. Processes started later are never added: this is not a process group.";
 pub const TAGS_CLEAR_LABEL: &str = "Clear tags";
 pub const TAGS_CLEAR_DESCRIPTION: &str =
-    "Removes every tag, including those of processes no longer listed. The selection is unchanged.";
+    "Removes every tag, including the historical tags of processes that exited or are no longer observed. The selection is unchanged.";
 /// The tags status of a shell that collects nothing.
 pub const UNCOLLECTED_STATUS: &str = "Tags disabled: process collection not started";
 /// The longest tags status published, in encoded bytes, before the cut mark.
 pub const MAX_TAGS_STATUS_BYTES: usize = 1024;
-/// The most historical tags kept; the oldest are forgotten first.
-pub const MAX_HISTORICAL_TAGS: usize = 64;
+/// The most historical tags kept; the oldest are forgotten first. They are
+/// tombstones, so they share the tombstones' count bound (PX-021).
+pub const MAX_HISTORICAL_TAGS: usize = crate::lastseen::MAX_TOMBSTONES;
 /// The most process instances tagged at once. A request that would tag more
 /// is refused whole. It bounds the set, and the bytes tagged cells add to a
 /// catch-up snapshot, which the row ceiling reserves once
@@ -82,8 +90,8 @@ fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
     }
 }
 
-/// The tag set (PX-020): the tagged process instances, the historical tags
-/// of tagged processes no longer listed, and what the last request did.
+/// The tag set (PX-020): the tagged process instances and what the last
+/// request did. The historical tags are tombstones (PX-021).
 ///
 /// Every change takes a new generation, which the tags status carries to the
 /// client; a request or a sample whose status never committed puts the
@@ -92,10 +100,6 @@ fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
 pub struct Tags {
     /// Each tagged process instance, and how it was named when tagged.
     live: HashMap<ProcessKey, String>,
-    /// Newest last, at most [`MAX_HISTORICAL_TAGS`].
-    history: VecDeque<String>,
-    /// Historical tags forgotten past the bound since the last clear.
-    forgotten: u64,
     generation: u64,
     /// What the last request did, until the next one.
     outcome: Option<String>,
@@ -128,17 +132,6 @@ impl Tags {
     /// How many process instances are tagged.
     pub fn tagged(&self) -> usize {
         self.live.len()
-    }
-
-    /// How many historical tags are kept.
-    pub fn historical(&self) -> usize {
-        self.history.len()
-    }
-
-    /// The historical tags kept, oldest first: each the PID and name the
-    /// process was last shown with.
-    pub fn history(&self) -> impl Iterator<Item = &str> {
-        self.history.iter().map(String::as_str)
     }
 
     /// This set's generation: every change takes a new one.
@@ -223,13 +216,11 @@ impl Tags {
         self.changed(outcome);
     }
 
-    /// Removes every tag, live and historical.
-    pub(crate) fn clear(&mut self) {
+    /// Removes every live tag; `historical` is how many historical tags the
+    /// caller removed from the tombstones with them.
+    pub(crate) fn clear(&mut self, historical: u64) {
         let live = self.live.len();
-        let historical = self.history.len() as u64 + self.forgotten;
         self.live.clear();
-        self.history.clear();
-        self.forgotten = 0;
         self.changed(format!(
             "Cleared {live} {} and {historical} historical; the selection is unchanged",
             plural(live, "tag", "tags"),
@@ -243,6 +234,38 @@ impl Tags {
         self.live
             .extend(keys.into_iter().map(|key| (key, "test".to_string())));
         self.generation += 1;
+    }
+
+    /// Makes the tags of `rows` live again (PX-021): each was a historical
+    /// tag whose record said only "no longer observed", and a scan lists the
+    /// same instance, under the same whole key, again. The caller keeps the
+    /// set within [`MAX_TAGGED`]; `forgotten` says which relisted ones it
+    /// could not tag again, and is stated with the ones it did.
+    pub(crate) fn retag(&mut self, rows: &[&Row], forgotten: Option<String>) {
+        if rows.is_empty() {
+            if let Some(forgotten) = forgotten {
+                self.changed(forgotten);
+            }
+            return;
+        }
+        for row in rows {
+            self.live.insert(row.key.clone(), who(row));
+        }
+        let mut outcome = match rows {
+            [row] => format!(
+                "Tagged again: {} is listed again after it was no longer observed",
+                who(row)
+            ),
+            _ => format!(
+                "Tagged again: {} processes are listed again after they were no longer observed",
+                rows.len()
+            ),
+        };
+        if let Some(forgotten) = forgotten {
+            outcome.push_str(" · ");
+            outcome.push_str(&forgotten);
+        }
+        self.changed(outcome);
     }
 
     /// Records a request that changed no tag, and why.
@@ -289,30 +312,27 @@ impl Tags {
         departed
     }
 
-    /// Makes the tags of `departed` historical (PX-020), under a new
-    /// generation, keeping at most [`MAX_HISTORICAL_TAGS`].
-    pub(crate) fn retire(&mut self, departed: Vec<(ProcessKey, String)>) {
+    /// Takes the tags of `departed` off the live set (PX-020), under a new
+    /// generation; their tombstones become the historical tags (PX-021).
+    pub(crate) fn retire(&mut self, departed: &[(ProcessKey, String)]) {
         if departed.is_empty() {
             return;
         }
-        for (key, subject) in departed {
-            if self.live.remove(&key).is_some() {
-                self.history.push_back(subject);
-            }
-        }
-        while self.history.len() > MAX_HISTORICAL_TAGS {
-            self.history.pop_front();
-            self.forgotten += 1;
+        for (key, _) in departed {
+            self.live.remove(key);
         }
         self.generation += 1;
     }
 
     /// The tags status (PX-020): how many processes are tagged and where the
-    /// ones not shown are, the historical tags, and what the last request
-    /// did, in fixed wording, numbers and cut names only.
-    pub(crate) fn status(&self, counts: TagCounts) -> String {
+    /// ones not shown are, the historical tags kept in `last_seen` with how
+    /// each left and when it was last observed (PX-021), and what the last
+    /// request did, in fixed wording, numbers and cut names only.
+    pub(crate) fn status(&self, counts: TagCounts, last_seen: &LastSeen) -> String {
         let mut clauses = Vec::new();
-        if self.live.is_empty() && self.history.is_empty() && self.forgotten == 0 {
+        let kept = last_seen.tagged().count();
+        let forgotten = last_seen.forgotten_tags();
+        if self.live.is_empty() && kept == 0 && forgotten == 0 {
             clauses.push(
                 "Tags: none · a tag marks a process instance on this server and changes no process"
                     .to_string(),
@@ -341,23 +361,41 @@ impl Tags {
                     clauses.push(format!("{count} {}", plural(count, one, many)));
                 }
             }
-            let historical = self.history.len() as u64 + self.forgotten;
+            let historical = kept as u64 + forgotten;
             if historical > 0 {
-                let named: Vec<&str> = self
-                    .history
-                    .iter()
+                let named: Vec<String> = last_seen
+                    .tagged()
                     .rev()
                     .take(NAMED_HISTORY)
-                    .map(String::as_str)
+                    .map(|tombstone| {
+                        format!(
+                            "{} {}, {}",
+                            tombstone.subject(),
+                            tombstone.departure().verdict(),
+                            tombstone.observed_text()
+                        )
+                    })
                     .collect();
-                let mut clause = format!("{historical} no longer listed: {}", named.join(", "));
-                let unnamed = historical - named.len() as u64;
-                if unnamed > 0 {
-                    clause.push_str(&format!(" and {unnamed} more"));
-                }
-                if self.forgotten > 0 {
-                    clause.push_str(&format!(" ({} forgotten)", self.forgotten));
-                }
+                // Every historical tag is counted once: the named ones, then
+                // the rest, of which the forgotten ones are a part.
+                let clause = if named.is_empty() {
+                    // All of them are forgotten: none is kept to name.
+                    if historical == 1 {
+                        "1 historical, forgotten".to_string()
+                    } else {
+                        format!("{historical} historical, all forgotten")
+                    }
+                } else {
+                    let mut clause = format!("{historical} historical: {}", named.join("; "));
+                    let unnamed = historical - named.len() as u64;
+                    if unnamed > 0 {
+                        clause.push_str(&format!(" and {unnamed} more"));
+                    }
+                    if forgotten > 0 {
+                        clause.push_str(&format!(" ({forgotten} forgotten)"));
+                    }
+                    clause
+                };
                 clauses.push(clause);
             }
         }

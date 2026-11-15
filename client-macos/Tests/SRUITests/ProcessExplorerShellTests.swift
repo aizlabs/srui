@@ -1178,7 +1178,7 @@ struct ProcessExplorerShellTests {
         table.scrollRowToVisible(59)
         let bottom = viewport()
         try await sample("the followed process ended") {
-            status.stringValue.hasPrefix("Follow stopped: PID 6010 · tracked has ended · a new process that reuses its PID is not followed")
+            status.stringValue.hasPrefix("Follow stopped: PID 6010 · tracked exited · a new process that reuses its PID is not followed")
                 && toggle.state == .off
         }
         let reusedRow = try #require(trackedRow())
@@ -1189,7 +1189,7 @@ struct ProcessExplorerShellTests {
         #expect(viewport() == bottom, "nothing scrolled to it")
         #expect(applier.store.getNode(NodeId(5))?.promotedSelection == nil)
         #expect(applier.store.getNode(NodeId(5))?.keepVisible == nil, "the hint is cleared")
-        #expect(inspectorStatus.stringValue.contains("this process has ended"))
+        #expect(inspectorStatus.stringValue.contains("exited: its PID now names a newer process"))
         try await sample("after the end") { true }
         #expect(table.selectedRowIndexes.isEmpty && viewport() == bottom && toggle.state == .off)
 
@@ -2019,7 +2019,7 @@ struct ProcessExplorerShellTests {
         #expect(after["202 (thread of 200)"] != before["202 (thread of 200)"], "a reused TID is a new thread")
         #expect(!Set(before.values).contains(after["203 (thread of 200)"] ?? 0), "a new thread has a new item ID")
         try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector says the thread ended") {
-            inspectorStatus.stringValue.contains("this thread has ended")
+            inspectorStatus.stringValue.contains("exited: a scan that read its process's threads no longer lists it")
         }
         print("PX-019 native SSH evidence: window \(window.windowNumber); rows=\(Self.nativeRows(table)); threads status=\(threadsStatus.stringValue); item IDs before=\(before) after=\(after); revision=\(applier.lastAppliedRevision.value)")
         await controller.stop()
@@ -2167,7 +2167,7 @@ struct ProcessExplorerShellTests {
         NativeActivation.click(refresh)
         try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "make's tag historical") {
             outline.numberOfRows == 11 && taggedInOutline() == ["301", "310", "311"]
-                && tagsStatus.stringValue.hasPrefix("Tags: 3 tagged · 1 no longer listed: PID 300 · make")
+                && tagsStatus.stringValue.hasPrefix("Tags: 3 tagged · 1 historical: PID 300 · make exited, last observed ")
         }
 
         // Clear tags: every mark goes; the selection, the inspector and the item IDs stay.
@@ -2699,10 +2699,10 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
-    /// PX-013: a selected process that ends is reported as ended, with no details and no
-    /// metrics, and the inspector stays on that instance: when the scripted fixture brings a
-    /// process back under the same PID, it is a new row with a new item ID, and the inspector
-    /// never shows it.
+    /// PX-013, PX-021: a selected process that exits leaves an inspectable tombstone — exited,
+    /// with its last sample and last-observed time, marked historical — and the inspector stays
+    /// on that instance: when the scripted fixture brings a process back under the same PID, it
+    /// is a new row with a new item ID, and the inspector never shows it.
     @Test(.timeLimit(.minutes(1)))
     @MainActor
     func inspectorReportsASelectedProcessThatEndedAndNeverItsPIDsNextRecord() async throws {
@@ -2753,18 +2753,29 @@ struct ProcessExplorerShellTests {
         }
         let item = try #require(clickedItem, "PID 4102 was selected while shown")
 
-        // The script ends PID 4102: the inspector says so, and shows nothing of any other record.
-        let ended = [
-            "Selected process: PID 4102 · worker · this process has ended; select another row",
-            "Name: worker · PID 4102 · Owner: unavailable",
-            "State, parent and start time: none: the process has ended",
-            "CPU and resident memory: none: the process has ended",
-        ]
-        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "PID 4102 ended") {
-            native() == ended
+        // The script ends PID 4102 with a complete scan that no longer lists it: the inspector
+        // shows its tombstone (PX-021) — exited, its identity, the details last read for it
+        // and its last sampled CPU and resident memory, with the time it was last observed,
+        // marked historical — and nothing of any other record.
+        let exited = "Selected process: PID 4102 · worker · exited: a scan that accounts for its PID no longer lists it · last observed 2027-01-15 08:0"
+        let historical = " UTC; a historical record: no action applies to it"
+        func isTombstone(_ lines: [String]) -> Bool {
+            lines.count == 4
+                && lines[0].hasPrefix(exited) && lines[0].hasSuffix(historical)
+                && lines[1] == "Name: worker · PID 4102 · Owner: unavailable"
+                && (lines[2].hasPrefix("Last read · State: S (sleeping) · Parent: PID 4101 · Started: ")
+                    || lines[2] == "State, parent and start time: none read while it was observed")
+                && lines[3].hasPrefix("Last sampled · CPU: ") && lines[3].contains(" · Resident: ")
+                && lines[3].contains(" · last observed 2027-01-15 08:0")
         }
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "PID 4102 exited") {
+            isTombstone(native())
+        }
+        let ended = native()
         #expect(Self.inspectorLines(applier) == ended)
         #expect(!Self.modelItemIDs(applier).contains(item))
+        let tombstoneCommand = Self.modelText(applier, NodeId(Self.inspectorCommandID))
+        #expect(tombstoneCommand == "Command line: not kept once the process left the list: arguments can carry secrets")
 
         // The next cycle lists PID 4102 again under a new item ID: another instance as far as
         // identity goes, which the inspector does not adopt.
@@ -2773,8 +2784,12 @@ struct ProcessExplorerShellTests {
         }
         let again = Self.modelItemIDs(applier)[try #require(row4102())]
         #expect(again != item, "a returning record is a new row")
-        #expect(native() == ended, "the inspector never shows the PID's next record")
-        print("PX-013 native SSH evidence (ended): window \(window.windowNumber); selected item \(item); returning item \(again); inspector=\(native()); revision=\(applier.lastAppliedRevision.value)")
+        // The scripted record reuses its own token, so it is the same instance to the server: the
+        // exited record stands while it is listed, and a later departure would only renew it. The
+        // inspector stays on the old row's record and never shows the new row (PX-021).
+        #expect(isTombstone(native()), "the inspector never shows the PID's next record: \(native())")
+        #expect(native()[0].hasPrefix(exited))
+        print("PX-013/PX-021 native SSH evidence (tombstone): window \(window.windowNumber); selected item \(item); returning item \(again); inspector=\(native()); command=\(tombstoneCommand); revision=\(applier.lastAppliedRevision.value)")
         await controller.stop()
     }
 

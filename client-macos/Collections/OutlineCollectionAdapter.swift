@@ -141,6 +141,10 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
     public var onRangeRequest: (@MainActor (CollectionRangeRequest) -> Void)?
     /// User-originated selection changes, including an empty selection (§22.5).
     public var onLocalSelection: (@MainActor (NodeId, [ItemId]) -> Void)?
+    /// Whether the user may change the selection now, with the same rules as
+    /// `TableCollectionAdapter.allowsUserSelectionChange` (PX-022-G02). Disclosure stays local and is
+    /// not affected.
+    public var allowsUserSelectionChange: @MainActor () -> Bool = { true }
     /// Local disclosure change: `(node, item, expanded)`, reported as EXPANSION_CHANGED (§7.6).
     public var onExpansionChanged: (@MainActor (NodeId, ItemId, Bool) -> Void)?
     /// Every change of the collapsed set, with the model it belongs to, so the renderer can keep
@@ -803,6 +807,11 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
         // A reused row view must not keep the previous row's state.
         let expandable = (cached?.descendantCount ?? 0) > 0
         rowView.setAccessibilityDisclosed(expandable && cached.map { isExpanded($0.itemID) } == true)
+    }
+
+    /// Asked before any user-initiated selection change, never for `selectRowIndexes`.
+    public func selectionShouldChange(in outlineView: NSOutlineView) -> Bool {
+        allowsUserSelectionChange()
     }
 
     public func outlineView(_ outlineView: NSOutlineView, shouldSelectItem item: Any) -> Bool {

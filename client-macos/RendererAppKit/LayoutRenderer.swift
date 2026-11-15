@@ -36,6 +36,11 @@ public final class LayoutRenderer {
     /// accessibility title varies by macOS release (§22.8). It lives as long as this renderer and
     /// is applied to every Surface window `mount(nodeID:from:)` creates, so a remount that rebuilds
     /// the windows, or a later commit that adds one, keeps it.
+    ///
+    /// While it is set, users cannot change a collection's selection (PX-022-G02): the status says the
+    /// session is not live, so a selection could not be reported (§18), and kept locally it would
+    /// disagree with the server's view of the selection after the reconnect (§22.5). Everything
+    /// else the window caches stays readable and scrollable.
     public private(set) var sessionWindowStatus: String?
 
     /// Local dispatch of the standard `shortcut` property for this renderer's surfaces.
@@ -312,6 +317,7 @@ public final class LayoutRenderer {
     /// window, now and for every window mounted later (PX-022-G01).
     public func setSessionWindowStatus(_ status: String?) {
         sessionWindowStatus = status?.isEmpty == false ? status : nil
+        controlFactory.allowsUserSelectionChange = sessionWindowStatus == nil
         for handle in registry.surfaceHandles {
             guard let window = handle.window else { continue }
             applySessionWindowStatus(to: window)

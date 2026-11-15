@@ -69,10 +69,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let stdio = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
-    bridge_streams(stdio, session_stream, shutdown).await?;
+    let result = bridge_streams(stdio, session_stream, shutdown).await;
 
-    info!("srui-ssh-bridge exited cleanly.");
-    Ok(())
+    // Leave the process directly. Tokio reads stdin on a blocking thread that returns only when
+    // the SSH side writes or closes, and a runtime shutdown waits for that thread, so returning
+    // from `main` after the daemon closed the connection left the process, and with it the SSH
+    // channel, open (PX-022-G02). Everything forwarded has been written and flushed by now.
+    match result {
+        Ok(()) => {
+            info!("srui-ssh-bridge exited cleanly.");
+            std::process::exit(0)
+        }
+        Err(error) => {
+            error!("srui-ssh-bridge forwarding failed: {error}");
+            std::process::exit(1)
+        }
+    }
 }
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() {

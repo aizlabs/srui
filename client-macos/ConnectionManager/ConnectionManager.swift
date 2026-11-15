@@ -621,9 +621,11 @@ public final class ConnectionManager {
         }
     }
 
+    /// `configureController` lets tests install `SessionController` interceptors before start.
     static func makeSessionControllerAttempt(
         request: ConnectionAttemptRequest,
-        transport: any Transport
+        transport: any Transport,
+        configureController: ((SessionController) -> Void)? = nil
     ) -> any ConnectionAttempt {
         let controller = SessionController(
             transport: transport,
@@ -636,6 +638,7 @@ public final class ConnectionManager {
             transactionIngressGate: request.context.transactionIngressGate
         )
         controller.attachRenderer(request.context.renderer)
+        configureController?(controller)
         return SessionControllerConnectionAttempt(controller: controller)
     }
 
@@ -694,7 +697,8 @@ public final class ConnectionManager {
             await self.runAttempt(
                 attempt,
                 connectionID: connection.id,
-                token: token
+                token: token,
+                context: context
             )
         }
         tasksByToken[token] = task
@@ -703,7 +707,8 @@ public final class ConnectionManager {
     private func runAttempt(
         _ attempt: any ConnectionAttempt,
         connectionID: SavedConnection.ID,
-        token: UInt64
+        token: UInt64,
+        context: ConnectionSessionContext
     ) async {
         var handledTerminalEvent = false
 
@@ -750,6 +755,12 @@ public final class ConnectionManager {
             if entries.contains(where: { $0.id == connectionID }) == false {
                 discardContext(for: connectionID)
             }
+        }
+        // Only now can this attempt's controller no longer render into `context`: a render already
+        // in flight when the session failed may have reopened its windows after the manager
+        // dropped it (PX-022-G01). So a context the manager no longer owns closes its windows here.
+        if contexts[connectionID] !== context {
+            closeWindows(of: context)
         }
     }
 
@@ -921,6 +932,7 @@ public final class ConnectionManager {
         }
         return await save(entries)
     }
+
     /// Records a connection's status and puts the matching client-owned chrome on every window of
     /// its session (PX-022-G01). Callers have already established that they speak for the current
     /// attempt generation (the `activeTokens` checks), so a superseded attempt's late outcome never
@@ -962,13 +974,28 @@ public final class ConnectionManager {
     /// needs one, and removing an entry only forgets it locally (D2 T38; the remote session lives
     /// on, §17). Its windows must not outlive it. AppKit keeps a shown `NSWindow` alive after its
     /// renderer is released, and nothing else would close it, so the window would stay on screen
-    /// frozen, and with its status cleared it would read as a live session. Mounting an empty
-    /// store closes every Surface window (`LayoutRenderer.tearDown`), as a REPLACED reset does.
-    /// The status is cleared first so the renderer holds no transport claim either. Pending text
-    /// in those windows belongs to the dropped outbox and is not sent (§18.3 covers resume only).
+    /// frozen, and with its status cleared it would read as a live session. The status is cleared
+    /// at once so the renderer holds no transport claim. Pending text in those windows belongs to
+    /// the dropped outbox and is not sent (§18.3 covers resume only).
+    ///
+    /// The windows close once nothing can render into them: now when no attempt is running for
+    /// this connection, otherwise in that attempt's `runAttempt` tail after `attempt.stop()`, which
+    /// closes the windows of every context the manager no longer owns. Closing earlier would let a
+    /// render already in flight reopen a window nobody closes (a first connection that fails
+    /// mid-snapshot).
     private func discardContext(for connectionID: SavedConnection.ID) {
         guard let context = contexts.removeValue(forKey: connectionID) else { return }
         context.renderer.setSessionWindowStatus(nil)
+        if activeTokens[connectionID] == nil {
+            closeWindows(of: context)
+        }
+    }
+
+    /// Closes every Surface window of a context the manager no longer owns, by mounting an empty
+    /// store (`LayoutRenderer.tearDown`), as a REPLACED reset does. Idempotent.
+    private func closeWindows(of context: ConnectionSessionContext) {
+        context.renderer.setSessionWindowStatus(nil)
+        guard context.renderer.registry.isEmpty == false else { return }
         // Mounting a store with no roots registers nothing, so it cannot throw.
         try? context.renderer.attach(store: SemanticStore())
     }

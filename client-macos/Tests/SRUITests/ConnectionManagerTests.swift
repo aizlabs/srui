@@ -10,7 +10,7 @@ import Foundation
 @testable import ConnectionManager
 import Protocol
 import SemanticModel
-import Session
+@testable import Session
 import Testing
 import TransportSSH
 
@@ -133,6 +133,11 @@ private actor ConnectionManagerCaptureTransport: Transport {
         continuation.finish()
     }
 
+    /// Ends the inbound stream with an error, as a dropped connection does.
+    func fail() {
+        continuation.finish(throwing: ConnectionManagerTestError.startFailed("connection dropped"))
+    }
+
     func frame(at index: Int) -> Data? {
         guard frames.indices.contains(index) else { return nil }
         return frames[index]
@@ -141,6 +146,12 @@ private actor ConnectionManagerCaptureTransport: Transport {
     func receive(_ message: SRUIMessage) throws {
         continuation.yield(try SRUIFraming.encodeFramed(message))
     }
+}
+
+@MainActor
+private final class TransportBox {
+    var values: [ConnectionManagerCaptureTransport] = []
+    var contexts: [ConnectionSessionContext] = []
 }
 
 @MainActor
@@ -1409,6 +1420,77 @@ struct ConnectionManagerTests {
         try await AsyncTestSupport.observed("failed draft removed") {
             manager.entries.isEmpty && manager.alert?.kind == .connectionFailed
         }
+        #expect(context.renderer.sessionWindowStatus == nil)
+        // The windows close once the attempt has stopped (see the in-flight render test below).
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "failed attempt released") {
+            manager.hasActiveAttemptForTesting(draft.id) == false
+        }
+        expectClosed(window, of: context)
+        await manager.shutdown()
+    }
+
+    @Test("a render in flight when a first connection fails cannot leave a window open")
+    func inFlightRenderAfterFailedFirstConnectionIsClosed() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let renderGate = AsyncGate()
+        let saveGate = AsyncGate()
+        let transports = TransportBox()
+        // Holds the manager in the failure's save: after it dropped the context, before
+        // `runAttempt` reaches `attempt.stop()`.
+        let gatedStore = SavedConnectionStore(url: temporary.file, beforeSave: { _ in
+            await saveGate.pause()
+        })
+        let manager = ConnectionManager(store: gatedStore, attemptFactory: { request in
+            let transport = ConnectionManagerCaptureTransport()
+            transports.values.append(transport)
+            transports.contexts.append(request.context)
+            return ConnectionManager.makeSessionControllerAttempt(
+                request: request,
+                transport: transport,
+                configureController: { controller in
+                    controller.rendererResourcesPreloadedInterceptorForTesting = {
+                        await renderGate.pause()
+                    }
+                }
+            )
+        })
+
+        let draft = ConnectDraft(id: UUID(), label: "Race", host: "race.example", user: "alice")
+        _ = try #require(manager.connect(draft))
+        let transport = try #require(transports.values.first)
+        let context = try #require(transports.contexts.first)
+        _ = try await waitForFrame(0, from: transport)
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "race-session"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.initialRevision = 1
+        var message = SRUIMessage()
+        message.serverWelcome = welcome
+        try await transport.receive(message)
+        try await transport.receive(textSnapshot(value: "race value"))
+        // The snapshot's render is in flight, paused before it mounts.
+        await renderGate.waitUntilPaused()
+        #expect(context.renderer.registry.isEmpty)
+
+        await transport.fail()
+        try await AsyncTestSupport.observed("failed draft removed") {
+            manager.entries.isEmpty
+        }
+        #expect(manager.hasActiveAttemptForTesting(draft.id))
+        await renderGate.release()
+        // The late render mounts the snapshot and shows its window after the context was dropped.
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "late render mounted") {
+            context.renderer.registry.surfaceHandles.contains { $0.window?.isVisible == true }
+        }
+        let window = try #require(context.renderer.registry.surfaceHandles.first?.window)
+        #expect(context.renderer.sessionWindowStatus == nil)
+
+        await saveGate.release()
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "failed attempt released") {
+            manager.hasActiveAttemptForTesting(draft.id) == false
+        }
         expectClosed(window, of: context)
         await manager.shutdown()
     }
@@ -1478,6 +1560,21 @@ struct ConnectionManagerTests {
         #expect(manager.entries.isEmpty)
         #expect(window.isVisible)
         #expect(window.subtitle == stale("connecting", 0))
+
+        await attempt.emit(.connecting)
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "removed entry reconnecting") {
+            context.renderer.sessionWindowStatus == stale("connecting", 1)
+        }
+        await attempt.emit(.replaced(
+            previousSessionID: "removed-connecting-session",
+            newSessionID: "removed-connecting-replacement"
+        ))
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "removed entry replaced") {
+            context.renderer.sessionWindowStatus == ConnectionStatus.sessionReplacedWindowStatus
+        }
+        #expect(window.subtitle == "session replaced — rebuilding")
+        // A removed row raises no replacement alert.
+        #expect(manager.alert == nil)
 
         await attempt.emit(.resynchronizing)
         try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "removed entry catching up") {

@@ -171,6 +171,48 @@ async fn eof_on_session_side_terminates_bridge() {
     assert!(result.is_ok());
 }
 
+/// PX-022: a daemon that stops or drops the connection ends the bridge even while the SSH side
+/// stays open and idle, so the client's transport ends and it can say it is disconnected. Before,
+/// the bridge waited for the SSH side to close as well, and an idle client stayed "connected" to
+/// a daemon that no longer existed.
+#[tokio::test]
+async fn daemon_eof_ends_the_bridge_while_the_ssh_side_stays_open() {
+    let (ssh_client, ssh_bridge_side) = duplex(1024);
+    let (session_daemon, session_bridge_side) = duplex(1024);
+    let shutdown = CancellationToken::new();
+
+    let bridge_task = spawn_bridge(ssh_bridge_side, session_bridge_side, shutdown).await;
+
+    // What the daemon sent before it went is still delivered.
+    let transaction = sample_transaction(4);
+    let (session_read, session_write) = tokio::io::split(session_daemon);
+    let mut session_framed_write = FramedWrite::new(session_write, SruiCodec::new());
+    session_framed_write
+        .send(transaction.clone())
+        .await
+        .expect("send from the daemon");
+    drop(session_framed_write);
+    drop(session_read);
+
+    let (ssh_read, _ssh_write) = tokio::io::split(ssh_client);
+    let mut ssh_framed_read = FramedRead::new(ssh_read, SruiCodec::new());
+    let received = ssh_framed_read
+        .next()
+        .await
+        .expect("ssh received frame")
+        .expect("decoded frame");
+    assert_eq!(transaction, received);
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), bridge_task)
+        .await
+        .expect("the bridge ends when the daemon side closes, with the ssh side still open");
+    assert!(result.expect("bridge join").is_ok());
+    assert!(
+        ssh_framed_read.next().await.is_none(),
+        "the ssh side sees EOF once the bridge has ended"
+    );
+}
+
 #[tokio::test]
 async fn cancellation_while_idle_exits_cleanly() {
     let (_ssh_client, ssh_bridge_side) = duplex(1024);
@@ -297,6 +339,109 @@ fn absorb_first_launch_assessment() {
 
 /// Far above the 12-19 s measured for a first exec on a busy machine.
 const LAUNCH_ASSESSMENT_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// PX-022: the real binary exits when the daemon closes its connection, although the SSH side
+/// keeps its standard input open and idle, and its standard output then reads EOF. That is how
+/// an idle client learns a daemon stopped: an open bridge process holds the SSH channel open.
+/// Skipped as root for the reason given at `binary_stderr_contains_no_protocol_bytes`.
+#[test]
+fn binary_exits_when_the_daemon_closes_while_stdin_stays_open() {
+    if srui_unix_security::effective_uid() == 0 {
+        eprintln!(
+            "skipping binary_exits_when_the_daemon_closes_while_stdin_stays_open: \
+             srui-ssh-bridge refuses effective UID 0 (§27)"
+        );
+        return;
+    }
+
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant, SystemTime};
+
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let runtime_dir =
+        std::path::Path::new("/tmp").join(format!("srui-d-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&runtime_dir).expect("create private bridge test runtime directory");
+    std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("secure bridge test runtime directory");
+    let socket_path = runtime_dir.join("s");
+    let listener = UnixListener::bind(&socket_path).expect("bind unix listener");
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+        .expect("secure bridge test socket");
+    absorb_first_launch_assessment();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_srui-ssh-bridge"))
+        .arg(&socket_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn srui-ssh-bridge");
+    // Kept open for the whole test: the SSH side never closes.
+    let stdin = child.stdin.take().expect("child stdin");
+
+    listener
+        .set_nonblocking(true)
+        .expect("a non-blocking listener");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut daemon = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = std::fs::remove_dir_all(&runtime_dir);
+                    panic!("bridge should connect to session socket");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("accept: {error}"),
+        }
+    };
+    daemon
+        .set_nonblocking(false)
+        .expect("a blocking daemon stream");
+    let frame = encode_framed(&sample_transaction(9)).expect("encode transaction");
+    daemon.write_all(&frame).expect("the daemon sends a frame");
+    // The daemon goes.
+    drop(daemon);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll the bridge") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&runtime_dir);
+            panic!("the bridge outlived its daemon's connection with stdin still open");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        status.success(),
+        "a daemon that closes is a clean end: {status}"
+    );
+    let mut forwarded = Vec::new();
+    child
+        .stdout
+        .take()
+        .expect("child stdout")
+        .read_to_end(&mut forwarded)
+        .expect("stdout reads to EOF");
+    assert_eq!(forwarded, frame, "what the daemon sent first was delivered");
+    drop(stdin);
+
+    let _ = std::fs::remove_file(&socket_path);
+    std::fs::remove_dir(&runtime_dir).expect("remove bridge test runtime directory");
+}
 
 /// The binary routes tracing to stderr so stdout stays a pure protocol stream (§19.1, §20.1).
 ///

@@ -47,6 +47,13 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
     /// `onSelectionChanged` this is not a semantic event; the renderer uses it to keep a local
     /// selection across remounts.
     public var onLocalSelection: (@MainActor (NodeId, [ItemId]) -> Void)?
+    /// Whether the user may change the selection now (PX-022). While it says no, a click, an
+    /// arrow key or a deselection leaves the selection where it is: the session cannot report the
+    /// change (§18: no new semantic events before a continuity decision), and a local selection
+    /// the server never heard of would outlive the reconnect and disagree with every server-side
+    /// view of it (§22.5). Server-driven selection (a commit, a promotion) is not a user change and
+    /// is never held back.
+    public var allowsUserSelectionChange: @MainActor () -> Bool = { true }
     /// Accessibility notification sink for promoted selections (§22.8). Replaceable for tests.
     public var postAccessibilityNotification: @MainActor (NSTableView, NSAccessibility.Notification) -> Void = {
         NSAccessibility.post(element: $0, notification: $1)
@@ -478,6 +485,12 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
 
     public func tableView(_ tableView: NSTableView, didAdd rowView: NSTableRowView, forRow row: Int) {
         applyAccessibility(to: rowView, row: row, selected: tableView.selectedRowIndexes.contains(row))
+    }
+
+    /// AppKit asks this before any user-initiated selection change, mouse or keyboard, and never
+    /// for `selectRowIndexes`, which the renderer's own promotions use.
+    public func selectionShouldChange(in tableView: NSTableView) -> Bool {
+        allowsUserSelectionChange()
     }
 
     public func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {

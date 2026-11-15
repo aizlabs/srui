@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-022",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "srtop's displayed state follows the runtime's continuity decisions (RESUME_OK within retention, RESYNC_REQUIRED{SAME_SESSION} outside it, RESYNC_REQUIRED{REPLACED} after a real restart) with no reconnect logic of its own; a detached window is labelled stale by client chrome (PX-022-G01), keeps its cached data readable, and takes no new action or selection; same-session continuity keeps process identities and server-side explorer state; replacement abandons pending intent and inherits no selection, tag or last-observed record; T29 text handling unchanged and verified. Two small shared fixes the ticket needs: the renderer freezes user collection selection while a session window carries a client status, and srui-ssh-bridge ends when its daemon closes the connection",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX022-001",
+      "feature": "srtop --journal-capacity N configures the one session's §18.1 retention window through srui_sessiond::Session::mint_with_config (default the runtime's; 0, a negative, non-numeric, empty, missing or repeated value is refused before any socket is published); every start mints a new incarnation and restores nothing, so a client resuming an earlier instance is answered REPLACED; srtop makes no continuity decision itself",
+      "scope": "PX-022/apps/srtop src/main.rs; tests/continuity_test.rs an_unusable_journal_capacity_is_refused_without_publishing_a_socket, a_reconnect_outside_retention_resynchronizes_the_same_session_with_the_same_identities",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-022",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-022.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX022-002",
+      "feature": "Same-session continuity preserves the explorer: RESUME_OK replays exactly the missed commits, contiguous and without a snapshot, and RESYNC_REQUIRED{SAME_SESSION} carries this client's event frontier and a snapshot; through both, every row keeps its item identity and the selected process, the inspector target and tags are the same, over the fake sequence and over a live Linux /proc table (srtop's own process)",
+      "scope": "PX-022/apps/srtop tests/continuity_test.rs a_reconnect_within_retention_replays_the_missed_commits_and_keeps_every_identity, a_reconnect_outside_retention_resynchronizes_the_same_session_with_the_same_identities, live_procfs_identities_follow_every_continuity_decision (Linux); client-macos SRUITests ProcessExplorerShellTests detachedWindowsSayTheyAreStaleAndEveryContinuityDecisionReachesTheExplorer",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-022",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-022.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX022-003",
+      "feature": "Replacement after a real srtop restart: RESYNC_REQUIRED{REPLACED} under a new token with frontier 0; the client closes the old incarnation's window and builds a new one from the new snapshot; no selection, no live or historical tag and no last-observed record of the old incarnation survives, and a text edit typed while detached is abandoned",
+      "scope": "PX-022/apps/srtop tests/continuity_test.rs a_reconnect_after_a_restart_is_replaced_and_inherits_no_selection_or_tag, live_procfs_identities_follow_every_continuity_decision (Linux); client-macos ProcessExplorerShellTests detachedWindowsSayTheyAreStaleAndEveryContinuityDecisionReachesTheExplorer",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-022",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-022.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX022-004",
+      "feature": "A detached or catching-up srtop window over real SSH: the client-owned subtitle and accessibility help name the stale revision in every non-live state (disconnected, connecting, resynchronizing, session replaced) and clear only at ready, after the catch-up is applied; the server-owned title is untouched; while detached the cached rows, inspector and freshness line stay as they were (nothing is shown as newly sampled), a tag or pause press is not sent and is never replayed, and an arrow key cannot change the selection; only the newer of two overlapping attempts reaches the window",
+      "scope": "PX-022/client-macos SRUITests ProcessExplorerShellTests detachedWindowsSayTheyAreStaleAndEveryContinuityDecisionReachesTheExplorer (ConnectionManager over SSHTransport, RecordingConnectionAttempt, ContinuityRecorder)",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-022",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-022.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX022-005",
+      "feature": "Pending text edits follow D1 §18.3 / D2 T29 in srtop: an edit typed while detached stays in its field locally, is replayed by RESUME_OK (the PID set filters on the server), and is discarded by a same-session snapshot resync and by a replacement, the field then showing the authoritative value",
+      "scope": "PX-022/client-macos ProcessExplorerShellTests detachedWindowsSayTheyAreStaleAndEveryContinuityDecisionReachesTheExplorer (PID set input); no change to the generic text-editing path",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-022",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-022.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX022-006",
+      "feature": "Shared renderer fix: while a session window carries a client-owned status (LayoutRenderer.sessionWindowStatus non-nil), List, Table and Tree adapters refuse every user-initiated selection change (selectionShouldChange(in:) via ControlFactory.allowsUserSelectionChange), so no selection the session cannot report is kept locally to disagree with the server after the reconnect; server promotions still apply; the gate follows the status through remounts and clears with it",
+      "scope": "PX-022/client-macos Collections/TableCollectionAdapter.swift, Collections/OutlineCollectionAdapter.swift, RendererAppKit/ControlFactory.swift, RendererAppKit/LayoutRenderer.swift; RendererAppKitTests StaleWindowSelectionTests",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-022",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-022.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX022-007",
+      "feature": "Shared bridge fix: srui-ssh-bridge ends as soon as the session daemon closes its connection, even while the SSH side stays open and idle (bridge_streams no longer waits for both directions), and the binary exits instead of returning into a runtime shutdown blocked on its stdin reader, so the SSH channel closes and an idle client sees its transport end after a daemon stop",
+      "scope": "PX-022/server-rust ssh-bridge src/lib.rs bridge_streams, src/main.rs; tests/bridge_failure_test.rs daemon_eof_ends_the_bridge_while_the_ssh_side_stays_open, binary_exits_when_the_daemon_closes_while_stdin_stays_open",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-022",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-022.md"
+      ]
+    }
+  ]
+}

@@ -67,6 +67,11 @@ public final class ControlFactory {
     /// with `pruneCollectionSelectionMemory(keeping:)`; an empty set removes the entry.
     var collectionDisclosureMemory: [NodeId: (modelID: ModelId?, collapsed: Set<ItemId>)] = [:]
 
+    /// Whether users may change collection selections (PX-022). `LayoutRenderer` clears it while
+    /// its session windows carry a client-owned status, that is, while the session cannot carry a
+    /// new selection report; every List/Table/Tree adapter consults it before a user change.
+    public internal(set) var allowsUserSelectionChange = true
+
     /// Key-equivalent hook every Surface window's content view consults first (PX-016-G01).
     /// `LayoutRenderer` points it at its `ShortcutRouter`.
     public var shortcutKeyEquivalentHandler: (@MainActor (NSEvent, NSWindow) -> Bool)?
@@ -767,6 +772,7 @@ public final class ControlFactory {
         adapter.onSelectionCleared = { [weak self] nodeID in
             self?.onInteraction?(.selectionCleared(nodeID: nodeID))
         }
+        adapter.allowsUserSelectionChange = { [weak self] in self?.allowsUserSelectionChange ?? true }
         tableView.dataSource = adapter
         tableView.delegate = adapter
         scrollView.documentView = tableView
@@ -815,6 +821,7 @@ public final class ControlFactory {
         adapter.onSelectionCleared = { [weak self] nodeID in
             self?.onInteraction?(.selectionCleared(nodeID: nodeID))
         }
+        adapter.allowsUserSelectionChange = { [weak self] in self?.allowsUserSelectionChange ?? true }
         adapter.onExpansionChanged = { [weak self] nodeID, itemID, expanded in
             self?.onInteraction?(.expansionChanged(nodeID: nodeID, itemID: itemID, expanded: expanded))
         }

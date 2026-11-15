@@ -343,6 +343,7 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
     private let continuation: AsyncStream<ConnectionAttemptEvent>.Continuation
     private let controller: SessionController
     private var forwardingTask: Task<Void, Never>?
+    private var stopTask: Task<Void, Never>?
 
     init(controller: SessionController) {
         let pair = AsyncStream.makeStream(
@@ -391,7 +392,20 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
         try await controller.start()
     }
 
+    /// Stops the controller once; every caller awaits that same stop to its end.
+    ///
+    /// `SessionController.stop()` returns at once while another stop is running, and `shutdown()`
+    /// stops attempts concurrently with their own `runAttempt` tail. Without one shared stop, the
+    /// tail could return from `stop()` while the controller still renders, and close a dropped
+    /// context's windows before a render in flight reopens them (PX-022-G01).
     func stop() async {
+        if stopTask == nil {
+            stopTask = Task { await self.performStop() }
+        }
+        await stopTask?.value
+    }
+
+    private func performStop() async {
         await controller.stop()
         let forwardingTask = self.forwardingTask
         forwardingTask?.cancel()
@@ -756,9 +770,10 @@ public final class ConnectionManager {
                 discardContext(for: connectionID)
             }
         }
-        // Only now can this attempt's controller no longer render into `context`: a render already
-        // in flight when the session failed may have reopened its windows after the manager
-        // dropped it (PX-022-G01). So a context the manager no longer owns closes its windows here.
+        // Only now can this attempt's controller no longer render into `context` (`stop()` is
+        // shared, so it returns only once the controller has finished stopping): a render already
+        // in flight when the session failed may have reopened windows `discardContext` closed
+        // (PX-022-G01). So a context the manager no longer owns closes its windows again here.
         if contexts[connectionID] !== context {
             closeWindows(of: context)
         }
@@ -978,17 +993,14 @@ public final class ConnectionManager {
     /// at once so the renderer holds no transport claim. Pending text in those windows belongs to
     /// the dropped outbox and is not sent (§18.3 covers resume only).
     ///
-    /// The windows close once nothing can render into them: now when no attempt is running for
-    /// this connection, otherwise in that attempt's `runAttempt` tail after `attempt.stop()`, which
-    /// closes the windows of every context the manager no longer owns. Closing earlier would let a
-    /// render already in flight reopen a window nobody closes (a first connection that fails
-    /// mid-snapshot).
+    /// The windows close at once, so none stays on screen without its status while the attempt
+    /// finishes its save and stop. A render already in flight may reopen them after that (a
+    /// first connection that fails mid-snapshot), so the attempt's `runAttempt` tail closes the
+    /// windows of every context the manager no longer owns again, after its shared `stop()` has
+    /// finished and the controller can no longer render.
     private func discardContext(for connectionID: SavedConnection.ID) {
         guard let context = contexts.removeValue(forKey: connectionID) else { return }
-        context.renderer.setSessionWindowStatus(nil)
-        if activeTokens[connectionID] == nil {
-            closeWindows(of: context)
-        }
+        closeWindows(of: context)
     }
 
     /// Closes every Surface window of a context the manager no longer owns, by mounting an empty

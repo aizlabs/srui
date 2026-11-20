@@ -1581,6 +1581,57 @@ struct ConnectionManagerTests {
         #expect(context.renderer.sessionWindowStatus == nil)
     }
 
+    @Test("a failed draft's late render is closed even when the same draft is retried meanwhile")
+    func lateRenderOfFailedDraftClosedAfterSameDraftRetry() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let renderGate = AsyncGate()
+        let saveGate = AsyncGate()
+        let stopGate = AsyncGate()
+        await stopGate.release()
+        let transports = TransportBox()
+        let gatedStore = SavedConnectionStore(url: temporary.file, beforeSave: { _ in
+            await saveGate.pause()
+        })
+        let manager = gatedControllerManager(
+            store: gatedStore,
+            transports: transports,
+            renderGate: renderGate,
+            stopGate: stopGate
+        )
+        let id = UUID()
+        _ = try #require(manager.connect(ConnectDraft(id: id, label: "Retry", host: "retry.example", user: "alice")))
+        let transport = try #require(transports.values.first)
+        let failed = try #require(transports.contexts.first)
+        try await sendWelcomeAndSnapshot(to: transport)
+        await renderGate.waitUntilPaused()
+
+        await transport.fail()
+        try await AsyncTestSupport.observed("failed draft removed") {
+            manager.entries.isEmpty
+        }
+        // Retry the same draft while the failed attempt is still in its failure save: the entry
+        // with that ID is back, owned by a fresh context.
+        _ = try #require(manager.connect(ConnectDraft(id: id, label: "Retry", host: "retry.example", user: "alice")))
+        let retried = try #require(transports.contexts.last)
+        #expect(retried !== failed)
+        #expect(manager.entries.contains { $0.id == id })
+
+        // The failed attempt's paused render lands in its dropped context after the retry.
+        await renderGate.release()
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "late render landed") {
+            self.visibleWindows(of: failed).isEmpty == false
+        }
+        await saveGate.release()
+        // Its tail closes it: the context is no longer owned, whatever the entries say.
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "dropped context closed") {
+            self.visibleWindows(of: failed).isEmpty && failed.renderer.registry.surfaceHandles.isEmpty
+        }
+        #expect(failed.renderer.sessionWindowStatus == nil)
+        #expect(retried.renderer.sessionWindowStatus == stale("connecting", 0))
+        await manager.shutdown()
+    }
+
     @Test("a render in flight when a first connection fails cannot leave a window open")
     func inFlightRenderAfterFailedFirstConnectionIsClosed() async throws {
         let temporary = TemporaryConnectionStore()

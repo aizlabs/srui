@@ -294,7 +294,24 @@ struct ConnectionLauncherLiveTests {
         await manager.shutdown()
     }
 
-    @Test("an unknown host key blocks with a diagnostic and adds nothing to known_hosts",
+    /// What the app writes for an `ssh` failure to this fixture, spelled out independently of the
+    /// production formatter: the endpoint and the local known_hosts fact, nothing else.
+    static func expectedAppText(_ live: LiveSSHD, present: Bool) -> String {
+        let name = "[127.0.0.1]:\(live.port)"
+        var text = "SRUI could not connect to \(NSUserName())@127.0.0.1:\(live.port).\n\n"
+        if present {
+            text += "A key for \(name) is in \(live.knownHosts). SRUI will not change it."
+        } else {
+            let globals = ["/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"]
+                .filter { FileManager.default.isReadableFile(atPath: $0) }
+            text += "\(name) is not in your known_hosts files (\(([live.knownHosts] + globals).joined(separator: ", "))). "
+                + "SRUI never adds or changes host keys. "
+                + "If you mean to trust this host, verify its key fingerprint out of band, then add the key with ssh yourself."
+        }
+        return text
+    }
+
+    @Test("an unknown or changed host key blocks as Connection Failed with a local known_hosts hint only",
           arguments: [LiveSSHD.KnownHosts.empty, .spoofed])
     func untrustedHostKeyBlocks(_ mode: LiveSSHD.KnownHosts) async throws {
         let live = try await LiveSSHD.launch(prefix: "px023-hostkey", knownHosts: mode, app: nil)
@@ -309,23 +326,17 @@ struct ConnectionLauncherLiveTests {
         #expect(manager.connect(ConnectDraft(host: "127.0.0.1:\(live.port)", user: NSUserName())) != nil)
         let request = try #require(probe.requests.first)
 
-        try await AsyncTestSupport.observed("host-key alert") { manager.alert != nil }
+        try await AsyncTestSupport.observed("connection alert") { manager.alert != nil }
         let alert = try #require(manager.alert)
-        #expect(alert.kind == .hostKeyRejected, "\(alert.message)")
-        #expect(alert.title == "Host Key Not Trusted")
-        #expect(alert.message.hasPrefix("SRUI did not connect to \(NSUserName())@127.0.0.1:\(live.port)."))
-        switch mode {
-        case .empty:
-            #expect(alert.message.contains("Your known_hosts file has no host key for [127.0.0.1]:\(live.port)"))
-            #expect(alert.message.contains("host key is known for [127.0.0.1]:\(live.port)"))
-        case .spoofed:
-            #expect(alert.message.contains("does not match the key your known_hosts file holds for [127.0.0.1]:\(live.port)"))
-            #expect(alert.message.contains("REMOTE HOST IDENTIFICATION HAS CHANGED"))
-        case .trusted:
-            Issue.record("not a host-key case")
-        }
-        #expect(alert.message.contains("Host key verification failed."))
         Self.recordEvidence(alert, mode: mode)
+        #expect(alert.kind == .connectionFailed, "\(alert.message)")
+        #expect(alert.title == "Connection Failed")
+        let (appText, quoted) = try #require(ConnectionFakeSSHServerTests.split(alert.message), "\(alert.message)")
+        // The hint is the local fact: no key at all for .empty, a (different) key for .spoofed.
+        #expect(appText == Self.expectedAppText(live, present: mode == .spoofed), "\(alert.message)")
+        #expect(appText.contains("ssh-keygen") == false)
+        // ssh's own refusal is still shown, verbatim, as ssh's words.
+        #expect(quoted.contains("Host key verification failed."))
 
         // Nothing connected: the draft is forgotten, no state was applied or rendered, the
         // subsystem never ran, and known_hosts is byte-for-byte unchanged.
@@ -340,10 +351,10 @@ struct ConnectionLauncherLiveTests {
 
     enum BannerCase: String, Sendable, CaseIterable {
         /// The key is trusted, the client's key is not authorized: the banner is printed, then
-        /// `ssh` ends with its own "Permission denied (…)." line.
+        /// `ssh` ends with "Permission denied (…).".
         case authenticationFails
         /// The key is trusted and authentication succeeds; the subsystem exits 255 silently, so
-        /// the banner is the last thing on `ssh`'s stderr: the documented residual.
+        /// the banner is the last thing on `ssh`'s stderr.
         case subsystemExits255
         /// known_hosts has no key for the server: key exchange never completes, so the banner,
         /// a userauth message, is never sent.
@@ -352,8 +363,7 @@ struct ConnectionLauncherLiveTests {
         case changedKey
     }
 
-    @Test("a server's hostile Banner never raises the host-key alert for a trusted key it cannot reach past",
-          arguments: BannerCase.allCases)
+    @Test("a server's hostile Banner never changes what the app writes", arguments: BannerCase.allCases)
     func hostileBanner(_ bannerCase: BannerCase) async throws {
         let mode: LiveSSHD.KnownHosts = switch bannerCase {
         case .authenticationFails, .subsystemExits255: .trusted
@@ -383,26 +393,21 @@ struct ConnectionLauncherLiveTests {
         try await AsyncTestSupport.observed("connection alert") { manager.alert != nil }
         let alert = try #require(manager.alert)
         Self.recordEvidence(alert, name: "banner-\(bannerCase.rawValue)")
+        // Same title and same app text as any failure for this known_hosts state; the banner can
+        // only appear below the label, as the server's words.
+        #expect(alert.kind == .connectionFailed, "\(alert.kind): \(alert.message)")
+        #expect(alert.title == "Connection Failed")
+        let (appText, quoted) = try #require(ConnectionFakeSSHServerTests.split(alert.message), "\(alert.message)")
+        #expect(appText == Self.expectedAppText(live, present: mode != .empty), "\(alert.message)")
+        #expect(appText.contains(LiveSSHD.bannerMarker) == false)
         switch bannerCase {
         case .authenticationFails:
-            // At INFO the banner is printed, but ssh's own line ends the stream.
-            #expect(alert.kind == .connectionFailed, "\(alert.kind): \(alert.message)")
-            #expect(alert.title == "Connection Failed")
-            #expect(alert.message.contains("ssh-keygen") == false)
-            #expect(Self.lastLine(alert.message).hasSuffix("Permission denied (publickey,password,keyboard-interactive)."),
-                    "\(alert.message)")
+            #expect(Self.lastLine(quoted).hasSuffix("Permission denied (publickey,password,keyboard-interactive)."), "\(quoted)")
         case .unknownKey, .changedKey:
-            // Protocol order: the banner follows key exchange, which a refused key never
-            // completes, so ssh's real verdict is classified and the banner is nowhere in it.
-            #expect(alert.kind == .hostKeyRejected, "\(alert.kind): \(alert.message)")
-            #expect(alert.message.contains(LiveSSHD.bannerMarker) == false, "\(alert.message)")
+            // Protocol order: no banner before a refused key exchange.
+            #expect(quoted.contains(LiveSSHD.bannerMarker) == false, "\(quoted)")
         case .subsystemExits255:
-            // The documented residual (PX-023 round 4): a trusted server the user authenticated
-            // to sends the banner, then its subsystem exits 255 without a byte or a word. At
-            // INFO nothing of ssh's own follows the banner, so its last line can be the verdict.
-            // Only safety is asserted: nothing connected and nothing was trusted. Which alert
-            // appears is recorded in the evidence, not pinned.
-            #expect(manager.status(for: request.connection.id) != .connected)
+            break
         }
         #expect(manager.entries.isEmpty, "a failed first connection is forgotten")
         #expect(try Data(contentsOf: URL(fileURLWithPath: live.knownHosts)) == knownHostsBefore)

@@ -4483,7 +4483,7 @@ fileprivate final class ContinuityRecorder {
         case .replaced: name = "replaced"
         case .ready: name = "ready"
         case .failed: name = "failed"
-        case .hostKeyRejected: name = "hostKeyRejected"
+        case .sshFailedBeforeStream: name = "sshFailedBeforeStream"
         case .stopped: name = "stopped"
         }
         eventsByGeneration[generation, default: []].append(name)

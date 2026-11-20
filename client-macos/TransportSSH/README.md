@@ -132,17 +132,22 @@ user 64 and the name 128. No field may hold a NUL or any other control or invisi
 `/usr/bin/ssh`, never a shell command, and a saved entry is checked again before every attempt.
 Every connection uses the same configuration whatever app serves `srui` (counter, srtop):
 `StrictHostKeyChecking=yes`, `BatchMode=yes`, your own agent, keys and `~/.ssh/known_hosts`. An
-unknown or changed host key stops the attempt with a **Host Key Not Trusted** alert that says which
-it was and how to check the key. Only `ssh`'s own verdict raises it: its stderr when it exited 255
-before any SRUI byte arrived (`SSHTransport.localFailureBeforeStream()`), with the verdict as its
-last line and no `Received disconnect from` line (a server's disconnect reason) anywhere in it. Every
-`ssh` runs with `-o LogLevel=INFO` pinned and emitted before any `extraOptions` (OpenSSH keeps the
-first value; blocked keys are dropped in any case), so `ssh` always ends a peer-initiated failure
-with a line of its own ("Disconnected from …", "Connection closed by …") that the alert shows, and
-a server whose key is not trusted never gets to send a `Banner`. One residual: a trusted server
-you authenticated to can send a banner and then exit 255 silently, which can show this alert for
-a key that is in fact trusted (it never connects). SRUI never adds or replaces a host key and offers no way to connect
-anyway. Record a new key by connecting once with `ssh` in Terminal after checking its fingerprint.
+unknown or changed host key stops the attempt. Every failure is a blocking **Connection Failed**
+alert, and no part of it is derived from `ssh`'s output, which a server can shape (a disconnect
+reason, a key-exchange name list, a banner). When `ssh` exits 255 before any SRUI byte
+(`SSHTransport.localFailureBeforeStream()`), the alert says only "SRUI could not connect to
+<endpoint>.", adds a hint computed from your own known_hosts files, and then quotes `ssh`'s stderr
+verbatim under "ssh reported (this text can include messages from the server):". To compute the
+hint, SRUI runs `ssh -G` with the same arguments to find the known_hosts files and the name `ssh`
+uses (`host`, `[host]:port` for any port but 22, or `HostKeyAlias`). It then runs
+`ssh-keygen -F <name> -f <file>` on each file, which handles hashed entries. Both run as argument
+vectors, with a 5-second limit. The hint says either that the host is not in those files, or that
+a key for it is in a named file and SRUI will not change it. If the lookup fails, there is no hint.
+SRUI never adds, replaces or removes a host key, never suggests a command that would, and offers no
+way to connect anyway. To trust a new host, check its fingerprint out of band and add it with `ssh`
+yourself. Every `ssh` runs with `-o LogLevel=INFO` pinned, so its own final lines ("Disconnected from
+…", "Connection closed by …", timeouts) reach the alert. Posture options come before any
+`extraOptions`, because OpenSSH keeps the first value, and blocked keys are dropped in any case.
 
 **From the command line.** Launch `RendererDemoApp` over SSH (defaults: `BatchMode=yes`, 30s
 connect timeout). This developer path takes its arguments as given and does not use the Connect

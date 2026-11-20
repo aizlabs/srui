@@ -15,12 +15,14 @@
 //
 // PX-023: the Connect form's endpoint is validated by `ConnectionEndpoint` before it becomes `ssh`
 // argv, and a saved entry is validated again before every attempt. Host-key verification stays
-// OpenSSH's (`StrictHostKeyChecking=yes`, `BatchMode=yes`, the user's own known_hosts, §19.1, §25):
-// a rejected key is a blocking alert that says whether the key is unknown or changed and how to
-// verify it outside SRUI. There is no trust-anyway path. Only `ssh`'s own verdict is classified:
-// its stderr when it exited 255 before any SRUI byte arrived (`SSHTransport
-// .localFailureBeforeStream()`). A failure string, which can carry server-authored text such as a
-// `SERVER HANDSHAKE_REFUSED` detail, is never read for host-key phrases (PX-023 round 2).
+// OpenSSH's (`StrictHostKeyChecking=yes`, `BatchMode=yes`, the user's own known_hosts, §19.1, §25),
+// and every failure is a blocking "Connection Failed" alert with no trust-anyway path.
+//
+// PX-023 round 5: no alert content is derived from `ssh`'s output, which a peer can shape. When
+// `ssh` exits 255 before any SRUI byte (`SSHTransport.localFailureBeforeStream()`), the alert
+// quotes its stderr verbatim under a label saying it can include the server's words, and adds
+// only a `KnownHostsHint` computed from the local known_hosts files. The app writes no host-key
+// verdict and no trust-changing advice.
 //
 
 import Foundation
@@ -194,8 +196,6 @@ public struct ConnectionAlert: Identifiable, Equatable, Sendable {
     public enum Kind: Equatable, Sendable {
         case invalidInput
         case connectionFailed
-        /// OpenSSH refused the server's host key (§19.1, §25). Blocking, with no bypass (PX-023).
-        case hostKeyRejected
         case sessionReplaced
         case persistenceFailed
     }
@@ -279,26 +279,25 @@ enum ConnectionAttemptEvent: Equatable, Sendable {
     case replaced(previousSessionID: String?, newSessionID: String)
     case ready(sessionID: String, revision: UInt64)
     case failed(String)
-    /// `ssh` itself refused the server's host key before the SRUI stream began (PX-023).
-    case hostKeyRejected(HostKeyRejection, sshMessage: String)
+    /// `ssh` exited 255 before any SRUI byte (PX-023 round 5). `stderr` is quoted verbatim and
+    /// never interpreted; `hint` comes only from the local known_hosts files, or is `nil`.
+    case sshFailedBeforeStream(stderr: String, hint: KnownHostsHint?)
     case stopped
 }
 
-/// Thrown by an attempt's `start()` when `ssh` refused the host key before the handshake could
-/// begin, so the failure is reported as `ssh`'s verdict rather than as its description.
-struct LocalHostKeyRejection: Error, Equatable, Sendable {
-    let rejection: HostKeyRejection
-    let sshMessage: String
+/// Thrown by an attempt's `start()` when `ssh` exited 255 before the handshake could begin.
+struct SSHFailedBeforeStream: Error, Equatable, Sendable {
+    let stderr: String
+    let hint: KnownHostsHint?
 
-    /// `ssh`'s own host-key verdict for `transport`, or `nil`. Only an `SSHTransport` whose child
-    /// exited 255 before any SRUI byte has one; nothing a server sent is consulted.
-    static func diagnose(_ transport: SSHTransport?) async -> LocalHostKeyRejection? {
-        guard let transport,
-              let local = await transport.localFailureBeforeStream(),
-              let rejection = HostKeyRejection(sshMessage: local.stderr) else {
+    /// `nil` unless `transport` is `ssh` and its child exited 255 before any SRUI byte. Only the
+    /// exit itself is the trigger; the hint is computed from local files by `lookup`.
+    static func check(_ transport: SSHTransport?, lookup: any KnownHostsLookup) async -> SSHFailedBeforeStream? {
+        guard let transport, let local = await transport.localFailureBeforeStream() else {
             return nil
         }
-        return LocalHostKeyRejection(rejection: rejection, sshMessage: local.stderr)
+        let hint = await lookup.hint(for: transport.configuration)
+        return SSHFailedBeforeStream(stderr: local.stderr, hint: hint)
     }
 }
 
@@ -359,12 +358,13 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
 
     private let continuation: AsyncStream<ConnectionAttemptEvent>.Continuation
     private let controller: SessionController
-    /// The transport when it is `ssh`, whose own exit is the only source of a host-key verdict.
+    /// The transport when it is `ssh`: its exit before the stream triggers the known_hosts hint.
     private let sshTransport: SSHTransport?
+    private let knownHostsLookup: any KnownHostsLookup
     private var forwardingTask: Task<Void, Never>?
     private var stopTask: Task<Void, Never>?
 
-    init(controller: SessionController, sshTransport: SSHTransport?) {
+    init(controller: SessionController, sshTransport: SSHTransport?, knownHostsLookup: any KnownHostsLookup) {
         let pair = AsyncStream.makeStream(
             of: ConnectionAttemptEvent.self,
             bufferingPolicy: .bufferingNewest(16)
@@ -373,6 +373,7 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
         self.continuation = pair.continuation
         self.controller = controller
         self.sshTransport = sshTransport
+        self.knownHostsLookup = knownHostsLookup
     }
 
     func start() async throws {
@@ -381,6 +382,7 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
 
         let lifecycleEvents = controller.lifecycleEvents
         let sshTransport = self.sshTransport
+        let knownHostsLookup = self.knownHostsLookup
         let continuation = self.continuation
         forwardingTask = Task {
             lifecycleLoop: for await event in lifecycleEvents {
@@ -400,8 +402,8 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
                 case .ready(let sessionID, let revision):
                     continuation.yield(.ready(sessionID: sessionID, revision: revision))
                 case .failed(let failure):
-                    if let local = await LocalHostKeyRejection.diagnose(sshTransport) {
-                        continuation.yield(.hostKeyRejected(local.rejection, sshMessage: local.sshMessage))
+                    if let local = await SSHFailedBeforeStream.check(sshTransport, lookup: knownHostsLookup) {
+                        continuation.yield(.sshFailedBeforeStream(stderr: local.stderr, hint: local.hint))
                     } else {
                         continuation.yield(.failed(failure.description))
                     }
@@ -419,7 +421,7 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            if let local = await LocalHostKeyRejection.diagnose(sshTransport) {
+            if let local = await SSHFailedBeforeStream.check(sshTransport, lookup: knownHostsLookup) {
                 throw local
             }
             throw error
@@ -522,7 +524,7 @@ public final class ConnectionManager {
         }
 
         let detail: String
-        if candidate.kind == .connectionFailed || candidate.kind == .hostKeyRejected,
+        if candidate.kind == .connectionFailed,
            candidate.connectionID == current.connectionID {
             detail = "The replacement connection then failed: \(candidate.message)"
         } else {
@@ -688,6 +690,7 @@ public final class ConnectionManager {
     static func makeSessionControllerAttempt(
         request: ConnectionAttemptRequest,
         transport: any Transport,
+        knownHostsLookup: any KnownHostsLookup = SSHKnownHostsLookup(),
         configureController: ((SessionController) -> Void)? = nil
     ) -> any ConnectionAttempt {
         let controller = SessionController(
@@ -704,7 +707,8 @@ public final class ConnectionManager {
         configureController?(controller)
         return SessionControllerConnectionAttempt(
             controller: controller,
-            sshTransport: transport as? SSHTransport
+            sshTransport: transport as? SSHTransport,
+            knownHostsLookup: knownHostsLookup
         )
     }
 
@@ -807,12 +811,12 @@ public final class ConnectionManager {
             }
         } catch is CancellationError {
             // Supersession and application shutdown are ordinary ownership transitions.
-        } catch let local as LocalHostKeyRejection {
+        } catch let local as SSHFailedBeforeStream {
             handledTerminalEvent = await recordFailure(
-                local.sshMessage,
+                local.stderr,
                 connectionID: connectionID,
                 token: token,
-                hostKey: local.rejection
+                sshHint: .some(local.hint)
             )
         } catch {
             handledTerminalEvent = await recordFailure(
@@ -858,7 +862,7 @@ public final class ConnectionManager {
             // ends, nothing will reconnect it: its windows close at once, not after the stop
             // (they would read as live meanwhile), and the `runAttempt` tail closes them again.
             switch event {
-            case .failed, .hostKeyRejected, .stopped:
+            case .failed, .sshFailedBeforeStream, .stopped:
                 discardContext(for: connectionID)
                 return true
             case .connecting:
@@ -937,12 +941,12 @@ public final class ConnectionManager {
                 token: token
             )
 
-        case .hostKeyRejected(let rejection, let sshMessage):
+        case .sshFailedBeforeStream(let stderr, let hint):
             return await recordFailure(
-                sshMessage,
+                stderr,
                 connectionID: connectionID,
                 token: token,
-                hostKey: rejection
+                sshHint: .some(hint)
             )
 
         case .stopped:
@@ -956,16 +960,21 @@ public final class ConnectionManager {
         _ message: String,
         connectionID: SavedConnection.ID,
         token: UInt64,
-        hostKey: HostKeyRejection? = nil
+        sshHint: KnownHostsHint?? = nil
 ) async -> Bool {
         guard activeTokens[connectionID] == token else { return true }
 
-        // Read before `markDisconnected`, which forgets a draft that never connected.
-        // Only `ssh`'s own verdict is classified, never the failure text (PX-023 round 2).
-        let hostKeyMessage = hostKey.flatMap { rejection in
-            entries.first(where: { $0.id == connectionID }).map {
-                rejection.alertMessage(for: $0, sshMessage: message)
-            }
+        // Read before `markDisconnected`, which forgets a draft that never connected. For an
+        // `ssh` exit before the stream (`sshHint` set, its inner value possibly nil), `message` is
+        // `ssh`'s stderr, quoted verbatim; nothing in it decides anything in the alert.
+        let sshMessage = sshHint.map { hint in
+            Self.sshFailureMessage(
+                endpoint: entries.first(where: { $0.id == connectionID }).map {
+                    ConnectionEndpoint.displayString(host: $0.host, port: $0.port, user: $0.user)
+                },
+                hint: hint,
+                stderr: message
+            )
         }
 
         let persistenceError = await markDisconnected(
@@ -974,17 +983,30 @@ public final class ConnectionManager {
         )
         guard activeTokens[connectionID] == token else { return true }
 
-        var fullMessage = hostKeyMessage ?? message
+        var fullMessage = sshMessage ?? message
         if let persistenceError {
             fullMessage += "\n\nThe latest connection metadata could not be saved: \(persistenceError)"
         }
         presentAlert(ConnectionAlert(
-            kind: hostKeyMessage == nil ? .connectionFailed : .hostKeyRejected,
+            kind: .connectionFailed,
             connectionID: connectionID,
-            title: hostKeyMessage == nil ? "Connection Failed" : "Host Key Not Trusted",
+            title: "Connection Failed",
             message: fullMessage
         ))
         return true
+    }
+
+    /// The label above `ssh`'s quoted stderr: what follows is not SRUI's and may be the server's.
+    nonisolated static let sshOutputLabel = "ssh reported (this text can include messages from the server):"
+
+    /// The alert text for an `ssh` exit before the stream. Everything SRUI writes depends only on
+    /// the endpoint and the local known_hosts hint; `stderr` is appended verbatim after the label.
+    nonisolated static func sshFailureMessage(endpoint: String?, hint: KnownHostsHint?, stderr: String) -> String {
+        var text = endpoint.map { "SRUI could not connect to \($0)." } ?? "SRUI could not connect."
+        if let hint {
+            text += "\n\n" + hint.text
+        }
+        return text + "\n\n" + sshOutputLabel + "\n" + stderr
     }
 
     private func recordStopped(

@@ -576,119 +576,10 @@ struct ConnectionEndpointTests {
     }
 }
 
-@Suite("Host-key rejection diagnostics (PX-023, §19.1, §25)", .timeLimit(.minutes(1)))
-struct HostKeyRejectionTests {
-    // OpenSSH's own text (sshconnect.c), as `SSHTransport` reports a child exit; the live suite
-    // records the same text from OpenSSH_10.2p1.
-    // `ssh`'s raw stderr, as `SSHTransport.localFailureBeforeStream()` reports it.
-    static let unknownMessage = "No ED25519 host key is known for [127.0.0.1]:2222 and you have requested strict checking.\n"
-        + "Host key verification failed."
-    static let changedMessage = "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
-        + "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n"
-        + "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
-        + "Host key for [127.0.0.1]:2222 has changed and you have requested strict checking.\n"
-        + "Host key verification failed."
-
-    /// Real `ssh` 10.2p1 stderr at the pinned `LogLevel=INFO`, byte for byte
-    /// (`impl4-probe-banner-order.log`, `impl4-probe-disconnect-info-cli.log`): OpenSSH ends its
-    /// own log lines with CR LF.
-    static let realUnknownINFO = "No ED25519 host key is known for [127.0.0.1]:65032 and you have requested strict checking.\r\n"
-        + "Host key verification failed.\r\n"
-    static let realChangedINFO = "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n"
-        + "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\r\n"
-        + "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n"
-        + "IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!\r\n"
-        + "Someone could be eavesdropping on you right now (man-in-the-middle attack)!\r\n"
-        + "It is also possible that a host key has just been changed.\r\n"
-        + "The fingerprint for the ED25519 key sent by the remote host is\n"
-        + "SHA256:oHpGto54u3Xb6V5LfeN9Jbd8OjflWsjFzMwpVE/+1Bc.\r\n"
-        + "Please contact your system administrator.\r\n"
-        + "Add correct host key in /tmp/px023e.Gjo2ZY/kh_changed to get rid of this message.\r\n"
-        + "Offending ED25519 key in /tmp/px023e.Gjo2ZY/kh_changed:1\r\n"
-        + "Host key for [127.0.0.1]:65032 has changed and you have requested strict checking.\r\n"
-        + "Host key verification failed.\r\n"
-    /// A peer's DISCONNECT whose reason imitates the unknown-key verdict, at INFO (round 4)...
-    static let realDisconnectUnknownINFO = "Received disconnect from 127.0.0.1 port 64665:2: x\n"
-        + "No ED25519 host key is known for [127.0.0.1]:2222 and you have requested strict checking.\n"
-        + "Host key verification failed.\r\n"
-        + "Disconnected from 127.0.0.1 port 64665\r\n"
-    /// ...and the same at round 3's `LogLevel=ERROR`, where "Disconnected from …" was hidden and
-    /// the reason's verdict line ended stderr (`verify3-probe-disconnect-cli.log`).
-    static let realDisconnectUnknownERROR = "Warning: Identity file /tmp/absent_key not accessible: No such file or directory.\n"
-        + "Received disconnect from 127.0.0.1 port 61656:2: x\n"
-        + "No ED25519 host key is known for [127.0.0.1]:2222 and you have requested strict checking.\n"
-        + "Host key verification failed.\r\n"
-    static let realDisconnectChangedERROR = "Received disconnect from 127.0.0.1 port 61658:2: x\n"
-        + "Host key for [127.0.0.1]:2222 has changed and you have requested strict checking.\n"
-        + "Host key verification failed.\r\n"
-    static let realDisconnectCRLFERROR = "Received disconnect from 127.0.0.1 port 61660:2: x\r\n"
-        + "Host key verification failed.\r\n  \r\n"
-
-    @Test("real ssh transcripts: real refusals classify, a peer's DISCONNECT never does")
-    func realTranscripts() {
-        #expect(HostKeyRejection(sshMessage: Self.realUnknownINFO) == .unknown)
-        #expect(HostKeyRejection(sshMessage: Self.realChangedINFO) == .changed)
-        #expect(HostKeyRejection(sshMessage: Self.realDisconnectUnknownINFO) == nil)
-        // Round 3's hole, closed by the "Received disconnect from " exclusion even if the
-        // "Disconnected from …" line were ever missing again.
-        #expect(HostKeyRejection(sshMessage: Self.realDisconnectUnknownERROR) == nil)
-        #expect(HostKeyRejection(sshMessage: Self.realDisconnectChangedERROR) == nil)
-        #expect(HostKeyRejection(sshMessage: Self.realDisconnectCRLFERROR) == nil)
-    }
-
-    @Test("the kind is read only from the line just before the verdict, after trimming")
-    func kindAndTrimming() {
-        // A kind line anywhere else does not name the kind.
-        #expect(HostKeyRejection(sshMessage: """
-        Host key for [h]:22 has changed and you have requested strict checking.
-        Update the SSHFP RR in DNS with the new host key to get rid of this message.
-        Host key verification failed.
-        """) == .unverified)
-        #expect(HostKeyRejection(sshMessage: """
-        No ED25519 host key is known for h and you have requested strict checking.
-        Please contact your system administrator.
-        Host key verification failed.
-        """) == .unverified)
-        // Surrounding spaces and a trailing blank line are not part of ssh's line.
-        #expect(HostKeyRejection(sshMessage: "  Host key verification failed.   ") == .unverified)
-        #expect(HostKeyRejection(sshMessage: Self.realUnknownINFO + "   \n\t\n") == .unknown)
-    }
-
-    @Test("OpenSSH's failures are classified, and other failures are not host-key failures")
-    func classification() {
-        #expect(HostKeyRejection(sshMessage: Self.unknownMessage) == .unknown)
-        #expect(HostKeyRejection(sshMessage: Self.changedMessage) == .changed)
-        #expect(HostKeyRejection(sshMessage: Self.unknownMessage.replacingOccurrences(of: "\n", with: "\r\n") + "\r\n") == .unknown)
-        #expect(HostKeyRejection(sshMessage: """
-        @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-        @       WARNING: REVOKED HOST KEY DETECTED!               @
-        @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-        The ED25519 host key for host.example is marked as revoked.
-        This could mean that a stolen key is being used to
-        impersonate this host.
-        Host key verification failed.
-        """) == .revoked)
-        #expect(HostKeyRejection(sshMessage: "Host key verification failed.") == .unverified)
-        #expect(HostKeyRejection(sshMessage: "@ WARNING: POSSIBLE DNS SPOOFING DETECTED! @") == nil)
-
-        // Structural (PX-023 round 3): the verdict must be ssh's last line. Server-authored text
-        // logged before it (a pre-auth banner, a disconnect reason) never ends ssh's stderr.
-        #expect(HostKeyRejection(sshMessage: Self.changedMessage + "\nalice@127.0.0.1: Permission denied (publickey).") == nil)
-        #expect(HostKeyRejection(sshMessage: """
-        Received disconnect from 127.0.0.1 port 2222:2: No ED25519 host key is known for h and you have requested strict checking.
-        Host key verification failed.
-        Disconnected from 127.0.0.1 port 2222
-        """) == nil)
-        #expect(HostKeyRejection(sshMessage: "Host key verification failed. Received disconnect") == nil)
-        #expect(HostKeyRejection(sshMessage: "x Host key verification failed.") == nil)
-        #expect(HostKeyRejection(sshMessage: "Permission denied (publickey).") == nil)
-        #expect(HostKeyRejection(sshMessage: "ssh: connect to host h port 22: Connection refused") == nil)
-        #expect(HostKeyRejection(sshMessage: "") == nil)
-    }
-
-    @Test("server-authored text can never raise the host-key alert (SERVER HANDSHAKE_REFUSED)")
+@Suite("Alert text comes from local facts only (PX-023 round 5, §19.1, §25)", .timeLimit(.minutes(1)))
+struct LocalFactAlertTests {
     @MainActor
-    func serverRefusalIsNotAHostKeyRejection() async throws {
+    private func refusalAlert(detail: String) async throws -> ConnectionAlert {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("srui-px023-spoof-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -701,55 +592,192 @@ struct HostKeyRejectionTests {
         )
         let serverInbound = pair.server.receiveStream()
         _ = try #require(manager.connect(ConnectDraft(host: "trusted.example", user: "alice")))
-        // The client's hello reaches the server; then a trusted, authenticated server refuses with
-        // a detail that imitates OpenSSH's host-key banner.
+        // The client's hello reaches the server; then the server refuses with `detail`.
         var iterator = serverInbound.makeAsyncIterator()
         _ = try await iterator.next()
         var refusal = SRUIServerHandshakeRefused()
         refusal.reason = .snapshotUndeliverable
-        // Shaped like OpenSSH's own refusal, verdict on its own last line, so not even the
-        // structural classifier could tell it apart: only never classifying it is safe.
-        refusal.detail = """
+        refusal.detail = detail
+        var message = SRUIMessage()
+        message.serverHandshakeRefused = refusal
+        try await pair.server.send(data: try SRUIFraming.encodeFramed(message))
+        try await AsyncTestSupport.observed("refusal alert") { manager.alert != nil }
+        let alert = try #require(manager.alert)
+        await manager.shutdown()
+        await pair.server.close()
+        return alert
+    }
+
+    @Test("a server refusal that imitates OpenSSH gets exactly what a benign refusal gets (SERVER HANDSHAKE_REFUSED)")
+    @MainActor
+    func serverRefusalSpoofMatchesBenignRefusal() async throws {
+        let spoof = """
         @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
         Host key for [trusted.example]:22 has changed and you have requested strict checking.
         Host key verification failed.
         """
-        var message = SRUIMessage()
-        message.serverHandshakeRefused = refusal
-        try await pair.server.send(data: try SRUIFraming.encodeFramed(message))
-
-        try await AsyncTestSupport.observed("refusal alert") { manager.alert != nil }
-        let alert = try #require(manager.alert)
-        #expect(alert.kind == .connectionFailed, "\(alert.kind): \(alert.message)")
-        #expect(alert.title == "Connection Failed")
-        #expect(alert.message.contains("server refused the handshake"))
-        #expect(alert.message.contains("ssh-keygen") == false)
-        #expect(alert.message.hasPrefix("SRUI did not connect") == false)
-        await manager.shutdown()
-        await pair.server.close()
+        let benign = "snapshot too large"
+        let spoofed = try await refusalAlert(detail: spoof)
+        let plain = try await refusalAlert(detail: benign)
+        #expect(spoofed.kind == .connectionFailed && plain.kind == .connectionFailed)
+        #expect(spoofed.title == plain.title)
+        #expect(spoofed.title == "Connection Failed")
+        // Everything but the server's own words is identical.
+        #expect(spoofed.message.replacingOccurrences(of: spoof, with: "<detail>")
+            == plain.message.replacingOccurrences(of: benign, with: "<detail>"))
+        #expect(spoofed.message.contains("ssh-keygen") == false)
     }
 
-    @Test("the alert says what happened and how to verify the key outside SRUI")
-    func messages() {
-        let entry = SavedConnection(label: "x", host: "127.0.0.1", port: 2222, user: "alice")
-        let unknown = HostKeyRejection.unknown.alertMessage(for: entry, sshMessage: Self.unknownMessage)
-        #expect(unknown.hasPrefix("SRUI did not connect to alice@127.0.0.1:2222. Your known_hosts file has no host key for [127.0.0.1]:2222"))
-        #expect(unknown.contains("SRUI never adds a host key by itself."))
-        #expect(unknown.contains("(ssh -p 2222 alice@127.0.0.1)"))
-        #expect(unknown.hasSuffix("OpenSSH reported:\n" + Self.unknownMessage))
+    @Test("the hint states only the local fact, with no trust-changing advice")
+    func hintText() {
+        let absent = KnownHostsHint(name: "[h.example]:2222", presence: .absent(checkedFiles: ["/k1", "/k2"]))
+        #expect(absent.text == "[h.example]:2222 is not in your known_hosts files (/k1, /k2). SRUI never adds or changes host keys. "
+            + "If you mean to trust this host, verify its key fingerprint out of band, then add the key with ssh yourself.")
+        let none = KnownHostsHint(name: "h.example", presence: .absent(checkedFiles: []))
+        #expect(none.text.hasPrefix("h.example is not in your known_hosts files (none of them exists yet)."))
+        let present = KnownHostsHint(name: "h.example", presence: .present(file: "/Users/a/.ssh/known_hosts"))
+        #expect(present.text == "A key for h.example is in /Users/a/.ssh/known_hosts. SRUI will not change it.")
+        for hint in [absent, none, present] {
+            #expect(hint.text.contains("ssh-keygen") == false)
+            #expect(hint.text.contains("-R") == false)
+            #expect(hint.text.lowercased().contains("remove") == false)
+        }
+        #expect(KnownHostsHint.knownHostsName(host: "h", port: 22) == "h")
+        #expect(KnownHostsHint.knownHostsName(host: "h", port: 2222) == "[h]:2222")
+        #expect(KnownHostsHint.knownHostsName(host: "::1", port: 23) == "[::1]:23")
+    }
 
-        let changed = HostKeyRejection.changed.alertMessage(for: entry, sshMessage: Self.changedMessage)
-        #expect(changed.contains("does not match the key your known_hosts file holds for [127.0.0.1]:2222"))
-        #expect(changed.contains("someone may be intercepting the connection"))
-        #expect(changed.contains("SRUI never replaces a known host key."))
-        #expect(changed.contains("ssh-keygen -R '[127.0.0.1]:2222'"))
+    @Test("the alert text: app text first, then ssh's stderr verbatim under the label")
+    func messageFormat() {
+        let hint = KnownHostsHint(name: "h", presence: .present(file: "/k"))
+        let stderr = "No ED25519 host key is known for h and you have requested strict checking.\r\nHost key verification failed.\r\n"
+        #expect(ConnectionManager.sshFailureMessage(endpoint: "alice@h", hint: hint, stderr: stderr)
+            == "SRUI could not connect to alice@h.\n\nA key for h is in /k. SRUI will not change it.\n\n"
+            + "ssh reported (this text can include messages from the server):\n" + stderr)
+        #expect(ConnectionManager.sshFailureMessage(endpoint: "alice@h", hint: nil, stderr: "")
+            == "SRUI could not connect to alice@h.\n\nssh reported (this text can include messages from the server):\n")
+    }
 
-        // Port 22, or none, is filed under the bare host.
-        let standard = SavedConnection(label: "x", host: "host.example", user: "alice")
-        #expect(HostKeyRejection.changed.alertMessage(for: standard, sshMessage: "")
-            .contains("ssh-keygen -R 'host.example'"))
-        let v6 = SavedConnection(label: "x", host: "::1", port: 22, user: "alice")
-        #expect(HostKeyRejection.unknown.alertMessage(for: v6, sshMessage: "")
-            .hasPrefix("SRUI did not connect to alice@[::1]:22. Your known_hosts file has no host key for ::1,"))
+    @Test("ssh -G output is read for the name and files, and any unrecoverable path abandons the lookup")
+    func parseEffectiveConfiguration() {
+        let parse = SSHKnownHostsLookup.parseEffectiveConfiguration
+        #expect(parse("""
+        hostname 127.0.0.1
+        port 2222
+        userknownhostsfile /a/known_hosts /a/known_hosts2
+        globalknownhostsfile /etc/ssh/ssh_known_hosts
+        """) == .init(name: "[127.0.0.1]:2222", files: ["/a/known_hosts", "/a/known_hosts2", "/etc/ssh/ssh_known_hosts"]))
+        #expect(parse("hostname h\nport 22\nuserknownhostsfile /k\n") == .init(name: "h", files: ["/k"]))
+        #expect(parse("hostname h\nport 2222\nhostkeyalias alias.example\nuserknownhostsfile /k\n")
+            == .init(name: "alias.example", files: ["/k"]))
+        #expect(parse("hostname h\nport 22\nhostkeyalias none\nuserknownhostsfile none\n") == .init(name: "h", files: []))
+        // `ssh -G` does not quote: "/tmp/a b/kh" would split into "/tmp/a" and "b/kh".
+        #expect(parse("hostname h\nport 22\nuserknownhostsfile /tmp/a b/kh\n") == nil)
+        #expect(parse("port 22\n") == nil)
+        #expect(parse("hostname h\nport 0\n") == nil)
+        #expect(parse("hostname h\nport x\n") == nil)
+    }
+}
+
+@Suite("Known-hosts lookup through ssh -G and ssh-keygen -F (PX-023 round 5)", .serialized, .timeLimit(.minutes(1)))
+struct KnownHostsLookupTests {
+    /// A real key line for `name`.
+    private static func entry(_ name: String, key: String) throws -> String {
+        let publicKey = try String(contentsOf: URL(fileURLWithPath: "\(key).pub"), encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return "\(name) \(publicKey)\n"
+    }
+
+    /// The production argv for 127.0.0.1, with this test's known_hosts and a global file that
+    /// does not exist, so nothing outside the fixture is consulted.
+    private static func configuration(port: UInt16?, knownHosts: String, directory: URL,
+                                      extra: [String: String] = [:]) -> SSHConfiguration {
+        var configuration = ConnectionManager.sshConfiguration(
+            for: SavedConnection(label: "x", host: "127.0.0.1", port: port, user: "alice"))
+        configuration.knownHostsFile = knownHosts
+        configuration.extraOptions = ["GlobalKnownHostsFile": directory.appendingPathComponent("absent_global").path]
+            .merging(extra) { $1 }
+        return configuration
+    }
+
+    @Test("present, absent, port formatting, hashed entries, HostKeyAlias")
+    func lookups() async throws {
+        let directory = try TestFixtureDirectory.make(prefix: "px023-kh")
+        defer { TestFixtureDirectory.release(directory) }
+        let key = directory.appendingPathComponent("host_key").path
+        try SSHTestSupport.generateEd25519Key(at: key)
+        let plain = directory.appendingPathComponent("plain_known_hosts").path
+        try (try Self.entry("[127.0.0.1]:2222", key: key) + Self.entry("alias.example", key: key))
+            .write(toFile: plain, atomically: true, encoding: .utf8)
+        let port22 = directory.appendingPathComponent("port22_known_hosts").path
+        try Self.entry("127.0.0.1", key: key).write(toFile: port22, atomically: true, encoding: .utf8)
+        let hashed = directory.appendingPathComponent("hashed_known_hosts").path
+        try Self.entry("[127.0.0.1]:2222", key: key).write(toFile: hashed, atomically: true, encoding: .utf8)
+        let hashing = try await BoundedProcessTestSupport.run("/usr/bin/ssh-keygen", ["-H", "-f", hashed])
+        #expect(hashing == 0)
+        #expect(try String(contentsOfFile: hashed, encoding: .utf8).hasPrefix("|1|"), "entry is hashed")
+
+        let lookup = SSHKnownHostsLookup()
+        #expect(await lookup.hint(for: Self.configuration(port: 2222, knownHosts: plain, directory: directory))
+            == KnownHostsHint(name: "[127.0.0.1]:2222", presence: .present(file: plain)))
+        #expect(await lookup.hint(for: Self.configuration(port: 2200, knownHosts: plain, directory: directory))
+            == KnownHostsHint(name: "[127.0.0.1]:2200", presence: .absent(checkedFiles: [plain])))
+        // Port 22 is filed under the bare host, and [host]:2222 is not the bare host.
+        #expect(await lookup.hint(for: Self.configuration(port: nil, knownHosts: port22, directory: directory))
+            == KnownHostsHint(name: "127.0.0.1", presence: .present(file: port22)))
+        #expect(await lookup.hint(for: Self.configuration(port: 2222, knownHosts: port22, directory: directory))
+            == KnownHostsHint(name: "[127.0.0.1]:2222", presence: .absent(checkedFiles: [port22])))
+        #expect(await lookup.hint(for: Self.configuration(port: 2222, knownHosts: hashed, directory: directory))
+            == KnownHostsHint(name: "[127.0.0.1]:2222", presence: .present(file: hashed)))
+        #expect(await lookup.hint(for: Self.configuration(
+            port: 2200, knownHosts: plain, directory: directory, extra: ["HostKeyAlias": "alias.example"]))
+            == KnownHostsHint(name: "alias.example", presence: .present(file: plain)))
+        // A known_hosts file that does not exist is not listed as checked.
+        let missing = directory.appendingPathComponent("missing").path
+        #expect(await lookup.hint(for: Self.configuration(port: 2222, knownHosts: missing, directory: directory))
+            == KnownHostsHint(name: "[127.0.0.1]:2222", presence: .absent(checkedFiles: [])))
+    }
+
+    @Test("a failed or slow lookup gives no hint at all")
+    func failures() async throws {
+        let directory = try TestFixtureDirectory.make(prefix: "px023-khf")
+        defer { TestFixtureDirectory.release(directory) }
+        let knownHosts = directory.appendingPathComponent("known_hosts").path
+        try Data().write(to: URL(fileURLWithPath: knownHosts))
+        var configuration = Self.configuration(port: 2222, knownHosts: knownHosts, directory: directory)
+
+        configuration.sshBinaryPath = "/nonexistent/ssh"
+        #expect(await SSHKnownHostsLookup().hint(for: configuration) == nil, "ssh cannot be launched")
+        configuration.sshBinaryPath = "/usr/bin/false"
+        #expect(await SSHKnownHostsLookup().hint(for: configuration) == nil, "ssh -G fails")
+        // `yes` never exits: the deadline ends it and there is no hint.
+        configuration.sshBinaryPath = "/usr/bin/yes"
+        let clock = ContinuousClock()
+        let started = clock.now
+        #expect(await SSHKnownHostsLookup(timeout: .milliseconds(300)).hint(for: configuration) == nil, "timeout")
+        #expect(clock.now - started < .seconds(5))
+
+        configuration.sshBinaryPath = "/usr/bin/ssh"
+        #expect(await SSHKnownHostsLookup(sshKeygenPath: "/nonexistent/ssh-keygen").hint(for: configuration) == nil,
+                "ssh-keygen cannot be launched")
+    }
+}
+
+/// Runs a fixture command to completion without blocking a thread on its exit.
+enum BoundedProcessTestSupport {
+    static func run(_ path: String, _ arguments: [String]) async throws -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        return try await withCheckedThrowingContinuation { continuation in
+            process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
+            do { try process.run() } catch {
+                process.terminationHandler = nil
+                continuation.resume(throwing: error)
+            }
+        }
     }
 }

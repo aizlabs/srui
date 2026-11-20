@@ -79,7 +79,7 @@ private final class StreamByteRecord: @unchecked Sendable {
     }
 }
 
-/// What `ssh` itself reported when it failed before the SRUI stream began (PX-023).
+/// The `ssh` child's exit before the SRUI stream began, and what it printed: quoted, never interpreted (PX-023).
 public struct SSHLocalFailure: Sendable, Equatable {
     /// `ssh`'s own error exit status.
     public static let sshErrorStatus: Int32 = 255
@@ -521,14 +521,11 @@ public actor SSHTransport: Transport {
         thread.start()
     }
 
-    /// `ssh`'s own failure, or `nil`: non-nil only when the child exited by itself with status 255
-    /// (`ssh`'s error status) before a single byte of the SRUI stream arrived on stdout. That is
-    /// when `ssh`'s stderr can carry its own verdict (a refused host key, a failed authentication)
-    /// and no SRUI server has spoken yet, so a caller may read it as `ssh`'s diagnosis. Anything a
-    /// server says over the protocol is never part of it (PX-023).
-    ///
-    /// Residual: an authenticated remote subsystem that writes to stderr and exits 255 before its
-    /// first stdout byte is indistinguishable from `ssh` here; it can only produce a refusal.
+    /// The child's exit before the stream, or `nil`: non-nil only when the child exited by itself
+    /// with status 255 (`ssh`'s error status) before a single byte of the SRUI stream arrived on
+    /// stdout. It is a trigger, not a diagnosis (PX-023 round 5): `stderr` is what `ssh` printed
+    /// and can contain text a server chose (a disconnect reason, a key-exchange name list, a
+    /// banner), so callers may quote it but must never derive a verdict from it.
     public func localFailureBeforeStream() -> SSHLocalFailure? {
         guard streamBytes.hasDelivered == false,
               let status = childExit.recorded,

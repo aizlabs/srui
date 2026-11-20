@@ -936,28 +936,36 @@ struct ConnectionManagerTests {
         await manager.load()
         manager.connect(id: saved.id)
         let attempt = try #require(harness.attempts.first)
-        await attempt.emit(.hostKeyRejected(.unverified, sshMessage: "Host key verification failed."))
+        let hint = KnownHostsHint(name: "secure.example", presence: .absent(checkedFiles: ["/k"]))
+        await attempt.emit(.sshFailedBeforeStream(stderr: "Host key verification failed.", hint: hint))
 
-        // PX-023: ssh's own host-key verdict is its own blocking alert that says what happened;
-        // the alert's only action is OK (ConnectionManagerView), so there is no connect-anyway path.
+        // PX-023 round 5: an ssh exit before the stream is a plain blocking "Connection Failed".
+        // The app writes only the endpoint and the local known_hosts hint; ssh's stderr follows
+        // verbatim under its label. The alert's only action is OK (ConnectionManagerView).
         try await AsyncTestSupport.observed("blocking SSH failure alert") {
-            manager.alert?.kind == .hostKeyRejected
+            manager.alert?.kind == .connectionFailed
         }
-        #expect(manager.alert?.title == "Host Key Not Trusted")
-        #expect(manager.alert?.message.hasPrefix("SRUI did not connect to alice@secure.example.") == true)
-        #expect(manager.alert?.message.hasSuffix("OpenSSH reported:\nHost key verification failed.") == true)
+        #expect(manager.alert?.title == "Connection Failed")
+        #expect(manager.alert?.message == "SRUI could not connect to alice@secure.example.\n\n" + hint.text
+            + "\n\nssh reported (this text can include messages from the server):\nHost key verification failed.")
         #expect(manager.status(for: saved.id) == .disconnected(resumeAvailable: true))
         #expect(harness.attempts.count == 1)
 
-        // A failure string is never read for host-key phrases (PX-023 round 2): it can carry
-        // server-authored text, so the same words in `.failed` stay a plain connection failure.
+        // A failed lookup leaves no hint, only the generic text.
         manager.dismissAlert()
         manager.connect(id: saved.id)
         let second = try #require(harness.attempts.last)
-        await second.emit(.failed("Host key verification failed."))
-        try await AsyncTestSupport.observed("blocking non-host-key failure alert") {
-            manager.alert?.kind == .connectionFailed
-        }
+        await second.emit(.sshFailedBeforeStream(stderr: "", hint: nil))
+        try await AsyncTestSupport.observed("alert without hint") { manager.alert != nil }
+        #expect(manager.alert?.message == "SRUI could not connect to alice@secure.example.\n\nssh reported (this text can include messages from the server):\n")
+
+        // Any other failure keeps its message, with the same title.
+        manager.dismissAlert()
+        manager.connect(id: saved.id)
+        let third = try #require(harness.attempts.last)
+        await third.emit(.failed("Host key verification failed."))
+        try await AsyncTestSupport.observed("blocking non-ssh failure alert") { manager.alert != nil }
+        #expect(manager.alert?.kind == .connectionFailed)
         #expect(manager.alert?.title == "Connection Failed")
         #expect(manager.alert?.message == "Host key verification failed.")
         await manager.shutdown()

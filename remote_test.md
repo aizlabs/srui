@@ -228,7 +228,7 @@ Click **Add Connection** and enter:
 | Port | Empty for `22`, or your configured SSH port |
 | Name | `Ubuntu` (optional; defaults to `user@host:port`) |
 
-Connect stays disabled, and the form says why, while the endpoint is malformed (for example a space, `;`, `$`, a leading `-`, or a port outside 1–65535). Click **Connect**. If the host key is not in `~/.ssh/known_hosts`, or has changed, a **Host Key Not Trusted** alert explains which; SRUI never adds or replaces the key, so check its fingerprint and record it with `ssh` in Terminal first. Expect a native window showing the remote process table and CPU/memory updates. The saved entry should show `connected`, a session ID, and a revision. Its primary action becomes **Open** while connected.
+Connect stays disabled, and the form says why, while the endpoint is malformed (for example a space, `;`, `$`, a leading `-`, or a port outside 1–65535). Click **Connect**. If the host key is not in `~/.ssh/known_hosts`, or has changed, the connection fails with a **Connection Failed** alert. The alert quotes `ssh`'s own output and adds a note saying whether your known_hosts files hold a key for the host. SRUI never adds or replaces the key, so check its fingerprint and record it with `ssh` in Terminal first. Expect a native window showing the remote process table and CPU/memory updates. The saved entry should show `connected`, a session ID, and a revision. Its primary action becomes **Open** while connected.
 
 ## 8. Manual acceptance checks
 

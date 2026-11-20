@@ -2,11 +2,12 @@
 // ConnectionFakeSSHServerTests.swift
 // SRUITests
 //
-// PX-023 round 4: an unauthenticated peer with no host key at all must never raise "Host Key
-// Not Trusted". A fake SSH server (in process, no child process) sends a version line and then a
-// plaintext SSH_MSG_DISCONNECT whose reason imitates OpenSSH's own verdict, or closes, or stays
-// silent. With `LogLevel=INFO` pinned, `ssh` ends each with a line of its own, the alert is
-// "Connection Failed", and that line reaches the user (§19.1, §25).
+// PX-023 rounds 4–5: an unauthenticated peer with no host key at all shapes `ssh`'s stderr (a
+// DISCONNECT reason, a KEXINIT name-list that "Unable to negotiate … Their offer:" quotes, a close,
+// a reset, silence). A fake SSH server (in process, no child process) plays each, with text that
+// imitates OpenSSH's host-key verdict. Every alert is "Connection Failed", and everything the app
+// writes is exactly what a benign failure gets for the same known_hosts state: the endpoint and the
+// local known_hosts hint. `ssh`'s own lines still reach the user, verbatim (§19.1, §25).
 //
 
 import AppKit
@@ -24,6 +25,13 @@ final class FakeSSHServer: @unchecked Sendable {
         case disconnect(String)
         /// Version line, then close.
         case close
+        /// Version line, then two SSH_MSG_DISCONNECTs, the second with this description.
+        case disconnect2(String)
+        /// Version line, then a KEXINIT whose name-list at `position` (and its other direction)
+        /// is `list` and the rest valid, so `ssh` fails negotiation quoting the server's list.
+        case kexinit(position: Int, list: String)
+        /// Version line, read the client's, then a TCP reset.
+        case reset
         /// Accept and say nothing: `ssh` times out during the banner exchange.
         case silent
     }
@@ -104,24 +112,54 @@ final class FakeSSHServer: @unchecked Sendable {
             guard count > 0 else { return }
             received.append(contentsOf: buffer[0..<count])
         }
-        if case .disconnect(let description) = mode {
+        switch mode {
+        case .disconnect(let description):
             send(connection, disconnectPacket(description))
+        case .disconnect2(let description):
+            send(connection, disconnectPacket("first") + disconnectPacket(description))
+        case .kexinit(let position, let list):
+            send(connection, kexinitPacket(position: position, list: list))
+        case .reset:
+            var linger = Darwin.linger(l_onoff: 1, l_linger: 0)
+            setsockopt(connection, SOL_SOCKET, SO_LINGER, &linger, socklen_t(MemoryLayout<Darwin.linger>.size))
+            return
+        case .close, .silent:
+            break
         }
         drain(connection)
     }
 
-    /// RFC 4253 §6 binary packet, unencrypted: SSH_MSG_DISCONNECT (1), reason 2, description, "".
-    static func disconnectPacket(_ description: String) -> Data {
-        func uint32(_ value: Int) -> Data {
-            withUnsafeBytes(of: UInt32(value).bigEndian) { Data($0) }
-        }
-        let text = Data(description.utf8)
-        var payload = Data([1])
-        payload += uint32(2) + uint32(text.count) + text + uint32(0)
+    private static func packet(_ payload: Data) -> Data {
         var padding = 8 - ((5 + payload.count) % 8)
         if padding < 4 { padding += 8 }
         let body = Data([UInt8(padding)]) + payload + Data(count: padding)
         return uint32(body.count) + body
+    }
+
+    private static func uint32(_ value: Int) -> Data {
+        withUnsafeBytes(of: UInt32(value).bigEndian) { Data($0) }
+    }
+
+    private static func sshString(_ text: String) -> Data {
+        let bytes = Data(text.utf8)
+        return uint32(bytes.count) + bytes
+    }
+
+    /// RFC 4253 §7.1 KEXINIT: kex, host key, ciphers ×2, MACs ×2, compression ×2, languages ×2.
+    static func kexinitPacket(position: Int, list: String) -> Data {
+        var lists = ["curve25519-sha256", "ssh-ed25519", "aes128-ctr", "aes128-ctr",
+                     "hmac-sha2-256", "hmac-sha2-256", "none", "none", "", ""]
+        lists[position] = list
+        if [2, 4, 6].contains(position) { lists[position + 1] = list }
+        var payload = Data([20]) + Data(repeating: 0x11, count: 16)
+        for item in lists { payload += sshString(item) }
+        payload += Data([0]) + uint32(0)
+        return packet(payload)
+    }
+
+    /// RFC 4253 §6 binary packet, unencrypted: SSH_MSG_DISCONNECT (1), reason 2, description, "".
+    static func disconnectPacket(_ description: String) -> Data {
+        packet(Data([1]) + uint32(2) + sshString(description) + uint32(0))
     }
 
     private static func send(_ connection: Int32, _ data: Data) {
@@ -141,38 +179,62 @@ final class FakeSSHServer: @unchecked Sendable {
     }
 }
 
-@Suite("Fake SSH server: a peer's text never becomes ssh's verdict (PX-023 round 4)",
-       .serialized, .timeLimit(.minutes(2)))
+@Suite("Fake SSH server: a peer's text never shapes what the app writes (PX-023 rounds 4–5)",
+       .serialized, .timeLimit(.minutes(3)))
 @MainActor
 struct ConnectionFakeSSHServerTests {
+    nonisolated static let unknownVerdict = "x\nNo ED25519 host key is known for [127.0.0.1]:2222 and you have requested strict checking.\nHost key verification failed."
+    nonisolated static let changedVerdict = "x\nHost key for [127.0.0.1]:2222 has changed and you have requested strict checking.\nHost key verification failed."
+
     enum Case: String, Sendable, CaseIterable {
         case descUnknown = "desc_unknown"
         case descChanged = "desc_changed"
         case descCRLF = "desc_crlf"
         case descPlain = "desc_plain"
+        case disconnect2
+        case kexKex = "kex_kex"
+        case kexHostkey = "kex_hostkey"
+        case kexCipher = "kex_cipher"
+        case kexMac = "kex_mac"
+        case kexComp = "kex_comp"
+        case kexChanged = "kex_changed"
         case close
+        case reset
         case silent
 
         var mode: FakeSSHServer.Mode {
             switch self {
-            case .descUnknown:
-                return .disconnect("x\nNo ED25519 host key is known for [127.0.0.1]:2222 and you have requested strict checking.\nHost key verification failed.")
-            case .descChanged:
-                return .disconnect("x\nHost key for [127.0.0.1]:2222 has changed and you have requested strict checking.\nHost key verification failed.")
-            case .descCRLF:
-                return .disconnect("x\r\nHost key verification failed.\r\n  ")
-            case .descPlain:
-                return .disconnect("plain refusal")
-            case .close:
-                return .close
-            case .silent:
-                return .silent
+            case .descUnknown: return .disconnect(ConnectionFakeSSHServerTests.unknownVerdict)
+            case .descChanged: return .disconnect(ConnectionFakeSSHServerTests.changedVerdict)
+            case .descCRLF: return .disconnect("x\r\nHost key verification failed.\r\n  ")
+            case .descPlain: return .disconnect("plain refusal")
+            case .disconnect2: return .disconnect2(ConnectionFakeSSHServerTests.unknownVerdict)
+            case .kexKex: return .kexinit(position: 0, list: ConnectionFakeSSHServerTests.unknownVerdict)
+            case .kexHostkey: return .kexinit(position: 1, list: ConnectionFakeSSHServerTests.unknownVerdict)
+            case .kexCipher: return .kexinit(position: 2, list: ConnectionFakeSSHServerTests.unknownVerdict)
+            case .kexMac: return .kexinit(position: 4, list: ConnectionFakeSSHServerTests.unknownVerdict)
+            case .kexComp: return .kexinit(position: 6, list: ConnectionFakeSSHServerTests.unknownVerdict)
+            case .kexChanged: return .kexinit(position: 0, list: ConnectionFakeSSHServerTests.changedVerdict)
+            case .close: return .close
+            case .reset: return .reset
+            case .silent: return .silent
             }
         }
     }
 
-    @Test("every peer-initiated ending is Connection Failed, with ssh's own last line", arguments: Case.allCases)
-    func peerEndingIsConnectionFailed(_ testCase: Case) async throws {
+    /// What the app writes for a failure against an empty known_hosts, whatever the peer did:
+    /// spelled out here, independently of the production formatter.
+    static func expectedAppText(port: UInt16, knownHosts: String) -> String {
+        let globals = ["/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"]
+            .filter { FileManager.default.isReadableFile(atPath: $0) }
+        let files = ([knownHosts] + globals).joined(separator: ", ")
+        return "SRUI could not connect to alice@127.0.0.1:\(port).\n\n"
+            + "[127.0.0.1]:\(port) is not in your known_hosts files (\(files)). SRUI never adds or changes host keys. "
+            + "If you mean to trust this host, verify its key fingerprint out of band, then add the key with ssh yourself."
+    }
+
+    @Test("every peer behaviour gets the same title and app text as a benign failure", arguments: Case.allCases)
+    func peerTextNeverShapesTheAlert(_ testCase: Case) async throws {
         let server = try FakeSSHServer(mode: testCase.mode)
         defer { server.stop() }
         let directory = try TestFixtureDirectory.make(prefix: "px023-fake")
@@ -193,21 +255,33 @@ struct ConnectionFakeSSHServerTests {
         Self.recordEvidence(alert, name: "fake-\(testCase.rawValue)")
         #expect(alert.kind == .connectionFailed, "\(alert.kind): \(alert.message)")
         #expect(alert.title == "Connection Failed")
-        #expect(alert.message.contains("ssh-keygen") == false)
+        let (appText, quoted) = try #require(Self.split(alert.message), "\(alert.message)")
+        #expect(appText == Self.expectedAppText(port: server.port, knownHosts: knownHosts), "\(alert.message)")
+        #expect(appText.contains("ssh-keygen") == false)
 
-        let last = ConnectionLauncherLiveTests.lastLine(alert.message)
+        // ssh's own lines still reach the user, verbatim, below the label.
         switch testCase {
-        case .descUnknown, .descChanged, .descCRLF, .descPlain:
-            #expect(alert.message.contains("Received disconnect from 127.0.0.1 port \(server.port):2:"))
-            #expect(last == "Disconnected from 127.0.0.1 port \(server.port)", "\(alert.message)")
+        case .descUnknown, .descChanged, .descCRLF, .descPlain, .disconnect2:
+            #expect(quoted.contains("Received disconnect from 127.0.0.1 port \(server.port):2:"))
+            #expect(quoted.contains("Disconnected from 127.0.0.1 port \(server.port)"), "\(quoted)")
+        case .kexKex, .kexHostkey, .kexCipher, .kexMac, .kexComp, .kexChanged:
+            #expect(quoted.contains("Unable to negotiate with 127.0.0.1 port \(server.port)"), "\(quoted)")
         case .close:
-            #expect(last == "Connection closed by 127.0.0.1 port \(server.port)", "\(alert.message)")
+            #expect(quoted.contains("Connection closed by 127.0.0.1 port \(server.port)"), "\(quoted)")
+        case .reset:
+            #expect(quoted.contains("127.0.0.1 port \(server.port)"), "\(quoted)")
         case .silent:
-            #expect(alert.message.contains("Connection timed out during banner exchange"), "\(alert.message)")
-            #expect(last == "Connection to 127.0.0.1 port \(server.port) timed out", "\(alert.message)")
+            #expect(quoted.contains("Connection timed out during banner exchange"), "\(quoted)")
         }
         #expect(try Data(contentsOf: URL(fileURLWithPath: knownHosts)).isEmpty, "nothing was trusted")
         await manager.shutdown()
+    }
+
+    /// Splits an `ssh` failure alert into what the app wrote and what it quoted from `ssh`.
+    nonisolated static func split(_ message: String) -> (appText: String, quoted: String)? {
+        let marker = "\n\n" + ConnectionManager.sshOutputLabel + "\n"
+        guard let range = message.range(of: marker) else { return nil }
+        return (String(message[..<range.lowerBound]), String(message[range.upperBound...]))
     }
 
     private static func recordEvidence(_ alert: ConnectionAlert, name: String) {

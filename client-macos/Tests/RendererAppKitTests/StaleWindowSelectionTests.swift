@@ -70,6 +70,19 @@ struct StaleWindowSelectionTests {
             return (handle.modelAdapter as! TableCollectionAdapter).selectionShouldChange(in: collection)
         }
 
+        /// After a server-driven change in a stale window, the user is still held back: the gate
+        /// refuses, and a real Down Arrow moves nothing and reports nothing. A suppression flag left
+        /// set by that change would open the gate and let the arrow move the row unreported.
+        func expectUserStillFrozen(
+            at rows: IndexSet, sourceLocation: SourceLocation = #_sourceLocation
+        ) throws {
+            #expect(!acceptsUserSelectionChange, "the gate is closed again", sourceLocation: sourceLocation)
+            try pressDownArrow()
+            #expect(collection.selectedRowIndexes == rows, "the user's arrow key moves nothing",
+                    sourceLocation: sourceLocation)
+            #expect(interactions.isEmpty, "nothing is reported", sourceLocation: sourceLocation)
+        }
+
         func tearDown() {
             window.close()
         }
@@ -127,6 +140,7 @@ struct StaleWindowSelectionTests {
         try harness.commit([.setProperty(id: Self.collectionID, property: .value, value: .itemID(ItemId(6)))])
         #expect(harness.collection.selectedRowIndexes == IndexSet(integer: 5))
         #expect(harness.interactions.isEmpty, "a promotion is not a user change")
+        try harness.expectUserStillFrozen(at: IndexSet(integer: 5))
     }
 
     // AppKit's `deselectAll(nil)` asks `selectionShouldChange(in:)` even when called by code, so a
@@ -142,6 +156,7 @@ struct StaleWindowSelectionTests {
         try harness.commit([.clearProperty(id: Self.collectionID, property: .value)])
         #expect(harness.collection.selectedRowIndexes.isEmpty, "the withdrawn row is deselected")
         #expect(harness.interactions.isEmpty, "a withdrawal is not a user change")
+        try harness.expectUserStillFrozen(at: IndexSet())
     }
 
     @Test("a promotion to an item absent from the replica still clears in a stale window",
@@ -154,6 +169,7 @@ struct StaleWindowSelectionTests {
         try harness.commit([.setProperty(id: Self.collectionID, property: .value, value: .itemID(ItemId(999)))])
         #expect(harness.collection.selectedRowIndexes.isEmpty, "no row stands in for an absent item (§8)")
         #expect(harness.interactions.isEmpty)
+        try harness.expectUserStillFrozen(at: IndexSet())
     }
 
     @Test("a selection_mode of none still clears a stale window's selection, and the user's deselect stays refused",
@@ -171,6 +187,7 @@ struct StaleWindowSelectionTests {
         ])
         #expect(harness.collection.selectedRowIndexes.isEmpty, "a collection that selects nothing shows nothing selected")
         #expect(harness.interactions.isEmpty)
+        try harness.expectUserStillFrozen(at: IndexSet())
     }
 
     @Test("the gate follows the status through a remount", arguments: [TypeRef.table, TypeRef.tree])

@@ -34,6 +34,13 @@ struct SSHTransportPostureTests {
         #expect(args.contains("StrictHostKeyChecking=yes"), "Expected StrictHostKeyChecking=yes (§19.1)")
 
         // §19.1 / PX-023: ssh's stderr holds only ssh's own errors, never a server's banner
+        // round 6: ssh never rewrites known_hosts (no UpdateHostKeys) for an SRUI connection
+        if let index = args.firstIndex(of: "UpdateHostKeys=no") {
+            #expect(args[index - 1] == "-o")
+        } else {
+            Issue.record("Expected -o UpdateHostKeys=no (PX-023)")
+        }
+
         // pinned to INFO (round 4), so ssh's own last line ends every peer-initiated failure
         if let index = args.firstIndex(of: "LogLevel=INFO") {
             #expect(args[index - 1] == "-o")
@@ -156,6 +163,8 @@ struct SSHTransportPostureTests {
         "stricthostkeychecking": "no",
         "STRICTHOSTKEYCHECKING": "no",
         "loglevel": "DEBUG3",
+        "updatehostkeys": "yes",
+        "UpdateHostKeys": "ask",
         "LOGLEVEL": "QUIET",
         "logLevel": "ERROR",
         "forwardagent": "yes",
@@ -197,7 +206,7 @@ struct SSHTransportPostureTests {
         // OpenSSH keeps the first value: every posture option comes before the first extra.
         let firstExtra = try? #require(options.firstIndex(of: "Compression=yes"))
         for posture in ["ClearAllForwardings=yes", "ExitOnForwardFailure=yes", "StrictHostKeyChecking=yes",
-                        "LogLevel=INFO", "UserKnownHostsFile=/tmp/px023-known-hosts", "BatchMode=yes",
+                        "LogLevel=INFO", "UpdateHostKeys=no", "UserKnownHostsFile=/tmp/px023-known-hosts", "BatchMode=yes",
                         "ConnectTimeout=5", "IdentitiesOnly=yes"] {
             let index = options.firstIndex(of: posture)
             #expect(index != nil, "missing \(posture)")
@@ -252,12 +261,14 @@ struct SSHTransportPostureTests {
             ClearAllForwardings no
             UserKnownHostsFile /tmp/px023-hostile-config-known-hosts
             IdentitiesOnly no
+            UpdateHostKeys yes
         """.write(to: config, atomically: true, encoding: .utf8)
 
         let effective = try await Self.effectiveConfiguration(
             Self.hostileConfiguration.buildArguments(), configFile: config.path)
         #expect(effective["stricthostkeychecking"] == "true", "\(effective)")
         #expect(effective["loglevel"] == "INFO")
+        #expect(effective["updatehostkeys"] == "false")
         #expect(effective["batchmode"] == "yes")
         #expect(effective["forwardagent"] == "no")
         #expect(effective["clearallforwardings"] == "yes")

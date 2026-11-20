@@ -141,11 +141,11 @@ verbatim under "ssh reported (this text can include messages from the server):".
 hint, SRUI runs `ssh -G` with the same arguments to find the known_hosts files and the name `ssh`
 uses (`host`, `[host]:port` for any port but 22, or `HostKeyAlias`). It then runs
 `ssh-keygen -F <name> -f <file>` on each file, which handles hashed entries. Both run as argument
-vectors, with a 5-second limit. The hint says either that the host is not in those files, or that
+vectors, each with its own 5-second limit (SIGTERM, then SIGKILL), and `ssh -G`'s output is read while it runs and capped at 256 KiB. The hint says either that the host is not in those files, or that
 a key for it is in a named file and SRUI will not change it. If the lookup fails, there is no hint.
 SRUI never adds, replaces or removes a host key, never suggests a command that would, and offers no
 way to connect anyway. To trust a new host, check its fingerprint out of band and add it with `ssh`
-yourself. Every `ssh` runs with `-o LogLevel=INFO` pinned, so its own final lines ("Disconnected from
+yourself. Every `ssh` runs with `-o UpdateHostKeys=no`, so OpenSSH itself never adds a server's rotated keys to known_hosts for SRUI, and with `-o LogLevel=INFO` pinned, so its own final lines ("Disconnected from
 …", "Connection closed by …", timeouts) reach the alert. Posture options come before any
 `extraOptions`, because OpenSSH keeps the first value, and blocked keys are dropped in any case.
 

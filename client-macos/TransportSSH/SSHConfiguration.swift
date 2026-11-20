@@ -29,6 +29,7 @@ public struct SSHConfiguration: Sendable, Equatable {
         "ProxyCommand",
         "PermitLocalCommand",
         "LogLevel",
+        "UpdateHostKeys",
     ]
 
     /// Remote host name or IP address.
@@ -110,6 +111,9 @@ public struct SSHConfiguration: Sendable, Equatable {
     ///   server's text is never the last line of `ssh`'s stderr before the stream starts, and the
     ///   user's `ssh_config` can neither lower it (hiding those lines and the diagnostics they
     ///   carry) nor raise it (adding debug lines after `ssh`'s verdict).
+    /// - `-o UpdateHostKeys=no` (PX-023 round 6): OpenSSH's default (`yes` when the user's own
+    ///   known_hosts is in use) lets a trusted server's extra or rotated keys be written into
+    ///   known_hosts after login. SRUI's connections never change known_hosts; trust stays explicit.
     /// - `-s <subsystem>`: Request fixed subsystem, preventing shell command interpolation.
     ///
     /// OpenSSH takes the **first** value given for an option. Every posture and configuration
@@ -124,6 +128,7 @@ public struct SSHConfiguration: Sendable, Equatable {
             "-o", "ExitOnForwardFailure=yes",
             "-o", "StrictHostKeyChecking=\(strictHostKeyChecking.rawValue)", // §19.1: Fail closed on host-key changes
             "-o", "LogLevel=INFO", // pinned: ssh's own final line always ends a peer-initiated failure
+            "-o", "UpdateHostKeys=no", // §25 explicit trust: ssh never rewrites known_hosts for SRUI
         ]
 
         if let knownHostsFile {

@@ -54,6 +54,7 @@ private let posturePrefix = [
     "-o", "ExitOnForwardFailure=yes",
     "-o", "StrictHostKeyChecking=yes",
     "-o", "LogLevel=INFO",
+    "-o", "UpdateHostKeys=no",
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=30",
 ]
@@ -746,20 +747,171 @@ struct KnownHostsLookupTests {
         try Data().write(to: URL(fileURLWithPath: knownHosts))
         var configuration = Self.configuration(port: 2222, knownHosts: knownHosts, directory: directory)
 
+        func lookup(_ lookup: SSHKnownHostsLookup, _ configuration: SSHConfiguration) async -> KnownHostsHint?? {
+            await TestDeadline.race(.seconds(20)) { await lookup.hint(for: configuration) }
+        }
+
         configuration.sshBinaryPath = "/nonexistent/ssh"
-        #expect(await SSHKnownHostsLookup().hint(for: configuration) == nil, "ssh cannot be launched")
+        #expect(await lookup(SSHKnownHostsLookup(), configuration) == .some(nil), "ssh cannot be launched")
         configuration.sshBinaryPath = "/usr/bin/false"
-        #expect(await SSHKnownHostsLookup().hint(for: configuration) == nil, "ssh -G fails")
-        // `yes` never exits: the deadline ends it and there is no hint.
+        #expect(await lookup(SSHKnownHostsLookup(), configuration) == .some(nil), "ssh -G fails")
+        // `yes` writes without end: the output cap stops it long before the deadline.
         configuration.sshBinaryPath = "/usr/bin/yes"
         let clock = ContinuousClock()
         let started = clock.now
-        #expect(await SSHKnownHostsLookup(timeout: .milliseconds(300)).hint(for: configuration) == nil, "timeout")
-        #expect(clock.now - started < .seconds(5))
+        #expect(await lookup(SSHKnownHostsLookup(timeout: .seconds(5)), configuration) == .some(nil), "output cap")
+        #expect(clock.now - started < .seconds(3), "the cap, not the 5 s deadline, ended it")
 
         configuration.sshBinaryPath = "/usr/bin/ssh"
-        #expect(await SSHKnownHostsLookup(sshKeygenPath: "/nonexistent/ssh-keygen").hint(for: configuration) == nil,
+        #expect(await lookup(SSHKnownHostsLookup(sshKeygenPath: "/nonexistent/ssh-keygen"), configuration) == .some(nil),
                 "ssh-keygen cannot be launched")
+    }
+
+    /// A stub that records its PID, optionally ignores SIGTERM, and then sleeps as that same PID.
+    private static func hungStub(ignoringSIGTERM: Bool, pidFile: String) async throws -> String {
+        let stub = try await SSHTestSupport.assessedStub(for: "KnownHostsLookupTests")
+        try """
+        echo $$ > "\(pidFile)"
+        \(ignoringSIGTERM ? "trap '' TERM" : ":")
+        exec /bin/sleep 30
+        """.write(to: URL(fileURLWithPath: stub.behavior), atomically: true, encoding: .utf8)
+        return stub.path
+    }
+
+    private static func waitUntilGone(pidFile: String) async throws -> pid_t {
+        let text = try String(contentsOfFile: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+        let pid = try #require(pid_t(text))
+        try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(5), description: "PID \(pid) gone") {
+            kill(pid, 0) == -1 && errno == ESRCH
+        }
+        return pid
+    }
+
+    @Test("a hung ssh -G ends at the deadline, and the test cannot hang if the deadline is missing")
+    func hungSSHEndsAtDeadline() async throws {
+        let directory = try TestFixtureDirectory.make(prefix: "px023-khh")
+        defer { TestFixtureDirectory.release(directory) }
+        let knownHosts = directory.appendingPathComponent("known_hosts").path
+        try Data().write(to: URL(fileURLWithPath: knownHosts))
+        let pidFile = directory.appendingPathComponent("pid").path
+        var configuration = Self.configuration(port: 2222, knownHosts: knownHosts, directory: directory)
+        configuration.sshBinaryPath = try await Self.hungStub(ignoringSIGTERM: false, pidFile: pidFile)
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        let stubbed = configuration
+        let outcome = await TestDeadline.race(.seconds(15)) {
+            await SSHKnownHostsLookup(timeout: .milliseconds(300)).hint(for: stubbed)
+        }
+        #expect(outcome != nil, "the production deadline never fired")
+        #expect(outcome == .some(nil))
+        #expect(clock.now - started < .seconds(10))
+        _ = try await Self.waitUntilGone(pidFile: pidFile)
+    }
+
+    @Test("a hung ssh-keygen that ignores SIGTERM is SIGKILLed: its exact PID is gone")
+    func hungKeygenIsKilled() async throws {
+        let directory = try TestFixtureDirectory.make(prefix: "px023-khk")
+        defer { TestFixtureDirectory.release(directory) }
+        let knownHosts = directory.appendingPathComponent("known_hosts").path
+        try Data().write(to: URL(fileURLWithPath: knownHosts))
+        let pidFile = directory.appendingPathComponent("pid").path
+        let keygen = try await Self.hungStub(ignoringSIGTERM: true, pidFile: pidFile)
+        let configuration = Self.configuration(port: 2222, knownHosts: knownHosts, directory: directory)
+
+        let outcome = await TestDeadline.race(.seconds(15)) {
+            await SSHKnownHostsLookup(sshKeygenPath: keygen, timeout: .milliseconds(300)).hint(for: configuration)
+        }
+        #expect(outcome == .some(nil), "no hint when ssh-keygen times out")
+        // SIGTERM is ignored; only the SIGKILL after the grace period ends it.
+        _ = try await Self.waitUntilGone(pidFile: pidFile)
+    }
+
+    @Test("thousands of matching entries still answer present, quickly", arguments: [500, 3000])
+    func manyMatchingEntries(_ count: Int) async throws {
+        let directory = try TestFixtureDirectory.make(prefix: "px023-khn")
+        defer { TestFixtureDirectory.release(directory) }
+        let key = directory.appendingPathComponent("host_key").path
+        try SSHTestSupport.generateEd25519Key(at: key)
+        let line = try Self.entry("[127.0.0.1]:2222", key: key)
+        let knownHosts = directory.appendingPathComponent("known_hosts").path
+        // Past one 64 KiB pipe buffer of `ssh-keygen -F` output at 500 entries, far past at 3000.
+        try String(repeating: line, count: count).write(toFile: knownHosts, atomically: true, encoding: .utf8)
+        #expect(line.utf8.count * count > 64 * 1024)
+        let configuration = Self.configuration(port: 2222, knownHosts: knownHosts, directory: directory)
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        let outcome = await TestDeadline.race(.seconds(15)) {
+            await SSHKnownHostsLookup().hint(for: configuration)
+        }
+        #expect(outcome == .some(KnownHostsHint(name: "[127.0.0.1]:2222", presence: .present(file: knownHosts))))
+        #expect(clock.now - started < .seconds(3), "answered well before the 5 s deadline")
+    }
+}
+
+@Suite("Bounded child processes: drain, cap, deadline, SIGKILL (PX-023 round 6)", .serialized, .timeLimit(.minutes(1)))
+struct BoundedProcessTests {
+    private func run(_ path: String, _ arguments: [String], timeout: Duration = .seconds(5)) async -> BoundedProcess.Result?? {
+        await TestDeadline.race(.seconds(20)) {
+            await BoundedProcess.run(path, arguments, timeout: timeout)
+        }
+    }
+
+    @Test("output past one pipe buffer is drained while the child runs")
+    func drainsPastPipeBuffer() async {
+        let clock = ContinuousClock()
+        let started = clock.now
+        let outcome = await run("/usr/bin/head", ["-c", "102400", "/dev/zero"])
+        #expect(outcome??.status == 0)
+        #expect(outcome??.output.count == 102_400)
+        #expect(clock.now - started < .seconds(3), "not held until the deadline")
+    }
+
+    @Test("output exactly at the cap is kept; one byte more is refused at once")
+    func cap() async {
+        let cap = BoundedProcess.maximumOutputBytes
+        let at = await run("/usr/bin/head", ["-c", "\(cap)", "/dev/zero"])
+        #expect(at??.status == 0)
+        #expect(at??.output.count == cap)
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        let past = await run("/usr/bin/head", ["-c", "\(cap + 1)", "/dev/zero"])
+        #expect(past == .some(nil), "past the cap there is no result")
+        #expect(clock.now - started < .seconds(3), "the cap, not the deadline, ended it")
+    }
+}
+
+/// Races `operation` against a test-side deadline without awaiting the loser: if the code under
+/// test never resumes (a missing production deadline), the test fails in `limit` instead of
+/// hanging the runner (a `.timeLimit` cannot cancel a continuation that is never resumed).
+enum TestDeadline {
+    private final class Once: @unchecked Sendable {
+        private let lock = NSLock()
+        private var done = false
+        func claim() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if done { return false }
+            done = true
+            return true
+        }
+    }
+
+    /// `.some(value)` when `operation` finished first, `nil` when the deadline did.
+    static func race<T: Sendable>(_ limit: Duration, _ operation: @escaping @Sendable () async -> T) async -> T? {
+        await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
+            let once = Once()
+            Task.detached {
+                let value = await operation()
+                if once.claim() { continuation.resume(returning: .some(value)) }
+            }
+            Task.detached {
+                try? await Task.sleep(for: limit)
+                if once.claim() { continuation.resume(returning: nil) }
+            }
+        }
     }
 }
 

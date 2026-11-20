@@ -13,8 +13,11 @@
 //
 // - the files are the ones `ssh` itself would use, read from `ssh -G` with the same argv;
 // - each is searched with `ssh-keygen -F <name> -f <file>`, which handles hashed entries;
-// - both are argv launches (no shell), with stdin, stdout and stderr set before `run()`, bounded
-//   by a timeout, and awaited without blocking any thread on the main actor;
+// - both are argv launches (no shell), with stdin, stdout and stderr set before `run()`, each
+//   bounded by its own 5 s deadline (SIGTERM, then SIGKILL), `ssh -G`'s stdout drained while it
+//   runs and capped, and awaited without blocking any thread on the main actor. The worst case is
+//   5 s × (1 + the number of readable known_hosts files), which only the user's own ssh_config
+//   (a slow `Match exec`, many files) can approach;
 // - any failure, timeout or unparseable answer yields no hint at all.
 //
 // SRUI never adds, replaces or removes a host key, and never suggests a command that would.
@@ -74,15 +77,16 @@ public struct SSHKnownHostsLookup: KnownHostsLookup {
         guard let resolved = await BoundedProcess.run(
             configuration.sshBinaryPath, ["-G"] + configuration.buildArguments(), timeout: timeout
         ), resolved.status == 0,
-            let settings = Self.parseEffectiveConfiguration(resolved.output) else {
+            let settings = Self.parseEffectiveConfiguration(resolved.text) else {
             return nil
         }
         let name = settings.name
         var checked: [String] = []
         for file in settings.files where FileManager.default.isReadableFile(atPath: file) {
             checked.append(file)
+            // Exit status only: 0 found, 1 not found. Its stdout (the matching lines) is not needed.
             guard let search = await BoundedProcess.run(
-                sshKeygenPath, ["-F", name, "-f", file], timeout: timeout
+                sshKeygenPath, ["-F", name, "-f", file], timeout: timeout, captureOutput: false
             ) else {
                 return nil
             }
@@ -138,61 +142,158 @@ public struct SSHKnownHostsLookup: KnownHostsLookup {
 }
 
 /// Runs one program with an argument vector (never a shell), its stdin, stdout and stderr set
-/// before launch, and a deadline. Waits through the termination handler, so no thread runs a run
-/// loop for it; past the deadline the child is sent SIGTERM and the result is `nil`.
+/// before launch, and a deadline. No thread waits on a run loop: the exit arrives through the
+/// termination handler and stdout is drained on its own thread while the child runs (PX-023 round
+/// 6: read only at exit, a child writing more than one pipe buffer blocked until the deadline).
+///
+/// The result is `nil` (and the child is stopped) when it cannot be launched, outlives `timeout`,
+/// or writes more than `maximumOutputBytes`. Stopping sends SIGTERM to the child's exact PID, then
+/// SIGKILL to the same PID after `killGrace` if it has not exited, so a child that ignores SIGTERM
+/// cannot outlive the lookup.
 enum BoundedProcess {
     struct Result: Sendable, Equatable {
         let status: Int32
-        let output: String
+        let output: Data
+        var text: String { String(decoding: output, as: UTF8.self) }
     }
 
-    /// Output beyond this is not read; the lookups print a few kilobytes.
+    /// The most stdout read from one child; `ssh -G` prints a few kilobytes.
     static let maximumOutputBytes = 256 * 1024
+    /// How long a child gets between SIGTERM and SIGKILL.
+    static let killGrace: Duration = .milliseconds(500)
 
-    private final class Once: @unchecked Sendable {
+    /// Shared between the termination handler, the stdout drain and the deadline; every field is
+    /// read and written under `lock`, and the continuation is resumed exactly once.
+    private final class Run: @unchecked Sendable {
         private let lock = NSLock()
-        private var done = false
-        func claim() -> Bool {
+        private var continuation: CheckedContinuation<Result?, Never>?
+        private var status: Int32?
+        private var output = Data()
+        private var drained: Bool
+        private var exited = false
+
+        init(continuation: CheckedContinuation<Result?, Never>, drains: Bool) {
+            self.continuation = continuation
+            self.drained = drains == false
+        }
+
+        var hasExited: Bool {
             lock.lock()
             defer { lock.unlock() }
-            if done { return false }
-            done = true
-            return true
+            return exited
+        }
+
+        /// Appends drained bytes; false once the cap is exceeded.
+        func append(_ data: Data, cap: Int) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            output.append(data)
+            return output.count <= cap
+        }
+
+        func drainFinished() {
+            lock.lock()
+            drained = true
+            let ready = takeIfComplete()
+            lock.unlock()
+            ready?.0.resume(returning: ready?.1)
+        }
+
+        func exit(_ code: Int32) {
+            lock.lock()
+            exited = true
+            status = code
+            let ready = takeIfComplete()
+            lock.unlock()
+            ready?.0.resume(returning: ready?.1)
+        }
+
+        /// Ends the run with no result (deadline, cap or launch failure); true if this call did.
+        @discardableResult
+        func fail() -> Bool {
+            lock.lock()
+            let taken = continuation
+            continuation = nil
+            lock.unlock()
+            taken?.resume(returning: nil)
+            return taken != nil
+        }
+
+        private func takeIfComplete() -> (CheckedContinuation<Result?, Never>, Result)? {
+            guard drained, let status, let taken = continuation else { return nil }
+            continuation = nil
+            return (taken, Result(status: status, output: output))
         }
     }
 
-    static func run(_ path: String, _ arguments: [String], timeout: Duration) async -> Result? {
+    /// SIGTERM now, SIGKILL after `grace` unless the child has exited.
+    // lc-debt: Foundation reaps the child before calling the termination handler, so between that
+    // reap and `exit(_:)` recording it a SIGKILL could reach a recycled PID (a window of
+    // microseconds, after the child already ignored SIGTERM for `grace`); upgrade path: launch
+    // with posix_spawn and reap with our own waitpid so the PID stays ours until we have signalled.
+    private static func stop(_ process: Process, run: Run, grace: Duration) {
+        let pid = process.processIdentifier
+        guard pid > 0, run.hasExited == false else { return }
+        kill(pid, SIGTERM)
+        Task.detached {
+            try? await Task.sleep(for: grace)
+            if run.hasExited == false {
+                kill(pid, SIGKILL)
+            }
+        }
+    }
+
+    /// `captureOutput: false` sends stdout to /dev/null: `ssh-keygen -F` is read by exit status
+    /// only, so a file with thousands of matching entries costs nothing.
+    static func run(
+        _ path: String,
+        _ arguments: [String],
+        timeout: Duration,
+        captureOutput: Bool = true,
+        maximumOutputBytes: Int = maximumOutputBytes,
+        killGrace: Duration = killGrace
+    ) async -> Result? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
-        let pipe = Pipe()
         process.standardInput = FileHandle.nullDevice
-        process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
-        let reader = pipe.fileHandleForReading
-        let once = Once()
+        let pipe = captureOutput ? Pipe() : nil
+        process.standardOutput = pipe ?? FileHandle.nullDevice
 
         return await withCheckedContinuation { continuation in
+            let run = Run(continuation: continuation, drains: pipe != nil)
             process.terminationHandler = { finished in
-                guard once.claim() else { return }
-                let data = (try? reader.read(upToCount: maximumOutputBytes)) ?? nil
-                continuation.resume(returning: Result(
-                    status: finished.terminationStatus,
-                    output: String(decoding: data ?? Data(), as: UTF8.self)
-                ))
+                run.exit(finished.terminationStatus)
             }
             do {
                 try process.run()
             } catch {
                 process.terminationHandler = nil
-                if once.claim() { continuation.resume(returning: nil) }
+                run.fail()
                 return
+            }
+            if let reader = pipe?.fileHandleForReading {
+                // Its own thread, so a blocking read never occupies the cooperative pool. It ends
+                // at EOF, which the child's exit (or its SIGKILL) delivers.
+                let drain = Thread {
+                    while true {
+                        guard let chunk = try? reader.read(upToCount: 64 * 1024), chunk.isEmpty == false else {
+                            break
+                        }
+                        if run.append(chunk, cap: maximumOutputBytes) == false {
+                            if run.fail() { stop(process, run: run, grace: killGrace) }
+                            break
+                        }
+                    }
+                    run.drainFinished()
+                }
+                drain.name = "org.srui.ConnectionManager.BoundedProcess.stdout"
+                drain.start()
             }
             Task.detached {
                 try? await Task.sleep(for: timeout)
-                guard once.claim() else { return }
-                process.terminate()
-                continuation.resume(returning: nil)
+                if run.fail() { stop(process, run: run, grace: killGrace) }
             }
         }
     }

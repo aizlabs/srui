@@ -34,10 +34,11 @@ struct SSHTransportPostureTests {
         #expect(args.contains("StrictHostKeyChecking=yes"), "Expected StrictHostKeyChecking=yes (§19.1)")
 
         // §19.1 / PX-023: ssh's stderr holds only ssh's own errors, never a server's banner
-        if let index = args.firstIndex(of: "LogLevel=ERROR") {
+        // pinned to INFO (round 4), so ssh's own last line ends every peer-initiated failure
+        if let index = args.firstIndex(of: "LogLevel=INFO") {
             #expect(args[index - 1] == "-o")
         } else {
-            Issue.record("Expected -o LogLevel=ERROR (PX-023)")
+            Issue.record("Expected -o LogLevel=INFO (PX-023)")
         }
 
         // §19.1 Rule 6: Fixed subsystem request, not a shell command string
@@ -137,15 +138,134 @@ struct SSHTransportPostureTests {
         #expect(!args.contains("ForwardAgent=yes"))
         #expect(!args.contains("LocalForward=8080:127.0.0.1:80"))
         #expect(!args.contains("LogLevel=DEBUG3"))
-        #expect(args.filter { $0.hasPrefix("LogLevel=") } == ["LogLevel=ERROR"])
+        #expect(args.filter { $0.hasPrefix("LogLevel=") } == ["LogLevel=INFO"])
         #expect(args.contains("Compression=no"))
 
         if let strictIdx = args.firstIndex(of: "StrictHostKeyChecking=yes") {
             if let compressionIdx = args.firstIndex(of: "Compression=no") {
-                #expect(strictIdx > compressionIdx, "Posture flags must follow filtered extraOptions")
+                // PX-023 round 4: OpenSSH keeps the first value, so posture comes first.
+                #expect(strictIdx < compressionIdx, "Posture flags must precede filtered extraOptions")
             }
         } else {
             Issue.record("Missing StrictHostKeyChecking=yes")
         }
+    }
+
+    /// Every case spelling of every blocked key, plus non-blocked keys the posture also sets.
+    static let hostileExtraOptions: [String: String] = [
+        "stricthostkeychecking": "no",
+        "STRICTHOSTKEYCHECKING": "no",
+        "loglevel": "DEBUG3",
+        "LOGLEVEL": "QUIET",
+        "logLevel": "ERROR",
+        "forwardagent": "yes",
+        "ProxyCommand": "/usr/bin/false",
+        "proxycommand": "/usr/bin/false",
+        "clearallforwardings": "no",
+        "exitonforwardfailure": "no",
+        "permitlocalcommand": "yes",
+        "localforward": "8080:127.0.0.1:80",
+        "BatchMode": "no",
+        "batchmode": "no",
+        "UserKnownHostsFile": "/tmp/px023-hostile-known-hosts",
+        "IdentitiesOnly": "no",
+        "ConnectTimeout": "999",
+        "Compression": "yes",
+    ]
+
+    static let hostileConfiguration = SSHConfiguration(
+        host: "127.0.0.1", port: 2222, user: "alice", subsystem: "srui",
+        identityFile: "/tmp/px023-id", knownHostsFile: "/tmp/px023-known-hosts",
+        strictHostKeyChecking: .yes, batchMode: true, connectTimeout: 5,
+        extraOptions: hostileExtraOptions)
+
+    @Test("blocked keys are dropped in any case, and every posture option precedes every extra option")
+    func blockedKeysAnyCaseAndPostureFirst() {
+        let args = Self.hostileConfiguration.buildArguments()
+        let options = args.indices.filter { $0 > 0 && args[$0 - 1] == "-o" }.map { args[$0] }
+        let lowered = options.map { $0.lowercased() }
+        for key in SSHConfiguration.blockedExtraOptionKeys {
+            let prefix = key.lowercased() + "="
+            let posture = lowered.filter { $0.hasPrefix(prefix) }
+            #expect(posture.count <= 1, "\(key) appears \(posture.count) times: \(options)")
+        }
+        #expect(options.contains("LogLevel=INFO"))
+        #expect(lowered.filter { $0.hasPrefix("loglevel=") } == ["loglevel=info"])
+        #expect(lowered.filter { $0.hasPrefix("stricthostkeychecking=") } == ["stricthostkeychecking=yes"])
+        #expect(lowered.contains { $0.hasPrefix("proxycommand=") } == false)
+        #expect(lowered.contains { $0.hasPrefix("forwardagent=") } == false)
+        // OpenSSH keeps the first value: every posture option comes before the first extra.
+        let firstExtra = try? #require(options.firstIndex(of: "Compression=yes"))
+        for posture in ["ClearAllForwardings=yes", "ExitOnForwardFailure=yes", "StrictHostKeyChecking=yes",
+                        "LogLevel=INFO", "UserKnownHostsFile=/tmp/px023-known-hosts", "BatchMode=yes",
+                        "ConnectTimeout=5", "IdentitiesOnly=yes"] {
+            let index = options.firstIndex(of: posture)
+            #expect(index != nil, "missing \(posture)")
+            if let index, let firstExtra {
+                #expect(index < firstExtra, "\(posture) must precede the extra options")
+            }
+            #expect(options.firstIndex { $0.lowercased().hasPrefix(posture.split(separator: "=")[0].lowercased() + "=") } == index,
+                    "\(posture) must be the first value for its key")
+        }
+    }
+
+    /// `ssh -G` prints the configuration `ssh` would use, without connecting. Run with a hostile
+    /// `-F` config too, standing in for the user's `~/.ssh/config`.
+    private static func effectiveConfiguration(_ args: [String], configFile: String) async throws -> [String: String] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        // `-G` before the posture; the trailing `-s -- host srui` is ignored by -G.
+        process.arguments = ["-G", "-F", configFile] + args
+        let pipe = Pipe()
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        let reader = pipe.fileHandleForReading
+        let output: String = try await withCheckedThrowingContinuation { continuation in
+            process.terminationHandler = { _ in
+                continuation.resume(returning: String(decoding: reader.readDataToEndOfFile(), as: UTF8.self))
+            }
+            do { try process.run() } catch {
+                process.terminationHandler = nil
+                continuation.resume(throwing: error)
+            }
+        }
+        var values: [String: String] = [:]
+        for line in output.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
+            if parts.count == 2, values[parts[0]] == nil { values[parts[0]] = parts[1] }
+        }
+        return values
+    }
+
+    @Test("ssh -G: no extra option and no ssh_config can override the posture")
+    func sshEffectiveConfigurationKeepsPosture() async throws {
+        let directory = try TestFixtureDirectory.make(prefix: "px023-sshG")
+        defer { TestFixtureDirectory.release(directory) }
+        let config = directory.appendingPathComponent("hostile_config")
+        try """
+        Host *
+            StrictHostKeyChecking no
+            LogLevel QUIET
+            BatchMode no
+            ForwardAgent yes
+            ClearAllForwardings no
+            UserKnownHostsFile /tmp/px023-hostile-config-known-hosts
+            IdentitiesOnly no
+        """.write(to: config, atomically: true, encoding: .utf8)
+
+        let effective = try await Self.effectiveConfiguration(
+            Self.hostileConfiguration.buildArguments(), configFile: config.path)
+        #expect(effective["stricthostkeychecking"] == "true", "\(effective)")
+        #expect(effective["loglevel"] == "INFO")
+        #expect(effective["batchmode"] == "yes")
+        #expect(effective["forwardagent"] == "no")
+        #expect(effective["clearallforwardings"] == "yes")
+        #expect(effective["exitonforwardfailure"] == "yes")
+        #expect(effective["identitiesonly"] == "yes")
+        #expect(effective["userknownhostsfile"] == "/tmp/px023-known-hosts")
+        #expect(effective["connecttimeout"] == "5")
+        #expect(effective["proxycommand"] == nil || effective["proxycommand"] == "none")
+        #expect(effective["compression"] == "yes", "a harmless extra option still applies")
     }
 }

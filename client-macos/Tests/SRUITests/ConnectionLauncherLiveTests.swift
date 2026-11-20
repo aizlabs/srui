@@ -18,20 +18,20 @@ import Testing
 import TransportSSH
 
 @MainActor
-private final class LauncherProbe {
+final class LauncherProbe {
     private(set) var requests: [ConnectionAttemptRequest] = []
 
     /// The production path with only the test's key and known_hosts file substituted: the request's
     /// configuration is what `ConnectionManager` built, and it must be the manager's one
     /// configuration for that entry, whatever app serves the subsystem.
-    func make(identityFile: String, knownHostsFile: String) -> ConnectionAttemptFactory {
+    func make(identityFile: String, knownHostsFile: String, connectTimeout: TimeInterval = 10) -> ConnectionAttemptFactory {
         { [self] request in
             requests.append(request)
             #expect(request.configuration == ConnectionManager.sshConfiguration(for: request.connection))
             var configuration = request.configuration
             configuration.identityFile = identityFile
             configuration.knownHostsFile = knownHostsFile
-            configuration.connectTimeout = 10
+            configuration.connectTimeout = connectTimeout
             return ConnectionManager.makeSessionControllerAttempt(
                 request: request,
                 transport: SSHTransport(configuration: configuration)
@@ -160,8 +160,11 @@ struct LiveSSHD: @unchecked Sendable {
 
     /// A server-authored banner, sent before authentication, shaped exactly like OpenSSH's own
     /// changed-key refusal for this port, last line included.
+    static let bannerMarker = "PX023 hostile banner marker"
+
     static func hostileBannerText(port: UInt16) -> String {
         """
+        \(bannerMarker)
         @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
         @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
         @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
@@ -336,19 +339,29 @@ struct ConnectionLauncherLiveTests {
     }
 
     enum BannerCase: String, Sendable, CaseIterable {
-        /// The key is trusted, the client's key is not authorized: `ssh` exits 255 with
-        /// "Permission denied", after the banner.
+        /// The key is trusted, the client's key is not authorized: the banner is printed, then
+        /// `ssh` ends with its own "Permission denied (…)." line.
         case authenticationFails
         /// The key is trusted and authentication succeeds; the subsystem exits 255 silently, so
-        /// the banner would be the last thing on `ssh`'s stderr if it were printed.
+        /// the banner is the last thing on `ssh`'s stderr: the documented residual.
         case subsystemExits255
+        /// known_hosts has no key for the server: key exchange never completes, so the banner,
+        /// a userauth message, is never sent.
+        case unknownKey
+        /// known_hosts holds another key for the server: the same.
+        case changedKey
     }
 
-    @Test("a trusted server's hostile pre-auth Banner never raises the host-key alert",
+    @Test("a server's hostile Banner never raises the host-key alert for a trusted key it cannot reach past",
           arguments: BannerCase.allCases)
-    func hostileBannerIsNotAHostKeyRejection(_ bannerCase: BannerCase) async throws {
+    func hostileBanner(_ bannerCase: BannerCase) async throws {
+        let mode: LiveSSHD.KnownHosts = switch bannerCase {
+        case .authenticationFails, .subsystemExits255: .trusted
+        case .unknownKey: .empty
+        case .changedKey: .spoofed
+        }
         let live = try await LiveSSHD.launch(
-            prefix: "px023-banner", knownHosts: .trusted, app: nil,
+            prefix: "px023-banner", knownHosts: mode, app: nil,
             hostileBanner: true, subsystemExits255: bannerCase == .subsystemExits255)
         defer { live.shutDownOffMainActor() }
         let (store, storeDirectory) = temporaryStore()
@@ -364,25 +377,45 @@ struct ConnectionLauncherLiveTests {
         let manager = ConnectionManager(
             store: store, attemptFactory: probe.make(identityFile: identity, knownHostsFile: live.knownHosts))
         #expect(manager.connect(ConnectDraft(host: "127.0.0.1:\(live.port)", user: NSUserName())) != nil)
-        // The banner is suppressed by the posture, not merely ignored by the classifier.
         let request = try #require(probe.requests.first)
-        #expect(request.configuration.buildArguments().contains("LogLevel=ERROR"))
+        #expect(request.configuration.buildArguments().contains("LogLevel=INFO"))
 
         try await AsyncTestSupport.observed("connection alert") { manager.alert != nil }
         let alert = try #require(manager.alert)
-        #expect(alert.kind == .connectionFailed, "\(alert.kind): \(alert.message)")
-        #expect(alert.title == "Connection Failed")
-        #expect(alert.message.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") == false, "\(alert.message)")
-        #expect(alert.message.contains("ssh-keygen") == false)
-        if bannerCase == .authenticationFails {
-            #expect(alert.message.contains("Permission denied"), "\(alert.message)")
-        }
         Self.recordEvidence(alert, name: "banner-\(bannerCase.rawValue)")
+        switch bannerCase {
+        case .authenticationFails:
+            // At INFO the banner is printed, but ssh's own line ends the stream.
+            #expect(alert.kind == .connectionFailed, "\(alert.kind): \(alert.message)")
+            #expect(alert.title == "Connection Failed")
+            #expect(alert.message.contains("ssh-keygen") == false)
+            #expect(Self.lastLine(alert.message).hasSuffix("Permission denied (publickey,password,keyboard-interactive)."),
+                    "\(alert.message)")
+        case .unknownKey, .changedKey:
+            // Protocol order: the banner follows key exchange, which a refused key never
+            // completes, so ssh's real verdict is classified and the banner is nowhere in it.
+            #expect(alert.kind == .hostKeyRejected, "\(alert.kind): \(alert.message)")
+            #expect(alert.message.contains(LiveSSHD.bannerMarker) == false, "\(alert.message)")
+        case .subsystemExits255:
+            // The documented residual (PX-023 round 4): a trusted server the user authenticated
+            // to sends the banner, then its subsystem exits 255 without a byte or a word. At
+            // INFO nothing of ssh's own follows the banner, so its last line can be the verdict.
+            // Only safety is asserted: nothing connected and nothing was trusted. Which alert
+            // appears is recorded in the evidence, not pinned.
+            #expect(manager.status(for: request.connection.id) != .connected)
+        }
+        #expect(manager.entries.isEmpty, "a failed first connection is forgotten")
         #expect(try Data(contentsOf: URL(fileURLWithPath: live.knownHosts)) == knownHostsBefore)
         await manager.shutdown()
     }
 
-    @Test("LogLevel=ERROR keeps ssh's own connection diagnostics: a refused connection says so")
+    static func lastLine(_ text: String) -> String {
+        text.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .last { $0.isEmpty == false } ?? ""
+    }
+
+    @Test("ssh's own connection diagnostics reach the alert: a refused connection says so")
     func connectionRefusedKeepsItsDiagnostic() async throws {
         let (store, storeDirectory) = temporaryStore()
         defer { try? FileManager.default.removeItem(at: storeDirectory) }

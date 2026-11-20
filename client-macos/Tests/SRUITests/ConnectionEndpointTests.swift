@@ -53,7 +53,7 @@ private let posturePrefix = [
     "-o", "ClearAllForwardings=yes",
     "-o", "ExitOnForwardFailure=yes",
     "-o", "StrictHostKeyChecking=yes",
-    "-o", "LogLevel=ERROR",
+    "-o", "LogLevel=INFO",
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=30",
 ]
@@ -588,6 +588,71 @@ struct HostKeyRejectionTests {
         + "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
         + "Host key for [127.0.0.1]:2222 has changed and you have requested strict checking.\n"
         + "Host key verification failed."
+
+    /// Real `ssh` 10.2p1 stderr at the pinned `LogLevel=INFO`, byte for byte
+    /// (`impl4-probe-banner-order.log`, `impl4-probe-disconnect-info-cli.log`): OpenSSH ends its
+    /// own log lines with CR LF.
+    static let realUnknownINFO = "No ED25519 host key is known for [127.0.0.1]:65032 and you have requested strict checking.\r\n"
+        + "Host key verification failed.\r\n"
+    static let realChangedINFO = "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n"
+        + "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\r\n"
+        + "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n"
+        + "IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!\r\n"
+        + "Someone could be eavesdropping on you right now (man-in-the-middle attack)!\r\n"
+        + "It is also possible that a host key has just been changed.\r\n"
+        + "The fingerprint for the ED25519 key sent by the remote host is\n"
+        + "SHA256:oHpGto54u3Xb6V5LfeN9Jbd8OjflWsjFzMwpVE/+1Bc.\r\n"
+        + "Please contact your system administrator.\r\n"
+        + "Add correct host key in /tmp/px023e.Gjo2ZY/kh_changed to get rid of this message.\r\n"
+        + "Offending ED25519 key in /tmp/px023e.Gjo2ZY/kh_changed:1\r\n"
+        + "Host key for [127.0.0.1]:65032 has changed and you have requested strict checking.\r\n"
+        + "Host key verification failed.\r\n"
+    /// A peer's DISCONNECT whose reason imitates the unknown-key verdict, at INFO (round 4)...
+    static let realDisconnectUnknownINFO = "Received disconnect from 127.0.0.1 port 64665:2: x\n"
+        + "No ED25519 host key is known for [127.0.0.1]:2222 and you have requested strict checking.\n"
+        + "Host key verification failed.\r\n"
+        + "Disconnected from 127.0.0.1 port 64665\r\n"
+    /// ...and the same at round 3's `LogLevel=ERROR`, where "Disconnected from …" was hidden and
+    /// the reason's verdict line ended stderr (`verify3-probe-disconnect-cli.log`).
+    static let realDisconnectUnknownERROR = "Warning: Identity file /tmp/absent_key not accessible: No such file or directory.\n"
+        + "Received disconnect from 127.0.0.1 port 61656:2: x\n"
+        + "No ED25519 host key is known for [127.0.0.1]:2222 and you have requested strict checking.\n"
+        + "Host key verification failed.\r\n"
+    static let realDisconnectChangedERROR = "Received disconnect from 127.0.0.1 port 61658:2: x\n"
+        + "Host key for [127.0.0.1]:2222 has changed and you have requested strict checking.\n"
+        + "Host key verification failed.\r\n"
+    static let realDisconnectCRLFERROR = "Received disconnect from 127.0.0.1 port 61660:2: x\r\n"
+        + "Host key verification failed.\r\n  \r\n"
+
+    @Test("real ssh transcripts: real refusals classify, a peer's DISCONNECT never does")
+    func realTranscripts() {
+        #expect(HostKeyRejection(sshMessage: Self.realUnknownINFO) == .unknown)
+        #expect(HostKeyRejection(sshMessage: Self.realChangedINFO) == .changed)
+        #expect(HostKeyRejection(sshMessage: Self.realDisconnectUnknownINFO) == nil)
+        // Round 3's hole, closed by the "Received disconnect from " exclusion even if the
+        // "Disconnected from …" line were ever missing again.
+        #expect(HostKeyRejection(sshMessage: Self.realDisconnectUnknownERROR) == nil)
+        #expect(HostKeyRejection(sshMessage: Self.realDisconnectChangedERROR) == nil)
+        #expect(HostKeyRejection(sshMessage: Self.realDisconnectCRLFERROR) == nil)
+    }
+
+    @Test("the kind is read only from the line just before the verdict, after trimming")
+    func kindAndTrimming() {
+        // A kind line anywhere else does not name the kind.
+        #expect(HostKeyRejection(sshMessage: """
+        Host key for [h]:22 has changed and you have requested strict checking.
+        Update the SSHFP RR in DNS with the new host key to get rid of this message.
+        Host key verification failed.
+        """) == .unverified)
+        #expect(HostKeyRejection(sshMessage: """
+        No ED25519 host key is known for h and you have requested strict checking.
+        Please contact your system administrator.
+        Host key verification failed.
+        """) == .unverified)
+        // Surrounding spaces and a trailing blank line are not part of ssh's line.
+        #expect(HostKeyRejection(sshMessage: "  Host key verification failed.   ") == .unverified)
+        #expect(HostKeyRejection(sshMessage: Self.realUnknownINFO + "   \n\t\n") == .unknown)
+    }
 
     @Test("OpenSSH's failures are classified, and other failures are not host-key failures")
     func classification() {

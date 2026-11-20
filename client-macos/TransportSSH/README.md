@@ -135,8 +135,13 @@ Every connection uses the same configuration whatever app serves `srui` (counter
 unknown or changed host key stops the attempt with a **Host Key Not Trusted** alert that says which
 it was and how to check the key. Only `ssh`'s own verdict raises it: its stderr when it exited 255
 before any SRUI byte arrived (`SSHTransport.localFailureBeforeStream()`), with the verdict as its
-last line, never text a server sent. Every `ssh` runs with `-o LogLevel=ERROR` (not overridable through
-`extraOptions`), so a server's pre-authentication `Banner` never reaches that stderr; SRUI never adds or replaces a host key and offers no way to connect
+last line and no `Received disconnect from` line (a server's disconnect reason) anywhere in it. Every
+`ssh` runs with `-o LogLevel=INFO` pinned and emitted before any `extraOptions` (OpenSSH keeps the
+first value; blocked keys are dropped in any case), so `ssh` always ends a peer-initiated failure
+with a line of its own ("Disconnected from …", "Connection closed by …") that the alert shows, and
+a server whose key is not trusted never gets to send a `Banner`. One residual: a trusted server
+you authenticated to can send a banner and then exit 255 silently, which can show this alert for
+a key that is in fact trusted (it never connects). SRUI never adds or replaces a host key and offers no way to connect
 anyway. Record a new key by connecting once with `ssh` in Terminal after checking its fingerprint.
 
 **From the command line.** Launch `RendererDemoApp` over SSH (defaults: `BatchMode=yes`, 30s

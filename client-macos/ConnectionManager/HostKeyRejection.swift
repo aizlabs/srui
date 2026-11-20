@@ -26,21 +26,35 @@ enum HostKeyRejection: Equatable, Sendable {
     /// The line OpenSSH's `fatal()` ends every host-key refusal with (`sshconnect2.c`).
     static let verdictLine = "Host key verification failed."
 
+    /// The prefix `ssh` writes itself, at ERROR, before a server's `SSH_MSG_DISCONNECT` reason.
+    /// The reason is server text, newlines included, and needs no host key and no authentication.
+    static let disconnectPrefix = "Received disconnect from "
+
     /// Classifies OpenSSH's own diagnostics (`sshconnect.c`), or returns `nil` when the failure
     /// was not a host-key failure.
     ///
-    /// Structural, not a phrase search (PX-023 round 3). `ssh` runs with `LogLevel=ERROR`, so its
-    /// stderr holds no server `Banner`; but a server's `SSH_MSG_DISCONNECT` reason is still logged
-    /// at ERROR ("Received disconnect from …: <text>"), and an authenticated subsystem's own stderr
-    /// shares the stream. So the verdict must be the **last** line, which only `ssh`'s fatal exit
-    /// writes (a disconnect is followed by "Disconnected from …", an authentication failure by
-    /// "Permission denied …"), and the kind is read from the line OpenSSH writes just before it.
+    /// Structural, not a phrase search. `ssh` runs with `LogLevel=INFO` pinned
+    /// (`SSHConfiguration`), and at INFO every failure a peer can cause ends with a line `ssh`
+    /// writes itself: "Disconnected from …" after a server's disconnect, "Connection closed by …"
+    /// after a TCP close, "… Permission denied (…)." after an authentication failure. So:
+    /// - the verdict must be the **last** line, exactly "Host key verification failed.", which only
+    ///   `ssh`'s fatal host-key exit writes last;
+    /// - nothing is classified if any line starts with `ssh`'s own "Received disconnect from "
+    ///   prefix: everything after it on that line, and any lines its reason spans, are the
+    ///   server's (PX-023 round 4: at round 3's `LogLevel=ERROR` the "Disconnected from …" line
+    ///   was hidden, and a reason ending with the verdict became the last line);
+    /// - the kind is read only from the line OpenSSH writes just before the verdict.
+    /// A server's userauth `Banner` is sent only after key exchange, which a refused host key
+    /// never completes, so a banner can precede only a connection whose key was trusted.
     init?(sshMessage message: String) {
         let lines = message
             .split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { $0.isEmpty == false }
-        guard lines.last == Self.verdictLine else { return nil }
+        guard lines.last == Self.verdictLine,
+              lines.contains(where: { $0.hasPrefix(Self.disconnectPrefix) }) == false else {
+            return nil
+        }
         let reason = lines.count >= 2 ? lines[lines.count - 2] : ""
         if reason.hasPrefix("No "),
            reason.contains(" host key is known for "),

@@ -3106,14 +3106,23 @@ struct ProcessExplorerShellTests {
             store: SavedConnectionStore(url: harness.temp.appendingPathComponent("connections.json")),
             attemptFactory: { request in
                 let generation = recorder.adopt(request.context)
+                let holdsHandshake = recorder.holdsHandshake(of: generation)
                 return RecordingConnectionAttempt(
                     inner: ConnectionManager.makeSessionControllerAttempt(
-                        request: request, transport: SSHTransport(configuration: configuration)),
+                        request: request, transport: SSHTransport(configuration: configuration),
+                        configureController: { controller in
+                            // The controller's own seam, after its handshake is on the wire and
+                            // before its receive loop exists: nothing the server answers can be
+                            // read, let alone applied, until the test releases it.
+                            guard holdsHandshake else { return }
+                            controller.handshakeSendDidFinishForTesting = { await recorder.waitAtHandshake() }
+                        }),
                     generation: generation, recorder: recorder)
             })
         var managerShutDown = false
         defer {
             // A failed expectation must not leave a session window on screen.
+            recorder.releaseHandshake()
             recorder.releaseReady()
             recorder.closeWindows()
             if !managerShutDown { Task { @MainActor in await manager.shutdown() } }
@@ -3293,7 +3302,10 @@ struct ProcessExplorerShellTests {
 
         // Resynchronized: the restarted instance retains one commit, so a client detached for
         // several gets a snapshot of the same incarnation. Two overlapping reconnects race; only
-        // the newer one's outcome reaches the window.
+        // the newer one's outcome reaches the window. The overlap is made, not hoped for: the first
+        // attempt is held after its CLIENT_RESUME is sent and before its receive loop starts, so it
+        // cannot apply its snapshot (which would let the newer one resume from it with RESUME_OK)
+        // until the newer one holds its own, and its late outcome then has a window to disturb.
         try table().selectRowIndexes(IndexSet(integer: try #require(row("4101"))), byExtendingSelection: false)
         try await waitFor("the inspector on 4101 again") {
             text(Self.inspectorLineIDs[0]).hasPrefix("Selected process: PID 4101 · worker")
@@ -3306,17 +3318,34 @@ struct ProcessExplorerShellTests {
         let resyncFrom = try applier().lastAppliedRevision.value
         try type("4101", into: Self.pidSetInputID)
         try await Task.sleep(for: .seconds(1))
+        recorder.holdHandshake(of: 5)
         manager.connect(id: connection)
-        try await waitFor("the first attempt connecting") { recorder.events(of: 5).contains("connecting") }
+        try await waitFor("the first attempt, held with its resume sent") { recorder.isHoldingHandshake }
+        #expect(recorder.events(of: 5) == ["connecting"])
+        #expect(try applier().lastAppliedRevision.value == resyncFrom, "the held attempt has applied nothing")
         let racedFrom = recorder.subtitles.count
         recorder.holdReady(of: 6)
         manager.connect(id: connection)
         try await waitFor("the newer attempt's snapshot, held at ready") {
             recorder.isHoldingReady && recorder.events(of: 6).contains("resynchronizing")
         }
+        #expect(recorder.isHoldingHandshake, "the first attempt was still held throughout")
+        #expect(recorder.events(of: 5) == ["connecting"])
         #expect(recorder.events(of: 6) == ["connecting", "resynchronizing", "ready"])
         #expect(window()?.subtitle == stale("resynchronizing", resyncFrom))
         record("same-session resync before ready")
+        // The superseded attempt is released while the newer one is still mid-decision, free to
+        // read whatever its server answered, and runs to its end: none of it reaches the window,
+        // the status or the replica.
+        let newerSnapshot = try applier().lastAppliedRevision.value
+        recorder.releaseHandshake()
+        try await waitFor("the superseded attempt ended") { recorder.hasEnded(5) }
+        record("superseded attempt ended (events \(recorder.events(of: 5)))")
+        #expect(!recorder.events(of: 5).contains("ready"), "the superseded attempt never became ready")
+        #expect(status() == .resynchronizing && window()?.subtitle == stale("resynchronizing", resyncFrom))
+        #expect(try applier().lastAppliedRevision.value >= newerSnapshot,
+                "the superseded attempt's snapshot never rolled the replica back")
+        #expect(manager.entries.first?.sessionID == replacement)
         recorder.releaseReady()
         try await waitFor("resynchronized") { status() == .connected && window()?.subtitle == "" }
         try await Task.sleep(for: .milliseconds(600))
@@ -4390,6 +4419,9 @@ fileprivate final class ContinuityRecorder {
     private var generation = 0
     private var heldGeneration: Int?
     private var held: [CheckedContinuation<Void, Never>] = []
+    private var handshakeGeneration: Int?
+    private var heldHandshakes: [CheckedContinuation<Void, Never>] = []
+    private var endedGenerations: Set<Int> = []
     private var windows: [NSWindow] = []
     private var observations: [NSKeyValueObservation] = []
 
@@ -4416,6 +4448,32 @@ fileprivate final class ContinuityRecorder {
         held.removeAll()
         for continuation in waiting { continuation.resume() }
     }
+
+    /// Makes `generation`'s controller wait, once its handshake is sent and before its receive
+    /// loop starts, until `releaseHandshake()`. Read by the attempt factory when it builds that
+    /// generation's controller, so it is set before the `connect` that mints it.
+    func holdHandshake(of generation: Int) { handshakeGeneration = generation }
+
+    func holdsHandshake(of generation: Int) -> Bool { handshakeGeneration == generation }
+
+    var isHoldingHandshake: Bool { !heldHandshakes.isEmpty }
+
+    /// The held controller's `handshakeSendDidFinishForTesting`.
+    func waitAtHandshake() async {
+        await withCheckedContinuation { heldHandshakes.append($0) }
+    }
+
+    func releaseHandshake() {
+        handshakeGeneration = nil
+        let waiting = heldHandshakes
+        heldHandshakes.removeAll()
+        for continuation in waiting { continuation.resume() }
+    }
+
+    /// Called once `generation`'s attempt has stopped: its controller can do nothing more.
+    func ended(_ generation: Int) { endedGenerations.insert(generation) }
+
+    func hasEnded(_ generation: Int) -> Bool { endedGenerations.contains(generation) }
 
     func record(_ event: ConnectionAttemptEvent, generation: Int) async {
         let name: String
@@ -4497,5 +4555,6 @@ fileprivate actor RecordingConnectionAttempt: ConnectionAttempt {
         await inner.stop()
         await forwarding?.value
         continuation.finish()
+        await recorder.ended(generation)
     }
 }

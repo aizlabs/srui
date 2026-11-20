@@ -19,6 +19,9 @@
 //! * After a real restart the new instance answers
 //!   `RESYNC_REQUIRED{REPLACED}` under a new token with frontier 0, and its
 //!   snapshot inherits no selection, tag or last-seen record of the old one.
+//! * The window is exact: with `--journal-capacity N`, and with the runtime
+//!   default when the flag is absent, exactly N missed commits replay and
+//!   N + 1 resynchronize the same session.
 //! * A retention window that cannot retain anything is refused at start.
 //!
 //! The client here is a minimal replica over the instance's private socket;
@@ -34,7 +37,7 @@ use srui_protocol::{
 };
 use srui_sdk::{ItemId, NodeId, PropertyRef, Value, COLUMNS, TEXT};
 use srui_semantic_tree::{Event as DomainEvent, ResyncSnapshot, SemanticStore};
-use srui_sessiond::CORE_VERSION;
+use srui_sessiond::{SessionConfig, CORE_VERSION};
 use std::{
     fs,
     io::{Read, Write},
@@ -353,8 +356,10 @@ impl Client {
     }
 
     /// Sends one event and waits for its terminal acknowledgement; a
-    /// processed event advances the acknowledged frontier.
-    fn settle(&mut self, event: DomainEvent) {
+    /// processed event advances the acknowledged frontier. Returns the
+    /// revision the event's effects reached (`revision_after_effect`); the
+    /// commits up to it may still be on their way.
+    fn settle(&mut self, event: DomainEvent) -> u64 {
         self.next_seq += 1;
         self.send(&SruiMessage {
             msg: Some(Msg::Event(
@@ -371,12 +376,12 @@ impl Client {
                     "not processed: {ack:?}"
                 );
                 self.last_acked = ack.last_processed_event_seq;
-                return;
+                return ack.revision_after_effect;
             }
         }
     }
 
-    fn select(&mut self, item: ItemId) {
+    fn select(&mut self, item: ItemId) -> u64 {
         let seq = self.next_seq;
         let observed = self.revision();
         self.settle(DomainEvent::selection_changed(
@@ -385,10 +390,10 @@ impl Client {
             observed,
             TABLE,
             item,
-        ));
+        ))
     }
 
-    fn click(&mut self, node: NodeId) {
+    fn click(&mut self, node: NodeId) -> u64 {
         let seq = self.next_seq;
         let observed = self.revision();
         self.settle(DomainEvent::activate(
@@ -396,7 +401,7 @@ impl Client {
             format!("px022-click-{seq}"),
             observed,
             node,
-        ));
+        ))
     }
 
     fn text(&self, node: NodeId) -> String {
@@ -596,6 +601,124 @@ fn a_reconnect_outside_retention_resynchronizes_the_same_session_with_the_same_i
     client.until("a commit after the snapshot", |client| {
         client.revision() > resynced_at
     });
+}
+
+/// Slower than any test: after its first sample the instance publishes
+/// nothing on its own, so the only commits are the ones a test causes.
+const QUIET_INTERVAL_MS: &str = "300000";
+
+/// Detaches a client from an instance started with `capacity` (the runtime
+/// default when `None`), lets exactly `missed` commits happen, one tag toggle
+/// each by a second client, and resumes. A replay must be exactly those
+/// commits from the client's own revision; a resync's snapshot must be at
+/// exactly the revision they reached. Returns `None` for a replay, else the
+/// resync's continuity.
+fn continuity_after_exactly(capacity: Option<&str>, missed: u64) -> Option<SessionContinuity> {
+    let directory = SocketDirectory::new();
+    let socket = directory.socket();
+    let mut options = vec![
+        "--fake-sequence",
+        "--refresh-interval-ms",
+        QUIET_INTERVAL_MS,
+    ];
+    if let Some(capacity) = capacity {
+        options.extend(["--journal-capacity", capacity]);
+    }
+    let _server = Server::start(&socket, &options);
+    let mut client = Client::hello(&socket);
+    let mut observer = Client::hello_as(&socket, b"px022-bound-observer");
+    observer.until("the steady process", |observer| {
+        observer.item_of(STEADY_PID).is_some()
+    });
+    let item = observer.item_of(STEADY_PID).unwrap();
+    // The sampler is quiet, so every commit is an event's effect. A selection
+    // commits its inspector line and then, once its details are read off the
+    // event path, the line without "loading details".
+    observer.select(item);
+    let inspected = format!("Selected process: PID {STEADY_PID} · worker");
+    observer.until("the selected process's details", |observer| {
+        observer.text(INSPECTOR_STATUS) == inspected
+    });
+    let detached_at = observer.revision();
+    client.until("the observer's revision", |client| {
+        client.revision() >= detached_at
+    });
+    assert_eq!(client.revision(), detached_at, "nothing commits on its own");
+    client.lose_transport();
+    let mut reached = detached_at;
+    for _ in 0..missed {
+        let after = observer.click(TAG_TOGGLE);
+        assert_eq!(after, reached + 1, "one toggle, one commit");
+        reached = after;
+        observer.until("the toggle's commit", |observer| {
+            observer.revision() >= after
+        });
+    }
+    assert_eq!(reached, detached_at + missed);
+    assert_eq!(observer.revision(), reached, "nothing commits on its own");
+
+    let continuity = match client.resume(&socket) {
+        Decision::ResumeOk { replay_from } => {
+            assert_eq!(
+                replay_from, detached_at,
+                "replay from the client's revision"
+            );
+            client.until("the replay", |client| client.revision() >= reached);
+            let expected: Vec<(u64, u64)> = (detached_at..reached)
+                .map(|base| (base, base + 1))
+                .collect();
+            assert_eq!(
+                client.applied, expected,
+                "exactly the missed commits, contiguous and in order"
+            );
+            None
+        }
+        Decision::Resync { continuity } => {
+            assert_eq!(client.revision(), reached, "the snapshot is current");
+            Some(continuity)
+        }
+    };
+    assert_eq!(client.item_of(STEADY_PID), Some(item), "identity kept");
+    let tagged = client.tag_of(STEADY_PID).as_deref() == Some(TAGGED_CELL);
+    assert_eq!(tagged, missed % 2 == 1, "every toggle reached the replica");
+    continuity
+}
+
+const REPLAYED: Option<SessionContinuity> = None;
+const SAME_SESSION: Option<SessionContinuity> = Some(SessionContinuity::SameSession);
+
+/// `--journal-capacity N` retains exactly N commits (§18.1): N missed commits
+/// replay, N + 1 resynchronize the same session. Pinned at and past the bound
+/// for N = 1 and for N = 3, so a window off by one either way fails.
+#[test]
+fn a_journal_capacity_replays_exactly_that_many_missed_commits_and_no_more() {
+    for (capacity, missed, want) in [
+        ("1", 1, REPLAYED),
+        ("1", 2, SAME_SESSION),
+        ("3", 3, REPLAYED),
+        ("3", 4, SAME_SESSION),
+    ] {
+        assert_eq!(
+            continuity_after_exactly(Some(capacity), missed),
+            want,
+            "--journal-capacity {capacity} after exactly {missed} missed commits"
+        );
+    }
+}
+
+/// Without `--journal-capacity` srtop keeps the runtime's default window
+/// (`SessionConfig::default()`), exactly: that many missed commits replay,
+/// one more resynchronizes the same session.
+#[test]
+fn the_default_journal_capacity_is_the_runtime_default_exactly() {
+    let default = u64::try_from(SessionConfig::default().journal_capacity).unwrap();
+    for (missed, want) in [(default, REPLAYED), (default + 1, SAME_SESSION)] {
+        assert_eq!(
+            continuity_after_exactly(None, missed),
+            want,
+            "default journal after exactly {missed} missed commits"
+        );
+    }
 }
 
 /// After a real restart the requested incarnation is gone: the new instance

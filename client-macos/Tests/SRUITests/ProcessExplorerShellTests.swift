@@ -1,4 +1,4 @@
-// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012/PX-013/PX-014/PX-015/PX-016/PX-017/PX-018/PX-018-G02/PX-019: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
+// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007/PX-008/PX-009/PX-012/PX-013/PX-014/PX-015/PX-016/PX-017/PX-018/PX-018-G02/PX-019/PX-022: real non-PTY SSH launch through the unchanged generic client (§§4, 6.2, 7.6, 8, 12, 19.2, 22, 29, 31).
 import Testing
 import Foundation
 import AppKit
@@ -6,6 +6,7 @@ import Darwin
 import SemanticModel
 import Protocol
 @testable import Session
+@testable import ConnectionManager
 import TransportSSH
 import RendererAppKit
 import Collections
@@ -3084,6 +3085,317 @@ struct ProcessExplorerShellTests {
         return matching[0]
     }
 
+    /// PX-022: the explorer through every continuity decision a real reconnect can get, with the
+    /// generic client's connection manager driving each session window's chrome (§§17–18.3).
+    ///
+    /// One srtop is detached twice and resumed within its journal (`RESUME_OK`), then restarted
+    /// for real (`REPLACED`), and the restarted instance, whose journal holds one commit, is
+    /// detached for several commits and resynchronized from a snapshot
+    /// (`RESYNC_REQUIRED{SAME_SESSION}`) by the newer of two overlapping attempts. srtop adds
+    /// nothing to any of it: the decisions are the runtime's and the chrome is the client's.
+    @Test(.timeLimit(.minutes(3)))
+    @MainActor
+    func detachedWindowsSayTheyAreStaleAndEveryContinuityDecisionReachesTheExplorer() async throws {
+        var harness = try await Self.launch(arguments: Self.continuityArguments)
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let socket = harness.temp.appendingPathComponent("s.sock").path
+        let configuration = harness.configuration
+        let recorder = ContinuityRecorder()
+        let manager = ConnectionManager(
+            store: SavedConnectionStore(url: harness.temp.appendingPathComponent("connections.json")),
+            attemptFactory: { request in
+                let generation = recorder.adopt(request.context)
+                let holdsHandshake = recorder.holdsHandshake(of: generation)
+                return RecordingConnectionAttempt(
+                    inner: ConnectionManager.makeSessionControllerAttempt(
+                        request: request, transport: SSHTransport(configuration: configuration),
+                        configureController: { controller in
+                            // The controller's own seam, after its handshake is on the wire and
+                            // before its receive loop exists: nothing the server answers can be
+                            // read, let alone applied, until the test releases it.
+                            guard holdsHandshake else { return }
+                            controller.handshakeSendDidFinishForTesting = { await recorder.waitAtHandshake() }
+                        }),
+                    generation: generation, recorder: recorder)
+            })
+        var managerShutDown = false
+        defer {
+            // A failed expectation must not leave a session window on screen.
+            recorder.releaseHandshake()
+            recorder.releaseReady()
+            recorder.closeWindows()
+            if !managerShutDown { Task { @MainActor in await manager.shutdown() } }
+        }
+
+        func renderer() throws -> AppKitRenderer { try #require(recorder.renderer) }
+        func applier() throws -> TransactionApplier { try #require(recorder.applier) }
+        func window() -> NSWindow? { recorder.renderer?.registry.handle(for: NodeId(1))?.window }
+        func view<T>(_ id: UInt64, as _: T.Type = T.self) throws -> T {
+            try #require(try renderer().registry.handle(for: NodeId(id))?.view as? T, "node \(id)")
+        }
+        func table() throws -> NSTableView {
+            try #require(try view(5, as: NSScrollView.self).documentView as? NSTableView)
+        }
+        func rows() -> [[String]] { (try? table()).map(Self.nativeRows) ?? [] }
+        func row(_ pid: String) -> Int? { rows().firstIndex { $0.first == pid } }
+        func selectedPIDs() -> [String] {
+            guard let table = try? table() else { return [] }
+            let shown = rows()
+            return table.selectedRowIndexes.compactMap { $0 < shown.count ? shown[$0][0] : nil }
+        }
+        func item(_ pid: String) throws -> UInt64 {
+            let applier = try applier()
+            let index = try #require(Self.modelRows(applier).firstIndex { $0.first == pid }, "PID \(pid) is held")
+            return Self.modelItemIDs(applier)[index]
+        }
+        func text(_ id: UInt64) -> String { (try? view(id, as: NSTextField.self))?.stringValue ?? "" }
+        func status() -> ConnectionStatus? { manager.entries.first.map { manager.status(for: $0.id) } }
+        var evidence: [String] = []
+        func waitFor(_ description: String, _ condition: @MainActor () -> Bool) async throws {
+            do {
+                try await AsyncTestSupport.eventually(timeout: .seconds(30), description: description) {
+                    recorder.watch(window())
+                    return condition()
+                }
+            } catch {
+                record("TIMED OUT \(description)")
+                for line in evidence { print("PX-022 native evidence: \(line)") }
+                print("PX-022 native evidence: attempts=\(recorder.allEvents) subtitles=\(recorder.subtitles.map { "\($0.subtitle)@\($0.revision)" })")
+                throw error
+            }
+        }
+        func type(_ text: String, into id: UInt64) throws {
+            let handle = try #require(try renderer().registry.handle(for: NodeId(id)))
+            let field = try #require(handle.view as? NSTextField)
+            let adapter = try #require(handle.textAdapter)
+            field.stringValue = text
+            adapter.notifyTextDidChangeForTests()
+            adapter.notifyEndEditingForTests()
+        }
+        func stale(_ verb: String, _ revision: UInt64) -> String {
+            "\(verb) — showing data from revision \(revision) (stale)"
+        }
+        let replaced = "session replaced — rebuilding"
+        func record(_ phase: String) {
+            evidence.append("\(phase): subtitle=\"\(window()?.subtitle ?? "<no window>")\" "
+                + "accessibilityHelp=\"\(window()?.accessibilityHelp() ?? "")\" title=\"\(window()?.title ?? "")\" "
+                + "status=\(status().map { "\($0)" } ?? "none") revision=\(recorder.applier?.lastAppliedRevision.value ?? 0) "
+                + "rows=\(rows().map { $0.prefix(2).joined(separator: " ") }) selected=\(selectedPIDs()) "
+                + "inspector=\"\(text(Self.inspectorLineIDs[0]))\" tags=\"\(text(Self.tagsStatusID))\" "
+                + "freshness=\"\(text(19))\"")
+        }
+
+        // Connected: the window carries no client status, and the explorer is live.
+        let connection = try #require(manager.connect(
+            ConnectDraft(label: "srtop", host: "127.0.0.1", user: NSUserName())))
+        try await waitFor("the first connection") { status() == .connected && row("4101") != nil }
+        // A fresh client catches up to a session already past revision 0 (§18, WELCOME).
+        #expect(recorder.events(of: 1) == ["connecting", "resynchronizing", "ready"])
+        #expect(manager.open(id: connection))
+        let first = try #require(window())
+        SurfacePresentation.forHostApplication().present(first)
+        #expect(first.title == "Process Explorer" && first.subtitle == "" && first.accessibilityHelp() == nil)
+        let session = try #require(manager.entries.first?.sessionID)
+        try table().selectRowIndexes(IndexSet(integer: try #require(row("4101"))), byExtendingSelection: false)
+        try await waitFor("the inspector on 4101") {
+            text(Self.inspectorLineIDs[0]).hasPrefix("Selected process: PID 4101 · worker")
+        }
+        NativeActivation.click(try view(Self.tagToggleID, as: NSButton.self))
+        try await waitFor("4101 tagged") {
+            row("4101").map { rows()[$0][4] == "tagged" } == true && text(Self.tagsStatusID).hasPrefix("Tags: 1 tagged")
+        }
+        let item4101 = try item("4101")
+        record("connected")
+
+        // Detached: the transport is lost and the session lives on. The window keeps its cached
+        // rows, inspector and summary, says they are stale as of the revision it holds, and takes
+        // no new intent: a tag, a pause and a new selection are not sent, and none is kept.
+        try await Self.killBridges(serving: socket)
+        try await waitFor("disconnected") { status() == .disconnected(resumeAvailable: true) }
+        let detached = try applier().lastAppliedRevision.value
+        #expect(first.subtitle == stale("disconnected", detached))
+        #expect(first.accessibilityHelp() == stale("disconnected", detached))
+        #expect(first.title == "Process Explorer", "the server's title is untouched")
+        let cachedRows = rows(), cachedFreshness = text(19), cachedInspector = text(Self.inspectorLineIDs[0])
+        NativeActivation.click(try view(Self.tagToggleID, as: NSButton.self))
+        NativeActivation.click(try view(Self.samplingPauseID, as: NSButton.self))
+        let down = try Self.keyEvent(Self.functionKey(NSDownArrowFunctionKey), [.numericPad, .function], keyCode: 125, in: first)
+        try table().keyDown(with: down)
+        #expect(selectedPIDs() == ["4101"], "a stale window takes no new selection")
+        try await Task.sleep(for: .seconds(1))
+        #expect(try applier().lastAppliedRevision.value == detached)
+        #expect(rows() == cachedRows && text(19) == cachedFreshness && text(Self.inspectorLineIDs[0]) == cachedInspector,
+                "nothing new is shown while detached")
+        #expect(first.subtitle == stale("disconnected", detached))
+        record("detached")
+
+        // Resumed within retention: RESUME_OK replays the missed commits into the same window,
+        // which says it is catching up until the replay is in, then clears.
+        recorder.holdReady(of: 2)
+        manager.connect(id: connection)
+        try await waitFor("the resume, held at ready") { recorder.isHoldingReady }
+        #expect(recorder.events(of: 2) == ["connecting", "ready"], "RESUME_OK needs no resync")
+        #expect(first.subtitle == stale("connecting", detached), "not live until ready")
+        record("resume-ok before ready")
+        recorder.releaseReady()
+        try await waitFor("resumed") { status() == .connected && window()?.subtitle == "" }
+        #expect(manager.entries.first?.sessionID == session)
+        try await waitFor("newer samples") { (try? applier().lastAppliedRevision.value).map { $0 > detached } == true && text(19) != cachedFreshness }
+        #expect(try item("4101") == item4101, "4101 keeps its identity")
+        #expect(row("4101").map { rows()[$0][4] } == "tagged", "the detached untag was never sent")
+        #expect(text(Self.samplingStatusID).hasPrefix("Live"), "the detached pause was never sent")
+        #expect(selectedPIDs() == ["4101"] && text(Self.inspectorLineIDs[0]).hasPrefix("Selected process: PID 4101 · worker"),
+                "the highlight is the process the inspector describes")
+        #expect(window()?.accessibilityHelp() == nil)
+        record("resume-ok ready")
+
+        // A text edit made while detached is kept locally, and replayed when the same session
+        // resumes (§18.3; D2 T29).
+        try await Self.killBridges(serving: socket)
+        try await waitFor("disconnected again") { status() == .disconnected(resumeAvailable: true) }
+        let detachedAgain = try applier().lastAppliedRevision.value
+        #expect(window()?.subtitle == stale("disconnected", detachedAgain))
+        try type("4101", into: Self.pidSetInputID)
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(rows().count > 1, "the PID set is the server's filter; nothing is filtered locally")
+        manager.connect(id: connection)
+        try await waitFor("the edit replayed") {
+            status() == .connected && window()?.subtitle == "" && rows().map { $0[0] } == ["4101"]
+        }
+        #expect(recorder.events(of: 3) == ["connecting", "ready"])
+        #expect(text(Self.pidSetInputID) == "4101" && manager.entries.first?.sessionID == session)
+        record("resume-ok with replayed edit")
+
+        // Replaced: the daemon itself restarts, so the incarnation the client resumes is gone. The
+        // old replica, its selection, its tag and last-seen records, and the edit typed while
+        // detached all go; the new window is built from the new incarnation's snapshot.
+        kill(harness.server.processIdentifier, SIGTERM)
+        harness.server.waitUntilExit()
+        try await waitFor("disconnected by the restart") { status() == .disconnected(resumeAvailable: true) }
+        let beforeRestart = try applier().lastAppliedRevision.value
+        #expect(window()?.subtitle == stale("disconnected", beforeRestart))
+        let beforeReplacement = try #require(window())
+        harness.server = try await Self.relaunchServer(in: harness, arguments: Self.continuityArguments + ["--journal-capacity", "1"])
+        try type("4103", into: Self.pidSetInputID)
+        recorder.holdReady(of: 4)
+        manager.connect(id: connection)
+        try await waitFor("the replacement, held at ready") { recorder.isHoldingReady && row("4101") != nil }
+        #expect(recorder.events(of: 4) == ["connecting", "replaced", "ready"])
+        let second = try #require(window())
+        #expect(second !== beforeReplacement && !beforeReplacement.isVisible, "the old incarnation's window is closed")
+        #expect(second.subtitle == replaced && second.accessibilityHelp() == replaced)
+        #expect(status() == .resynchronizing && manager.alert?.kind == .sessionReplaced)
+        record("replaced before ready")
+        recorder.releaseReady()
+        try await waitFor("rebuilt") { status() == .connected && second.subtitle == "" }
+        let replacement = try #require(manager.entries.first?.sessionID)
+        #expect(replacement != session)
+        #expect(selectedPIDs().isEmpty && text(Self.inspectorLineIDs[0]) == "Selected process: none · select a row to inspect it",
+                "no selection of the old incarnation survives")
+        #expect(text(Self.tagsStatusID).hasPrefix("Tags: none") && rows().allSatisfy { $0[4] == "" },
+                "no live or historical tag of the old incarnation survives")
+        try await Task.sleep(for: .milliseconds(600))
+        #expect(text(Self.pidSetInputID) == "" && rows().count == 3, "the old incarnation's edits are abandoned")
+        SurfacePresentation.forHostApplication().present(second)
+        record("replaced ready")
+
+        // Resynchronized: the restarted instance retains one commit, so a client detached for
+        // several gets a snapshot of the same incarnation. Two overlapping reconnects race; only
+        // the newer one's outcome reaches the window. The overlap is made, not hoped for: the first
+        // attempt is held after its CLIENT_RESUME is sent and before its receive loop starts, so it
+        // cannot apply its snapshot (which would let the newer one resume from it with RESUME_OK)
+        // until the newer one holds its own, and its late outcome then has a window to disturb.
+        try table().selectRowIndexes(IndexSet(integer: try #require(row("4101"))), byExtendingSelection: false)
+        try await waitFor("the inspector on 4101 again") {
+            text(Self.inspectorLineIDs[0]).hasPrefix("Selected process: PID 4101 · worker")
+        }
+        NativeActivation.click(try view(Self.tagToggleID, as: NSButton.self))
+        try await waitFor("4101 tagged again") { row("4101").map { rows()[$0][4] == "tagged" } == true }
+        let replacedItem = try item("4101")
+        try await Self.killBridges(serving: socket)
+        try await waitFor("disconnected from the replacement") { status() == .disconnected(resumeAvailable: true) }
+        let resyncFrom = try applier().lastAppliedRevision.value
+        try type("4101", into: Self.pidSetInputID)
+        try await Task.sleep(for: .seconds(1))
+        recorder.holdHandshake(of: 5)
+        manager.connect(id: connection)
+        try await waitFor("the first attempt, held with its resume sent") { recorder.isHoldingHandshake }
+        #expect(recorder.events(of: 5) == ["connecting"])
+        #expect(try applier().lastAppliedRevision.value == resyncFrom, "the held attempt has applied nothing")
+        let racedFrom = recorder.subtitles.count
+        recorder.holdReady(of: 6)
+        manager.connect(id: connection)
+        try await waitFor("the newer attempt's snapshot, held at ready") {
+            recorder.isHoldingReady && recorder.events(of: 6).contains("resynchronizing")
+        }
+        #expect(recorder.isHoldingHandshake, "the first attempt was still held throughout")
+        #expect(recorder.events(of: 5) == ["connecting"])
+        #expect(recorder.events(of: 6) == ["connecting", "resynchronizing", "ready"])
+        #expect(window()?.subtitle == stale("resynchronizing", resyncFrom))
+        record("same-session resync before ready")
+        // The superseded attempt is released while the newer one is still mid-decision, free to
+        // read whatever its server answered, and runs to its end: none of it reaches the window,
+        // the status or the replica.
+        let newerSnapshot = try applier().lastAppliedRevision.value
+        recorder.releaseHandshake()
+        try await waitFor("the superseded attempt ended") { recorder.hasEnded(5) }
+        record("superseded attempt ended (events \(recorder.events(of: 5)))")
+        #expect(!recorder.events(of: 5).contains("ready"), "the superseded attempt never became ready")
+        #expect(status() == .resynchronizing && window()?.subtitle == stale("resynchronizing", resyncFrom))
+        #expect(try applier().lastAppliedRevision.value >= newerSnapshot,
+                "the superseded attempt's snapshot never rolled the replica back")
+        #expect(manager.entries.first?.sessionID == replacement)
+        recorder.releaseReady()
+        try await waitFor("resynchronized") { status() == .connected && window()?.subtitle == "" }
+        try await Task.sleep(for: .milliseconds(600))
+        #expect(recorder.subtitles[racedFrom...].allSatisfy { !$0.subtitle.hasPrefix("disconnected") },
+                "the superseded attempt's end never reached the window: \(recorder.subtitles[racedFrom...].map(\.subtitle))")
+        #expect(manager.entries.first?.sessionID == replacement)
+        #expect(try item("4101") == replacedItem, "4101 keeps its identity through the snapshot")
+        #expect(selectedPIDs() == ["4101"] && text(Self.inspectorLineIDs[0]).hasPrefix("Selected process: PID 4101 · worker"))
+        #expect(row("4101").map { rows()[$0][4] } == "tagged")
+        #expect(text(Self.pidSetInputID) == "" && rows().count > 1, "a full resync discards the unsent edit (§18.3; D2 T29)")
+        record("same-session resync ready")
+
+        await manager.shutdown()
+        managerShutDown = true
+        record("shut down")
+        for line in evidence { print("PX-022 native evidence: \(line)") }
+        print("PX-022 native evidence: attempts=\(recorder.allEvents) subtitles=\(recorder.subtitles.map { "\($0.subtitle)@\($0.revision)" })")
+    }
+
+    /// The scripted fixture at a fast tick, so a detached client misses commits within a second.
+    fileprivate static let continuityArguments = ["--fake-sequence", "--refresh-interval-ms", "200"]
+
+    /// Ends every bridge process serving `socket`, as a lost network does: srtop is not told.
+    private static func killBridges(serving socket: String) async throws {
+        let found = try await runToCompletion("/usr/bin/pgrep", ["-f", "srui-ssh-bridge \(socket)"])
+        let pids = found.output.split(whereSeparator: \.isNewline).compactMap { Int32($0) }
+        try #require(!pids.isEmpty, "no bridge serves \(socket): \(found.output)")
+        for pid in pids { kill(pid, SIGKILL) }
+    }
+
+    /// Starts a new srtop on the harness's socket after the previous one stopped: the same
+    /// endpoint, a new incarnation.
+    @MainActor
+    private static func relaunchServer(in harness: Harness, arguments: [String]) async throws -> Process {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let socket = harness.temp.appendingPathComponent("s.sock").path
+        let server = Process()
+        server.executableURL = root.appendingPathComponent("apps/srtop/target/debug/srtop")
+        server.arguments = ["--socket", socket] + arguments
+        server.standardOutput = FileHandle.nullDevice
+        server.standardError = FileHandle.nullDevice
+        try server.run()
+        try await AsyncTestSupport.eventually(timeout: .seconds(5), description: "the restarted srtop's socket") {
+            FileManager.default.fileExists(atPath: socket)
+        }
+        return server
+    }
+
     /// PX-010-G01: 1,000 synthetic rows over real SSH with continuous churn.
     /// Asserts native macOS AppKit rendering performance, memory and layout stability,
     /// and selection preservation under active row churn.
@@ -3338,7 +3650,8 @@ struct ProcessExplorerShellTests {
 
     private struct Harness {
         let temp: URL
-        let server: Process
+        /// The app server; PX-022 replaces it with a restarted instance on the same socket.
+        var server: Process
         let sshd: Process
         let configuration: SSHConfiguration
     }
@@ -4087,5 +4400,161 @@ private final class RenderWaiter {
                 renders.signal()
             }
         }
+    }
+}
+
+/// What the PX-022 test saw of a connection manager's attempts and session windows.
+@MainActor
+fileprivate final class ContinuityRecorder {
+    struct Subtitle {
+        let subtitle: String
+        let revision: UInt64
+    }
+
+    private(set) var renderer: AppKitRenderer?
+    private(set) var applier: TransactionApplier?
+    private(set) var allEvents: [String] = []
+    private(set) var subtitles: [Subtitle] = []
+    private var eventsByGeneration: [Int: [String]] = [:]
+    private var generation = 0
+    private var heldGeneration: Int?
+    private var held: [CheckedContinuation<Void, Never>] = []
+    private var handshakeGeneration: Int?
+    private var heldHandshakes: [CheckedContinuation<Void, Never>] = []
+    private var endedGenerations: Set<Int> = []
+    private var windows: [NSWindow] = []
+    private var observations: [NSKeyValueObservation] = []
+
+    /// Called by the attempt factory: the session context every attempt shares.
+    func adopt(_ context: ConnectionSessionContext) -> Int {
+        renderer = context.renderer
+        applier = context.applier
+        context.renderer.textEditingSession.debounceNanoseconds = 0
+        generation += 1
+        return generation
+    }
+
+    func events(of generation: Int) -> [String] { eventsByGeneration[generation] ?? [] }
+
+    var isHoldingReady: Bool { !held.isEmpty }
+
+    /// Holds `generation`'s ready event until `releaseReady()`, so the window can be read with the
+    /// decision's data in and the chrome not yet cleared.
+    func holdReady(of generation: Int) { heldGeneration = generation }
+
+    func releaseReady() {
+        heldGeneration = nil
+        let waiting = held
+        held.removeAll()
+        for continuation in waiting { continuation.resume() }
+    }
+
+    /// Makes `generation`'s controller wait, once its handshake is sent and before its receive
+    /// loop starts, until `releaseHandshake()`. Read by the attempt factory when it builds that
+    /// generation's controller, so it is set before the `connect` that mints it.
+    func holdHandshake(of generation: Int) { handshakeGeneration = generation }
+
+    func holdsHandshake(of generation: Int) -> Bool { handshakeGeneration == generation }
+
+    var isHoldingHandshake: Bool { !heldHandshakes.isEmpty }
+
+    /// The held controller's `handshakeSendDidFinishForTesting`.
+    func waitAtHandshake() async {
+        await withCheckedContinuation { heldHandshakes.append($0) }
+    }
+
+    func releaseHandshake() {
+        handshakeGeneration = nil
+        let waiting = heldHandshakes
+        heldHandshakes.removeAll()
+        for continuation in waiting { continuation.resume() }
+    }
+
+    /// Called once `generation`'s attempt has stopped: its controller can do nothing more.
+    func ended(_ generation: Int) { endedGenerations.insert(generation) }
+
+    func hasEnded(_ generation: Int) -> Bool { endedGenerations.contains(generation) }
+
+    func record(_ event: ConnectionAttemptEvent, generation: Int) async {
+        let name: String
+        switch event {
+        case .connecting: name = "connecting"
+        case .resynchronizing: name = "resynchronizing"
+        case .replaced: name = "replaced"
+        case .ready: name = "ready"
+        case .failed: name = "failed"
+        case .stopped: name = "stopped"
+        }
+        eventsByGeneration[generation, default: []].append(name)
+        allEvents.append("\(generation):\(name)")
+        if case .ready = event, heldGeneration == generation {
+            await withCheckedContinuation { held.append($0) }
+        }
+    }
+
+    /// Records every subtitle `window` shows from now on.
+    func watch(_ window: NSWindow?) {
+        guard let window, !windows.contains(where: { $0 === window }) else { return }
+        windows.append(window)
+        observations.append(window.observe(\.subtitle, options: [.initial, .new]) { [weak self] window, _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let revision = self.applier?.lastAppliedRevision.value ?? 0
+                if self.subtitles.last?.subtitle != window.subtitle || self.subtitles.last?.revision != revision {
+                    self.subtitles.append(Subtitle(subtitle: window.subtitle, revision: revision))
+                }
+            }
+        })
+    }
+
+    func closeWindows() {
+        observations.forEach { $0.invalidate() }
+        observations.removeAll()
+        for window in windows {
+            window.orderOut(nil)
+            window.close()
+        }
+    }
+}
+
+/// A real connection attempt whose events the PX-022 test records, and whose ready event it can
+/// hold.
+fileprivate actor RecordingConnectionAttempt: ConnectionAttempt {
+    nonisolated let events: AsyncStream<ConnectionAttemptEvent>
+    private let continuation: AsyncStream<ConnectionAttemptEvent>.Continuation
+    private let inner: any ConnectionAttempt
+    private let generation: Int
+    private let recorder: ContinuityRecorder
+    private var forwarding: Task<Void, Never>?
+
+    init(inner: any ConnectionAttempt, generation: Int, recorder: ContinuityRecorder) {
+        let pair = AsyncStream.makeStream(of: ConnectionAttemptEvent.self, bufferingPolicy: .bufferingNewest(16))
+        events = pair.stream
+        continuation = pair.continuation
+        self.inner = inner
+        self.generation = generation
+        self.recorder = recorder
+    }
+
+    func start() async throws {
+        if forwarding == nil {
+            let inner = self.inner, continuation = self.continuation
+            let generation = self.generation, recorder = self.recorder
+            forwarding = Task {
+                for await event in inner.events {
+                    await recorder.record(event, generation: generation)
+                    continuation.yield(event)
+                }
+                continuation.finish()
+            }
+        }
+        try await inner.start()
+    }
+
+    func stop() async {
+        await inner.stop()
+        await forwarding?.value
+        continuation.finish()
+        await recorder.ended(generation)
     }
 }

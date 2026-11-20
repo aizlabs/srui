@@ -1,4 +1,12 @@
 //! Existing sessiond runtime/SSH bridge host for the PX-001 shell (§§12, 20, 27, 29).
+//!
+//! `--journal-capacity N` sets the §18.1 retention window of this instance's
+//! one session (PX-022): how many committed transactions a reconnecting client
+//! can still be replayed (`RESUME_OK`) before it has to be resynchronized from
+//! a snapshot (`RESYNC_REQUIRED{SAME_SESSION}`). The continuity decision is the
+//! runtime's (`srui_sessiond`); srtop only configures the window. Every start
+//! mints a new incarnation and restores nothing, so a client resuming an
+//! earlier instance is answered `REPLACED` (§§17–18).
 use srui_process_explorer::{
     initialize, install_column_handlers, install_filter_handlers, install_follow_handlers,
     install_inspector, install_owner_handlers, install_sampling_handlers, install_search_handlers,
@@ -12,7 +20,7 @@ use srui_process_explorer::{
     },
     update_title, FIXTURE_TITLE,
 };
-use srui_sessiond::{handle_connection, Session};
+use srui_sessiond::{handle_connection, Session, SessionConfig};
 use srui_unix_security::{
     effective_uid, prepare_private_socket_parent, require_unprivileged_uid, validate_peer,
 };
@@ -102,13 +110,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              [--fake-source | --fake-repeated-names | --fake-follow | --fake-tree | --fake-threads \
              | --fake-sequence \
              | --live-source | --procfs | --scale-source COUNT] \
-             [--refresh-interval-ms MS | --scale-interval-ms MS]"
+             [--refresh-interval-ms MS | --scale-interval-ms MS] [--journal-capacity N]"
             .into());
     }
     let socket_path = PathBuf::from(args.next().ok_or("missing --socket PATH")?);
     let mut fixture = false;
     let mut collection = Collection::None;
     let mut interval = None;
+    let mut journal_capacity = None;
     let mut args = args.peekable();
     while let Some(value) = args.next() {
         let select = |current: &mut Collection, chosen| {
@@ -148,6 +157,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|error| format!("--refresh-interval-ms: {error}"))?;
                 interval = Some(chosen);
             }
+            Some("--journal-capacity") if journal_capacity.is_none() => {
+                // As `srui-sessiond --journal-capacity`: a window that can
+                // retain nothing would turn every reconnect into a snapshot
+                // resync, so it is refused rather than clamped (§18.1).
+                let capacity = args
+                    .next()
+                    .ok_or("missing --journal-capacity N")?
+                    .to_str()
+                    .and_then(|text| text.parse::<usize>().ok())
+                    .filter(|capacity| *capacity > 0)
+                    .ok_or("--journal-capacity N must be a positive integer")?;
+                journal_capacity = Some(capacity);
+            }
             _ => return Err("unknown or repeated option".into()),
         }
     }
@@ -164,7 +186,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let identity = parent
         .socket_identity()?
         .ok_or("socket vanished after bind")?;
-    let session = Arc::new(Session::mint());
+    let mut config = SessionConfig::default();
+    if let Some(capacity) = journal_capacity {
+        config.journal_capacity = capacity;
+    }
+    let session = Arc::new(Session::mint_with_config(config));
     let shutdown = CancellationToken::new();
     let mut connections = JoinSet::new();
     // Each collecting mode publishes its first snapshot and then refreshes the

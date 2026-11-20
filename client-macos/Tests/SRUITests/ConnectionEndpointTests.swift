@@ -53,6 +53,7 @@ private let posturePrefix = [
     "-o", "ClearAllForwardings=yes",
     "-o", "ExitOnForwardFailure=yes",
     "-o", "StrictHostKeyChecking=yes",
+    "-o", "LogLevel=ERROR",
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=30",
 ]
@@ -71,7 +72,7 @@ private func parseError(_ host: String, _ user: String = "alice", _ port: String
     return nil
 }
 
-@Suite("Connect form endpoint parsing and argv (PX-023, §19.1, §25)")
+@Suite("Connect form endpoint parsing and argv (PX-023, §19.1, §25)", .timeLimit(.minutes(1)))
 struct ConnectionEndpointTests {
     struct Accepted: Sendable, CustomTestStringConvertible {
         let host: String
@@ -381,6 +382,65 @@ struct ConnectionEndpointTests {
         }
     }
 
+    @Test("error messages echo a bounded excerpt, at and past the cap")
+    func errorEchoIsBounded() {
+        let cap = ConnectionEndpoint.maximumEchoedScalars
+        let atCap = String(repeating: "x", count: cap)
+        #expect(ConnectionEndpoint.ParseError.excerpt(atCap) == atCap)
+        #expect(ConnectionEndpoint.ParseError.excerpt(atCap + "y") == atCap + "…")
+        #expect(ConnectionEndpoint.ParseError.excerpt("") == "")
+
+        // One Character carrying many combining scalars is still bounded.
+        let grapheme = Character("a" + String(repeating: "\u{301}", count: 10_000))
+        let echoed = ConnectionEndpoint.ParseError.invalidHostCharacter(grapheme).description
+        #expect(echoed.unicodeScalars.count < 200, "\(echoed.unicodeScalars.count) scalars")
+        #expect(echoed.contains("…"))
+        let longLiteral = String(repeating: "f", count: 10_000)
+        #expect(ConnectionEndpoint.ParseError.invalidIPv6(longLiteral).description.unicodeScalars.count < 100)
+        #expect(ConnectionEndpoint.ParseError.conflictingUser(inHost: longLiteral, inField: longLiteral)
+            .description.unicodeScalars.count < 200)
+        #expect(ConnectionEndpoint.ParseError.conflictingPort(inHost: longLiteral, inField: longLiteral)
+            .description.unicodeScalars.count < 200)
+    }
+
+    @Test("bounds count Unicode scalars and raw bytes, so one huge grapheme cannot pass them")
+    func scalarAndByteBounds() throws {
+        let mark = "\u{301}"
+        // Host: 253 scalars as one grapheme passes the length bound and fails the character rule
+        // with a bounded echo; 254 scalars fail the length bound.
+        let host253 = "a" + String(repeating: mark, count: 252)
+        #expect(host253.count == 1 && host253.unicodeScalars.count == 253)
+        if case .invalidHostCharacter(let character)? = parseError(host253) {
+            #expect(ConnectionEndpoint.ParseError.invalidHostCharacter(character).description.unicodeScalars.count < 200)
+        } else {
+            Issue.record("expected invalidHostCharacter, got \(String(describing: parseError(host253)))")
+        }
+        #expect(parseError("a" + String(repeating: mark, count: 253)) == .hostTooLong)
+        // User: 64 scalars reach the character rule, 65 do not.
+        if case .invalidUserCharacter? = parseError("h", "u" + String(repeating: mark, count: 63)) {} else {
+            Issue.record("expected invalidUserCharacter at 64 scalars")
+        }
+        #expect(parseError("h", "u" + String(repeating: mark, count: 64)) == .userTooLong)
+        // Name: 128 scalars accepted (combining marks are fine in a local name), 129 refused.
+        #expect(ConnectDraft(label: "n" + String(repeating: mark, count: 127), host: "h", user: "alice").validationMessage == nil)
+        #expect(ConnectDraft(label: "n" + String(repeating: mark, count: 128), host: "h", user: "alice").validationMessage
+            == ConnectionEndpoint.ParseError.labelTooLong.description)
+        // Raw size: 4096 UTF-8 bytes are trimmed and parsed, 4097 are refused before any scan.
+        let pad = ConnectionEndpoint.maximumRawFieldBytes - "alice".utf8.count
+        #expect(parseError("h", "alice" + String(repeating: " ", count: pad)) == nil)
+        #expect(parseError("h", "alice" + String(repeating: " ", count: pad + 1)) == .userTooLong)
+        #expect(parseError("h", "alice", String(repeating: " ", count: 4097)) == .invalidPort)
+        #expect(ConnectDraft(label: String(repeating: " ", count: 4097), host: "h", user: "alice").validationMessage
+            == ConnectionEndpoint.ParseError.labelTooLong.description)
+        // A million combining scalars in one grapheme: refused by size, with a short message.
+        let huge = "a" + String(repeating: mark, count: 1_000_000)
+        let error = try #require(parseError(huge))
+        #expect(error == .hostTooLong)
+        #expect(error.description.count < 100)
+        #expect(ConnectionEndpoint.validate(savedHost: huge, user: "alice", port: nil) == .hostTooLong)
+        #expect(ConnectionEndpoint.validate(savedHost: "h", user: huge, port: nil) == .userTooLong)
+    }
+
     @Test("an empty name defaults to the endpoint, bracketing IPv6")
     func defaultLabel() throws {
         let plain = try #require(ConnectDraft(host: "host.example:2222", user: "alice").savedConnection)
@@ -516,15 +576,14 @@ struct ConnectionEndpointTests {
     }
 }
 
-@Suite("Host-key rejection diagnostics (PX-023, §19.1, §25)")
+@Suite("Host-key rejection diagnostics (PX-023, §19.1, §25)", .timeLimit(.minutes(1)))
 struct HostKeyRejectionTests {
     // OpenSSH's own text (sshconnect.c), as `SSHTransport` reports a child exit; the live suite
     // records the same text from OpenSSH_10.2p1.
-    static let unknownMessage = "transport ended: SSH process terminated with exit code 255: "
-        + "No ED25519 host key is known for [127.0.0.1]:2222 and you have requested strict checking.\n"
+    // `ssh`'s raw stderr, as `SSHTransport.localFailureBeforeStream()` reports it.
+    static let unknownMessage = "No ED25519 host key is known for [127.0.0.1]:2222 and you have requested strict checking.\n"
         + "Host key verification failed."
-    static let changedMessage = "transport ended: SSH process terminated with exit code 255: "
-        + "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+    static let changedMessage = "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
         + "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n"
         + "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
         + "Host key for [127.0.0.1]:2222 has changed and you have requested strict checking.\n"
@@ -534,9 +593,29 @@ struct HostKeyRejectionTests {
     func classification() {
         #expect(HostKeyRejection(sshMessage: Self.unknownMessage) == .unknown)
         #expect(HostKeyRejection(sshMessage: Self.changedMessage) == .changed)
-        #expect(HostKeyRejection(sshMessage: "@ WARNING: POSSIBLE DNS SPOOFING DETECTED! @") == .changed)
-        #expect(HostKeyRejection(sshMessage: "@ WARNING: REVOKED HOST KEY DETECTED! @\nHost key verification failed.") == .revoked)
+        #expect(HostKeyRejection(sshMessage: Self.unknownMessage.replacingOccurrences(of: "\n", with: "\r\n") + "\r\n") == .unknown)
+        #expect(HostKeyRejection(sshMessage: """
+        @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+        @       WARNING: REVOKED HOST KEY DETECTED!               @
+        @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+        The ED25519 host key for host.example is marked as revoked.
+        This could mean that a stolen key is being used to
+        impersonate this host.
+        Host key verification failed.
+        """) == .revoked)
         #expect(HostKeyRejection(sshMessage: "Host key verification failed.") == .unverified)
+        #expect(HostKeyRejection(sshMessage: "@ WARNING: POSSIBLE DNS SPOOFING DETECTED! @") == nil)
+
+        // Structural (PX-023 round 3): the verdict must be ssh's last line. Server-authored text
+        // logged before it (a pre-auth banner, a disconnect reason) never ends ssh's stderr.
+        #expect(HostKeyRejection(sshMessage: Self.changedMessage + "\nalice@127.0.0.1: Permission denied (publickey).") == nil)
+        #expect(HostKeyRejection(sshMessage: """
+        Received disconnect from 127.0.0.1 port 2222:2: No ED25519 host key is known for h and you have requested strict checking.
+        Host key verification failed.
+        Disconnected from 127.0.0.1 port 2222
+        """) == nil)
+        #expect(HostKeyRejection(sshMessage: "Host key verification failed. Received disconnect") == nil)
+        #expect(HostKeyRejection(sshMessage: "x Host key verification failed.") == nil)
         #expect(HostKeyRejection(sshMessage: "Permission denied (publickey).") == nil)
         #expect(HostKeyRejection(sshMessage: "ssh: connect to host h port 22: Connection refused") == nil)
         #expect(HostKeyRejection(sshMessage: "") == nil)
@@ -563,7 +642,13 @@ struct HostKeyRejectionTests {
         _ = try await iterator.next()
         var refusal = SRUIServerHandshakeRefused()
         refusal.reason = .snapshotUndeliverable
-        refusal.detail = "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! Host key verification failed."
+        // Shaped like OpenSSH's own refusal, verdict on its own last line, so not even the
+        // structural classifier could tell it apart: only never classifying it is safe.
+        refusal.detail = """
+        @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+        Host key for [trusted.example]:22 has changed and you have requested strict checking.
+        Host key verification failed.
+        """
         var message = SRUIMessage()
         message.serverHandshakeRefused = refusal
         try await pair.server.send(data: try SRUIFraming.encodeFramed(message))

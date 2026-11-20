@@ -33,6 +33,13 @@ struct SSHTransportPostureTests {
         // §19.1 Rule 5: Strict host key checking
         #expect(args.contains("StrictHostKeyChecking=yes"), "Expected StrictHostKeyChecking=yes (§19.1)")
 
+        // §19.1 / PX-023: ssh's stderr holds only ssh's own errors, never a server's banner
+        if let index = args.firstIndex(of: "LogLevel=ERROR") {
+            #expect(args[index - 1] == "-o")
+        } else {
+            Issue.record("Expected -o LogLevel=ERROR (PX-023)")
+        }
+
         // §19.1 Rule 6: Fixed subsystem request, not a shell command string
         // `-s` is a flag; the subsystem name is the operand after the host, and `--` ends
         // option parsing before the host.
@@ -117,6 +124,7 @@ struct SSHTransportPostureTests {
                 "ClearAllForwardings": "no",
                 "ForwardAgent": "yes",
                 "LocalForward": "8080:127.0.0.1:80",
+                "LogLevel": "DEBUG3",
                 "Compression": "no",
             ]
         )
@@ -128,6 +136,8 @@ struct SSHTransportPostureTests {
         #expect(args.contains("ClearAllForwardings=yes"))
         #expect(!args.contains("ForwardAgent=yes"))
         #expect(!args.contains("LocalForward=8080:127.0.0.1:80"))
+        #expect(!args.contains("LogLevel=DEBUG3"))
+        #expect(args.filter { $0.hasPrefix("LogLevel=") } == ["LogLevel=ERROR"])
         #expect(args.contains("Compression=no"))
 
         if let strictIdx = args.firstIndex(of: "StrictHostKeyChecking=yes") {

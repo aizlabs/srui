@@ -134,7 +134,9 @@ Every connection uses the same configuration whatever app serves `srui` (counter
 `StrictHostKeyChecking=yes`, `BatchMode=yes`, your own agent, keys and `~/.ssh/known_hosts`. An
 unknown or changed host key stops the attempt with a **Host Key Not Trusted** alert that says which
 it was and how to check the key. Only `ssh`'s own verdict raises it: its stderr when it exited 255
-before any SRUI byte arrived (`SSHTransport.localFailureBeforeStream()`), never text a server sent; SRUI never adds or replaces a host key and offers no way to connect
+before any SRUI byte arrived (`SSHTransport.localFailureBeforeStream()`), with the verdict as its
+last line, never text a server sent. Every `ssh` runs with `-o LogLevel=ERROR` (not overridable through
+`extraOptions`), so a server's pre-authentication `Banner` never reaches that stderr; SRUI never adds or replaces a host key and offers no way to connect
 anyway. Record a new key by connecting once with `ssh` in Terminal after checking its fingerprint.
 
 **From the command line.** Launch `RendererDemoApp` over SSH (defaults: `BatchMode=yes`, 30s

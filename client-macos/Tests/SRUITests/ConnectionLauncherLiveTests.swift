@@ -40,7 +40,7 @@ private final class LauncherProbe {
     }
 }
 
-struct LiveSSHD {
+struct LiveSSHD: @unchecked Sendable {
     enum KnownHosts: Sendable {
         case trusted
         case empty
@@ -61,10 +61,16 @@ struct LiveSSHD {
     /// An authenticated localhost sshd whose `srui` subsystem is either the real bridge in front
     /// of `app` (its binary path and arguments) or, with no app, `/usr/bin/touch <marker>`, which
     /// records whether the subsystem ever ran.
+    ///
+    /// `hostileBanner` gives sshd a pre-authentication `Banner` that imitates OpenSSH's changed-key
+    /// verdict for this port; `subsystemExits255` (without an app) makes the subsystem exit 255
+    /// silently, so `ssh` exits 255 with no stream byte and no error of its own (PX-023 round 3).
     static func launch(
         prefix: String,
         knownHosts mode: KnownHosts,
-        app: (binary: String, arguments: [String], refusal: [String])?
+        app: (binary: String, arguments: [String], refusal: [String])?,
+        hostileBanner: Bool = false,
+        subsystemExits255: Bool = false
     ) async throws -> LiveSSHD {
         let bridge = root.appendingPathComponent("server-rust/target/debug/srui-ssh-bridge").path
         let directory = try TestFixtureDirectory.make(prefix: prefix)
@@ -107,8 +113,19 @@ struct LiveSSHD {
                 try await AsyncTestSupport.eventually(timeout: .seconds(10), description: "\(app.binary) socket") {
                     FileManager.default.fileExists(atPath: socket)
                 }
+            } else if subsystemExits255 {
+                // Read by `/bin/sh` rather than executed, so no first-exec assessment applies.
+                let script = directory.appendingPathComponent("exit255.sh")
+                try "exit 255\n".write(to: script, atomically: true, encoding: .utf8)
+                subsystem = "/bin/sh \(script.path)"
             } else {
                 subsystem = "/usr/bin/touch \(directory.appendingPathComponent("subsystem-ran").path)"
+            }
+            var bannerLine = ""
+            if hostileBanner {
+                let banner = directory.appendingPathComponent("banner")
+                try Self.hostileBannerText(port: port).write(to: banner, atomically: true, encoding: .utf8)
+                bannerLine = "Banner \(banner.path)"
             }
 
             try """
@@ -120,6 +137,7 @@ struct LiveSSHD {
             UsePAM no
             PidFile \(directory.appendingPathComponent("sshd.pid").path)
             Subsystem srui \(subsystem)
+            \(bannerLine)
             """.write(to: config, atomically: true, encoding: .utf8)
             let sshd = try SSHTestSupport.launchSSHD(configPath: config.path, hostKeyPath: hostKey, port: port)
             do {
@@ -140,8 +158,31 @@ struct LiveSSHD {
         }
     }
 
+    /// A server-authored banner, sent before authentication, shaped exactly like OpenSSH's own
+    /// changed-key refusal for this port, last line included.
+    static func hostileBannerText(port: UInt16) -> String {
+        """
+        @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+        @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+        @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+        Host key for [127.0.0.1]:\(port) has changed and you have requested strict checking.
+        Host key verification failed.
+
+        """
+    }
+
     var subsystemRan: Bool {
         FileManager.default.fileExists(atPath: directory.appendingPathComponent("subsystem-ran").path)
+    }
+
+    /// Tears the fixture down on a detached task. `shutDown()` waits with `Process.waitUntilExit()`,
+    /// which services the calling thread's run loop: on the main actor that nests the main-actor
+    /// executor's own run loop, and one PX-023 run parked there for 27 minutes with sshd already
+    /// gone (`impl3-wedge-sample.txt`). The wait never runs on the main actor; whatever is still
+    /// running when the test process exits is killed by `SSHDRegistry`'s exit hook.
+    func shutDownOffMainActor() {
+        let fixture = self
+        Task.detached { fixture.shutDown() }
     }
 
     func shutDown() {
@@ -177,7 +218,7 @@ struct ConnectionLauncherLiveTests {
         let live = try await LiveSSHD.launch(
             prefix: "px023-counter", knownHosts: .trusted,
             app: ("examples/counter/target/debug/counter", [], FixtureBinaries.counterRefusal))
-        defer { live.shutDown() }
+        defer { live.shutDownOffMainActor() }
         let (store, storeDirectory) = temporaryStore()
         defer { try? FileManager.default.removeItem(at: storeDirectory) }
         _ = NSApplication.shared
@@ -218,7 +259,7 @@ struct ConnectionLauncherLiveTests {
         let live = try await LiveSSHD.launch(
             prefix: "px023-srtop", knownHosts: .trusted,
             app: ("apps/srtop/target/debug/srtop", ["--fake-source"], FixtureBinaries.srtopRefusal))
-        defer { live.shutDown() }
+        defer { live.shutDownOffMainActor() }
         let (store, storeDirectory) = temporaryStore()
         defer { try? FileManager.default.removeItem(at: storeDirectory) }
         _ = NSApplication.shared
@@ -254,7 +295,7 @@ struct ConnectionLauncherLiveTests {
           arguments: [LiveSSHD.KnownHosts.empty, .spoofed])
     func untrustedHostKeyBlocks(_ mode: LiveSSHD.KnownHosts) async throws {
         let live = try await LiveSSHD.launch(prefix: "px023-hostkey", knownHosts: mode, app: nil)
-        defer { live.shutDown() }
+        defer { live.shutDownOffMainActor() }
         let (store, storeDirectory) = temporaryStore()
         defer { try? FileManager.default.removeItem(at: storeDirectory) }
         let knownHostsBefore = try Data(contentsOf: URL(fileURLWithPath: live.knownHosts))
@@ -294,13 +335,89 @@ struct ConnectionLauncherLiveTests {
         await manager.shutdown()
     }
 
+    enum BannerCase: String, Sendable, CaseIterable {
+        /// The key is trusted, the client's key is not authorized: `ssh` exits 255 with
+        /// "Permission denied", after the banner.
+        case authenticationFails
+        /// The key is trusted and authentication succeeds; the subsystem exits 255 silently, so
+        /// the banner would be the last thing on `ssh`'s stderr if it were printed.
+        case subsystemExits255
+    }
+
+    @Test("a trusted server's hostile pre-auth Banner never raises the host-key alert",
+          arguments: BannerCase.allCases)
+    func hostileBannerIsNotAHostKeyRejection(_ bannerCase: BannerCase) async throws {
+        let live = try await LiveSSHD.launch(
+            prefix: "px023-banner", knownHosts: .trusted, app: nil,
+            hostileBanner: true, subsystemExits255: bannerCase == .subsystemExits255)
+        defer { live.shutDownOffMainActor() }
+        let (store, storeDirectory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: storeDirectory) }
+        let knownHostsBefore = try Data(contentsOf: URL(fileURLWithPath: live.knownHosts))
+        var identity = live.userKey
+        if bannerCase == .authenticationFails {
+            identity = live.directory.appendingPathComponent("stranger_key").path
+            try SSHTestSupport.generateEd25519Key(at: identity)
+        }
+
+        let probe = LauncherProbe()
+        let manager = ConnectionManager(
+            store: store, attemptFactory: probe.make(identityFile: identity, knownHostsFile: live.knownHosts))
+        #expect(manager.connect(ConnectDraft(host: "127.0.0.1:\(live.port)", user: NSUserName())) != nil)
+        // The banner is suppressed by the posture, not merely ignored by the classifier.
+        let request = try #require(probe.requests.first)
+        #expect(request.configuration.buildArguments().contains("LogLevel=ERROR"))
+
+        try await AsyncTestSupport.observed("connection alert") { manager.alert != nil }
+        let alert = try #require(manager.alert)
+        #expect(alert.kind == .connectionFailed, "\(alert.kind): \(alert.message)")
+        #expect(alert.title == "Connection Failed")
+        #expect(alert.message.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") == false, "\(alert.message)")
+        #expect(alert.message.contains("ssh-keygen") == false)
+        if bannerCase == .authenticationFails {
+            #expect(alert.message.contains("Permission denied"), "\(alert.message)")
+        }
+        Self.recordEvidence(alert, name: "banner-\(bannerCase.rawValue)")
+        #expect(try Data(contentsOf: URL(fileURLWithPath: live.knownHosts)) == knownHostsBefore)
+        await manager.shutdown()
+    }
+
+    @Test("LogLevel=ERROR keeps ssh's own connection diagnostics: a refused connection says so")
+    func connectionRefusedKeepsItsDiagnostic() async throws {
+        let (store, storeDirectory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: storeDirectory) }
+        let directory = try TestFixtureDirectory.make(prefix: "px023-refused")
+        defer { TestFixtureDirectory.release(directory) }
+        let knownHosts = directory.appendingPathComponent("known_hosts").path
+        try Data().write(to: URL(fileURLWithPath: knownHosts))
+        // Bound and released at once: nothing listens there.
+        let port = SSHTestSupport.findFreePort()
+
+        let probe = LauncherProbe()
+        let manager = ConnectionManager(
+            store: store,
+            attemptFactory: probe.make(identityFile: directory.appendingPathComponent("absent_key").path,
+                                       knownHostsFile: knownHosts))
+        #expect(manager.connect(ConnectDraft(host: "127.0.0.1:\(port)", user: NSUserName())) != nil)
+        try await AsyncTestSupport.observed("refused alert") { manager.alert != nil }
+        let alert = try #require(manager.alert)
+        #expect(alert.kind == .connectionFailed, "\(alert.message)")
+        #expect(alert.message.contains("ssh: connect to host 127.0.0.1 port \(port): Connection refused"), "\(alert.message)")
+        Self.recordEvidence(alert, name: "connection-refused")
+        await manager.shutdown()
+    }
+
     /// Writes the real alert text to `PX023_EVIDENCE_DIR` when set, for the completion note, named
     /// with `PX023_EVIDENCE_PREFIX` (default `px023`) so separate runs keep separate files.
     private static func recordEvidence(_ alert: ConnectionAlert, mode: LiveSSHD.KnownHosts) {
+        recordEvidence(alert, name: "hostkey-alert-\(mode)")
+    }
+
+    private static func recordEvidence(_ alert: ConnectionAlert, name: String) {
         let environment = ProcessInfo.processInfo.environment
         guard let directory = environment["PX023_EVIDENCE_DIR"] else { return }
         let prefix = environment["PX023_EVIDENCE_PREFIX"] ?? "px023"
-        let file = URL(fileURLWithPath: directory).appendingPathComponent("\(prefix)-hostkey-alert-\(mode).txt")
+        let file = URL(fileURLWithPath: directory).appendingPathComponent("\(prefix)-\(name).txt")
         try? "\(alert.title)\n\n\(alert.message)\n".write(to: file, atomically: true, encoding: .utf8)
     }
 }

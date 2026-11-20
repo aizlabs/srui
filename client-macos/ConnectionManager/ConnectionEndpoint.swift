@@ -31,6 +31,15 @@ public struct ConnectionEndpoint: Equatable, Sendable {
     public static let maximumLabelLength = 128
     /// Five digits hold every valid port; more digits are rejected before any conversion.
     static let maximumPortDigits = 5
+    /// Every bound counts Unicode scalars, not `Character`s: one grapheme can carry any number of
+    /// combining scalars, so a `Character` count bounds nothing (PX-023 round 3). The composite
+    /// Host field holds at most `user@[host]:port`.
+    static let maximumHostFieldScalars = maximumHostLength + maximumUserLength + 1 + 2 + 1 + maximumPortDigits
+    /// Any field larger than this many UTF-8 bytes is refused before it is trimmed or scanned
+    /// (`String.utf8.count` is constant time for native strings).
+    static let maximumRawFieldBytes = 4096
+    /// An error message repeats at most this many scalars of the input, then "…".
+    static let maximumEchoedScalars = 32
 
     /// The destination `ssh` receives after `--`: a name, an IPv4 address, or an IPv6 address
     /// without its brackets.
@@ -82,7 +91,7 @@ public struct ConnectionEndpoint: Equatable, Sendable {
             case .bareIPv6:
                 return "Put an IPv6 address in brackets, for example [::1] or [::1]:2222."
             case .invalidIPv6(let literal):
-                return "[\(literal)] is not a valid IPv6 address."
+                return "[\(Self.excerpt(literal))] is not a valid IPv6 address."
             case .emptyUser:
                 return "Enter a remote user."
             case .userTooLong:
@@ -92,22 +101,36 @@ public struct ConnectionEndpoint: Equatable, Sendable {
             case .userStartsWith(let character):
                 return "Remote user can’t start with \(Self.quoted(character))."
             case .conflictingUser(let inHost, let inField):
-                return "Host names user “\(inHost)” but Remote User is “\(inField)”. Enter the user once."
+                return "Host names user “\(Self.excerpt(inHost))” but Remote User is “\(Self.excerpt(inField))”. Enter the user once."
             case .invalidPort:
                 return "Port must be a number from 1 through 65535."
             case .conflictingPort(let inHost, let inField):
-                return "Host names port \(inHost) but Port is \(inField). Enter the port once."
+                return "Host names port \(Self.excerpt(inHost)) but Port is \(Self.excerpt(inField)). Enter the port once."
             case .labelTooLong:
                 return "Name must be at most \(ConnectionEndpoint.maximumLabelLength) characters."
             }
         }
 
+        /// At most `maximumEchoedScalars` scalars of `text`, then "…": a message never repeats an
+        /// unbounded input (one `Character` can hold millions of combining scalars).
+        static func excerpt(_ text: String) -> String {
+            let limit = ConnectionEndpoint.maximumEchoedScalars
+            var scalars = String.UnicodeScalarView()
+            var iterator = text.unicodeScalars.makeIterator()
+            while scalars.count < limit, let scalar = iterator.next() {
+                scalars.append(scalar)
+            }
+            return iterator.next() == nil ? String(scalars) : String(scalars) + "…"
+        }
+
         private static func quoted(_ character: Character) -> String {
+            let text = String(character)
             if character.isWhitespace || character.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F }) {
-                let scalars = character.unicodeScalars.map { "U+" + String($0.value, radix: 16, uppercase: true) }
+                let scalars = excerpt(text).unicodeScalars
+                    .map { $0 == "…" ? "…" : "U+" + String($0.value, radix: 16, uppercase: true) }
                 return "a space or control character (\(scalars.joined(separator: " ")))"
             }
-            return "“\(character)”"
+            return "“\(excerpt(text))”"
         }
     }
 
@@ -127,11 +150,16 @@ public struct ConnectionEndpoint: Equatable, Sendable {
         user userField: String,
         port portField: String
     ) -> Result<ConnectionEndpoint, ParseError> {
+        // Size first, in constant time, so nothing below scans or copies an unbounded field.
+        if hostField.utf8.count > maximumRawFieldBytes { return .failure(.hostTooLong) }
+        if userField.utf8.count > maximumRawFieldBytes { return .failure(.userTooLong) }
+        if portField.utf8.count > maximumRawFieldBytes { return .failure(.invalidPort) }
+
         var rest = trimmed(hostField)
         let userField = trimmed(userField)
         let portField = trimmed(portField)
 
-        // First, before any per-field rule: no NUL, control or invisible scalar anywhere.
+        // Then, before any per-field rule: no NUL, control or invisible scalar anywhere.
         for (field, text) in [(Field.host, rest), (.user, userField), (.port, portField)] {
             if let scalar = firstDisallowedScalar(in: text) {
                 return .failure(.controlCharacter(field, scalar))
@@ -139,9 +167,10 @@ public struct ConnectionEndpoint: Equatable, Sendable {
         }
 
         guard rest.isEmpty == false else { return .failure(.emptyHost) }
-        guard rest.count <= maximumHostLength + maximumUserLength + 1 + 2 + 1 + maximumPortDigits else {
+        guard rest.unicodeScalars.count <= maximumHostFieldScalars else {
             return .failure(.hostTooLong)
         }
+        guard userField.unicodeScalars.count <= maximumUserLength else { return .failure(.userTooLong) }
         if rest.contains("://") {
             return .failure(.hostIsURL)
         }
@@ -229,6 +258,8 @@ public struct ConnectionEndpoint: Equatable, Sendable {
     /// the form, port included (a stored `0` would otherwise become `-p 0`). Stored values are
     /// never trimmed: an entry the form could not have produced is refused.
     public static func validate(savedHost host: String, user: String, port: UInt16?) -> ParseError? {
+        if host.utf8.count > maximumRawFieldBytes { return .hostTooLong }
+        if user.utf8.count > maximumRawFieldBytes { return .userTooLong }
         if let scalar = firstDisallowedScalar(in: host) {
             return .controlCharacter(.host, scalar)
         }
@@ -247,11 +278,12 @@ public struct ConnectionEndpoint: Equatable, Sendable {
 
     /// The Name field: local only, but held to the same no-invisible-character rule and its bound.
     static func validate(label: String) -> ParseError? {
+        guard label.utf8.count <= maximumRawFieldBytes else { return .labelTooLong }
         let label = trimmed(label)
         if let scalar = firstDisallowedScalar(in: label) {
             return .controlCharacter(.name, scalar)
         }
-        return label.count > maximumLabelLength ? .labelTooLong : nil
+        return label.unicodeScalars.count > maximumLabelLength ? .labelTooLong : nil
     }
 
     /// The first NUL, control (C0, DEL, C1), format (zero-width, bidirectional override),
@@ -308,7 +340,7 @@ public struct ConnectionEndpoint: Equatable, Sendable {
     /// digits, `-`, `.` and `_`, not starting with `-` or `.`.
     private static func validateName(_ name: String) -> ParseError? {
         guard name.isEmpty == false else { return .emptyHost }
-        guard name.count <= maximumHostLength else { return .hostTooLong }
+        guard name.unicodeScalars.count <= maximumHostLength else { return .hostTooLong }
         for character in name {
             guard character.unicodeScalars.count == 1,
                   let scalar = character.unicodeScalars.first,
@@ -329,7 +361,7 @@ public struct ConnectionEndpoint: Equatable, Sendable {
     /// C string handed over must be exactly as long as the Swift string, so the check can never
     /// pass on a prefix (PX-023 round 2).
     static func validateIPv6(_ literal: String) -> ParseError? {
-        guard literal.count <= maximumHostLength else { return .hostTooLong }
+        guard literal.unicodeScalars.count <= maximumHostLength else { return .hostTooLong }
         guard literal.utf8.contains(0) == false else { return .invalidIPv6(literal) }
         var address = literal
         if let percent = literal.firstIndex(of: "%") {
@@ -360,7 +392,7 @@ public struct ConnectionEndpoint: Equatable, Sendable {
     /// A portable user name: ASCII letters, digits, `.`, `_` and `-`, not starting with `-` or `.`.
     private static func validateUser(_ user: String) -> ParseError? {
         guard user.isEmpty == false else { return .emptyUser }
-        guard user.count <= maximumUserLength else { return .userTooLong }
+        guard user.unicodeScalars.count <= maximumUserLength else { return .userTooLong }
         for character in user {
             guard character.unicodeScalars.count == 1,
                   let scalar = character.unicodeScalars.first,
@@ -377,7 +409,7 @@ public struct ConnectionEndpoint: Equatable, Sendable {
     /// One to five ASCII digits naming 1 through 65535. `UInt16(_:)` alone would accept `+22`.
     private static func parsePort(_ text: String) -> UInt16? {
         guard text.isEmpty == false,
-              text.count <= maximumPortDigits,
+              text.unicodeScalars.count <= maximumPortDigits,
               text.unicodeScalars.allSatisfy({ $0.value >= 0x30 && $0.value <= 0x39 }),
               let value = UInt32(text),
               (1...65535).contains(value) else {

@@ -27,6 +27,7 @@ public struct SSHConfiguration: Sendable, Equatable {
         "DynamicForward",
         "ProxyCommand",
         "PermitLocalCommand",
+        "LogLevel",
     ]
 
     /// Remote host name or IP address.
@@ -95,6 +96,10 @@ public struct SSHConfiguration: Sendable, Equatable {
     /// - `-o ClearAllForwardings=yes`: Prevent ad hoc local/remote port forwards.
     /// - `-o ExitOnForwardFailure=yes`: Exit immediately if any forwarding fails.
     /// - `-o StrictHostKeyChecking=...`: Enforce strict host-key verification with fail-closed semantics.
+    /// - `-o LogLevel=ERROR`: `ssh`'s stderr carries only `ssh`'s own errors and fatal verdicts
+    ///   (host-key refusal, authentication failure, connection errors), never the server's
+    ///   pre-authentication `Banner` or other INFO-level text a server can author (§19.1: remote
+    ///   stderr kept apart from `ssh`'s own diagnosis; PX-023 round 3).
     /// - `-s <subsystem>`: Request fixed subsystem, preventing shell command interpolation.
     ///
     /// Normative posture flags are appended **after** filtered `extraOptions` so they cannot be overridden.
@@ -114,6 +119,7 @@ public struct SSHConfiguration: Sendable, Equatable {
             "-o", "ClearAllForwardings=yes", // §19.1: No ad hoc port forwards
             "-o", "ExitOnForwardFailure=yes",
             "-o", "StrictHostKeyChecking=\(strictHostKeyChecking.rawValue)", // §19.1: Fail closed on host-key changes
+            "-o", "LogLevel=ERROR", // §19.1: no server-authored banner on ssh's own diagnostic stream
         ])
 
         if let knownHostsFile {

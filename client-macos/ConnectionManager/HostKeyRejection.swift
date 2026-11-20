@@ -23,23 +23,37 @@ enum HostKeyRejection: Equatable, Sendable {
     /// OpenSSH reported a host-key verification failure without saying which kind.
     case unverified
 
+    /// The line OpenSSH's `fatal()` ends every host-key refusal with (`sshconnect2.c`).
+    static let verdictLine = "Host key verification failed."
+
     /// Classifies OpenSSH's own diagnostics (`sshconnect.c`), or returns `nil` when the failure
-    /// was not a host-key failure. The most specific message wins: OpenSSH ends every one of these
-    /// cases with "Host key verification failed."
+    /// was not a host-key failure.
+    ///
+    /// Structural, not a phrase search (PX-023 round 3). `ssh` runs with `LogLevel=ERROR`, so its
+    /// stderr holds no server `Banner`; but a server's `SSH_MSG_DISCONNECT` reason is still logged
+    /// at ERROR ("Received disconnect from …: <text>"), and an authenticated subsystem's own stderr
+    /// shares the stream. So the verdict must be the **last** line, which only `ssh`'s fatal exit
+    /// writes (a disconnect is followed by "Disconnected from …", an authentication failure by
+    /// "Permission denied …"), and the kind is read from the line OpenSSH writes just before it.
     init?(sshMessage message: String) {
-        if message.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
-            || message.contains("has changed and you have requested strict checking")
-            || message.contains("POSSIBLE DNS SPOOFING DETECTED") {
-            self = .changed
-        } else if message.contains("REVOKED HOST KEY DETECTED") {
-            self = .revoked
-        } else if message.contains("host key is known for")
-            && message.contains("you have requested strict checking") {
+        let lines = message
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.isEmpty == false }
+        guard lines.last == Self.verdictLine else { return nil }
+        let reason = lines.count >= 2 ? lines[lines.count - 2] : ""
+        if reason.hasPrefix("No "),
+           reason.contains(" host key is known for "),
+           reason.hasSuffix(" and you have requested strict checking.") {
             self = .unknown
-        } else if message.contains("Host key verification failed") {
-            self = .unverified
+        } else if reason.hasPrefix("Host key for "),
+                  reason.hasSuffix(" has changed and you have requested strict checking.") {
+            self = .changed
+        } else if reason == "impersonate this host.",
+                  lines.contains(where: { $0.contains("WARNING: REVOKED HOST KEY DETECTED!") }) {
+            self = .revoked
         } else {
-            return nil
+            self = .unverified
         }
     }
 

@@ -936,10 +936,10 @@ struct ConnectionManagerTests {
         await manager.load()
         manager.connect(id: saved.id)
         let attempt = try #require(harness.attempts.first)
-        await attempt.emit(.failed("Host key verification failed."))
+        await attempt.emit(.hostKeyRejected(.unverified, sshMessage: "Host key verification failed."))
 
-        // PX-023: a host-key failure is its own blocking alert that says what happened; the
-        // alert's only action is OK (ConnectionManagerView), so there is no connect-anyway path.
+        // PX-023: ssh's own host-key verdict is its own blocking alert that says what happened;
+        // the alert's only action is OK (ConnectionManagerView), so there is no connect-anyway path.
         try await AsyncTestSupport.observed("blocking SSH failure alert") {
             manager.alert?.kind == .hostKeyRejected
         }
@@ -949,16 +949,17 @@ struct ConnectionManagerTests {
         #expect(manager.status(for: saved.id) == .disconnected(resumeAvailable: true))
         #expect(harness.attempts.count == 1)
 
-        // Any other SSH failure keeps the plain connection-failed alert and its message.
+        // A failure string is never read for host-key phrases (PX-023 round 2): it can carry
+        // server-authored text, so the same words in `.failed` stay a plain connection failure.
         manager.dismissAlert()
         manager.connect(id: saved.id)
         let second = try #require(harness.attempts.last)
-        await second.emit(.failed("Permission denied (publickey)."))
+        await second.emit(.failed("Host key verification failed."))
         try await AsyncTestSupport.observed("blocking non-host-key failure alert") {
             manager.alert?.kind == .connectionFailed
         }
         #expect(manager.alert?.title == "Connection Failed")
-        #expect(manager.alert?.message == "Permission denied (publickey).")
+        #expect(manager.alert?.message == "Host key verification failed.")
         await manager.shutdown()
     }
 

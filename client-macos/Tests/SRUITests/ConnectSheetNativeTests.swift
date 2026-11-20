@@ -59,12 +59,13 @@ struct ConnectSheetNativeTests {
     }
 
     private static func capture(_ window: NSWindow, name: String) {
+        let prefix = ProcessInfo.processInfo.environment["PX023_EVIDENCE_PREFIX"] ?? "px023"
         guard let directory = ProcessInfo.processInfo.environment["PX023_EVIDENCE_DIR"],
               let frameView = window.contentView?.superview,
               let bitmap = frameView.bitmapImageRepForCachingDisplay(in: frameView.bounds) else { return }
         frameView.cacheDisplay(in: frameView.bounds, to: bitmap)
         try? bitmap.representation(using: .png, properties: [:])?
-            .write(to: URL(fileURLWithPath: directory).appendingPathComponent("\(name).png"))
+            .write(to: URL(fileURLWithPath: directory).appendingPathComponent("\(prefix)-\(name).png"))
     }
 
     @Test("Connect submits only a valid endpoint, exactly as typed")
@@ -103,6 +104,10 @@ struct ConnectSheetNativeTests {
             ("host.example", "alice", "65536"),
             ("host.example", "alice", "0"),
             ("::1", "alice", ""),
+            // PX-023 round 2: a NUL inside brackets once passed and then aborted the client.
+            ("[::\u{0};id -oProxyCommand=x]", "alice", ""),
+            ("host.example", "al\u{0}ice", ""),
+            ("host.example", "alice", "22\u{0}"),
         ] {
             try Self.type(hostText, into: hostField, in: window)
             try Self.type(userText, into: userField, in: window)
@@ -115,14 +120,14 @@ struct ConnectSheetNativeTests {
         try Self.type("host.example;id", into: hostField, in: window)
         try Self.type("", into: portField, in: window)
         try await Self.settle(host)
-        Self.capture(window, name: "impl-connect-form-rejected")
+        Self.capture(window, name: "connect-form-rejected")
 
         // A valid endpoint, user@host:port in the Host field, submits exactly that draft.
         try Self.type("alice@127.0.0.1:2222", into: hostField, in: window)
         try Self.type("", into: userField, in: window)
         try Self.type("Lab", into: nameField, in: window)
         try await Self.settle(host)
-        Self.capture(window, name: "impl-connect-form-valid")
+        Self.capture(window, name: "connect-form-valid")
         #expect(try Self.pressReturn(in: window))
         try await Self.settle(host)
         let draft = try #require(submitted.drafts.first)

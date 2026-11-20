@@ -8,6 +8,8 @@
 
 import Foundation
 @testable import ConnectionManager
+import Protocol
+@testable import Session
 import Testing
 import TransportSSH
 
@@ -177,7 +179,7 @@ struct ConnectionEndpointTests {
         Rejected(host: "$(touch /tmp/px023)", user: "alice", port: "", error: .invalidHostCharacter("$")),
         Rejected(host: "`id`", user: "alice", port: "", error: .invalidHostCharacter("`")),
         Rejected(host: "host example", user: "alice", port: "", error: .invalidHostCharacter(" ")),
-        Rejected(host: "host\nexample", user: "alice", port: "", error: .invalidHostCharacter("\n")),
+        Rejected(host: "host\nexample", user: "alice", port: "", error: .controlCharacter(.host, "\n")),
         Rejected(host: "host|cat", user: "alice", port: "", error: .invalidHostCharacter("|")),
         Rejected(host: "host&", user: "alice", port: "", error: .invalidHostCharacter("&")),
         Rejected(host: "host>out", user: "alice", port: "", error: .invalidHostCharacter(">")),
@@ -201,6 +203,29 @@ struct ConnectionEndpointTests {
         Rejected(host: "host.example", user: "al@ice", port: "", error: .invalidUserCharacter("@")),
         Rejected(host: "a@b@host.example", user: "", port: "", error: .invalidUserCharacter("@")),
         Rejected(host: "-x@host.example", user: "", port: "", error: .userStartsWith("-")),
+        // PX-023 round 2: NUL, C0, DEL, C1 and invisible format scalars, in every field, first. A
+        // NUL inside brackets used to pass: `inet_pton` read only the prefix before it, and
+        // `Process.run` then aborted the client on the whole string.
+        Rejected(host: "[::\u{0};id -oProxyCommand=x]", user: "alice", port: "", error: .controlCharacter(.host, "\u{0}")),
+        Rejected(host: "[::1\u{0} -F /tmp/x]", user: "alice", port: "", error: .controlCharacter(.host, "\u{0}")),
+        Rejected(host: "alice@[fe80::1\u{0}$(id)]:22", user: "", port: "", error: .controlCharacter(.host, "\u{0}")),
+        Rejected(host: "[::\u{0}1]", user: "alice", port: "", error: .controlCharacter(.host, "\u{0}")),
+        Rejected(host: "[fe80::1%en0\u{0}x]", user: "alice", port: "", error: .controlCharacter(.host, "\u{0}")),
+        Rejected(host: "host.example\u{0}", user: "alice", port: "", error: .controlCharacter(.host, "\u{0}")),
+        Rejected(host: "\u{0}host.example", user: "alice", port: "", error: .controlCharacter(.host, "\u{0}")),
+        Rejected(host: "host\u{1}", user: "alice", port: "", error: .controlCharacter(.host, "\u{1}")),
+        Rejected(host: "host\u{1B}[31m", user: "alice", port: "", error: .controlCharacter(.host, "\u{1B}")),
+        Rejected(host: "host\u{7F}", user: "alice", port: "", error: .controlCharacter(.host, "\u{7F}")),
+        Rejected(host: "host\u{85}x", user: "alice", port: "", error: .controlCharacter(.host, "\u{85}")),
+        Rejected(host: "host\u{9F}", user: "alice", port: "", error: .controlCharacter(.host, "\u{9F}")),
+        Rejected(host: "host\u{200B}", user: "alice", port: "", error: .controlCharacter(.host, "\u{200B}")),
+        Rejected(host: "host\u{202E}", user: "alice", port: "", error: .controlCharacter(.host, "\u{202E}")),
+        Rejected(host: "host.example", user: "al\u{0}ice", port: "", error: .controlCharacter(.user, "\u{0}")),
+        Rejected(host: "host.example", user: "alice\u{0}-oX", port: "", error: .controlCharacter(.user, "\u{0}")),
+        Rejected(host: "host.example", user: "al\u{9B}ice", port: "", error: .controlCharacter(.user, "\u{9B}")),
+        Rejected(host: "host.example", user: "alice", port: "22\u{0}", error: .controlCharacter(.port, "\u{0}")),
+        Rejected(host: "host.example", user: "alice", port: "\u{0}22", error: .controlCharacter(.port, "\u{0}")),
+        Rejected(host: "host.example", user: "alice", port: "2\u{FEFF}2", error: .controlCharacter(.port, "\u{FEFF}")),
         // The user or port named twice, differently.
         Rejected(host: "bob@host.example", user: "alice", port: "",
                  error: .conflictingUser(inHost: "bob", inField: "alice")),
@@ -247,6 +272,115 @@ struct ConnectionEndpointTests {
         #expect(parseError("h:65536") == .invalidPort)
     }
 
+    @Test("every argv element of an accepted endpoint reaches exec whole: no NUL anywhere")
+    func acceptedArgvHasNoNUL() throws {
+        for input in Self.accepted {
+            for element in try argv(input.host, input.user, input.port) {
+                #expect(element.utf8.contains(0) == false, "\(element.debugDescription)")
+                // What `Process.run` hands to exec: the C string must be the whole element.
+                #expect(element.withCString { strlen($0) } == element.utf8.count)
+            }
+        }
+    }
+
+    @Test("the IPv6 check never passes on a prefix of the literal")
+    func ipv6CheckSeesWholeLiteral() {
+        // Called directly, below the field-wide control check, so each layer is pinned on its own.
+        for literal in ["::\u{0};id", "::1\u{0}", "::\u{0}1", "fe80::1%en0\u{0}x", "\u{0}::1"] {
+            #expect(ConnectionEndpoint.validateIPv6(literal) == .invalidIPv6(literal), "\(literal.debugDescription)")
+        }
+        #expect(ConnectionEndpoint.validateIPv6("::1") == nil)
+        #expect(ConnectionEndpoint.validateIPv6("fe80::1%en0") == nil)
+    }
+
+    @Test("the name refuses control and invisible characters too")
+    func nameControlCharacters() {
+        for (label, scalar) in [("Lab\u{0}", "\u{0}"), ("La\u{202E}b", "\u{202E}"), ("L\u{7F}ab", "\u{7F}")] as [(String, Unicode.Scalar)] {
+            let draft = ConnectDraft(label: label, host: "host.example", user: "alice")
+            #expect(draft.validationMessage == ConnectionEndpoint.ParseError.controlCharacter(.name, scalar).description)
+            #expect(draft.savedConnection == nil)
+        }
+        #expect(ConnectionEndpoint.ParseError.controlCharacter(.host, "\u{0}").description
+            == "Host can’t contain a control or invisible character (U+0000).")
+    }
+
+    /// A fixed-seed generator, so a failure names an input that reproduces.
+    private struct SplitMix64: RandomNumberGenerator {
+        var state: UInt64
+        mutating func next() -> UInt64 {
+            state &+= 0x9E37_79B9_7F4A_7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+            z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+            return z ^ (z >> 31)
+        }
+    }
+
+    /// The safety property, stated independently of the parser: what an accepted endpoint hands
+    /// `ssh` is a printable-ASCII name or a whole IPv6 literal, a portable user and a valid port.
+    private static func referenceSafe(_ endpoint: ConnectionEndpoint) -> Bool {
+        let nameCharacters = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+        func portable(_ text: String, max: Int) -> Bool {
+            !text.isEmpty && text.count <= max && text.allSatisfy(nameCharacters.contains)
+                && text.first != "-" && text.first != "."
+        }
+        let hostSafe: Bool
+        if endpoint.host.contains(":") {
+            let address = endpoint.host.split(separator: "%", maxSplits: 1).first.map(String.init) ?? ""
+            let v6Characters = Set("0123456789abcdefABCDEF:.")
+            var storage = in6_addr()
+            hostSafe = address.allSatisfy(v6Characters.contains)
+                && address.withCString { inet_pton(AF_INET6, $0, &storage) } == 1
+                && endpoint.host.allSatisfy { nameCharacters.contains($0) || $0 == ":" || $0 == "%" }
+        } else {
+            hostSafe = portable(endpoint.host, max: 253)
+        }
+        return hostSafe && portable(endpoint.user, max: 64) && endpoint.port != 0
+    }
+
+    @Test("randomized: no hostile input is accepted unsafely, and generated valid endpoints are accepted")
+    func randomizedDifferential() throws {
+        var random = SplitMix64(state: 0x5058_3032_3352_3200) // fixed seed
+        let alphabet: [String] = ["a", "Z", "0", "9", ".", "-", "_", ":", "::", "[", "]", "@", "%", "1",
+                                  "fe80", "::1", "en0", " ", "\t", "\u{0}", "\u{1}", "\u{7F}", "\u{85}",
+                                  "\u{9F}", "\u{200B}", "\u{202E}", "\u{FEFF}", ";", "$(", ")", "`", "|", "&",
+                                  "'", "\"", "\\", "/", "=", "-o", "é", "\u{043E}", "２", "+", "*"]
+        var accepted = 0
+        for _ in 0..<20_000 {
+            func field(_ maxPieces: Int) -> String {
+                (0..<Int.random(in: 0...maxPieces, using: &random))
+                    .map { _ in alphabet.randomElement(using: &random)! }.joined()
+            }
+            let host = field(8), user = field(3), port = field(2)
+            guard case .success(let endpoint) = ConnectionEndpoint.parse(host: host, user: user, port: port) else {
+                continue
+            }
+            accepted += 1
+            #expect(Self.referenceSafe(endpoint), "accepted unsafely: \(host.debugDescription) \(user.debugDescription) \(port.debugDescription)")
+            let arguments = ConnectionManager.sshConfiguration(
+                for: SavedConnection(label: "x", host: endpoint.host, port: endpoint.port, user: endpoint.user)
+            ).buildArguments()
+            #expect(arguments.allSatisfy { $0.utf8.contains(0) == false })
+        }
+        #expect(accepted > 0, "the generator must reach the accepting side too")
+
+        // Fail-safe direction: generated valid endpoints are all accepted, decomposed as built.
+        let labelCharacters = Array("abcdefghijklmnopqrstuvwxyz0123456789-")
+        for _ in 0..<2_000 {
+            let labels = (0..<Int.random(in: 1...4, using: &random)).map { _ in
+                "h" + String((0..<Int.random(in: 0...10, using: &random)).map { _ in labelCharacters.randomElement(using: &random)! })
+            }
+            let host = labels.joined(separator: ".")
+            let user = "u" + String((0..<Int.random(in: 0...8, using: &random)).map { _ in labelCharacters.randomElement(using: &random)! })
+            let port = UInt16.random(in: 1...65535, using: &random)
+            let v6 = Bool.random(using: &random)
+            let hostText = v6 ? "[fe80::\(String(port, radix: 16))]" : host
+            let result = ConnectionEndpoint.parse(host: "\(user)@\(hostText):\(port)", user: "", port: "")
+            #expect(result == .success(ConnectionEndpoint(
+                host: v6 ? "fe80::\(String(port, radix: 16))" : host, port: port, user: user)))
+        }
+    }
+
     @Test("an empty name defaults to the endpoint, bracketing IPv6")
     func defaultLabel() throws {
         let plain = try #require(ConnectDraft(host: "host.example:2222", user: "alice").savedConnection)
@@ -288,6 +422,16 @@ struct ConnectionEndpointTests {
             SavedConnection(label: "shell", host: "host;id", user: "alice"),
             SavedConnection(label: "user", host: "host.example", user: "-oProxyCommand=id"),
             SavedConnection(label: "v6", host: "::1;id", user: "alice"),
+            // PX-023 round 2: a NUL the IPv6 check used to read past, and other invisible scalars.
+            SavedConnection(label: "v6-nul", host: "::\u{0};id", user: "alice"),
+            SavedConnection(label: "v6-nul-tail", host: "::1\u{0} -F /tmp/x", user: "alice"),
+            SavedConnection(label: "user-nul", host: "host.example", user: "al\u{0}ice"),
+            SavedConnection(label: "bidi", host: "host\u{202E}.example", user: "alice"),
+            // Entries saved before PX-023 that the form no longer produces.
+            SavedConnection(label: "legacy-user-at", host: "alice@host.example", user: "alice"),
+            SavedConnection(label: "legacy-space", host: "host.example ", user: "alice"),
+            // Port 0 used to reach `-p 0`.
+            SavedConnection(label: "port-zero", host: "host.example", port: 0, user: "alice"),
         ]
         let good = SavedConnection(label: "good", host: "fe80::1%en0", port: 2222, user: "alice")
         try await store.save(tampered + [good])
@@ -311,6 +455,51 @@ struct ConnectionEndpointTests {
         #expect(configuration.buildArguments() == posturePrefix
             + ["-p", "2222", "-l", "alice", "-s", "--", "fe80::1%en0", "srui"])
         await manager.shutdown()
+    }
+
+    @Test("a saved port is checked at and past each bound")
+    @MainActor
+    func savedPortBounds() async throws {
+        #expect(ConnectionEndpoint.validate(savedHost: "h", user: "alice", port: 0) == .invalidPort)
+        #expect(ConnectionEndpoint.validate(savedHost: "h", user: "alice", port: 1) == nil)
+        #expect(ConnectionEndpoint.validate(savedHost: "h", user: "alice", port: 65535) == nil)
+        #expect(ConnectionEndpoint.validate(savedHost: "h", user: "alice", port: nil) == nil)
+
+        let (store, directory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let zero = SavedConnection(label: "zero", host: "h", port: 0, user: "alice")
+        let one = SavedConnection(label: "one", host: "h", port: 1, user: "alice")
+        let top = SavedConnection(label: "top", host: "h", port: 65535, user: "alice")
+        try await store.save([zero, one, top])
+        let probe = FactoryProbe()
+        let manager = ConnectionManager(store: store, attemptFactory: { probe.make($0) })
+        await manager.load()
+        manager.connect(id: zero.id)
+        #expect(manager.alert?.message == "This saved connection’s endpoint is invalid: Port must be a number from 1 through 65535. Remove it and add it again.")
+        #expect(probe.configurations.isEmpty)
+        manager.dismissAlert()
+        manager.connect(id: one.id)
+        manager.connect(id: top.id)
+        #expect(probe.configurations.map { Array($0.buildArguments().suffix(8)) } == [
+            ["-p", "1", "-l", "alice", "-s", "--", "h", "srui"],
+            ["-p", "65535", "-l", "alice", "-s", "--", "h", "srui"],
+        ])
+        await manager.shutdown()
+
+        // 65536 cannot be stored as a port at all: the file is refused on load, nothing connects.
+        let (bad, badDirectory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: badDirectory) }
+        try FileManager.default.createDirectory(at: bad.url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("""
+        [{"id":"\(UUID().uuidString)","label":"over","host":"h","port":65536,"user":"alice","lastKnownRevision":0}]
+        """.utf8).write(to: bad.url)
+        let badProbe = FactoryProbe()
+        let badManager = ConnectionManager(store: bad, attemptFactory: { badProbe.make($0) })
+        await badManager.load()
+        #expect(badManager.entries.isEmpty)
+        #expect(badManager.alert?.kind == .persistenceFailed)
+        #expect(badProbe.configurations.isEmpty)
+        await badManager.shutdown()
     }
 
     @Test("the one SSH configuration keeps OpenSSH's strict, non-interactive trust policy")
@@ -351,6 +540,43 @@ struct HostKeyRejectionTests {
         #expect(HostKeyRejection(sshMessage: "Permission denied (publickey).") == nil)
         #expect(HostKeyRejection(sshMessage: "ssh: connect to host h port 22: Connection refused") == nil)
         #expect(HostKeyRejection(sshMessage: "") == nil)
+    }
+
+    @Test("server-authored text can never raise the host-key alert (SERVER HANDSHAKE_REFUSED)")
+    @MainActor
+    func serverRefusalIsNotAHostKeyRejection() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("srui-px023-spoof-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let pair = await PipeTransport.createPair()
+        let manager = ConnectionManager(
+            store: SavedConnectionStore(url: directory.appendingPathComponent("connections.json")),
+            attemptFactory: { request in
+                ConnectionManager.makeSessionControllerAttempt(request: request, transport: pair.client)
+            }
+        )
+        let serverInbound = pair.server.receiveStream()
+        _ = try #require(manager.connect(ConnectDraft(host: "trusted.example", user: "alice")))
+        // The client's hello reaches the server; then a trusted, authenticated server refuses with
+        // a detail that imitates OpenSSH's host-key banner.
+        var iterator = serverInbound.makeAsyncIterator()
+        _ = try await iterator.next()
+        var refusal = SRUIServerHandshakeRefused()
+        refusal.reason = .snapshotUndeliverable
+        refusal.detail = "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! Host key verification failed."
+        var message = SRUIMessage()
+        message.serverHandshakeRefused = refusal
+        try await pair.server.send(data: try SRUIFraming.encodeFramed(message))
+
+        try await AsyncTestSupport.observed("refusal alert") { manager.alert != nil }
+        let alert = try #require(manager.alert)
+        #expect(alert.kind == .connectionFailed, "\(alert.kind): \(alert.message)")
+        #expect(alert.title == "Connection Failed")
+        #expect(alert.message.contains("server refused the handshake"))
+        #expect(alert.message.contains("ssh-keygen") == false)
+        #expect(alert.message.hasPrefix("SRUI did not connect") == false)
+        await manager.shutdown()
+        await pair.server.close()
     }
 
     @Test("the alert says what happened and how to verify the key outside SRUI")

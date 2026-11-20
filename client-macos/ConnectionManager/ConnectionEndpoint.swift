@@ -12,6 +12,12 @@
 // one were ever involved. Rejected input is never trimmed into something acceptable: only leading
 // and trailing whitespace is dropped.
 //
+// PX-023 round 2: before any per-field rule, every field is refused if it still holds a NUL or any
+// other control, format or otherwise invisible scalar. A NUL is the dangerous one: C APIs
+// (`inet_pton`, `Process.run`'s file-system representation) read a string only up to it, so a
+// check made through them sees a prefix while `ssh` would be handed the whole string, and
+// `Process.run` raises an Objective-C exception that aborts the client.
+//
 
 import Foundation
 
@@ -32,7 +38,16 @@ public struct ConnectionEndpoint: Equatable, Sendable {
     public let port: UInt16?
     public let user: String
 
+    /// A Connect-form field, as an error names it.
+    public enum Field: String, Equatable, Sendable {
+        case host = "Host"
+        case user = "Remote user"
+        case port = "Port"
+        case name = "Name"
+    }
+
     public enum ParseError: Error, Equatable, Sendable, CustomStringConvertible {
+        case controlCharacter(Field, Unicode.Scalar)
         case emptyHost
         case hostTooLong
         case hostIsURL
@@ -51,6 +66,9 @@ public struct ConnectionEndpoint: Equatable, Sendable {
 
         public var description: String {
             switch self {
+            case .controlCharacter(let field, let scalar):
+                let code = String(scalar.value, radix: 16, uppercase: true)
+                return "\(field.rawValue) can’t contain a control or invisible character (U+\(String(repeating: "0", count: max(0, 4 - code.count)))\(code))."
             case .emptyHost:
                 return "Enter a host."
             case .hostTooLong:
@@ -112,6 +130,13 @@ public struct ConnectionEndpoint: Equatable, Sendable {
         var rest = trimmed(hostField)
         let userField = trimmed(userField)
         let portField = trimmed(portField)
+
+        // First, before any per-field rule: no NUL, control or invisible scalar anywhere.
+        for (field, text) in [(Field.host, rest), (.user, userField), (.port, portField)] {
+            if let scalar = firstDisallowedScalar(in: text) {
+                return .failure(.controlCharacter(field, scalar))
+            }
+        }
 
         guard rest.isEmpty == false else { return .failure(.emptyHost) }
         guard rest.count <= maximumHostLength + maximumUserLength + 1 + 2 + 1 + maximumPortDigits else {
@@ -200,10 +225,46 @@ public struct ConnectionEndpoint: Equatable, Sendable {
     }
 
     /// Re-checks a saved entry before it reaches `ssh`: the saved-connections file is local input
-    /// too, and a cold launch connects from it without passing through the form.
-    public static func validate(savedHost host: String, user: String) -> ParseError? {
+    /// too, and a cold launch connects from it without passing through the form. The same rules as
+    /// the form, port included (a stored `0` would otherwise become `-p 0`). Stored values are
+    /// never trimmed: an entry the form could not have produced is refused.
+    public static func validate(savedHost host: String, user: String, port: UInt16?) -> ParseError? {
+        if let scalar = firstDisallowedScalar(in: host) {
+            return .controlCharacter(.host, scalar)
+        }
+        if let scalar = firstDisallowedScalar(in: user) {
+            return .controlCharacter(.user, scalar)
+        }
         let hostError = host.contains(":") ? validateIPv6(host) : validateName(host)
-        return hostError ?? validateUser(user)
+        if let error = hostError ?? validateUser(user) {
+            return error
+        }
+        if let port, port == 0 {
+            return .invalidPort
+        }
+        return nil
+    }
+
+    /// The Name field: local only, but held to the same no-invisible-character rule and its bound.
+    static func validate(label: String) -> ParseError? {
+        let label = trimmed(label)
+        if let scalar = firstDisallowedScalar(in: label) {
+            return .controlCharacter(.name, scalar)
+        }
+        return label.count > maximumLabelLength ? .labelTooLong : nil
+    }
+
+    /// The first NUL, control (C0, DEL, C1), format (zero-width, bidirectional override),
+    /// separator, surrogate, private-use or unassigned scalar in `text`.
+    static func firstDisallowedScalar(in text: String) -> Unicode.Scalar? {
+        text.unicodeScalars.first { scalar in
+            switch scalar.properties.generalCategory {
+            case .control, .format, .lineSeparator, .paragraphSeparator, .surrogate, .privateUse, .unassigned:
+                return true
+            default:
+                return false
+            }
+        }
     }
 
     /// `user@host[:port]`, bracketing an IPv6 address so the port stays unambiguous.
@@ -217,8 +278,21 @@ public struct ConnectionEndpoint: Equatable, Sendable {
         return "\(user)@\(shownHost)\(portSuffix)"
     }
 
+    /// Drops leading and trailing spaces (Unicode `Zs`), tabs and line feeds, as a paste brings
+    /// them. Nothing invisible is trimmed: a zero-width or other format scalar, or any other
+    /// control, stays and is refused by `firstDisallowedScalar(in:)`.
+    /// (`CharacterSet.whitespaces` is not used: it also holds U+200B ZERO WIDTH SPACE.)
     static func trimmed(_ text: String) -> String {
-        text.trimmingCharacters(in: .whitespacesAndNewlines)
+        func trimmable(_ scalar: Unicode.Scalar) -> Bool {
+            scalar == "\t" || scalar == "\n" || scalar == "\r"
+                || scalar.properties.generalCategory == .spaceSeparator
+        }
+        let scalars = text.unicodeScalars
+        guard let first = scalars.firstIndex(where: { !trimmable($0) }),
+              let last = scalars.lastIndex(where: { !trimmable($0) }) else {
+            return ""
+        }
+        return String(scalars[first...last])
     }
 
     private static func isASCIIAlphanumeric(_ scalar: Unicode.Scalar) -> Bool {
@@ -250,8 +324,13 @@ public struct ConnectionEndpoint: Equatable, Sendable {
 
     /// An IPv6 address `inet_pton` accepts, optionally with a `%zone` of ASCII letters, digits, `.`,
     /// `_` and `-` (an interface name such as `en0`).
-    private static func validateIPv6(_ literal: String) -> ParseError? {
+    ///
+    /// The literal must reach `inet_pton` whole: one containing a NUL is refused outright, and the
+    /// C string handed over must be exactly as long as the Swift string, so the check can never
+    /// pass on a prefix (PX-023 round 2).
+    static func validateIPv6(_ literal: String) -> ParseError? {
         guard literal.count <= maximumHostLength else { return .hostTooLong }
+        guard literal.utf8.contains(0) == false else { return .invalidIPv6(literal) }
         var address = literal
         if let percent = literal.firstIndex(of: "%") {
             address = String(literal[..<percent])
@@ -270,7 +349,11 @@ public struct ConnectionEndpoint: Equatable, Sendable {
             return .invalidIPv6(literal)
         }
         var storage = in6_addr()
-        let parsed = address.withCString { inet_pton(AF_INET6, $0, &storage) }
+        let utf8Count = address.utf8.count
+        let parsed = address.withCString { cString -> Int32 in
+            guard strlen(cString) == utf8Count else { return 0 }
+            return inet_pton(AF_INET6, cString, &storage)
+        }
         return parsed == 1 ? nil : .invalidIPv6(literal)
     }
 

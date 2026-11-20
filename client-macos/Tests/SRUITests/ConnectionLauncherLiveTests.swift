@@ -294,10 +294,13 @@ struct ConnectionLauncherLiveTests {
         await manager.shutdown()
     }
 
-    /// Writes the real alert text to `PX023_EVIDENCE_DIR` when set, for the completion note.
+    /// Writes the real alert text to `PX023_EVIDENCE_DIR` when set, for the completion note, named
+    /// with `PX023_EVIDENCE_PREFIX` (default `px023`) so separate runs keep separate files.
     private static func recordEvidence(_ alert: ConnectionAlert, mode: LiveSSHD.KnownHosts) {
-        guard let directory = ProcessInfo.processInfo.environment["PX023_EVIDENCE_DIR"] else { return }
-        let file = URL(fileURLWithPath: directory).appendingPathComponent("impl-hostkey-alert-\(mode).txt")
+        let environment = ProcessInfo.processInfo.environment
+        guard let directory = environment["PX023_EVIDENCE_DIR"] else { return }
+        let prefix = environment["PX023_EVIDENCE_PREFIX"] ?? "px023"
+        let file = URL(fileURLWithPath: directory).appendingPathComponent("\(prefix)-hostkey-alert-\(mode).txt")
         try? "\(alert.title)\n\n\(alert.message)\n".write(to: file, atomically: true, encoding: .utf8)
     }
 }

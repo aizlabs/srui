@@ -127,12 +127,14 @@ also takes `user@host`, `host:port`, `[::1]` and `user@[::1]:2222`; a user or po
 places must agree. Connect stays disabled, with the reason shown, until the endpoint is a host name,
 an IPv4 address or a bracketed IPv6 address, a user of ASCII letters, digits, `.`, `_` and `-`, and a
 port from 1 through 65535; nothing may start with `-`, and the host is at most 253 characters, the
-user 64 and the name 128. The endpoint becomes `-p <port> -l <user> -s -- <host> srui` argv for
+user 64 and the name 128. No field may hold a NUL or any other control or invisible character
+(C0, DEL, C1, zero-width, bidi override); only spaces, tabs and line breaks at either end are dropped. The endpoint becomes `-p <port> -l <user> -s -- <host> srui` argv for
 `/usr/bin/ssh`, never a shell command, and a saved entry is checked again before every attempt.
 Every connection uses the same configuration whatever app serves `srui` (counter, srtop):
 `StrictHostKeyChecking=yes`, `BatchMode=yes`, your own agent, keys and `~/.ssh/known_hosts`. An
 unknown or changed host key stops the attempt with a **Host Key Not Trusted** alert that says which
-it was and how to check the key; SRUI never adds or replaces a host key and offers no way to connect
+it was and how to check the key. Only `ssh`'s own verdict raises it: its stderr when it exited 255
+before any SRUI byte arrived (`SSHTransport.localFailureBeforeStream()`), never text a server sent; SRUI never adds or replaces a host key and offers no way to connect
 anyway. Record a new key by connecting once with `ssh` in Terminal after checking its fingerprint.
 
 **From the command line.** Launch `RendererDemoApp` over SSH (defaults: `BatchMode=yes`, 30s

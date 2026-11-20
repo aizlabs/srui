@@ -17,7 +17,10 @@
 // argv, and a saved entry is validated again before every attempt. Host-key verification stays
 // OpenSSH's (`StrictHostKeyChecking=yes`, `BatchMode=yes`, the user's own known_hosts, §19.1, §25):
 // a rejected key is a blocking alert that says whether the key is unknown or changed and how to
-// verify it outside SRUI. There is no trust-anyway path.
+// verify it outside SRUI. There is no trust-anyway path. Only `ssh`'s own verdict is classified:
+// its stderr when it exited 255 before any SRUI byte arrived (`SSHTransport
+// .localFailureBeforeStream()`). A failure string, which can carry server-authored text such as a
+// `SERVER HANDSHAKE_REFUSED` detail, is never read for host-key phrases (PX-023 round 2).
 //
 
 import Foundation
@@ -85,12 +88,9 @@ public struct ConnectDraft: Identifiable, Equatable, Sendable {
     }
 
     public var validationMessage: String? {
-        if normalizedLabel.count > ConnectionEndpoint.maximumLabelLength {
-            return ConnectionEndpoint.ParseError.labelTooLong.description
-        }
         switch endpoint {
         case .success:
-            return nil
+            return ConnectionEndpoint.validate(label: label)?.description
         case .failure(let error):
             return error.description
         }
@@ -279,7 +279,27 @@ enum ConnectionAttemptEvent: Equatable, Sendable {
     case replaced(previousSessionID: String?, newSessionID: String)
     case ready(sessionID: String, revision: UInt64)
     case failed(String)
+    /// `ssh` itself refused the server's host key before the SRUI stream began (PX-023).
+    case hostKeyRejected(HostKeyRejection, sshMessage: String)
     case stopped
+}
+
+/// Thrown by an attempt's `start()` when `ssh` refused the host key before the handshake could
+/// begin, so the failure is reported as `ssh`'s verdict rather than as its description.
+struct LocalHostKeyRejection: Error, Equatable, Sendable {
+    let rejection: HostKeyRejection
+    let sshMessage: String
+
+    /// `ssh`'s own host-key verdict for `transport`, or `nil`. Only an `SSHTransport` whose child
+    /// exited 255 before any SRUI byte has one; nothing a server sent is consulted.
+    static func diagnose(_ transport: SSHTransport?) async -> LocalHostKeyRejection? {
+        guard let transport,
+              let local = await transport.localFailureBeforeStream(),
+              let rejection = HostKeyRejection(sshMessage: local.stderr) else {
+            return nil
+        }
+        return LocalHostKeyRejection(rejection: rejection, sshMessage: local.stderr)
+    }
 }
 
 protocol ConnectionAttempt: Sendable {
@@ -339,10 +359,12 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
 
     private let continuation: AsyncStream<ConnectionAttemptEvent>.Continuation
     private let controller: SessionController
+    /// The transport when it is `ssh`, whose own exit is the only source of a host-key verdict.
+    private let sshTransport: SSHTransport?
     private var forwardingTask: Task<Void, Never>?
     private var stopTask: Task<Void, Never>?
 
-    init(controller: SessionController) {
+    init(controller: SessionController, sshTransport: SSHTransport?) {
         let pair = AsyncStream.makeStream(
             of: ConnectionAttemptEvent.self,
             bufferingPolicy: .bufferingNewest(16)
@@ -350,6 +372,7 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
         self.events = pair.stream
         self.continuation = pair.continuation
         self.controller = controller
+        self.sshTransport = sshTransport
     }
 
     func start() async throws {
@@ -357,6 +380,7 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
         guard forwardingTask == nil else { return }
 
         let lifecycleEvents = controller.lifecycleEvents
+        let sshTransport = self.sshTransport
         let continuation = self.continuation
         forwardingTask = Task {
             lifecycleLoop: for await event in lifecycleEvents {
@@ -376,7 +400,11 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
                 case .ready(let sessionID, let revision):
                     continuation.yield(.ready(sessionID: sessionID, revision: revision))
                 case .failed(let failure):
-                    continuation.yield(.failed(failure.description))
+                    if let local = await LocalHostKeyRejection.diagnose(sshTransport) {
+                        continuation.yield(.hostKeyRejected(local.rejection, sshMessage: local.sshMessage))
+                    } else {
+                        continuation.yield(.failed(failure.description))
+                    }
                 case .stopped:
                     continuation.yield(.stopped)
                     break lifecycleLoop
@@ -386,7 +414,16 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
         }
 
         try Task.checkCancellation()
-        try await controller.start()
+        do {
+            try await controller.start()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            if let local = await LocalHostKeyRejection.diagnose(sshTransport) {
+                throw local
+            }
+            throw error
+        }
     }
 
     /// Stops the controller once; every caller awaits that same stop to its end.
@@ -542,7 +579,11 @@ public final class ConnectionManager {
         }
         // The saved-connections file is local input that a cold launch connects from without the
         // form, so it passes the same endpoint validation before it can become `ssh` argv (PX-023).
-        if let error = ConnectionEndpoint.validate(savedHost: connection.host, user: connection.user) {
+        if let error = ConnectionEndpoint.validate(
+            savedHost: connection.host,
+            user: connection.user,
+            port: connection.port
+        ) {
             presentAlert(ConnectionAlert(
                 kind: .invalidInput,
                 connectionID: connectionID,
@@ -661,7 +702,10 @@ public final class ConnectionManager {
         )
         controller.attachRenderer(request.context.renderer)
         configureController?(controller)
-        return SessionControllerConnectionAttempt(controller: controller)
+        return SessionControllerConnectionAttempt(
+            controller: controller,
+            sshTransport: transport as? SSHTransport
+        )
     }
 
     /// The one SSH configuration every connection uses, whatever application serves the remote
@@ -763,6 +807,13 @@ public final class ConnectionManager {
             }
         } catch is CancellationError {
             // Supersession and application shutdown are ordinary ownership transitions.
+        } catch let local as LocalHostKeyRejection {
+            handledTerminalEvent = await recordFailure(
+                local.sshMessage,
+                connectionID: connectionID,
+                token: token,
+                hostKey: local.rejection
+            )
         } catch {
             handledTerminalEvent = await recordFailure(
                 String(describing: error),
@@ -807,7 +858,7 @@ public final class ConnectionManager {
             // ends, nothing will reconnect it: its windows close at once, not after the stop
             // (they would read as live meanwhile), and the `runAttempt` tail closes them again.
             switch event {
-            case .failed, .stopped:
+            case .failed, .hostKeyRejected, .stopped:
                 discardContext(for: connectionID)
                 return true
             case .connecting:
@@ -886,6 +937,14 @@ public final class ConnectionManager {
                 token: token
             )
 
+        case .hostKeyRejected(let rejection, let sshMessage):
+            return await recordFailure(
+                sshMessage,
+                connectionID: connectionID,
+                token: token,
+                hostKey: rejection
+            )
+
         case .stopped:
             await recordStopped(connectionID: connectionID, token: token)
             return true
@@ -896,13 +955,17 @@ public final class ConnectionManager {
     private func recordFailure(
         _ message: String,
         connectionID: SavedConnection.ID,
-        token: UInt64
-    ) async -> Bool {
+        token: UInt64,
+        hostKey: HostKeyRejection? = nil
+) async -> Bool {
         guard activeTokens[connectionID] == token else { return true }
 
         // Read before `markDisconnected`, which forgets a draft that never connected.
-        let hostKeyMessage = entries.first(where: { $0.id == connectionID }).flatMap { entry in
-            HostKeyRejection(sshMessage: message).map { $0.alertMessage(for: entry, sshMessage: message) }
+        // Only `ssh`'s own verdict is classified, never the failure text (PX-023 round 2).
+        let hostKeyMessage = hostKey.flatMap { rejection in
+            entries.first(where: { $0.id == connectionID }).map {
+                rejection.alertMessage(for: $0, sshMessage: message)
+            }
         }
 
         let persistenceError = await markDisconnected(

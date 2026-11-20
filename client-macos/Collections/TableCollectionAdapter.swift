@@ -47,6 +47,13 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
     /// `onSelectionChanged` this is not a semantic event; the renderer uses it to keep a local
     /// selection across remounts.
     public var onLocalSelection: (@MainActor (NodeId, [ItemId]) -> Void)?
+    /// Whether the user may change the selection now (PX-022-G02). While it says no, a click, an
+    /// arrow key or a deselection leaves the selection where it is: the session cannot report the
+    /// change (§18: no new semantic events before a continuity decision), and a local selection
+    /// the server never heard of would outlive the reconnect and disagree with every server-side
+    /// view of it (§22.5). Server-driven selection (a commit, a promotion, its withdrawal, a
+    /// `selection_mode` of none) is not a user change and is never held back.
+    public var allowsUserSelectionChange: @MainActor () -> Bool = { true }
     /// Accessibility notification sink for promoted selections (§22.8). Replaceable for tests.
     public var postAccessibilityNotification: @MainActor (NSTableView, NSAccessibility.Notification) -> Void = {
         NSAccessibility.post(element: $0, notification: $1)
@@ -198,7 +205,10 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
             tableView.allowsEmptySelection = true
             tableView.allowsMultipleSelection = false
             tableView.selectionHighlightStyle = .none
-            tableView.deselectAll(nil)
+            // A server-driven clear, so not `deselectAll(nil)`: that asks the delegate's
+            // `selectionShouldChange(in:)` even when called programmatically, and a stale window's
+            // gate would keep the row selected (PX-022-G02). `selectRowIndexes` does not ask.
+            tableView.selectRowIndexes(IndexSet(), byExtendingSelection: false)
         case .single:
             tableView.allowsEmptySelection = true
             tableView.allowsMultipleSelection = false
@@ -478,6 +488,15 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
 
     public func tableView(_ tableView: NSTableView, didAdd rowView: NSTableRowView, forRow row: Int) {
         applyAccessibility(to: rowView, row: row, selected: tableView.selectedRowIndexes.contains(row))
+    }
+
+    /// AppKit asks this before a user-initiated selection change (mouse, keyboard, Cmd-A,
+    /// type-select, the `deselectAll(_:)` action, accessibility), never for `selectRowIndexes`,
+    /// but also for a programmatic `deselectAll(nil)`. The adapter's own server-driven changes (a
+    /// promotion's withdrawal or an absent item clearing it, a reload restoring the selection)
+    /// run with selection events suppressed, so they always pass; only the user is held back.
+    public func selectionShouldChange(in tableView: NSTableView) -> Bool {
+        isSuppressingSelectionEvents || allowsUserSelectionChange()
     }
 
     public func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {

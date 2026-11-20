@@ -5,7 +5,7 @@ Edition 1.2 · 12 September 2026. Use the authoritative SRUI v0.6 design and the
 ## PX-022 — Expose disconnect, catch-up, and replacement correctly
 
 **Phase:** C · **Scope size:** M · **Status:** planned · **Gate:** none
-**Dependencies:** PX-021, PX-022-G01
+**Dependencies:** PX-021, PX-022-G01, PX-022-G02
 **Read:** D1 §§17–18.3; D2 T22–T24, T29
 
 ### Standing execution contract

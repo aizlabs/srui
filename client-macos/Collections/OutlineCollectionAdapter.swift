@@ -809,9 +809,11 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
         rowView.setAccessibilityDisclosed(expandable && cached.map { isExpanded($0.itemID) } == true)
     }
 
-    /// Asked before any user-initiated selection change, never for `selectRowIndexes`.
+    /// Asked before a user-initiated selection change and for a programmatic `deselectAll(nil)`,
+    /// never for `selectRowIndexes`. Server-driven changes run with selection events suppressed
+    /// and always pass, as in `TableCollectionAdapter.selectionShouldChange(in:)`.
     public func selectionShouldChange(in outlineView: NSOutlineView) -> Bool {
-        allowsUserSelectionChange()
+        isSuppressingSelectionEvents || allowsUserSelectionChange()
     }
 
     public func outlineView(_ outlineView: NSOutlineView, shouldSelectItem item: Any) -> Bool {

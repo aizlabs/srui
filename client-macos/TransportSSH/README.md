@@ -121,7 +121,23 @@ Subsystem srui /usr/local/bin/srui-ssh-bridge
 
 ### 2. Client-Side Launch
 
-Launch `RendererDemoApp` over SSH (defaults: `BatchMode=yes`, 30s connect timeout):
+**From the Connections window (PX-023).** Run `RendererDemoApp` with no arguments, click **Add
+Connection**, and enter a host, a remote user and, optionally, a port and a name. The Host field
+also takes `user@host`, `host:port`, `[::1]` and `user@[::1]:2222`; a user or port typed in both
+places must agree. Connect stays disabled, with the reason shown, until the endpoint is a host name,
+an IPv4 address or a bracketed IPv6 address, a user of ASCII letters, digits, `.`, `_` and `-`, and a
+port from 1 through 65535; nothing may start with `-`, and the host is at most 253 characters, the
+user 64 and the name 128. The endpoint becomes `-p <port> -l <user> -s -- <host> srui` argv for
+`/usr/bin/ssh`, never a shell command, and a saved entry is checked again before every attempt.
+Every connection uses the same configuration whatever app serves `srui` (counter, srtop):
+`StrictHostKeyChecking=yes`, `BatchMode=yes`, your own agent, keys and `~/.ssh/known_hosts`. An
+unknown or changed host key stops the attempt with a **Host Key Not Trusted** alert that says which
+it was and how to check the key; SRUI never adds or replaces a host key and offers no way to connect
+anyway. Record a new key by connecting once with `ssh` in Terminal after checking its fingerprint.
+
+**From the command line.** Launch `RendererDemoApp` over SSH (defaults: `BatchMode=yes`, 30s
+connect timeout). This developer path takes its arguments as given and does not use the Connect
+form's validation:
 
 ```bash
 swift run --package-path client-macos RendererDemoApp --ssh remote.host.example.com --user username

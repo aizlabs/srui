@@ -13,6 +13,12 @@
 // written only with the status, by the current attempt generation (§18), never from a server claim.
 // A dropped session context closes its windows, so none is left on screen without that status.
 //
+// PX-023: the Connect form's endpoint is validated by `ConnectionEndpoint` before it becomes `ssh`
+// argv, and a saved entry is validated again before every attempt. Host-key verification stays
+// OpenSSH's (`StrictHostKeyChecking=yes`, `BatchMode=yes`, the user's own known_hosts, §19.1, §25):
+// a rejected key is a blocking alert that says whether the key is unknown or changed and how to
+// verify it outside SRUI. There is no trust-anyway path.
+//
 
 import Foundation
 import Observation
@@ -73,48 +79,37 @@ public struct ConnectDraft: Identifiable, Equatable, Sendable {
         self.user = user
     }
 
-    public var validationMessage: String? {
-        if normalizedLabel.isEmpty {
-            return "Enter a label."
-        }
-        if normalizedHost.isEmpty {
-            return "Enter a host."
-        }
-        if normalizedUser.isEmpty {
-            return "Enter a remote user."
-        }
-        if normalizedPort.isEmpty == false,
-           (UInt16(normalizedPort) == nil || UInt16(normalizedPort) == 0) {
-            return "Port must be a number from 1 through 65535."
-        }
-        return nil
+    /// The endpoint the fields name, or why they name none (PX-023).
+    public var endpoint: Result<ConnectionEndpoint, ConnectionEndpoint.ParseError> {
+        ConnectionEndpoint.parse(host: host, user: user, port: port)
     }
 
-    fileprivate var savedConnection: SavedConnection? {
-        guard validationMessage == nil else { return nil }
+    public var validationMessage: String? {
+        if normalizedLabel.count > ConnectionEndpoint.maximumLabelLength {
+            return ConnectionEndpoint.ParseError.labelTooLong.description
+        }
+        switch endpoint {
+        case .success:
+            return nil
+        case .failure(let error):
+            return error.description
+        }
+    }
+
+    /// The saved entry for a valid draft. An empty name defaults to the endpoint itself.
+    var savedConnection: SavedConnection? {
+        guard validationMessage == nil, case .success(let endpoint) = endpoint else { return nil }
         return SavedConnection(
             id: id,
-            label: normalizedLabel,
-            host: normalizedHost,
-            port: normalizedPort.isEmpty ? nil : UInt16(normalizedPort),
-            user: normalizedUser
+            label: normalizedLabel.isEmpty ? endpoint.displayString : normalizedLabel,
+            host: endpoint.host,
+            port: endpoint.port,
+            user: endpoint.user
         )
     }
 
     private var normalizedLabel: String {
-        label.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private var normalizedHost: String {
-        host.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private var normalizedPort: String {
-        port.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private var normalizedUser: String {
-        user.trimmingCharacters(in: .whitespacesAndNewlines)
+        ConnectionEndpoint.trimmed(label)
     }
 }
 
@@ -199,6 +194,8 @@ public struct ConnectionAlert: Identifiable, Equatable, Sendable {
     public enum Kind: Equatable, Sendable {
         case invalidInput
         case connectionFailed
+        /// OpenSSH refused the server's host key (§19.1, §25). Blocking, with no bypass (PX-023).
+        case hostKeyRejected
         case sessionReplaced
         case persistenceFailed
     }
@@ -488,7 +485,7 @@ public final class ConnectionManager {
         }
 
         let detail: String
-        if candidate.kind == .connectionFailed,
+        if candidate.kind == .connectionFailed || candidate.kind == .hostKeyRejected,
            candidate.connectionID == current.connectionID {
             detail = "The replacement connection then failed: \(candidate.message)"
         } else {
@@ -540,6 +537,17 @@ public final class ConnectionManager {
                 connectionID: connectionID,
                 title: "Can’t Connect",
                 message: "This saved connection no longer exists."
+            ))
+            return
+        }
+        // The saved-connections file is local input that a cold launch connects from without the
+        // form, so it passes the same endpoint validation before it can become `ssh` argv (PX-023).
+        if let error = ConnectionEndpoint.validate(savedHost: connection.host, user: connection.user) {
+            presentAlert(ConnectionAlert(
+                kind: .invalidInput,
+                connectionID: connectionID,
+                title: "Can’t Connect",
+                message: "This saved connection’s endpoint is invalid: \(error.description) Remove it and add it again."
             ))
             return
         }
@@ -656,6 +664,26 @@ public final class ConnectionManager {
         return SessionControllerConnectionAttempt(controller: controller)
     }
 
+    /// The one SSH configuration every connection uses, whatever application serves the remote
+    /// `srui` subsystem (PX-023: counter and srtop alike). The remote app never chooses any of it.
+    /// Identity, agent and known_hosts are the user's own OpenSSH setup (§19.1); host keys are
+    /// checked strictly and never prompted for, so an unknown or changed key fails the attempt.
+    nonisolated static func sshConfiguration(for connection: SavedConnection) -> SSHConfiguration {
+        SSHConfiguration(
+            host: connection.host,
+            port: connection.port,
+            user: connection.user,
+            subsystem: "srui",
+            identityFile: nil,
+            knownHostsFile: nil,
+            strictHostKeyChecking: .yes,
+            batchMode: true,
+            connectTimeout: 30,
+            extraOptions: [:],
+            sshBinaryPath: "/usr/bin/ssh"
+        )
+    }
+
     private func beginAttempt(for connection: SavedConnection) {
         precondition(nextAttemptToken < UInt64.max, "ConnectionManager attempt token exhausted")
         nextAttemptToken += 1
@@ -671,19 +699,7 @@ public final class ConnectionManager {
             context = created
         }
 
-        let configuration = SSHConfiguration(
-            host: connection.host,
-            port: connection.port,
-            user: connection.user,
-            subsystem: "srui",
-            identityFile: nil,
-            knownHostsFile: nil,
-            strictHostKeyChecking: .yes,
-            batchMode: true,
-            connectTimeout: 30,
-            extraOptions: [:],
-            sshBinaryPath: "/usr/bin/ssh"
-        )
+        let configuration = Self.sshConfiguration(for: connection)
         let request = ConnectionAttemptRequest(
             connection: connection,
             configuration: configuration,
@@ -884,20 +900,25 @@ public final class ConnectionManager {
     ) async -> Bool {
         guard activeTokens[connectionID] == token else { return true }
 
+        // Read before `markDisconnected`, which forgets a draft that never connected.
+        let hostKeyMessage = entries.first(where: { $0.id == connectionID }).flatMap { entry in
+            HostKeyRejection(sshMessage: message).map { $0.alertMessage(for: entry, sshMessage: message) }
+        }
+
         let persistenceError = await markDisconnected(
             connectionID: connectionID,
             token: token
         )
         guard activeTokens[connectionID] == token else { return true }
 
-        var fullMessage = message
+        var fullMessage = hostKeyMessage ?? message
         if let persistenceError {
             fullMessage += "\n\nThe latest connection metadata could not be saved: \(persistenceError)"
         }
         presentAlert(ConnectionAlert(
-            kind: .connectionFailed,
+            kind: hostKeyMessage == nil ? .connectionFailed : .hostKeyRejected,
             connectionID: connectionID,
-            title: "Connection Failed",
+            title: hostKeyMessage == nil ? "Connection Failed" : "Host Key Not Trusted",
             message: fullMessage
         ))
         return true

@@ -938,12 +938,27 @@ struct ConnectionManagerTests {
         let attempt = try #require(harness.attempts.first)
         await attempt.emit(.failed("Host key verification failed."))
 
+        // PX-023: a host-key failure is its own blocking alert that says what happened; the
+        // alert's only action is OK (ConnectionManagerView), so there is no connect-anyway path.
         try await AsyncTestSupport.observed("blocking SSH failure alert") {
+            manager.alert?.kind == .hostKeyRejected
+        }
+        #expect(manager.alert?.title == "Host Key Not Trusted")
+        #expect(manager.alert?.message.hasPrefix("SRUI did not connect to alice@secure.example.") == true)
+        #expect(manager.alert?.message.hasSuffix("OpenSSH reported:\nHost key verification failed.") == true)
+        #expect(manager.status(for: saved.id) == .disconnected(resumeAvailable: true))
+        #expect(harness.attempts.count == 1)
+
+        // Any other SSH failure keeps the plain connection-failed alert and its message.
+        manager.dismissAlert()
+        manager.connect(id: saved.id)
+        let second = try #require(harness.attempts.last)
+        await second.emit(.failed("Permission denied (publickey)."))
+        try await AsyncTestSupport.observed("blocking non-host-key failure alert") {
             manager.alert?.kind == .connectionFailed
         }
         #expect(manager.alert?.title == "Connection Failed")
-        #expect(manager.alert?.message == "Host key verification failed.")
-        #expect(manager.status(for: saved.id) == .disconnected(resumeAvailable: true))
+        #expect(manager.alert?.message == "Permission denied (publickey).")
         await manager.shutdown()
     }
 

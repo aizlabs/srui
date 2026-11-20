@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-023",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Generic macOS client: the first bounded slice of D2 T38, a minimal Connect form (host, remote user, optional port, optional name) in client-owned chrome, over the existing SSHTransport, OpenSSH known_hosts and credential handling (§19, §19.1, §22.1, §25); endpoint validation before argv, strict non-interactive host-key policy with understandable blocking diagnostics, one launcher path for counter and srtop; no server, SDK, protocol, registry, proto, framing, generated-file or srtop change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX023-001",
+      "feature": "ConnectionEndpoint.parse(host:user:port:): the Connect form's fields become a validated SSH destination; the Host field also takes user@host, host:port, [v6] and user@[v6]:port, and a user or port named twice must agree; hosts are ASCII names/IPv4 ([A-Za-z0-9._-], not starting with - or .) or inet_pton IPv6 literals in brackets with an optional %zone, at most 253 characters; users are [A-Za-z0-9._-], not starting with - or ., at most 64; ports are one to five ASCII digits naming 1-65535; names at most 128; bare IPv6, URLs, whitespace inside a value, shell metacharacters and non-ASCII are rejected with a specific message; ConnectDraft.validationMessage/savedConnection use it and an empty name defaults to the endpoint",
+      "scope": "PX-023/client-macos ConnectionManager/ConnectionEndpoint.swift, ConnectionManager/ConnectionManager.swift ConnectDraft; SRUITests ConnectionEndpointTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-023",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-023.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX023-002",
+      "feature": "ConnectionManager.sshConfiguration(for:) is the one SSH configuration every connection uses whatever app serves the srui subsystem (StrictHostKeyChecking=yes, BatchMode=yes, user's own agent/keys/known_hosts, fixed subsystem, -- before the host); connect(id:) re-validates a saved entry before it can become argv, so a tampered saved-connections file never reaches ssh; counter and srtop both connect through connect(_:) over a real localhost sshd and the real srui-ssh-bridge",
+      "scope": "PX-023/client-macos ConnectionManager/ConnectionManager.swift sshConfiguration(for:), connect(id:), beginAttempt; SRUITests ConnectionEndpointTests, ConnectionLauncherLiveTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-023",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-023.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX023-003",
+      "feature": "HostKeyRejection classifies OpenSSH's own unknown, changed, revoked and generic host-key failures; ConnectionManager presents them as a blocking ConnectionAlert.Kind.hostKeyRejected ('Host Key Not Trusted') that names the endpoint and known_hosts entry, says SRUI never adds or replaces a key, and tells the user how to verify it outside SRUI, followed by OpenSSH's text; the alert's only action is OK; other SSH failures keep the Connection Failed alert unchanged; an unknown or changed key never runs the subsystem and leaves known_hosts byte-for-byte unchanged",
+      "scope": "PX-023/client-macos ConnectionManager/HostKeyRejection.swift, ConnectionManager/ConnectionManager.swift recordFailure, presentAlert; SRUITests HostKeyRejectionTests, ConnectionManagerTests, ConnectionLauncherLiveTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-023",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-023.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX023-004",
+      "feature": "ConnectSheet: the Connect form as client chrome with Host, Remote User, optional Port and optional Name fields, the validation reason shown inline, Connect disabled and its action guarded until the endpoint is valid, Cancel and Connect as the sheet's cancel and default actions; a native AppKit test types into its NSTextFields and submits with Return",
+      "scope": "PX-023/client-macos ConnectionManager/ConnectionManagerView.swift ConnectSheet, SavedConnectionRow endpoint; SRUITests ConnectSheetNativeTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-023",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-023.md"
+      ]
+    }
+  ]
+}

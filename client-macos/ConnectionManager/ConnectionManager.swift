@@ -788,9 +788,11 @@ public final class ConnectionManager {
         guard let index = entries.firstIndex(where: { $0.id == connectionID }) else {
             // A removed entry's session keeps running until its transport ends, and its windows
             // stay open until then, so they keep following the transport (PX-022-G01). When it
-            // ends, `runAttempt` discards the context and closes them.
+            // ends, nothing will reconnect it: its windows close at once, not after the stop
+            // (they would read as live meanwhile), and the `runAttempt` tail closes them again.
             switch event {
             case .failed, .stopped:
+                discardContext(for: connectionID)
                 return true
             case .connecting:
                 showWindowStatus(.connecting, for: connectionID)
@@ -925,6 +927,9 @@ public final class ConnectionManager {
     ) async -> String? {
         guard activeTokens[connectionID] == token else { return nil }
         guard let index = entries.firstIndex(where: { $0.id == connectionID }) else {
+            // The entry was removed while its session ran: the session has now ended, so its
+            // windows close at once (PX-022-G01).
+            discardContext(for: connectionID)
             return nil
         }
 
@@ -993,8 +998,11 @@ public final class ConnectionManager {
     /// at once so the renderer holds no transport claim. Pending text in those windows belongs to
     /// the dropped outbox and is not sent (§18.3 covers resume only).
     ///
-    /// The windows close at once, so none stays on screen without its status while the attempt
-    /// finishes its save and stop. A render already in flight may reopen them after that (a
+    /// It runs as soon as nothing can bring the session back for that entry: a failed first
+    /// connection, the end of a removed entry's session (its `.failed` or `.stopped`, or any
+    /// failure reaching `markDisconnected`), `remove(id:)` with no attempt running, and drafts
+    /// that never connected, at shutdown. The windows close at once, so none stays on screen
+    /// without its status while the attempt finishes its save and stop. A render already in flight may reopen them after that (a
     /// first connection that fails mid-snapshot), so the attempt's `runAttempt` tail closes the
     /// windows of every context the manager no longer owns again, after its shared `stop()` has
     /// finished and the controller can no longer render.

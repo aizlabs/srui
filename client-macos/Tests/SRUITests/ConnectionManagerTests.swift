@@ -31,12 +31,14 @@ private actor TestConnectionAttempt: ConnectionAttempt {
     private let continuation: AsyncStream<ConnectionAttemptEvent>.Continuation
     private let startGate: AsyncGate?
     private let startError: ConnectionManagerTestError?
+    private let stopGate: AsyncGate?
     private var starts = 0
     private var stops = 0
 
     init(
         startGate: AsyncGate? = nil,
-        startError: ConnectionManagerTestError? = nil
+        startError: ConnectionManagerTestError? = nil,
+        stopGate: AsyncGate? = nil
     ) {
         let pair = AsyncStream.makeStream(
             of: ConnectionAttemptEvent.self,
@@ -46,6 +48,7 @@ private actor TestConnectionAttempt: ConnectionAttempt {
         self.continuation = pair.continuation
         self.startGate = startGate
         self.startError = startError
+        self.stopGate = stopGate
     }
 
     func start() async throws {
@@ -60,6 +63,9 @@ private actor TestConnectionAttempt: ConnectionAttempt {
 
     func stop() async {
         stops += 1
+        if let stopGate {
+            await stopGate.pause()
+        }
         continuation.finish()
     }
 
@@ -81,6 +87,7 @@ private final class ConnectionAttemptHarness {
     struct StartPlan {
         var gate: AsyncGate?
         var error: ConnectionManagerTestError?
+        var stopGate: AsyncGate?
     }
 
     private(set) var requests: [ConnectionAttemptRequest] = []
@@ -89,7 +96,11 @@ private final class ConnectionAttemptHarness {
 
     func makeAttempt(_ request: ConnectionAttemptRequest) -> any ConnectionAttempt {
         let plan = startPlans.isEmpty ? StartPlan() : startPlans.removeFirst()
-        let attempt = TestConnectionAttempt(startGate: plan.gate, startError: plan.error)
+        let attempt = TestConnectionAttempt(
+            startGate: plan.gate,
+            startError: plan.error,
+            stopGate: plan.stopGate
+        )
         requests.append(request)
         attempts.append(attempt)
         return attempt
@@ -1629,6 +1640,97 @@ struct ConnectionManagerTests {
         }
         #expect(failed.renderer.sessionWindowStatus == nil)
         #expect(retried.renderer.sessionWindowStatus == stale("connecting", 0))
+        await manager.shutdown()
+    }
+
+    @Test("a removed live entry's windows close as soon as its session fails, before the stop")
+    func removedLiveEntryClosesOnFailureBeforeStop() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(label: "Live", host: "live.example", user: "alice")
+        try await temporary.store.save([saved])
+        let renderGate = AsyncGate()
+        let stopGate = AsyncGate()
+        await renderGate.release()
+        let transports = TransportBox()
+        let manager = gatedControllerManager(
+            store: temporary.store,
+            transports: transports,
+            renderGate: renderGate,
+            stopGate: stopGate
+        )
+        await manager.load()
+        manager.connect(id: saved.id)
+        let transport = try #require(transports.values.first)
+        let context = try #require(transports.contexts.first)
+        try await sendWelcomeAndSnapshot(to: transport)
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "live window") {
+            manager.status(for: saved.id) == .connected && self.visibleWindows(of: context).isEmpty == false
+        }
+        #expect(context.renderer.sessionWindowStatus == nil)
+
+        // The row is deleted; the session keeps running and its window stays, live.
+        manager.remove(id: saved.id)
+        #expect(visibleWindows(of: context).isEmpty == false)
+
+        // The transport fails; the attempt's stop is paused before it retires the mount.
+        await transport.fail()
+        await stopGate.waitUntilPaused()
+        // Nothing will reconnect a deleted row: its window must not stay up reading as live.
+        #expect(visibleWindows(of: context).isEmpty)
+        #expect(context.renderer.registry.surfaceHandles.isEmpty)
+        #expect(context.renderer.sessionWindowStatus == nil)
+
+        await stopGate.release()
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "attempt released") {
+            manager.hasActiveAttemptForTesting(saved.id) == false
+        }
+        #expect(visibleWindows(of: context).isEmpty)
+        await manager.shutdown()
+    }
+
+    @Test("a removed entry whose attempt fails to start closes its windows before the stop")
+    func removedEntryFailedStartClosesBeforeStop() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Removed Start",
+            host: "removed-start.example",
+            user: "alice",
+            sessionID: "removed-start-session"
+        )
+        try await temporary.store.save([saved])
+        let startGate = AsyncGate()
+        let stopGate = AsyncGate()
+        let harness = ConnectionAttemptHarness()
+        harness.startPlans = [
+            .init(gate: startGate, error: .startFailed("start failed"), stopGate: stopGate),
+        ]
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+        manager.connect(id: saved.id)
+        let context = try #require(harness.requests.first).context
+        let window = try mountTitledSurface(in: context, shown: true)
+        await startGate.waitUntilPaused()
+
+        // Deleting the row keeps the starting attempt and its window.
+        manager.remove(id: saved.id)
+        #expect(window.isVisible)
+        await startGate.release()
+        // The start failure reaches `markDisconnected` for a missing entry; the attempt's stop is
+        // paused, so its tail has not closed anything yet.
+        await stopGate.waitUntilPaused()
+        #expect(manager.hasActiveAttemptForTesting(saved.id))
+        expectClosed(window, of: context)
+
+        await stopGate.release()
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "attempt released") {
+            manager.hasActiveAttemptForTesting(saved.id) == false
+        }
+        expectClosed(window, of: context)
         await manager.shutdown()
     }
 

@@ -5,11 +5,12 @@
 // Deterministic coverage for client-owned saved connections and reconnect orchestration.
 //
 
+import AppKit
 import Foundation
 @testable import ConnectionManager
 import Protocol
 import SemanticModel
-import Session
+@testable import Session
 import Testing
 import TransportSSH
 
@@ -30,12 +31,14 @@ private actor TestConnectionAttempt: ConnectionAttempt {
     private let continuation: AsyncStream<ConnectionAttemptEvent>.Continuation
     private let startGate: AsyncGate?
     private let startError: ConnectionManagerTestError?
+    private let stopGate: AsyncGate?
     private var starts = 0
     private var stops = 0
 
     init(
         startGate: AsyncGate? = nil,
-        startError: ConnectionManagerTestError? = nil
+        startError: ConnectionManagerTestError? = nil,
+        stopGate: AsyncGate? = nil
     ) {
         let pair = AsyncStream.makeStream(
             of: ConnectionAttemptEvent.self,
@@ -45,6 +48,7 @@ private actor TestConnectionAttempt: ConnectionAttempt {
         self.continuation = pair.continuation
         self.startGate = startGate
         self.startError = startError
+        self.stopGate = stopGate
     }
 
     func start() async throws {
@@ -59,6 +63,9 @@ private actor TestConnectionAttempt: ConnectionAttempt {
 
     func stop() async {
         stops += 1
+        if let stopGate {
+            await stopGate.pause()
+        }
         continuation.finish()
     }
 
@@ -80,6 +87,7 @@ private final class ConnectionAttemptHarness {
     struct StartPlan {
         var gate: AsyncGate?
         var error: ConnectionManagerTestError?
+        var stopGate: AsyncGate?
     }
 
     private(set) var requests: [ConnectionAttemptRequest] = []
@@ -88,7 +96,11 @@ private final class ConnectionAttemptHarness {
 
     func makeAttempt(_ request: ConnectionAttemptRequest) -> any ConnectionAttempt {
         let plan = startPlans.isEmpty ? StartPlan() : startPlans.removeFirst()
-        let attempt = TestConnectionAttempt(startGate: plan.gate, startError: plan.error)
+        let attempt = TestConnectionAttempt(
+            startGate: plan.gate,
+            startError: plan.error,
+            stopGate: plan.stopGate
+        )
         requests.append(request)
         attempts.append(attempt)
         return attempt
@@ -132,6 +144,11 @@ private actor ConnectionManagerCaptureTransport: Transport {
         continuation.finish()
     }
 
+    /// Ends the inbound stream with an error, as a dropped connection does.
+    func fail() {
+        continuation.finish(throwing: ConnectionManagerTestError.startFailed("connection dropped"))
+    }
+
     func frame(at index: Int) -> Data? {
         guard frames.indices.contains(index) else { return nil }
         return frames[index]
@@ -140,6 +157,12 @@ private actor ConnectionManagerCaptureTransport: Transport {
     func receive(_ message: SRUIMessage) throws {
         continuation.yield(try SRUIFraming.encodeFramed(message))
     }
+}
+
+@MainActor
+private final class TransportBox {
+    var values: [ConnectionManagerCaptureTransport] = []
+    var contexts: [ConnectionSessionContext] = []
 }
 
 @MainActor
@@ -1154,6 +1177,727 @@ struct ConnectionManagerTests {
             context.value == nil
         }
 
+        await manager.shutdown()
+        await manager.shutdown()
+    }
+
+    // MARK: - Client-owned session-window status (PX-022-G01; §17, §18)
+
+    private func stale(_ state: String, _ revision: UInt64) -> String {
+        "\(state) — showing data from revision \(revision) (stale)"
+    }
+
+    /// Commits revision 1 with one titled Surface to `context`'s replica and mounts it, so the
+    /// status can be read off a real `NSWindow`. `shown` orders it in, as the session controller
+    /// does after its first mount (concealed in the test host).
+    private func mountTitledSurface(
+        in context: ConnectionSessionContext,
+        shown: Bool = false
+    ) throws -> NSWindow {
+        let revision = try context.applier.apply(
+            baseRevision: .initial,
+            operations: [
+                .createNode(
+                    id: NodeId(1),
+                    nodeType: .surface,
+                    properties: [Property(property: .label, value: .string("Server Title"))]
+                ),
+            ]
+        ).get()
+        #expect(revision == Revision(1))
+        try context.renderer.attach(store: context.applier.store)
+        if shown {
+            context.renderer.showWindows()
+        }
+        let window = try #require(context.renderer.registry.handle(for: NodeId(1))?.window)
+        #expect(window.isVisible == shown)
+        return window
+    }
+
+    /// A dropped context's windows are closed, not left on screen without their status.
+    private func expectClosed(_ window: NSWindow, of context: ConnectionSessionContext) {
+        #expect(window.isVisible == false)
+        #expect(NSApplication.shared.windows.contains { $0 === window && $0.isVisible } == false)
+        #expect(context.renderer.registry.surfaceHandles.isEmpty)
+        #expect(context.renderer.sessionWindowStatus == nil)
+    }
+
+    @Test("every connection status maps to its session-window chrome")
+    func connectionStatusMapsToSessionWindowStatus() {
+        #expect(ConnectionStatus.unknown.sessionWindowStatus(lastAppliedRevision: 9) == nil)
+        #expect(ConnectionStatus.connected.sessionWindowStatus(lastAppliedRevision: 9) == nil)
+        #expect(
+            ConnectionStatus.connecting.sessionWindowStatus(lastAppliedRevision: 9)
+                == stale("connecting", 9)
+        )
+        #expect(
+            ConnectionStatus.resynchronizing.sessionWindowStatus(lastAppliedRevision: 9)
+                == stale("resynchronizing", 9)
+        )
+        #expect(
+            ConnectionStatus.disconnected(resumeAvailable: true)
+                .sessionWindowStatus(lastAppliedRevision: 9) == stale("disconnected", 9)
+        )
+        #expect(
+            ConnectionStatus.disconnected(resumeAvailable: false)
+                .sessionWindowStatus(lastAppliedRevision: 0) == stale("disconnected", 0)
+        )
+        #expect(ConnectionStatus.sessionReplacedWindowStatus == "session replaced — rebuilding")
+    }
+
+    @Test("session windows follow every connection status transition")
+    func sessionWindowsFollowConnectionStatus() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Window Status",
+            host: "window-status.example",
+            user: "alice",
+            sessionID: "window-session"
+        )
+        try await temporary.store.save([saved])
+
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+
+        manager.connect(id: saved.id)
+        let first = try #require(harness.attempts.first)
+        let context = try #require(harness.requests.first).context
+        #expect(manager.status(for: saved.id) == .connecting)
+        #expect(context.renderer.sessionWindowStatus == stale("connecting", 0))
+        // A window mounted while the status stands gets it.
+        let window = try mountTitledSurface(in: context)
+        #expect(window.subtitle == stale("connecting", 0))
+
+        await first.emit(.ready(sessionID: "window-session", revision: 1))
+        try await AsyncTestSupport.observed("first attempt ready") {
+            manager.status(for: saved.id) == .connected
+        }
+        #expect(context.renderer.sessionWindowStatus == nil)
+        #expect(window.subtitle.isEmpty)
+        #expect(window.title == "Server Title")
+
+        await first.emit(.stopped)
+        try await AsyncTestSupport.observed("transport lost") {
+            manager.status(for: saved.id) == .disconnected(resumeAvailable: true)
+        }
+        #expect(window.subtitle == stale("disconnected", 1))
+        #expect(window.accessibilityHelp() == stale("disconnected", 1))
+        #expect(window.title == "Server Title")
+
+        manager.connect(id: saved.id)
+        let second = try #require(harness.attempts.last)
+        #expect(second !== first)
+        #expect(harness.requests.last?.context === context)
+        #expect(window.subtitle == stale("connecting", 1))
+
+        await second.emit(.resynchronizing)
+        try await AsyncTestSupport.observed("catch-up") {
+            manager.status(for: saved.id) == .resynchronizing
+        }
+        #expect(window.subtitle == stale("resynchronizing", 1))
+
+        await second.emit(.ready(sessionID: "window-session", revision: 1))
+        try await AsyncTestSupport.observed("catch-up ready") {
+            manager.status(for: saved.id) == .connected
+        }
+        #expect(window.subtitle.isEmpty)
+        #expect(window.accessibilityHelp() == nil)
+
+        await manager.shutdown()
+        #expect(manager.status(for: saved.id) == .disconnected(resumeAvailable: true))
+        #expect(window.subtitle == stale("disconnected", 1))
+        #expect(window.title == "Server Title")
+    }
+
+    @Test("REPLACED says the session is rebuilding until ready clears it")
+    func replacedThenReadyClearsSessionWindowStatus() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Replaced Window",
+            host: "replaced-window.example",
+            user: "alice",
+            sessionID: "old-session",
+            lastKnownRevision: 30
+        )
+        try await temporary.store.save([saved])
+
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+        manager.connect(id: saved.id)
+        let attempt = try #require(harness.attempts.first)
+        let context = try #require(harness.requests.first).context
+
+        await attempt.emit(.replaced(previousSessionID: "old-session", newSessionID: "new-session"))
+        try await AsyncTestSupport.observed("replacement decision") {
+            manager.status(for: saved.id) == .resynchronizing
+                && manager.alert?.kind == .sessionReplaced
+        }
+        #expect(context.renderer.sessionWindowStatus == ConnectionStatus.sessionReplacedWindowStatus)
+        // The replacement's snapshot mounts while the decision stands.
+        let window = try mountTitledSurface(in: context)
+        #expect(window.subtitle == "session replaced — rebuilding")
+        #expect(window.title == "Server Title")
+
+        await attempt.emit(.ready(sessionID: "new-session", revision: 1))
+        try await AsyncTestSupport.observed("replacement ready") {
+            manager.status(for: saved.id) == .connected
+        }
+        #expect(context.renderer.sessionWindowStatus == nil)
+        #expect(window.subtitle.isEmpty)
+        #expect(window.title == "Server Title")
+        await manager.shutdown()
+    }
+
+    @Test("a superseded attempt's late failure cannot overwrite the newer window status")
+    func supersededAttemptCannotOverwriteSessionWindowStatus() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Window Race",
+            host: "window-race.example",
+            user: "alice",
+            sessionID: "race-session"
+        )
+        try await temporary.store.save([saved])
+
+        let firstStartGate = AsyncGate()
+        let harness = ConnectionAttemptHarness()
+        harness.startPlans = [
+            .init(gate: firstStartGate, error: .startFailed("stale failure")),
+            .init(),
+        ]
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+
+        manager.connect(id: saved.id)
+        let context = try #require(harness.requests.first).context
+        let window = try mountTitledSurface(in: context)
+        await firstStartGate.waitUntilPaused()
+        manager.connect(id: saved.id)
+        let secondAttempt = try #require(harness.attempts.last)
+        await secondAttempt.emit(.resynchronizing)
+        try await AsyncTestSupport.observed("newer attempt catching up") {
+            manager.status(for: saved.id) == .resynchronizing
+        }
+        #expect(window.subtitle == stale("resynchronizing", 1))
+
+        await firstStartGate.release()
+        let firstAttempt = try #require(harness.attempts.first)
+        try await AsyncTestSupport.eventuallyAsync(timeout: .roundTrip, description: "stale attempt teardown") {
+            await firstAttempt.stopCount() > 0
+        }
+        #expect(manager.status(for: saved.id) == .resynchronizing)
+        #expect(context.renderer.sessionWindowStatus == stale("resynchronizing", 1))
+        #expect(window.subtitle == stale("resynchronizing", 1))
+
+        await secondAttempt.emit(.ready(sessionID: "race-session", revision: 1))
+        try await AsyncTestSupport.observed("newer attempt ready") {
+            manager.status(for: saved.id) == .connected
+        }
+        #expect(window.subtitle.isEmpty)
+        await manager.shutdown()
+    }
+
+    @Test("a failed first connection closes the windows it had mounted")
+    func failedFirstConnectionClosesItsWindows() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saveGate = AsyncGate()
+        // Holds the failed attempt in its failure save, before its save and stop finish.
+        let gatedStore = SavedConnectionStore(url: temporary.file, beforeSave: { _ in
+            await saveGate.pause()
+        })
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(
+            store: gatedStore,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+
+        let draft = ConnectDraft(id: UUID(), label: "Never", host: "never.example", user: "alice")
+        _ = try #require(manager.connect(draft))
+        let context = try #require(harness.requests.first).context
+        let window = try mountTitledSurface(in: context, shown: true)
+        #expect(window.subtitle == stale("connecting", 0))
+        let attempt = try #require(harness.attempts.first)
+        await attempt.emit(.failed("initial failure"))
+        try await AsyncTestSupport.observed("failed draft removed") {
+            manager.entries.isEmpty
+        }
+        // Closed at once: no window waits out the save and stop without its status.
+        #expect(manager.hasActiveAttemptForTesting(draft.id))
+        expectClosed(window, of: context)
+
+        await saveGate.release()
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "failed attempt released") {
+            manager.hasActiveAttemptForTesting(draft.id) == false
+        }
+        expectClosed(window, of: context)
+        await manager.shutdown()
+    }
+
+    /// A real `SessionController` attempt whose snapshot render pauses on `renderGate` and whose
+    /// stop pauses on `stopGate` before it retires the mount and resource owner. Both hooks are
+    /// per controller, so nothing leaks into other tests.
+    private func gatedControllerManager(
+        store: SavedConnectionStore,
+        transports: TransportBox,
+        renderGate: AsyncGate,
+        stopGate: AsyncGate
+    ) -> ConnectionManager {
+        ConnectionManager(store: store, attemptFactory: { request in
+            let transport = ConnectionManagerCaptureTransport()
+            transports.values.append(transport)
+            transports.contexts.append(request.context)
+            return ConnectionManager.makeSessionControllerAttempt(
+                request: request,
+                transport: transport,
+                configureController: { controller in
+                    controller.rendererResourcesPreloadedInterceptorForTesting = {
+                        await renderGate.pause()
+                    }
+                    controller.stopWillRetireMountForTesting = {
+                        await stopGate.pause()
+                    }
+                }
+            )
+        })
+    }
+
+    /// WELCOME plus a one-Surface snapshot, whose render then pauses on the render gate.
+    private func sendWelcomeAndSnapshot(to transport: ConnectionManagerCaptureTransport) async throws {
+        _ = try await waitForFrame(0, from: transport)
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "gated-session"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.initialRevision = 1
+        var message = SRUIMessage()
+        message.serverWelcome = welcome
+        try await transport.receive(message)
+        try await transport.receive(textSnapshot(value: "gated value"))
+    }
+
+    private func visibleWindows(of context: ConnectionSessionContext) -> [NSWindow] {
+        context.renderer.registry.surfaceHandles.compactMap(\.window).filter(\.isVisible)
+    }
+
+    @Test("a render that lands while the failed attempt is stopping is closed after the stop")
+    func renderDuringStopIsClosedAfterStop() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let renderGate = AsyncGate()
+        let stopGate = AsyncGate()
+        let transports = TransportBox()
+        let manager = gatedControllerManager(
+            store: temporary.store,
+            transports: transports,
+            renderGate: renderGate,
+            stopGate: stopGate
+        )
+        let draft = ConnectDraft(id: UUID(), label: "Stopping", host: "stopping.example", user: "alice")
+        _ = try #require(manager.connect(draft))
+        let transport = try #require(transports.values.first)
+        let context = try #require(transports.contexts.first)
+        try await sendWelcomeAndSnapshot(to: transport)
+        await renderGate.waitUntilPaused()
+
+        await transport.fail()
+        try await AsyncTestSupport.observed("failed draft removed") {
+            manager.entries.isEmpty
+        }
+        // The failed attempt's own stop is running, paused before it retires the mount.
+        await stopGate.waitUntilPaused()
+        await renderGate.release()
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "render landed during stop") {
+            self.visibleWindows(of: context).isEmpty == false
+        }
+        #expect(manager.hasActiveAttemptForTesting(draft.id))
+
+        await stopGate.release()
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "failed attempt released") {
+            manager.hasActiveAttemptForTesting(draft.id) == false
+        }
+        #expect(visibleWindows(of: context).isEmpty)
+        #expect(context.renderer.registry.surfaceHandles.isEmpty)
+        #expect(context.renderer.sessionWindowStatus == nil)
+        await manager.shutdown()
+    }
+
+    @Test("shutdown's stop and the failed attempt's own stop share one stop before the close")
+    func shutdownStopAndTailStopShareOneStop() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let renderGate = AsyncGate()
+        let saveGate = AsyncGate()
+        let stopGate = AsyncGate()
+        let transports = TransportBox()
+        let gatedStore = SavedConnectionStore(url: temporary.file, beforeSave: { _ in
+            await saveGate.pause()
+        })
+        let manager = gatedControllerManager(
+            store: gatedStore,
+            transports: transports,
+            renderGate: renderGate,
+            stopGate: stopGate
+        )
+        let draft = ConnectDraft(id: UUID(), label: "Quit", host: "quit.example", user: "alice")
+        _ = try #require(manager.connect(draft))
+        let transport = try #require(transports.values.first)
+        let context = try #require(transports.contexts.first)
+        try await sendWelcomeAndSnapshot(to: transport)
+        await renderGate.waitUntilPaused()
+
+        await transport.fail()
+        try await AsyncTestSupport.observed("failed draft removed") {
+            manager.entries.isEmpty
+        }
+        // The app quits while the failed attempt is still in its failure save.
+        let shutdown = Task { @MainActor in await manager.shutdown() }
+        await stopGate.waitUntilPaused()
+        await saveGate.release()
+        try await AsyncTestSupport.observed("failure reported, the attempt's tail reaches stop()") {
+            manager.alert?.kind == .connectionFailed
+        }
+        // The tail must not finish while shutdown's stop is still running. This bound only
+        // limits how long a regression takes to show; a correct stop never ends inside it.
+        let tailEndedDuringStop = (try? await AsyncTestSupport.eventually(
+            timeout: .milliseconds(500),
+            description: "tail finished during the stop"
+        ) {
+            manager.hasActiveAttemptForTesting(draft.id) == false
+        }) != nil
+        #expect(tailEndedDuringStop == false)
+
+        await renderGate.release()
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "render landed during stop") {
+            self.visibleWindows(of: context).isEmpty == false
+        }
+        await stopGate.release()
+        await shutdown.value
+        #expect(visibleWindows(of: context).isEmpty, "a window survived shutdown with no status")
+        #expect(context.renderer.registry.surfaceHandles.isEmpty)
+        #expect(context.renderer.sessionWindowStatus == nil)
+    }
+
+    @Test("a failed draft's late render is closed even when the same draft is retried meanwhile")
+    func lateRenderOfFailedDraftClosedAfterSameDraftRetry() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let renderGate = AsyncGate()
+        let saveGate = AsyncGate()
+        let stopGate = AsyncGate()
+        await stopGate.release()
+        let transports = TransportBox()
+        let gatedStore = SavedConnectionStore(url: temporary.file, beforeSave: { _ in
+            await saveGate.pause()
+        })
+        let manager = gatedControllerManager(
+            store: gatedStore,
+            transports: transports,
+            renderGate: renderGate,
+            stopGate: stopGate
+        )
+        let id = UUID()
+        _ = try #require(manager.connect(ConnectDraft(id: id, label: "Retry", host: "retry.example", user: "alice")))
+        let transport = try #require(transports.values.first)
+        let failed = try #require(transports.contexts.first)
+        try await sendWelcomeAndSnapshot(to: transport)
+        await renderGate.waitUntilPaused()
+
+        await transport.fail()
+        try await AsyncTestSupport.observed("failed draft removed") {
+            manager.entries.isEmpty
+        }
+        // Retry the same draft while the failed attempt is still in its failure save: the entry
+        // with that ID is back, owned by a fresh context.
+        _ = try #require(manager.connect(ConnectDraft(id: id, label: "Retry", host: "retry.example", user: "alice")))
+        let retried = try #require(transports.contexts.last)
+        #expect(retried !== failed)
+        #expect(manager.entries.contains { $0.id == id })
+
+        // The failed attempt's paused render lands in its dropped context after the retry.
+        await renderGate.release()
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "late render landed") {
+            self.visibleWindows(of: failed).isEmpty == false
+        }
+        await saveGate.release()
+        // Its tail closes it: the context is no longer owned, whatever the entries say.
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "dropped context closed") {
+            self.visibleWindows(of: failed).isEmpty && failed.renderer.registry.surfaceHandles.isEmpty
+        }
+        #expect(failed.renderer.sessionWindowStatus == nil)
+        #expect(retried.renderer.sessionWindowStatus == stale("connecting", 0))
+        await manager.shutdown()
+    }
+
+    @Test("a removed live entry's windows close as soon as its session fails, before the stop")
+    func removedLiveEntryClosesOnFailureBeforeStop() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(label: "Live", host: "live.example", user: "alice")
+        try await temporary.store.save([saved])
+        let renderGate = AsyncGate()
+        let stopGate = AsyncGate()
+        await renderGate.release()
+        let transports = TransportBox()
+        let manager = gatedControllerManager(
+            store: temporary.store,
+            transports: transports,
+            renderGate: renderGate,
+            stopGate: stopGate
+        )
+        await manager.load()
+        manager.connect(id: saved.id)
+        let transport = try #require(transports.values.first)
+        let context = try #require(transports.contexts.first)
+        try await sendWelcomeAndSnapshot(to: transport)
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "live window") {
+            manager.status(for: saved.id) == .connected && self.visibleWindows(of: context).isEmpty == false
+        }
+        #expect(context.renderer.sessionWindowStatus == nil)
+
+        // The row is deleted; the session keeps running and its window stays, live.
+        manager.remove(id: saved.id)
+        #expect(visibleWindows(of: context).isEmpty == false)
+
+        // The transport fails; the attempt's stop is paused before it retires the mount.
+        await transport.fail()
+        await stopGate.waitUntilPaused()
+        // Nothing will reconnect a deleted row: its window must not stay up reading as live.
+        #expect(visibleWindows(of: context).isEmpty)
+        #expect(context.renderer.registry.surfaceHandles.isEmpty)
+        #expect(context.renderer.sessionWindowStatus == nil)
+
+        await stopGate.release()
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "attempt released") {
+            manager.hasActiveAttemptForTesting(saved.id) == false
+        }
+        #expect(visibleWindows(of: context).isEmpty)
+        await manager.shutdown()
+    }
+
+    @Test("a removed entry whose attempt fails to start closes its windows before the stop")
+    func removedEntryFailedStartClosesBeforeStop() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Removed Start",
+            host: "removed-start.example",
+            user: "alice",
+            sessionID: "removed-start-session"
+        )
+        try await temporary.store.save([saved])
+        let startGate = AsyncGate()
+        let stopGate = AsyncGate()
+        let harness = ConnectionAttemptHarness()
+        harness.startPlans = [
+            .init(gate: startGate, error: .startFailed("start failed"), stopGate: stopGate),
+        ]
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+        manager.connect(id: saved.id)
+        let context = try #require(harness.requests.first).context
+        let window = try mountTitledSurface(in: context, shown: true)
+        await startGate.waitUntilPaused()
+
+        // Deleting the row keeps the starting attempt and its window.
+        manager.remove(id: saved.id)
+        #expect(window.isVisible)
+        await startGate.release()
+        // The start failure reaches `markDisconnected` for a missing entry; the attempt's stop is
+        // paused, so its tail has not closed anything yet.
+        await stopGate.waitUntilPaused()
+        #expect(manager.hasActiveAttemptForTesting(saved.id))
+        expectClosed(window, of: context)
+
+        await stopGate.release()
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "attempt released") {
+            manager.hasActiveAttemptForTesting(saved.id) == false
+        }
+        expectClosed(window, of: context)
+        await manager.shutdown()
+    }
+
+    @Test("a render in flight when a first connection fails cannot leave a window open")
+    func inFlightRenderAfterFailedFirstConnectionIsClosed() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let renderGate = AsyncGate()
+        let saveGate = AsyncGate()
+        let transports = TransportBox()
+        // Holds the manager in the failure's save: after it dropped the context, before
+        // `runAttempt` reaches `attempt.stop()`.
+        let gatedStore = SavedConnectionStore(url: temporary.file, beforeSave: { _ in
+            await saveGate.pause()
+        })
+        let manager = ConnectionManager(store: gatedStore, attemptFactory: { request in
+            let transport = ConnectionManagerCaptureTransport()
+            transports.values.append(transport)
+            transports.contexts.append(request.context)
+            return ConnectionManager.makeSessionControllerAttempt(
+                request: request,
+                transport: transport,
+                configureController: { controller in
+                    controller.rendererResourcesPreloadedInterceptorForTesting = {
+                        await renderGate.pause()
+                    }
+                }
+            )
+        })
+
+        let draft = ConnectDraft(id: UUID(), label: "Race", host: "race.example", user: "alice")
+        _ = try #require(manager.connect(draft))
+        let transport = try #require(transports.values.first)
+        let context = try #require(transports.contexts.first)
+        _ = try await waitForFrame(0, from: transport)
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "race-session"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.initialRevision = 1
+        var message = SRUIMessage()
+        message.serverWelcome = welcome
+        try await transport.receive(message)
+        try await transport.receive(textSnapshot(value: "race value"))
+        // The snapshot's render is in flight, paused before it mounts.
+        await renderGate.waitUntilPaused()
+        #expect(context.renderer.registry.isEmpty)
+
+        await transport.fail()
+        try await AsyncTestSupport.observed("failed draft removed") {
+            manager.entries.isEmpty
+        }
+        #expect(manager.hasActiveAttemptForTesting(draft.id))
+        await renderGate.release()
+        // The late render mounts the snapshot and shows its window after the context was dropped.
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "late render mounted") {
+            context.renderer.registry.surfaceHandles.contains { $0.window?.isVisible == true }
+        }
+        let window = try #require(context.renderer.registry.surfaceHandles.first?.window)
+        #expect(context.renderer.sessionWindowStatus == nil)
+
+        await saveGate.release()
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "failed attempt released") {
+            manager.hasActiveAttemptForTesting(draft.id) == false
+        }
+        expectClosed(window, of: context)
+        await manager.shutdown()
+    }
+
+    @Test("removing a disconnected entry closes its windows")
+    func removingDisconnectedEntryClosesItsWindows() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Removed",
+            host: "removed.example",
+            user: "alice",
+            sessionID: "removed-session"
+        )
+        try await temporary.store.save([saved])
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+        manager.connect(id: saved.id)
+        let attempt = try #require(harness.attempts.last)
+        let context = try #require(harness.requests.last).context
+        let window = try mountTitledSurface(in: context, shown: true)
+        await attempt.emit(.stopped)
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "attempt ownership released") {
+            manager.status(for: saved.id) == .disconnected(resumeAvailable: true)
+                && manager.hasActiveAttemptForTesting(saved.id) == false
+        }
+        #expect(window.isVisible)
+        #expect(window.subtitle == stale("disconnected", 1))
+
+        manager.remove(id: saved.id)
+        expectClosed(window, of: context)
+        await manager.waitForPersistenceForTesting()
+        await manager.shutdown()
+    }
+
+    @Test("a removed entry's running session keeps its window status, then closes when it ends")
+    func removedEntryWithRunningAttemptFollowsThenCloses() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Removed While Connecting",
+            host: "removed-connecting.example",
+            user: "alice",
+            sessionID: "removed-connecting-session"
+        )
+        try await temporary.store.save([saved])
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+        manager.connect(id: saved.id)
+        let attempt = try #require(harness.attempts.last)
+        let context = try #require(harness.requests.last).context
+        let window = try mountTitledSurface(in: context, shown: true)
+        try await AsyncTestSupport.eventuallyAsync(timeout: .roundTrip, description: "attempt start") {
+            await attempt.startCount() == 1
+        }
+
+        // Removing the row is local bookkeeping: the session keeps running, and its window stays.
+        manager.remove(id: saved.id)
+        #expect(manager.entries.isEmpty)
+        #expect(window.isVisible)
+        #expect(window.subtitle == stale("connecting", 0))
+
+        await attempt.emit(.connecting)
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "removed entry reconnecting") {
+            context.renderer.sessionWindowStatus == stale("connecting", 1)
+        }
+        await attempt.emit(.replaced(
+            previousSessionID: "removed-connecting-session",
+            newSessionID: "removed-connecting-replacement"
+        ))
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "removed entry replaced") {
+            context.renderer.sessionWindowStatus == ConnectionStatus.sessionReplacedWindowStatus
+        }
+        #expect(window.subtitle == "session replaced — rebuilding")
+        // A removed row raises no replacement alert.
+        #expect(manager.alert == nil)
+
+        await attempt.emit(.resynchronizing)
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "removed entry catching up") {
+            context.renderer.sessionWindowStatus == stale("resynchronizing", 1)
+        }
+        await attempt.emit(.ready(sessionID: "removed-connecting-session", revision: 1))
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "removed entry live") {
+            context.renderer.sessionWindowStatus == nil
+        }
+        #expect(window.isVisible)
+        #expect(window.subtitle.isEmpty)
+
+        await attempt.emit(.stopped)
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "removed session ended") {
+            manager.hasActiveAttemptForTesting(saved.id) == false
+                && context.renderer.registry.surfaceHandles.isEmpty
+        }
+        expectClosed(window, of: context)
         await manager.shutdown()
     }
 }

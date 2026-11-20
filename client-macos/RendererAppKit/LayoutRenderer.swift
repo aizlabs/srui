@@ -26,6 +26,18 @@ public final class LayoutRenderer {
     /// Whether surfaces have been ordered on screen, so a remount can restore visibility.
     private var surfacesShown = false
 
+    /// Client-owned status line on every Surface window of this session (PX-022-G01), or `nil`.
+    ///
+    /// The connection manager, never the server, sets it from the transport state it owns (§17
+    /// DETACHED, §18 continuity decisions), so a window can say its data is stale without trusting
+    /// a remote claim. It is drawn as `NSWindow.subtitle`, which no Surface property writes: the
+    /// server-owned `label` keeps `NSWindow.title`, and neither overwrites the other. It also sets
+    /// the window's accessibility help, because whether AppKit folds the subtitle into the window's
+    /// accessibility title varies by macOS release (§22.8). It lives as long as this renderer and
+    /// is applied to every Surface window `mount(nodeID:from:)` creates, so a remount that rebuilds
+    /// the windows, or a later commit that adds one, keeps it.
+    public private(set) var sessionWindowStatus: String?
+
     /// Local dispatch of the standard `shortcut` property for this renderer's surfaces.
     public let shortcutRouter: ShortcutRouter
 
@@ -296,6 +308,24 @@ public final class LayoutRenderer {
         )
     }
 
+    /// Sets or, with `nil` or an empty string, clears the client-owned status line on every Surface
+    /// window, now and for every window mounted later (PX-022-G01).
+    public func setSessionWindowStatus(_ status: String?) {
+        sessionWindowStatus = status?.isEmpty == false ? status : nil
+        for handle in registry.surfaceHandles {
+            guard let window = handle.window else { continue }
+            applySessionWindowStatus(to: window)
+        }
+        RendererDiagnostics.log(
+            "sessionWindowStatus=\(sessionWindowStatus ?? "<none>") surfaces=\(registry.surfaceHandles.count)"
+        )
+    }
+
+    private func applySessionWindowStatus(to window: NSWindow) {
+        window.subtitle = sessionWindowStatus ?? ""
+        window.setAccessibilityHelp(sessionWindowStatus)
+    }
+
     /// Validates extension negotiation and fallback structure without mutating AppKit state.
     public func validateExtensionMounts(in store: SemanticStore) throws {
         try controlFactory.extensionMountResolver.validateMountableExtensions(in: store)
@@ -312,6 +342,9 @@ public final class LayoutRenderer {
             mountDecision: mountDecision
         )
         try registry.register(handle)
+        if let window = handle.window {
+            applySessionWindowStatus(to: window)
+        }
         RendererDiagnostics.log(
             "mounted node=\(node.id) type=\(node.nodeType) parent=\(node.parentID?.description ?? "root")"
         )

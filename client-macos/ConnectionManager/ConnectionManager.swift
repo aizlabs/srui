@@ -8,6 +8,11 @@
 // resumed with a fresh client identity and an empty revision-zero replica. Warm reconnects reuse
 // the in-memory applier, outbox, resource cache, ingress gate, and renderer.
 //
+// Every window of a session shows the connection status as client-owned chrome (PX-022-G01): stale
+// while detached or catching up, rebuilding after a REPLACED decision, and cleared once ready. It is
+// written only with the status, by the current attempt generation (§18), never from a server claim.
+// A dropped session context closes its windows, so none is left on screen without that status.
+//
 
 import Foundation
 import Observation
@@ -166,6 +171,28 @@ public enum ConnectionStatus: Equatable, Sendable {
             return "disconnected"
         }
     }
+
+    /// Client-owned chrome every window of the session shows for this status, or `nil` for none
+    /// (PX-022-G01). It is derived only from the client's own transport state, never from a server
+    /// property. While the transport is not delivering live state (§17 DETACHED, or the catch-up
+    /// that follows a §18 continuity decision) the window still shows the replica at
+    /// `lastAppliedRevision`, so the text says that data is stale.
+    func sessionWindowStatus(lastAppliedRevision: UInt64) -> String? {
+        switch self {
+        case .unknown, .connected:
+            return nil
+        case .connecting:
+            return "connecting — showing data from revision \(lastAppliedRevision) (stale)"
+        case .resynchronizing:
+            return "resynchronizing — showing data from revision \(lastAppliedRevision) (stale)"
+        case .disconnected:
+            return "disconnected — showing data from revision \(lastAppliedRevision) (stale)"
+        }
+    }
+
+    /// Window chrome from a REPLACED continuity decision until its snapshot is ready (§18): the old
+    /// incarnation's replica is discarded, so there is no revision to call stale.
+    static let sessionReplacedWindowStatus = "session replaced — rebuilding"
 }
 
 public struct ConnectionAlert: Identifiable, Equatable, Sendable {
@@ -316,6 +343,7 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
     private let continuation: AsyncStream<ConnectionAttemptEvent>.Continuation
     private let controller: SessionController
     private var forwardingTask: Task<Void, Never>?
+    private var stopTask: Task<Void, Never>?
 
     init(controller: SessionController) {
         let pair = AsyncStream.makeStream(
@@ -364,7 +392,20 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
         try await controller.start()
     }
 
+    /// Stops the controller once; every caller awaits that same stop to its end.
+    ///
+    /// `SessionController.stop()` returns at once while another stop is running, and `shutdown()`
+    /// stops attempts concurrently with their own `runAttempt` tail. Without one shared stop, the
+    /// tail could return from `stop()` while the controller still renders, and close a dropped
+    /// context's windows before a render in flight reopens them (PX-022-G01).
     func stop() async {
+        if stopTask == nil {
+            stopTask = Task { await self.performStop() }
+        }
+        await stopTask?.value
+    }
+
+    private func performStop() async {
         await controller.stop()
         let forwardingTask = self.forwardingTask
         forwardingTask?.cancel()
@@ -525,7 +566,7 @@ public final class ConnectionManager {
         statuses.removeValue(forKey: connectionID)
         pendingFirstSuccess.remove(connectionID)
         if activeTokens[connectionID] == nil {
-            contexts.removeValue(forKey: connectionID)
+            discardContext(for: connectionID)
         }
 
         enqueueSave(entries) { [weak self] errorMessage in
@@ -569,7 +610,7 @@ public final class ConnectionManager {
         entries.removeAll { neverConnected.contains($0.id) }
         for connectionID in neverConnected {
             statuses.removeValue(forKey: connectionID)
-            contexts.removeValue(forKey: connectionID)
+            discardContext(for: connectionID)
         }
 
         for index in entries.indices {
@@ -579,8 +620,9 @@ public final class ConnectionManager {
                ) {
                 entries[index].lastKnownRevision = revision
             }
-            statuses[entries[index].id] = .disconnected(
-                resumeAvailable: entries[index].sessionID != nil
+            setStatus(
+                .disconnected(resumeAvailable: entries[index].sessionID != nil),
+                for: entries[index].id
             )
         }
 
@@ -593,9 +635,11 @@ public final class ConnectionManager {
         }
     }
 
+    /// `configureController` lets tests install `SessionController` interceptors before start.
     static func makeSessionControllerAttempt(
         request: ConnectionAttemptRequest,
-        transport: any Transport
+        transport: any Transport,
+        configureController: ((SessionController) -> Void)? = nil
     ) -> any ConnectionAttempt {
         let controller = SessionController(
             transport: transport,
@@ -608,6 +652,7 @@ public final class ConnectionManager {
             transactionIngressGate: request.context.transactionIngressGate
         )
         controller.attachRenderer(request.context.renderer)
+        configureController?(controller)
         return SessionControllerConnectionAttempt(controller: controller)
     }
 
@@ -653,7 +698,7 @@ public final class ConnectionManager {
             tasksByToken[previousToken]?.cancel()
         }
         attemptsByToken[token] = attempt
-        statuses[connection.id] = .connecting
+        setStatus(.connecting, for: connection.id)
         if alert?.kind != .sessionReplaced {
             alert = nil
         }
@@ -666,7 +711,8 @@ public final class ConnectionManager {
             await self.runAttempt(
                 attempt,
                 connectionID: connection.id,
-                token: token
+                token: token,
+                context: context
             )
         }
         tasksByToken[token] = task
@@ -675,7 +721,8 @@ public final class ConnectionManager {
     private func runAttempt(
         _ attempt: any ConnectionAttempt,
         connectionID: SavedConnection.ID,
-        token: UInt64
+        token: UInt64,
+        context: ConnectionSessionContext
     ) async {
         var handledTerminalEvent = false
 
@@ -720,8 +767,15 @@ public final class ConnectionManager {
         if activeTokens[connectionID] == token {
             activeTokens.removeValue(forKey: connectionID)
             if entries.contains(where: { $0.id == connectionID }) == false {
-                contexts.removeValue(forKey: connectionID)
+                discardContext(for: connectionID)
             }
+        }
+        // Only now can this attempt's controller no longer render into `context` (`stop()` is
+        // shared, so it returns only once the controller has finished stopping): a render already
+        // in flight when the session failed may have reopened windows `discardContext` closed
+        // (PX-022-G01). So a context the manager no longer owns closes its windows again here.
+        if contexts[connectionID] !== context {
+            closeWindows(of: context)
         }
     }
 
@@ -732,29 +786,44 @@ public final class ConnectionManager {
     ) async -> Bool {
         guard activeTokens[connectionID] == token else { return true }
         guard let index = entries.firstIndex(where: { $0.id == connectionID }) else {
+            // A removed entry's session keeps running until its transport ends, and its windows
+            // stay open until then, so they keep following the transport (PX-022-G01). When it
+            // ends, nothing will reconnect it: its windows close at once, not after the stop
+            // (they would read as live meanwhile), and the `runAttempt` tail closes them again.
             switch event {
             case .failed, .stopped:
+                discardContext(for: connectionID)
                 return true
-            case .connecting, .resynchronizing, .replaced, .ready:
+            case .connecting:
+                showWindowStatus(.connecting, for: connectionID)
+                return false
+            case .resynchronizing:
+                showWindowStatus(.resynchronizing, for: connectionID)
+                return false
+            case .replaced:
+                showWindowStatus(.resynchronizing, for: connectionID, replaced: true)
+                return false
+            case .ready:
+                showWindowStatus(.connected, for: connectionID)
                 return false
             }
         }
 
         switch event {
         case .connecting:
-            statuses[connectionID] = .connecting
+            setStatus(.connecting, for: connectionID)
             return false
 
         case .resynchronizing:
             contexts[connectionID]?.invalidatePersistableRevision()
-            statuses[connectionID] = .resynchronizing
+            setStatus(.resynchronizing, for: connectionID)
             return false
 
         case .replaced(let previousSessionID, let newSessionID):
             contexts[connectionID]?.invalidatePersistableRevision()
             entries[index].sessionID = newSessionID
             entries[index].lastKnownRevision = 0
-            statuses[connectionID] = .resynchronizing
+            setStatus(.resynchronizing, for: connectionID, replaced: true)
             let persistenceError = await save(entries)
             guard activeTokens[connectionID] == token else { return true }
 
@@ -781,7 +850,7 @@ public final class ConnectionManager {
             entries[index].lastKnownRevision = revision
             contexts[connectionID]?.markPersistableRevisionReady(for: sessionID)
             pendingFirstSuccess.remove(connectionID)
-            statuses[connectionID] = .connected
+            setStatus(.connected, for: connectionID)
             let persistenceError = await save(entries)
             guard activeTokens[connectionID] == token else { return true }
             if let persistenceError {
@@ -858,6 +927,9 @@ public final class ConnectionManager {
     ) async -> String? {
         guard activeTokens[connectionID] == token else { return nil }
         guard let index = entries.firstIndex(where: { $0.id == connectionID }) else {
+            // The entry was removed while its session ran: the session has now ended, so its
+            // windows close at once (PX-022-G01).
+            discardContext(for: connectionID)
             return nil
         }
 
@@ -865,7 +937,7 @@ public final class ConnectionManager {
         if wasPending {
             entries.remove(at: index)
             statuses.removeValue(forKey: connectionID)
-            contexts.removeValue(forKey: connectionID)
+            discardContext(for: connectionID)
         } else {
             if let context = contexts[connectionID],
                let revision = context.persistableRevision(
@@ -873,11 +945,79 @@ public final class ConnectionManager {
                ) {
                 entries[index].lastKnownRevision = revision
             }
-            statuses[connectionID] = .disconnected(
-                resumeAvailable: entries[index].sessionID != nil
+            setStatus(
+                .disconnected(resumeAvailable: entries[index].sessionID != nil),
+                for: connectionID
             )
         }
         return await save(entries)
+    }
+
+    /// Records a connection's status and puts the matching client-owned chrome on every window of
+    /// its session (PX-022-G01). Callers have already established that they speak for the current
+    /// attempt generation (the `activeTokens` checks), so a superseded attempt's late outcome never
+    /// reaches either one (§18, generation-bound resume attempts).
+    private func setStatus(
+        _ status: ConnectionStatus,
+        for connectionID: SavedConnection.ID,
+        replaced: Bool = false
+    ) {
+        statuses[connectionID] = status
+        showWindowStatus(status, for: connectionID, replaced: replaced)
+    }
+
+    /// Puts the chrome for `status` on every window of the connection's session, if it still has
+    /// a context. Used directly only for a removed entry whose attempt is still running: it has no
+    /// row status any more, but its windows are still on screen (PX-022-G01).
+    ///
+    /// N is the applier's `lastAppliedRevision` when the transition happens, not a rendered
+    /// revision: it can briefly lead or trail what the window draws, but every non-live state says
+    /// `(stale)`, so live data is never claimed.
+    private func showWindowStatus(
+        _ status: ConnectionStatus,
+        for connectionID: SavedConnection.ID,
+        replaced: Bool = false
+    ) {
+        guard let context = contexts[connectionID] else { return }
+        context.renderer.setSessionWindowStatus(
+            replaced
+                ? ConnectionStatus.sessionReplacedWindowStatus
+                : status.sessionWindowStatus(
+                    lastAppliedRevision: context.applier.lastAppliedRevision.value
+                )
+        )
+    }
+
+    /// Drops a session context and closes its windows.
+    ///
+    /// A dropped context is never reconnected or reopened: `connect` mints a fresh one and `open`
+    /// needs one, and removing an entry only forgets it locally (D2 T38; the remote session lives
+    /// on, §17). Its windows must not outlive it. AppKit keeps a shown `NSWindow` alive after its
+    /// renderer is released, and nothing else would close it, so the window would stay on screen
+    /// frozen, and with its status cleared it would read as a live session. The status is cleared
+    /// at once so the renderer holds no transport claim. Pending text in those windows belongs to
+    /// the dropped outbox and is not sent (§18.3 covers resume only).
+    ///
+    /// It runs as soon as nothing can bring the session back for that entry: a failed first
+    /// connection, the end of a removed entry's session (its `.failed` or `.stopped`, or any
+    /// failure reaching `markDisconnected`), `remove(id:)` with no attempt running, and drafts
+    /// that never connected, at shutdown. The windows close at once, so none stays on screen
+    /// without its status while the attempt finishes its save and stop. A render already in flight may reopen them after that (a
+    /// first connection that fails mid-snapshot), so the attempt's `runAttempt` tail closes the
+    /// windows of every context the manager no longer owns again, after its shared `stop()` has
+    /// finished and the controller can no longer render.
+    private func discardContext(for connectionID: SavedConnection.ID) {
+        guard let context = contexts.removeValue(forKey: connectionID) else { return }
+        closeWindows(of: context)
+    }
+
+    /// Closes every Surface window of a context the manager no longer owns, by mounting an empty
+    /// store (`LayoutRenderer.tearDown`), as a REPLACED reset does. Idempotent.
+    private func closeWindows(of context: ConnectionSessionContext) {
+        context.renderer.setSessionWindowStatus(nil)
+        guard context.renderer.registry.isEmpty == false else { return }
+        // Mounting a store with no roots registers nothing, so it cannot throw.
+        try? context.renderer.attach(store: SemanticStore())
     }
 
     @discardableResult

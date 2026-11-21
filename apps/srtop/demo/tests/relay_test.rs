@@ -7,6 +7,7 @@ use srtop_demo::relay::{DelayRelay, Traffic, DEFAULT_IN_FLIGHT, MAX_IN_FLIGHT, M
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
+    net::Shutdown,
     os::unix::{
         fs::PermissionsExt,
         net::{UnixListener, UnixStream},
@@ -500,6 +501,159 @@ fn stop_cuts_a_blocked_connection_and_ends_its_threads() {
         "PX-025 stop evidence: blocked server and 4 delay-line threads ended {:?} after stop()",
         stopped.elapsed()
     );
+}
+
+/// A relay at `rtt` joined to an upstream this test drives directly: the
+/// client's socket and the upstream's accepted socket.
+fn joined(scratch: &Scratch, rtt: Duration) -> (DelayRelay, UnixStream, UnixStream) {
+    let upstream = scratch.path("u.sock");
+    let listener = UnixListener::bind(&upstream).unwrap();
+    let relay = DelayRelay::start(&scratch.path("r.sock"), &upstream, rtt).unwrap();
+    let client = connect(relay.listen_path());
+    let (server, _) = listener.accept().unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    wait_for(
+        "the four delay-line threads",
+        Duration::from_secs(2),
+        || relay.pump_threads() == 4,
+    );
+    (relay, client, server)
+}
+
+/// Which end shuts its write half first.
+#[derive(Clone, Copy, Debug)]
+enum Closer {
+    Server,
+    Client,
+}
+
+/// Reads until end of file or an error, on its own thread; reports when.
+fn read_to_end_on_a_thread(mut stream: UnixStream) -> mpsc::Receiver<(usize, Instant)> {
+    let (done, ended) = mpsc::channel();
+    thread::spawn(move || {
+        let mut total = 0;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => total += read,
+            }
+        }
+        let _ = done.send((total, Instant::now()));
+    });
+    ended
+}
+
+/// A half-closed connection stays the relay's until both directions end:
+/// after one end shuts its write half (and keeps reading), `stop()` or
+/// `cut()` still reaches the other direction, so the half-closed end's read
+/// ends and every delay-line thread is gone within RTT/2 + 100 ms.
+#[test]
+fn a_half_closed_connection_is_still_cut_and_stopped() {
+    let rtt = Duration::from_millis(100);
+    let bound = rtt / 2 + Duration::from_millis(100);
+    for closer in [Closer::Server, Closer::Client] {
+        for by_stop in [true, false] {
+            let scratch = Scratch::new();
+            let (mut relay, client, server) = joined(&scratch, rtt);
+            let (closing, mut other) = match closer {
+                Closer::Server => (server, client),
+                Closer::Client => (client, server),
+            };
+            other
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            closing.shutdown(Shutdown::Write).unwrap();
+            // The FIN is forwarded: the other end reads end of file.
+            let mut byte = [0_u8; 1];
+            assert_eq!(
+                other.read(&mut byte).unwrap(),
+                0,
+                "{closer:?}: EOF forwarded"
+            );
+            // That direction is done; the other one still runs.
+            wait_for("one direction to end", Duration::from_secs(2), || {
+                relay.pump_threads() == 2
+            });
+            assert_eq!(
+                relay.live_connections(),
+                1,
+                "{closer:?}: a half-closed connection is still the relay's"
+            );
+            let ended = read_to_end_on_a_thread(closing.try_clone().unwrap());
+            let started = Instant::now();
+            if by_stop {
+                relay.stop();
+            } else {
+                assert_eq!(
+                    relay.cut(),
+                    1,
+                    "{closer:?}: cut finds the half-closed connection"
+                );
+            }
+            let (_, at) = ended.recv_timeout(bound).unwrap_or_else(|_| {
+                panic!("{closer:?}, stop {by_stop}: the half-closed end's read did not end")
+            });
+            assert!(at - started < bound);
+            wait_for("every delay-line thread to end", bound, || {
+                relay.pump_threads() == 0
+            });
+            assert_eq!(relay.live_connections(), 0);
+            drop(other);
+        }
+    }
+}
+
+/// Half-close is forwarded and nothing more: after one end sends its last
+/// bytes and FIN, the other end receives every byte and then end of file,
+/// and can still send to the half-closed end, which receives everything; when
+/// the other end closes too, the connection ends by itself.
+#[test]
+fn half_close_is_forwarded_in_each_direction_without_ending_the_other() {
+    let rtt = Duration::from_millis(100);
+    for closer in [Closer::Server, Closer::Client] {
+        let scratch = Scratch::new();
+        let (relay, client, server) = joined(&scratch, rtt);
+        let (mut closing, other) = match closer {
+            Closer::Server => (server, client),
+            Closer::Client => (client, server),
+        };
+        let first: Vec<u8> = (0..100_000_u32).map(|index| (index % 251) as u8).collect();
+        let reply: Vec<u8> = (0..70_000_u32).map(|index| (index % 241) as u8).collect();
+        closing.write_all(&first).unwrap();
+        closing.shutdown(Shutdown::Write).unwrap();
+        let mut other_reader = other.try_clone().unwrap();
+        other_reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut received = Vec::new();
+        other_reader.read_to_end(&mut received).unwrap();
+        assert_eq!(received, first, "{closer:?}: every byte, then end of file");
+        // The other direction still flows.
+        let mut other_writer = other;
+        other_writer.write_all(&reply).unwrap();
+        let mut back = vec![0_u8; reply.len()];
+        closing
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        closing.read_exact(&mut back).unwrap();
+        assert_eq!(
+            back, reply,
+            "{closer:?}: the half-closed end still receives"
+        );
+        assert_eq!(relay.live_connections(), 1);
+        // The other end closes too: both directions end, and so does the connection.
+        other_writer.shutdown(Shutdown::Write).unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(closing.read(&mut byte).unwrap(), 0);
+        wait_for(
+            "the connection to end by itself",
+            rtt + Duration::from_secs(1),
+            || relay.pump_threads() == 0 && relay.live_connections() == 0,
+        );
+    }
 }
 
 /// A relay whose socket path was removed underneath it still stops, and its

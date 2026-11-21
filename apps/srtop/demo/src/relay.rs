@@ -31,7 +31,7 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc, Condvar, Mutex,
     },
     thread,
@@ -292,28 +292,48 @@ fn accept_loop(listener: UnixListener, inner: Arc<Inner>) {
             .lock()
             .unwrap()
             .push((id, client_copy, server_copy));
-        let joined = (|| -> io::Result<()> {
+        // The connection stays registered, so `cut` and `stop` can reach both
+        // of its sockets, until both directions have ended: a half-closed
+        // connection still carries the other direction.
+        let directions = Arc::new(AtomicUsize::new(2));
+        let (Ok(client_up), Ok(server_up)) = (client.try_clone(), server.try_clone()) else {
+            abandon(&inner, id, &client, &server);
+            continue;
+        };
+        let joined = pump(
+            client_up,
+            server_up,
+            inner.up_delay,
+            Arc::clone(&inner),
+            Direction::Up,
+            id,
+            Arc::clone(&directions),
+        )
+        .and_then(|()| {
             pump(
-                client.try_clone()?,
                 server.try_clone()?,
-                inner.up_delay,
-                Arc::clone(&inner),
-                Direction::Up,
-                id,
-            )?;
-            pump(
-                server,
-                client,
+                client.try_clone()?,
                 inner.down_delay,
                 Arc::clone(&inner),
                 Direction::Down,
                 id,
+                directions,
             )
-        })();
+        });
         if joined.is_err() {
-            continue;
+            // A thread could not be started: end what was started, which
+            // sees its sockets shut, and forget the connection now, since a
+            // direction that never started will never end it.
+            abandon(&inner, id, &client, &server);
         }
     }
+}
+
+/// Shuts both sockets of connection `id` and forgets it.
+fn abandon(inner: &Inner, id: u64, client: &UnixStream, server: &UnixStream) {
+    let _ = client.shutdown(Shutdown::Both);
+    let _ = server.shutdown(Shutdown::Both);
+    inner.live.lock().unwrap().retain(|entry| entry.0 != id);
 }
 
 #[derive(Clone, Copy)]
@@ -393,6 +413,8 @@ fn pump(
     inner: Arc<Inner>,
     direction: Direction,
     id: u64,
+    // Directions of this connection still running; the last to end forgets it.
+    directions: Arc<AtomicUsize>,
 ) -> io::Result<()> {
     // The channel itself is unbounded; what it may hold is bounded by `budget`.
     let (line, queue) = mpsc::channel::<Option<(Instant, Vec<u8>)>>();
@@ -435,10 +457,12 @@ fn pump(
                     };
                     in_flight.fetch_sub(chunk.len() as u64, Ordering::SeqCst);
                 }
-                // The reader saw end of file (or the far side failed): pass it on.
+                // The reader saw end of file (or the far side failed): pass it
+                // on. Only this direction's write half: the other direction of
+                // a half-closed connection goes on.
                 let _ = to.shutdown(Shutdown::Write);
-                // The server's side is done, so the connection is: forget it.
-                if matches!(direction, Direction::Down) {
+                // Both directions are done, so the connection is: forget it.
+                if directions.fetch_sub(1, Ordering::SeqCst) == 1 {
                     inner.live.lock().unwrap().retain(|entry| entry.0 != id);
                 }
             })?

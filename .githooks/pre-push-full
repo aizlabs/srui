@@ -67,6 +67,8 @@ fi
 # Pure grep, no Swift toolchain required, so it runs on every platform.
 run "swift: LogicalChannelScheduling imports" bash scripts/check-logical-channel-scheduling-imports.sh
 run "swift: test process stdio" bash scripts/check-test-process-stdio.sh
+run "swift: client opens no listener or IPC endpoint (§22.9)" bash scripts/check-client-no-listener-api.sh
+run "scripts: client listener/IPC gate self-test" bash scripts/test_check_client_no_listener_api.sh
 
 if command -v swiftc >/dev/null 2>&1; then
 	run "swift: parse changed sources (syntax-only)" bash scripts/parse-changed-swift.sh
@@ -133,6 +135,8 @@ if [ "$(uname -s)" = Darwin ]; then
 		fi
 	}
 	run "swift: swift test (watchdog, ${client_test_timeout}s)" swift_client_tests
+	# PX-026: the strict lsof listener diff, with the automation tests alone in their process.
+	run "swift: PX-026 isolated endpoint check" bash scripts/run-px026-isolated-endpoint-check.sh
 	run "benchmarks: isolated Swift driver tests" \
 		swift test --disable-automatic-resolution --package-path client-macos/Benchmarks -c release
 

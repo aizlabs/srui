@@ -408,6 +408,16 @@
           "srui-semantic-tree",
           "--test",
           "capability_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-sessiond",
+          "--test",
+          "connection_failure_test"
         ]
       ],
       "swift": [

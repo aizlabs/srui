@@ -118,7 +118,7 @@ Before using an unqualified full-coverage claim, the release report must name th
 
 ### C. Prove the SRUI advantages
 
-**PX-022–PX-027 plus PX-022-G01, PX-022-G02 and PX-026-G01 · 9 tickets · mainline.** Connection UX, continuity, latency demo, in-process automation.
+**PX-022–PX-027 plus PX-022-G01, PX-022-G02, PX-026-G02 and PX-026-G01 · 10 tickets · mainline.** Connection UX, continuity, latency demo, in-process automation.
 
 ### D. Add safe process controls
 
@@ -1206,6 +1206,30 @@ The automation-generated action follows the same wire/authorization path as a re
 ##### Handoff and completion
 
 Apply the standing completion contract. Record evidence in `docs/process-explorer/completions/PX-026.md`, update the individual feature ledger, and commit only this bounded change after required checks pass. A gate remains open if a required behavior or native test is missing.
+
+---
+
+#### PX-026-G02 — Refuse incompatible clients with the existing handshake refusal
+
+**Phase:** C · **Scope size:** S · **Status:** planned · **Gate:** R1-prerequisite
+**Dependencies:** PX-026
+**Read:** D1 §§15, 18, 19.2, 26, 32.7
+
+##### Build
+
+A generic `srui-sessiond` fix that PX-026-G01's "incompatible versions fail clearly" criterion needs. Today a HELLO or RESUME whose `core_version` has a `major.minor` this build does not serve (`SessionError::UnsupportedCoreVersion`), or whose offer does not satisfy the session's required profiles (`SessionError::Negotiation`), is closed without a frame. Both sides use the same `major.minor` rule and the server checks first, so real core-version skew always takes this path: the client reports only `transport ended: receive stream closed by peer` and logs `Reconnect and resume to recover (§18)`. §18 requires the server to fail closed before it subscribes the connection or emits replay, snapshot, resource or Terminal data. `handle_connection` now writes the existing `ServerHandshakeRefused { reason: HANDSHAKE_REFUSAL_REASON_UNSPECIFIED, detail }` through the refusal path PX-004-G01 added for undeliverable snapshots, flushes it within `WRITE_TIMEOUT`, and closes. The detail is deterministic, bounded to 256 bytes and names only versions and profiles. It echoes at most 32 characters of the client's `core_version`, with every character outside `[A-Za-z0-9.+_-]` replaced by `?` and an absent version shown as `(none)`. It lists at most 8 missing required profiles followed by `+N more`, and never echoes the client's own offer. Every other handshake failure keeps its close-only behaviour. The generic Swift client already fails as `handshakeRefused` without reconnecting; for `UNSPECIFIED` it now shows the detail without a `reason 0:` prefix. `protocol/README.md` and the `connection.rs` documentation state when the refusal is sent and how older clients behave.
+
+##### Out of scope
+
+No change to `protocol/srui.proto`, `registry.yaml`, codegen, generated files or enum values, and no new refusal reason. No change to the negotiation rules, the core version, session continuity, resume, replay or retry, `ConnectionManager` or srtop. No edit of the read-only design document, and none of PX-026-G01's packaging work.
+
+##### Verification / acceptance criteria
+
+Each new test fails with its fix reverted, and the mutants are recorded in the completion note: no refusal sent, refusal sent after a snapshot or replay frame, unbounded detail, refusal sent to a compatible client, and RESUME skipping the refusal. `connection_failure_test` asserts exactly one `ServerHandshakeRefused{UNSPECIFIED, detail}` and then close, with no frame before it. It covers HELLO and RESUME (same and replaced incarnation), for both the core-version and the profile case. It also asserts a bounded, sanitized detail for a hostile multi-megabyte `core_version` and a huge hostile profile offer, a bounded list for many or very long missing required profiles, and an unchanged WELCOME or RESUME_OK for a compatible client. `HandshakeNegotiationTests` shows the client reports `server refused the handshake: <detail>` and sends no further HELLO or RESUME. Against a live `srui-sessiond` over a Unix socket, both cases are refused on the wire and the native client shows the detail. `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo test -p srui-benchmark-driver`, srtop `cargo test --locked` on macOS and on Linux, `bash scripts/run-swift-tests.sh`, `scripts/run-conformance --suite 7` and `--suite 8` for both implementations, and `uv run pytest protocol/tests` pass.
+
+##### Handoff and completion
+
+Apply the standing completion contract. Record evidence in `docs/process-explorer/completions/PX-026-G02.md`, update the individual feature ledger, and commit only this bounded change after required checks pass. A gate remains open if a required behavior or native test is missing.
 
 ---
 

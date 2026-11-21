@@ -749,4 +749,91 @@ struct HandshakeNegotiationTests {
         await controller.stop()
         await serverTransport.close()
     }
+
+    /// PX-026-G02: sessiond refuses an incompatible core version or a missing required profile with
+    /// `SERVER HANDSHAKE_REFUSED{UNSPECIFIED, detail}` and closes (§15, §18). The client reports the
+    /// detail itself, not a closed stream, and neither retries nor resumes into the same refusal.
+    @Test(
+        "An UNSPECIFIED handshake refusal reports its detail and is not retried or resumed",
+        arguments: [
+            (false, "unsupported core protocol version 0.5.0 (this server serves 0.6)"),
+            (true, "client offer does not satisfy required profiles: [org.srui.x/1]"),
+        ]
+    )
+    func unspecifiedRefusalReportsDetailWithoutRetry(resume: Bool, detail: String) async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let controller = resume
+            ? SessionController(
+                transport: clientTransport,
+                sessionId: "refused-session",
+                clientCapabilities: [Profile.standardWidgetsV1]
+            )
+            : SessionController(transport: clientTransport, clientCapabilities: [Profile.standardWidgetsV1])
+        let failures = ManagedAtomic<[SessionFailure]>([])
+        controller.onFailure = { failure in
+            failures.store(failures.load() + [failure])
+        }
+
+        try await controller.start()
+
+        var iterator = serverTransport.receiveStream().makeAsyncIterator()
+        var decoder = SRUIMessageStreamDecoder()
+        var handshakes: [SRUIMessage.OneOf_Msg] = []
+        while handshakes.isEmpty, let chunk = try await iterator.next() {
+            for message in try decoder.appendAndExtract(incoming: chunk) {
+                if let msg = message.msg { handshakes.append(msg) }
+            }
+        }
+        if resume {
+            guard case .clientResume? = handshakes.first else {
+                Issue.record("expected CLIENT RESUME, got \(handshakes)")
+                return
+            }
+        } else {
+            guard case .clientHello? = handshakes.first else {
+                Issue.record("expected CLIENT HELLO, got \(handshakes)")
+                return
+            }
+        }
+
+        var refusal = SRUIServerHandshakeRefused()
+        refusal.reason = .unspecified
+        refusal.detail = detail
+        var message = SRUIMessage()
+        message.serverHandshakeRefused = refusal
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(message))
+
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "refusal reported") {
+            !failures.load().isEmpty
+        }
+        guard case .handshakeRefused? = failures.load().first else {
+            Issue.record("expected .handshakeRefused, got \(failures.load())")
+            return
+        }
+        let shown = failures.load().first.map(String.init(describing:)) ?? ""
+        #expect(shown == "server refused the handshake: \(detail)")
+        #expect(!shown.contains("reason 0"))
+        #expect(!shown.lowercased().contains("resume"))
+        #expect(!controller.isHandshakeComplete)
+        #expect(controller.negotiatedCapabilities == nil)
+
+        // The controller closes its own transport after the refusal, so the server's stream ends;
+        // nothing after the first handshake may be another HELLO or RESUME.
+        while let chunk = try await iterator.next() {
+            for message in try decoder.appendAndExtract(incoming: chunk) {
+                if let msg = message.msg { handshakes.append(msg) }
+            }
+        }
+        let retries = handshakes.dropFirst().filter {
+            switch $0 {
+            case .clientHello, .clientResume: return true
+            default: return false
+            }
+        }
+        #expect(retries.isEmpty, "a refused handshake must not be retried or resumed: \(retries)")
+        #expect(failures.load().count == 1)
+
+        await controller.stop()
+        await serverTransport.close()
+    }
 }

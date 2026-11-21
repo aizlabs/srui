@@ -44,7 +44,7 @@ use srui_protocol::{
     ServerHandshakeRefused, SruiCodec, SruiMessage, MAX_TERMINAL_INPUT_BYTES,
 };
 use srui_pty::TerminalSubscription;
-use srui_semantic_tree::NodeId;
+use srui_semantic_tree::{NegotiationError, NodeId, Profile};
 use thiserror::Error;
 
 /// Handshake timeout in seconds (5 seconds, §18.1).
@@ -216,34 +216,135 @@ fn clear_stale_if_settled(
 /// Bound on `ServerHandshakeRefused.detail`, far below every §26 `max_string_length`.
 const MAX_HANDSHAKE_REFUSAL_DETAIL_BYTES: usize = 1024;
 
+/// Bound on the detail of a core-version or required-profile refusal (PX-026-G02).
+///
+/// The text names only versions and profiles, so it is short; the bound keeps it short whatever a
+/// misconfigured required-profile set or a hostile `core_version` would otherwise make it.
+const MAX_INCOMPATIBLE_CLIENT_DETAIL_BYTES: usize = 256;
+
+/// Characters of the client's own `core_version` that a refusal echoes back.
+const MAX_ECHOED_CORE_VERSION_CHARS: usize = 32;
+
+/// Missing required profiles a refusal names before summarising the rest as a count.
+const MAX_LISTED_MISSING_PROFILES: usize = 8;
+
+/// The client's `core_version` as a refusal echoes it: at most [`MAX_ECHOED_CORE_VERSION_CHARS`]
+/// characters, every character outside `[A-Za-z0-9.+_-]` replaced by `?`, and `(none)` for the
+/// proto3 default `""`. Peer bytes are never reflected verbatim (§26).
+fn echoed_core_version(requested: &str) -> String {
+    if requested.is_empty() {
+        return "(none)".to_string();
+    }
+    let mut chars = requested.chars();
+    let mut echoed: String = chars
+        .by_ref()
+        .take(MAX_ECHOED_CORE_VERSION_CHARS)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '_' | '-') {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    if chars.next().is_some() {
+        echoed.push_str("...");
+    }
+    echoed
+}
+
+/// The `major.minor` this build serves; compatibility ignores the patch level (§15).
+fn served_core_version() -> String {
+    crate::session::CORE_VERSION
+        .split('.')
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// The bounded, deterministic detail of a core-version refusal.
+fn unsupported_core_version_detail(requested: &str) -> String {
+    crate::session::bound_diagnostic_string(
+        format!(
+            "unsupported core protocol version {} (this server serves {})",
+            echoed_core_version(requested),
+            served_core_version()
+        ),
+        MAX_INCOMPATIBLE_CLIENT_DETAIL_BYTES,
+    )
+}
+
+/// The bounded, deterministic detail of a required-profile refusal. It names the server's
+/// required profiles the offer lacks (§15), never the client's offer itself.
+fn unsatisfied_profiles_detail(missing: &[Profile]) -> String {
+    let mut names: Vec<String> = missing
+        .iter()
+        .take(MAX_LISTED_MISSING_PROFILES)
+        .map(Profile::to_string)
+        .collect();
+    if missing.len() > MAX_LISTED_MISSING_PROFILES {
+        names.push(format!(
+            "+{} more",
+            missing.len() - MAX_LISTED_MISSING_PROFILES
+        ));
+    }
+    crate::session::bound_diagnostic_string(
+        format!(
+            "client offer does not satisfy required profiles: [{}]",
+            names.join(", ")
+        ),
+        MAX_INCOMPATIBLE_CLIENT_DETAIL_BYTES,
+    )
+}
+
+/// The `ServerHandshakeRefused` that tells the client why `error` ends its handshake, if any.
+fn handshake_refusal(error: &SessionError) -> Option<ServerHandshakeRefused> {
+    let (reason, detail) = match error {
+        SessionError::SnapshotUnrepresentable { .. } | SessionError::SnapshotUndeliverable(_) => (
+            HandshakeRefusalReason::SnapshotUndeliverable,
+            crate::session::bound_diagnostic_string(
+                error.to_string(),
+                MAX_HANDSHAKE_REFUSAL_DETAIL_BYTES,
+            ),
+        ),
+        SessionError::UnsupportedCoreVersion { requested, .. } => (
+            HandshakeRefusalReason::Unspecified,
+            unsupported_core_version_detail(requested),
+        ),
+        SessionError::Negotiation(NegotiationError::UnsatisfiedRequiredProfiles { missing }) => (
+            HandshakeRefusalReason::Unspecified,
+            unsatisfied_profiles_detail(missing),
+        ),
+        _ => return None,
+    };
+    Some(ServerHandshakeRefused {
+        reason: reason as i32,
+        detail,
+    })
+}
+
 /// Tells the client why its handshake cannot complete before the connection closes (§18, §19.2).
 ///
-/// Only a snapshot that cannot be delivered within the client's limits is reported this way: it is
-/// deterministic, so without a diagnosis on the wire a reconnect would reproduce the same silent
-/// close forever. Every other handshake failure keeps its existing close-only behaviour. The write
-/// is best effort and bounded by [`WRITE_TIMEOUT`]; the caller returns the original error either way.
-async fn refuse_undeliverable_snapshot<W>(
-    framed_write: &mut FramedWrite<W, SruiCodec>,
-    error: &SessionError,
-) where
+/// Sent only for deterministic refusals, where a reconnect with the same client would reproduce
+/// the same failure, so without a diagnosis on the wire the client could only report a closed
+/// stream:
+/// - a snapshot that cannot be delivered within the client's limits (`SNAPSHOT_UNDELIVERABLE`);
+/// - a HELLO or RESUME `core_version` whose `major.minor` this build does not serve, and an offer
+///   that lacks a required profile (`UNSPECIFIED`, PX-026-G02; §15, §4 inv. 13).
+///
+/// Every one of these errors is raised before the connection is subscribed and before any frame
+/// is written, so the refusal is the only frame the client receives. Every other handshake failure
+/// keeps its existing close-only behaviour. The write is best effort and bounded by
+/// [`WRITE_TIMEOUT`]; the caller returns the original error either way, which closes the stream.
+async fn refuse_handshake<W>(framed_write: &mut FramedWrite<W, SruiCodec>, error: &SessionError)
+where
     W: AsyncWrite + Unpin,
 {
-    if !matches!(
-        error,
-        SessionError::SnapshotUnrepresentable { .. } | SessionError::SnapshotUndeliverable(_)
-    ) {
+    let Some(refusal) = handshake_refusal(error) else {
         return;
-    }
+    };
     let refusal = SruiMessage {
-        msg: Some(srui_message::Msg::ServerHandshakeRefused(
-            ServerHandshakeRefused {
-                reason: HandshakeRefusalReason::SnapshotUndeliverable as i32,
-                detail: crate::session::bound_diagnostic_string(
-                    error.to_string(),
-                    MAX_HANDSHAKE_REFUSAL_DETAIL_BYTES,
-                ),
-            },
-        )),
+        msg: Some(srui_message::Msg::ServerHandshakeRefused(refusal)),
     };
     match tokio::time::timeout(WRITE_TIMEOUT, framed_write.send(refusal)).await {
         Ok(Ok(())) => {}
@@ -297,7 +398,7 @@ where
             let bootstrap = match session.bootstrap_fresh_client(&hello) {
                 Ok(bootstrap) => bootstrap,
                 Err(error) => {
-                    refuse_undeliverable_snapshot(&mut framed_write, &error).await;
+                    refuse_handshake(&mut framed_write, &error).await;
                     return Err(error.into());
                 }
             };
@@ -355,7 +456,7 @@ where
             let bootstrap = match session.bootstrap_resume(&resume) {
                 Ok(bootstrap) => bootstrap,
                 Err(error) => {
-                    refuse_undeliverable_snapshot(&mut framed_write, &error).await;
+                    refuse_handshake(&mut framed_write, &error).await;
                     return Err(error.into());
                 }
             };
@@ -1028,6 +1129,71 @@ mod tests {
         assert_eq!(ack.last_processed_event_seq, 0);
         assert_ne!(ack.event_id, event.event_id);
         assert!(ack.event_id.len() <= srui_semantic_tree::MAX_EVENT_ID_BYTES);
+    }
+
+    /// Only deterministic incompatibility and undeliverable snapshots are refused on the wire;
+    /// every other handshake failure keeps its close-only behaviour (PX-026-G02).
+    #[test]
+    fn only_incompatible_clients_and_undeliverable_snapshots_are_refused() {
+        let version = handshake_refusal(&SessionError::UnsupportedCoreVersion {
+            requested: "1.5.0".to_owned(),
+            supported: crate::session::CORE_VERSION.to_owned(),
+        })
+        .expect("core-version skew is refused");
+        assert_eq!(version.reason, HandshakeRefusalReason::Unspecified as i32);
+        assert_eq!(
+            version.detail,
+            "unsupported core protocol version 1.5.0 (this server serves 0.5)"
+        );
+
+        let profiles = handshake_refusal(&SessionError::Negotiation(
+            NegotiationError::UnsatisfiedRequiredProfiles {
+                missing: vec![Profile::standard_widgets_v1()],
+            },
+        ))
+        .expect("a missing required profile is refused");
+        assert_eq!(profiles.reason, HandshakeRefusalReason::Unspecified as i32);
+
+        let snapshot = handshake_refusal(&SessionError::SnapshotUnrepresentable {
+            limit: 1,
+            actual: 2,
+        })
+        .expect("an undeliverable snapshot is refused");
+        assert_eq!(
+            snapshot.reason,
+            HandshakeRefusalReason::SnapshotUndeliverable as i32
+        );
+
+        for close_only in [
+            SessionError::InvalidInput("client_instance_id".to_owned()),
+            SessionError::InvalidConfiguration("namespace".to_owned()),
+            SessionError::LockPoisoned,
+            SessionError::OutboundClosed,
+            SessionError::LaggedResyncRequired,
+            SessionError::TerminalState(crate::session::SessionState::Expired),
+        ] {
+            assert!(
+                handshake_refusal(&close_only).is_none(),
+                "{close_only:?} keeps its close-only behaviour"
+            );
+        }
+    }
+
+    #[test]
+    fn echoed_core_version_is_bounded_and_sanitized() {
+        assert_eq!(echoed_core_version(""), "(none)");
+        assert_eq!(echoed_core_version("0.6.1-rc+b_2"), "0.6.1-rc+b_2");
+        assert_eq!(echoed_core_version("1.0\n\u{1b}[2J"), "1.0???2J");
+        let long = "7".repeat(MAX_ECHOED_CORE_VERSION_CHARS + 1);
+        assert_eq!(
+            echoed_core_version(&long),
+            format!("{}...", "7".repeat(MAX_ECHOED_CORE_VERSION_CHARS))
+        );
+        assert_eq!(
+            echoed_core_version(&"7".repeat(MAX_ECHOED_CORE_VERSION_CHARS)),
+            "7".repeat(MAX_ECHOED_CORE_VERSION_CHARS)
+        );
+        assert_eq!(served_core_version(), "0.5");
     }
 
     fn overflow_client_queue(session: &Session) {

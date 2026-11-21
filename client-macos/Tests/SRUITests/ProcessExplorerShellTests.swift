@@ -4422,7 +4422,10 @@ struct ProcessExplorerR1DevboxTests {
             failure.store("start failed: \(error)")
         }
         try await AsyncTestSupport.eventually(timeout: .seconds(20), description: "the handshake's outcome") {
-            (controller.isHandshakeComplete && applier.lastAppliedRevision.value >= 1) || failure.load() != nil
+            // Dispatch is enabled only after the snapshot is rendered and finalized, later than the
+            // handshake and the first revision (PX-026-G01 round 2, verifier F2): wait for all three.
+            (controller.isHandshakeComplete && applier.lastAppliedRevision.value >= 1 && controller.isEventDispatchEnabled)
+                || failure.load() != nil
         }
         if failure.load() != nil {
             // A refused session must stay refused: nothing applied, nothing enabled, a moment later too.
@@ -4437,19 +4440,18 @@ struct ProcessExplorerR1DevboxTests {
         return outcome
     }
 
-    /// A compatible client reaches the live data plane; every incompatible pairing — a profile the
-    /// server lacks, a newer major of the required profile, a newer client core version, a newer
-    /// server core version — fails at the handshake with nothing applied and nothing enabled, and
-    /// the connection manager says so in a blocking alert. The first two refusals are the client's
-    /// own §15 checks against the real WELCOME; the other two are the real server's §15 fail-closed
-    /// check and the client's core-version check, each met by rewriting one handshake field of the
-    /// live exchange (to a version string of the same length, so no byte count moves).
+    /// A compatible client reaches the live data plane. Where the client refuses — a profile it
+    /// requires that the server lacks, or a SERVER WELCOME of a newer core version (met by rewriting
+    /// that one field of the live exchange to a value of the same length) — it fails at the
+    /// handshake with nothing applied and nothing enabled, names the profile or the version, and the
+    /// connection manager shows it in a blocking alert. The server's refusals are
+    /// `theServerRefusesAnIncompatibleClientWithItsReason`.
     @Test(.timeLimit(.minutes(3)))
     @MainActor
-    func compatibleProfilesConnectAndEveryIncompatiblePairingFailsAtTheHandshake() async throws {
+    func compatibleProfilesConnectAndTheClientRefusesAnIncompatibleServerClearly() async throws {
         let box = try #require(DevboxScenario.fromEnvironment())
         _ = NSApplication.shared
-        let newerCore = "1.5.0"
+        let newerCore = Self.newerCore
         try #require(newerCore.utf8.count == SRUICoreVersion.utf8.count, "same-length rewrite")
 
         let compatible = try await Self.handshake(over: SSHTransport(configuration: box.configuration))
@@ -4457,29 +4459,13 @@ struct ProcessExplorerR1DevboxTests {
                 "compatible: \(compatible)")
         #expect(compatible.negotiated.contains(Profile.standardWidgetsV1.description), "compatible: \(compatible)")
 
-        func refused(_ outcome: HandshakeOutcome, _ name: String) {
-            #expect(!outcome.complete && !outcome.dispatchEnabled && outcome.revision == 0 && outcome.failure != nil,
-                    "\(name) was not refused: \(outcome)")
-            #expect(outcome.failure?.contains("superseded") != true, "\(name): \(outcome)")
-        }
         let absent = try Profile(name: "org.srui.r1-absent-profile", version: 1)
         let clientRequires = try await Self.handshake(
             over: SSHTransport(configuration: box.configuration),
             clientCapabilities: [Profile.standardWidgetsV1, absent], requiredServerProfiles: [absent])
-        refused(clientRequires, "a client requiring a profile the server lacks")
+        Self.expectRefused(clientRequires, "a client requiring a profile the server lacks")
         #expect(clientRequires.failure?.contains("Server does not satisfy client required profiles") == true,
                 "\(clientRequires)")
-
-        let widgetsV2 = try Profile(name: StandardProfiles.standardWidgets, version: 2)
-        let newerWidgets = try await Self.handshake(
-            over: SSHTransport(configuration: box.configuration), clientCapabilities: [widgetsV2])
-        refused(newerWidgets, "a client offering only standard-widgets/2")
-
-        let helloRewrite = HandshakeRewritingTransport(
-            inner: SSHTransport(configuration: box.configuration), rewrite: .clientHelloCoreVersion(newerCore))
-        let newerClient = try await Self.handshake(over: helloRewrite)
-        #expect(helloRewrite.rewrites == 1, "the CLIENT HELLO carried core_version \(newerCore)")
-        refused(newerClient, "a client of core version \(newerCore)")
 
         let welcomeRewrite = HandshakeRewritingTransport(
             inner: SSHTransport(configuration: box.configuration), rewrite: .serverWelcomeCoreVersion(newerCore))
@@ -4487,38 +4473,87 @@ struct ProcessExplorerR1DevboxTests {
         #expect(welcomeRewrite.rewrites == 1, "the SERVER WELCOME carried core_version \(newerCore)")
         #expect(welcomeRewrite.originalServerCoreVersion == SRUICoreVersion,
                 "the live server speaks \(welcomeRewrite.originalServerCoreVersion ?? "nothing")")
-        refused(newerServer, "a server of core version \(newerCore)")
-        #expect(newerServer.failure?.contains("core_version") == true, "\(newerServer)")
+        Self.expectRefused(newerServer, "a server of core version \(newerCore)")
+        #expect(newerServer.failure?.contains("core_version \(newerCore) is not compatible with \(SRUICoreVersion)") == true,
+                "\(newerServer)")
 
-        // What a user of the connection manager is told, for both directions of a version skew.
-        var alerts: [String] = []
-        for rewrite in [HandshakeRewritingTransport.Rewrite.clientHelloCoreVersion(newerCore),
-                        .serverWelcomeCoreVersion(newerCore)] {
-            let temp = try TestFixtureDirectory.make(prefix: "srui-r1-compat")
-            defer { TestFixtureDirectory.release(temp) }
-            let configuration = box.configuration
-            let manager = ConnectionManager(
-                store: SavedConnectionStore(url: temp.appendingPathComponent("connections.json")),
-                attemptFactory: { request in
-                    ConnectionManager.makeSessionControllerAttempt(
-                        request: request,
-                        transport: HandshakeRewritingTransport(
-                            inner: SSHTransport(configuration: configuration), rewrite: rewrite))
-                })
-            let id = try #require(manager.connect(ConnectDraft(label: "devbox", host: "127.0.0.1", port: String(configuration.port ?? 22), user: "srui")))
-            try await AsyncTestSupport.eventually(timeout: .seconds(20), description: "the alert for \(rewrite)") {
-                manager.alert != nil
-            }
-            let alert = try #require(manager.alert)
-            #expect(alert.title == "Connection Failed", "\(rewrite): \(alert.title)")
-            #expect(manager.status(for: id) != .connected)
-            alerts.append("\(rewrite) -> \"\(alert.title)\": \"\(alert.message)\"")
-            await manager.shutdown()
-        }
-        print("\(Self.evidencePrefix) compatibility: compatible \(compatible); client-required absent profile \(clientRequires); "
-            + "standard-widgets/2 only \(newerWidgets); client core \(newerCore) \(newerClient); "
+        let alert = try await Self.managerAlert(box, rewrite: .serverWelcomeCoreVersion(newerCore))
+        #expect(alert.contains("is not compatible with \(SRUICoreVersion)"), "\(alert)")
+        print("\(Self.evidencePrefix) client-side compatibility: compatible \(compatible); client-required absent profile \(clientRequires); "
             + "server core \(newerCore) (live server spoke \(welcomeRewrite.originalServerCoreVersion ?? "?")) \(newerServer); "
-            + "alerts \(alerts)")
+            + "alert \(alert)")
+    }
+
+    /// The server's own §15 refusals: a client offering only `standard-widgets/2` (a newer major of
+    /// the profile the server requires) and a client of a newer core version (its CLIENT HELLO
+    /// rewritten in flight, same length). Each must fail at the handshake with nothing applied, and
+    /// the user must be told why: `SERVER HANDSHAKE_REFUSED` with the server's reason, shown as
+    /// "server refused the handshake: …" naming the profile or the version, never a bare
+    /// "transport ended". The server sends that refusal from PX-026-G02 on; against an earlier
+    /// server, which closes without a reason, this test fails, deliberately (verifier F1).
+    @Test(.timeLimit(.minutes(3)))
+    @MainActor
+    func theServerRefusesAnIncompatibleClientWithItsReason() async throws {
+        let box = try #require(DevboxScenario.fromEnvironment())
+        _ = NSApplication.shared
+        let newerCore = Self.newerCore
+        let refusedPrefix = "server refused the handshake:"
+
+        let widgetsV2 = try Profile(name: StandardProfiles.standardWidgets, version: 2)
+        let newerWidgets = try await Self.handshake(
+            over: SSHTransport(configuration: box.configuration), clientCapabilities: [widgetsV2])
+        Self.expectRefused(newerWidgets, "a client offering only standard-widgets/2")
+        #expect(newerWidgets.failure?.hasPrefix(refusedPrefix) == true
+                    && newerWidgets.failure?.contains(Profile.standardWidgetsV1.description) == true,
+                "the refusal names the required profile: \(newerWidgets)")
+
+        let helloRewrite = HandshakeRewritingTransport(
+            inner: SSHTransport(configuration: box.configuration), rewrite: .clientHelloCoreVersion(newerCore))
+        let newerClient = try await Self.handshake(over: helloRewrite)
+        #expect(helloRewrite.rewrites == 1, "the CLIENT HELLO carried core_version \(newerCore)")
+        Self.expectRefused(newerClient, "a client of core version \(newerCore)")
+        #expect(newerClient.failure?.hasPrefix(refusedPrefix) == true
+                    && newerClient.failure?.contains(newerCore) == true,
+                "the refusal names the version: \(newerClient)")
+
+        let alert = try await Self.managerAlert(box, rewrite: .clientHelloCoreVersion(newerCore))
+        #expect(alert.contains(refusedPrefix) && alert.contains(newerCore), "\(alert)")
+        #expect(!alert.contains("transport ended"), "\(alert)")
+        print("\(Self.evidencePrefix) server-side compatibility: standard-widgets/2 only \(newerWidgets); "
+            + "client core \(newerCore) \(newerClient); alert \(alert)")
+    }
+
+    static let newerCore = "1.5.0"
+
+    static func expectRefused(_ outcome: HandshakeOutcome, _ name: String) {
+        #expect(!outcome.complete && !outcome.dispatchEnabled && outcome.revision == 0 && outcome.failure != nil,
+                "\(name) was not refused: \(outcome)")
+        #expect(outcome.failure?.contains("superseded") != true, "\(name): \(outcome)")
+    }
+
+    /// The blocking alert the connection manager shows for one attempt through `rewrite`.
+    @MainActor
+    private static func managerAlert(_ box: DevboxScenario, rewrite: HandshakeRewritingTransport.Rewrite) async throws -> String {
+        let temp = try TestFixtureDirectory.make(prefix: "srui-r1-compat")
+        defer { TestFixtureDirectory.release(temp) }
+        let configuration = box.configuration
+        let manager = ConnectionManager(
+            store: SavedConnectionStore(url: temp.appendingPathComponent("connections.json")),
+            attemptFactory: { request in
+                ConnectionManager.makeSessionControllerAttempt(
+                    request: request,
+                    transport: HandshakeRewritingTransport(
+                        inner: SSHTransport(configuration: configuration), rewrite: rewrite))
+            })
+        let id = try #require(manager.connect(ConnectDraft(label: "devbox", host: "127.0.0.1", port: String(configuration.port ?? 22), user: "srui")))
+        try await AsyncTestSupport.eventually(timeout: .seconds(20), description: "the alert for \(rewrite)") {
+            manager.alert != nil
+        }
+        let alert = try #require(manager.alert)
+        #expect(alert.title == "Connection Failed", "\(rewrite): \(alert.title)")
+        #expect(manager.status(for: id) != .connected)
+        await manager.shutdown()
+        return "\(rewrite) -> \"\(alert.title)\": \"\(alert.message)\""
     }
 
     // MARK: Host keys and authentication
@@ -4749,6 +4784,22 @@ struct ProcessExplorerR1DevboxTests {
         print("\(Self.evidencePrefix) continuity: session \(session) dropped at revision \(detached) -> subtitle \"\(staleSubtitle)\"; "
             + "resumed \(recorder.events(of: 2)) same session (same NSWindow: \(sameWindow)); srtop restarted -> \(recorder.events(of: 3)) new session \(replacement); "
             + "alert \"\(manager.alert?.title ?? "")\": \"\(manager.alert?.message ?? "")\"; subtitles \(replacedSubtitles); attempts \(recorder.allEvents)")
+        // F7 (round 2): the real client store wrote this file. It is kept for the privacy audit,
+        // which live-checks.sh runs over it: an endpoint, a label and a session, no credential.
+        let storeFile = temp.appendingPathComponent("connections.json")
+        try await AsyncTestSupport.eventually(timeout: .seconds(10), description: "the saved replacement session") {
+            ((try? String(contentsOf: storeFile, encoding: .utf8)) ?? "").contains(replacement)
+        }
+        let stored = try String(contentsOf: storeFile, encoding: .utf8)
+        #expect(stored.contains("127.0.0.1") && stored.contains("\"srui\""), "\(stored)")
+        if let evidence = ProcessInfo.processInfo.environment["PX026G01_EVIDENCE_DIR"] {
+            let directory = URL(fileURLWithPath: evidence)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let kept = directory.appendingPathComponent("saved-connections.json")
+            try? FileManager.default.removeItem(at: kept)
+            try FileManager.default.copyItem(at: storeFile, to: kept)
+        }
+        print("PX-026-G01 R1 saved endpoint: the client store wrote \(stored.utf8.count) B: \(stored)")
         managerShutDown = true
         await manager.shutdown()
     }

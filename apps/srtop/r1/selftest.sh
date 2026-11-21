@@ -11,7 +11,14 @@
 # 3. clean-account-walkthrough.sh: refuses root before writing anything; a --dry-run (under
 #    sandbox-exec, allowed to write only inside the throwaway HOME) ends DRY-RUN-OK, verifies its
 #    own checksum, leaves a planted file intact and lists every file it created; a failing
-#    prerequisite makes its step FAIL and the summary FAIL; an edited result fails --verify.
+#    prerequisite makes its step FAIL, stops the run there and makes the summary FAIL; an edited
+#    result fails --verify. A HOME that already holds an R1 install, saved connections, devbox
+#    state or a srtop-devbox container is refused before any write, byte for byte unchanged; with
+#    --allow-existing-srui-data, saved connections it did not create are kept.
+# 4. ssh-config-alias.sh (checklist-session.sh's ~/.ssh/config edit): after add and remove, an
+#    absent, empty, unterminated, ordinary or 0600 config is byte for byte, mode and existence what
+#    it was; a symbolic link, an existing block and an existing srtop-devbox host are refused; a
+#    config edited during the session loses only the block.
 # Bash 3.2 compatible. Exit 0 only if every case passes.
 set -uo pipefail
 
@@ -106,15 +113,25 @@ STUBS=$ROOT/stubs
 mkdir -p "$W/Documents" "$STUBS/pass" "$STUBS/fail"
 printf 'a document the walkthrough must not touch\n' > "$W/Documents/keep-me.txt"
 keep_before=$(sha "$W/Documents/keep-me.txt")
-# Docker stand-ins: a running daemon, and none.
+# Docker stand-ins: a running daemon with no srtop-devbox container, no daemon, and a daemon that
+# has one.
+mkdir -p "$STUBS/container"
 printf '#!/bin/sh\ncase "$*" in version*) echo "28.3.2 6.10.14-linuxkit linux/arm64" ;; esac\nexit 0\n' > "$STUBS/pass/docker"
 printf '#!/bin/sh\necho "Cannot connect to the Docker daemon" >&2\nexit 1\n' > "$STUBS/fail/docker"
-chmod 755 "$STUBS/pass/docker" "$STUBS/fail/docker"
+printf '#!/bin/sh\ncase "$*" in version*) echo "28.3.2 6.10.14-linuxkit linux/arm64" ;; ps*) echo 0123abcd4567 ;; esac\nexit 0\n' > "$STUBS/container/docker"
+chmod 755 "$STUBS/pass/docker" "$STUBS/fail/docker" "$STUBS/container/docker"
 
 walk() { # stubs-dir args...
   local stubs=$1
   shift
-  HOME=$W PATH="$stubs:$PATH" TMPDIR=$W/tmp bash "$R1_DIR/clean-account-walkthrough.sh" "$@"
+  HOME=${WALK_HOME:-$W} PATH="$stubs:$PATH" TMPDIR=${WALK_HOME:-$W}/tmp bash "$R1_DIR/clean-account-walkthrough.sh" "$@"
+}
+# Every path under a directory, with each file's digest and mode: what "nothing changed" means.
+snapshot() {
+  (cd "$1" && find . | LC_ALL=C sort | while IFS= read -r f; do
+    if [ -f "$f" ] && [ ! -L "$f" ]; then echo "$f $(stat -f '%Lp' "$f") $(shasum -a 256 "$f" | awk '{print $1}')"
+    else echo "$f"; fi
+  done)
 }
 
 before=$(cd "$W" && find . | LC_ALL=C sort)
@@ -134,11 +151,15 @@ if [ -n "$SANDBOX" ]; then
   [ -e "$ROOT/escape-probe" ] && ok=1
   check "sandbox: a write outside the throwaway HOME is refused" [ "$ok" -eq 0 ]
 fi
-sandboxed_walk() {
+sandboxed_walk() { # stubs output [extra args]; HOME is WALK_HOME or $W
+  local home=${WALK_HOME:-$W} stubs=$1 output=$2
+  shift 2
   if [ -n "$SANDBOX" ]; then
-    HOME=$W PATH="$1:$PATH" TMPDIR=$W/tmp sandbox-exec -p "$SANDBOX" bash "$R1_DIR/clean-account-walkthrough.sh" --dry-run --output "$2"
+    local profile="(version 1)(allow default)(deny file-write*)
+(allow file-write* (subpath \"$home\") (literal \"/dev/null\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/\"))"
+    HOME=$home PATH="$stubs:$PATH" TMPDIR=$home/tmp sandbox-exec -p "$profile" bash "$R1_DIR/clean-account-walkthrough.sh" --dry-run --output "$output" "$@"
   else
-    walk "$1" --dry-run --output "$2"
+    walk "$stubs" --dry-run --output "$output" "$@"
   fi
 }
 sandboxed_walk "$STUBS/pass" "$W/result-pass.txt" >"$ROOT/walk-pass.log" 2>&1
@@ -162,6 +183,9 @@ sandboxed_walk "$STUBS/fail" "$W/result-fail.txt" >"$ROOT/walk-fail.log" 2>&1
 check "walkthrough: a failed prerequisite fails the run (non-zero exit)" [ "$?" -ne 0 ]
 check "walkthrough: the prerequisites step reports FAIL" grep -q '^STEP 2 prerequisites FAIL exit=1 ' "$W/result-fail.txt"
 check "walkthrough: the summary is FAIL" grep -q '^SUMMARY FAIL mode=dry-run ' "$W/result-fail.txt"
+ok=1; grep -q '^STOPPED after prerequisites failed' "$W/result-fail.txt" && ! grep -q '^STEP 3 ' "$W/result-fail.txt" \
+  && [ -z "$(cd "$W" && find . -name 'srui-r1-unrelated-sentinel.txt')" ] && [ ! -e "$W/.local/share/srui-r1" ] && ok=0
+check "walkthrough: a failed prerequisite stops the run before anything is planted or installed" [ "$ok" -eq 0 ]
 ok=1; walk "$STUBS/pass" --verify "$W/result-fail.txt" >"$ROOT/verify-fail.log" 2>&1 || ok=0
 grep -q '^verify: OK checksum matches; SUMMARY FAIL ' "$ROOT/verify-fail.log" || ok=1
 check "walkthrough --verify: the failed result's checksum holds and its verdict fails" [ "$ok" -eq 0 ]
@@ -169,6 +193,98 @@ sed 's/^STEP 2 prerequisites FAIL/STEP 2 prerequisites PASS/' "$W/result-fail.tx
 ok=1; walk "$STUBS/pass" --verify "$W/result-edited.txt" >"$ROOT/verify-edited.log" 2>&1 || ok=0
 grep -q 'checksum mismatch' "$ROOT/verify-edited.log" || ok=1
 check "walkthrough --verify: an edited result is refused" [ "$ok" -eq 0 ]
+
+# Not a fresh account: each of these is refused before any write, and the HOME is unchanged.
+not_fresh() { # name stubs setup-command...
+  local name=$1 stubs=$2 home=$ROOT/main-$1 before after status
+  shift 2
+  mkdir -p "$home/Documents" && printf 'mine\n' > "$home/Documents/notes.txt"
+  (cd "$home" && "$@")
+  before=$(snapshot "$home")
+  WALK_HOME=$home walk "$stubs" --dry-run >"$ROOT/main-$name.log" 2>&1
+  status=$?
+  after=$(snapshot "$home")
+  ok=1; [ "$status" -eq 4 ] && [ "$before" = "$after" ] && grep -q 'not a fresh account' "$ROOT/main-$name.log" && ok=0
+  check "walkthrough: refuses a HOME with $name (exit $status), nothing written or removed" [ "$ok" -eq 0 ]
+}
+not_fresh saved-connections "$STUBS/pass" sh -c 'mkdir -p "Library/Application Support/SRUI" && printf "{\"connections\":[],\"version\":1}\n" > "Library/Application Support/SRUI/saved-connections.json"'
+not_fresh unreadable-backup "$STUBS/pass" sh -c 'mkdir -p "Library/Application Support/SRUI" && printf "x" > "Library/Application Support/SRUI/saved-connections.json.unreadable"'
+not_fresh an-r1-install "$STUBS/pass" sh -c 'mkdir -p .local/share/srui-r1/releases && printf "srui-r1 install prefix v1\n" > .local/share/srui-r1/.srui-r1-prefix'
+not_fresh devbox-state "$STUBS/pass" sh -c 'mkdir -p .codex/srtop-devbox && printf "k\n" > .codex/srtop-devbox/known_hosts'
+not_fresh a-devbox-container "$STUBS/container" true
+echo "  the main-account-like HOME with saved connections, before and after (identical):"
+snapshot "$ROOT/main-saved-connections" | sed 's/^/    /'
+
+# The dangerous override: the run proceeds, and saved connections it did not create are kept.
+O=$ROOT/override-home
+mkdir -p "$O/Library/Application Support/SRUI"
+printf '{"connections":[],"version":1}\n' > "$O/Library/Application Support/SRUI/saved-connections.json"
+saved_before=$(sha "$O/Library/Application Support/SRUI/saved-connections.json")
+WALK_HOME=$O sandboxed_walk "$STUBS/pass" "$O/result.txt" --allow-existing-srui-data >"$ROOT/override.log" 2>&1
+status=$?
+ok=1; [ "$status" -eq 0 ] && grep -q '^WARNING --allow-existing-srui-data' "$O/result.txt" \
+  && [ "$(sha "$O/Library/Application Support/SRUI/saved-connections.json")" = "$saved_before" ] && ok=0
+check "walkthrough --allow-existing-srui-data: proceeds, warns, and keeps saved connections it did not create" [ "$ok" -eq 0 ]
+[ "$ok" -eq 0 ] || sed 's/^/  | /' "$ROOT/override.log" | tail -20
+
+# ---------------------------------------------------------------------------------------------
+echo "== ssh-config-alias.sh"
+ALIAS=$R1_DIR/ssh-config-alias.sh
+BEGIN_MARK="# >>> srui-r1 checklist alias (added by apps/srtop/r1/checklist-session.sh; removed when it ends) >>>"
+config_state() { # home: existence, mode and digest of ~/.ssh and ~/.ssh/config
+  local c=$1/.ssh/config
+  if [ -L "$c" ]; then echo "link $(readlink "$c") $(sha "$1/real-config") $(stat -f '%Lp' "$1/real-config")"
+  elif [ -f "$c" ]; then echo "file $(stat -f '%Lp' "$c") $(sha "$c") dir=$([ -d "$1/.ssh" ] && echo yes)"
+  else echo "absent dir=$([ -d "$1/.ssh" ] && echo yes || echo no)"; fi
+}
+alias_cycle() { # name setup-command...
+  local name=$1 home=$ROOT/alias-$1 state before after added=1
+  shift
+  mkdir -p "$home"
+  (cd "$home" && "$@")
+  state=$(mktemp -d "$ROOT/alias-state.XXXXXX")
+  before=$(config_state "$home")
+  HOME=$home bash "$ALIAS" add "$state" 2222 "$home/.codex/srtop-devbox" >/dev/null 2>&1 || added=0
+  grep -qxF "$BEGIN_MARK" "$home/.ssh/config" 2>/dev/null || added=0
+  HOME=$home bash "$ALIAS" remove "$state" >/dev/null 2>&1
+  after=$(config_state "$home")
+  ok=1; [ "$added" -eq 1 ] && [ "$before" = "$after" ] && ok=0
+  check "ssh-config-alias: $name config is byte for byte, mode and existence what it was ($after)" [ "$ok" -eq 0 ]
+}
+alias_cycle absent true
+alias_cycle empty sh -c 'mkdir -m 700 .ssh && : > .ssh/config && chmod 644 .ssh/config'
+alias_cycle no-final-newline sh -c 'mkdir -m 700 .ssh && printf "Host a\n  User x" > .ssh/config && chmod 644 .ssh/config'
+alias_cycle ordinary sh -c 'mkdir -m 700 .ssh && printf "Host a\n  User x\n\nHost b\n  Port 2200\n" > .ssh/config && chmod 644 .ssh/config'
+alias_cycle mode-0600 sh -c 'mkdir -m 700 .ssh && printf "Host a\n  User x\n" > .ssh/config && chmod 600 .ssh/config'
+
+refused_alias() { # name setup-command...
+  local name=$1 home=$ROOT/alias-$1 state before after status
+  shift
+  mkdir -p "$home"
+  (cd "$home" && "$@")
+  state=$(mktemp -d "$ROOT/alias-state.XXXXXX")
+  before=$(config_state "$home")
+  HOME=$home bash "$ALIAS" add "$state" 2222 "$home/.codex/srtop-devbox" >"$ROOT/alias-$name.log" 2>&1
+  status=$?
+  HOME=$home bash "$ALIAS" remove "$state" >/dev/null 2>&1
+  after=$(config_state "$home")
+  ok=1; [ "$status" -ne 0 ] && [ "$before" = "$after" ] && ok=0
+  check "ssh-config-alias: refuses $name, nothing changed ($(head -1 "$ROOT/alias-$name.log"))" [ "$ok" -eq 0 ]
+}
+refused_alias a-symlinked-config sh -c 'mkdir -m 700 .ssh && printf "Host a\n" > real-config && ln -s ../real-config .ssh/config'
+refused_alias an-existing-block sh -c "mkdir -m 700 .ssh && printf '%s\n' 'Host a' '$BEGIN_MARK' > .ssh/config"
+refused_alias an-existing-srtop-devbox-host sh -c 'mkdir -m 700 .ssh && printf "Host other srtop-devbox\n  Port 1\n" > .ssh/config'
+
+# Edited during the session: only the block goes, the user's own later lines stay.
+E=$ROOT/alias-edited
+mkdir -p "$E/.ssh" && chmod 700 "$E/.ssh"
+printf 'Host a\n  User x\n' > "$E/.ssh/config"
+state=$(mktemp -d "$ROOT/alias-state.XXXXXX")
+HOME=$E bash "$ALIAS" add "$state" 2222 "$E/.codex/srtop-devbox" >/dev/null 2>&1
+printf 'Host added-later\n  Port 2201\n' >> "$E/.ssh/config"
+HOME=$E bash "$ALIAS" remove "$state" >/dev/null 2>&1
+expected=$(printf 'Host a\n  User x\nHost added-later\n  Port 2201\n' | shasum -a 256 | awk '{print $1}')
+check "ssh-config-alias: a config edited during the session loses only the block" [ "$(sha "$E/.ssh/config")" = "$expected" ]
 
 echo "selftest: $((CASES - FAILURES)) of $CASES cases passed"
 [ "$FAILURES" -eq 0 ]

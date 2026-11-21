@@ -14,7 +14,9 @@
 #   private-key   PEM/OpenSSH private key blocks, PuTTY key files
 #   token         GitHub, GitLab, AWS, Slack and OpenAI-style tokens, JWTs, bearer credentials
 #   password      password/passwd/passphrase/secret/pwd assignments, credentials in a URL
-#   private-path  the auditing user's home directory, or any /Users/<name>/ path but /Users/Shared
+#   private-path  the auditing user's home directory ($HOME, wherever it is), any /Users/<name>/
+#                 path but /Users/Shared, and any Linux /home/<name>/ path but /home/srui, the
+#                 devbox's own throwaway account
 # A binary file (one with a NUL byte) is scanned for the first three classes only: a from-source
 # build embeds the builder's own checkout path in its binaries, which is reported once per binary
 # as BINARY-PATH information, not as a finding. Bash 3.2 compatible (the macOS /bin/bash).
@@ -65,6 +67,10 @@ scan_paths() { # file
   fi
   for line in $(LC_ALL=C grep -a -n -o -E '/Users/[^/[:space:]"]+/' "$1" 2>/dev/null \
                 | grep -v ':/Users/Shared/$' | cut -d: -f1 | sort -un); do
+    finding private-path "$1" "$line"
+  done
+  for line in $(LC_ALL=C grep -a -n -o -E '/home/[^/[:space:]"]+/' "$1" 2>/dev/null \
+                | grep -v ':/home/srui/$' | cut -d: -f1 | sort -un); do
     finding private-path "$1" "$line"
   done
 }
@@ -128,7 +134,8 @@ audit() {
 }
 
 random_chars() { # count alphabet
-  LC_ALL=C tr -dc "$2" </dev/urandom | head -c "$1"
+  # head closing the pipe ends tr with SIGPIPE; that is the expected end, not a failure.
+  LC_ALL=C tr -dc "$2" </dev/urandom | head -c "$1" || true
 }
 
 self_test() {
@@ -155,18 +162,23 @@ self_test() {
   plant password-flag "--password=$(random_chars 12 "$alnum")"
   plant password-json "\"passphrase\": \"$(random_chars 12 "$alnum")\""
   plant password-url "https://alice:$(random_chars 10 "$alnum")@example.invalid/x"
-  plant private-path-home "${HOME:-/Users/nobody}/Library/plant.txt"
+  # A home outside /Users and /home, so only the $HOME rule can find it. The path need not exist:
+  # the rule matches the text of $HOME.
+  local other_home
+  other_home=/private/var/empty/srui-r1-selftest-home-$(random_chars 8 'a-z')
+  plant private-path-home "$other_home/Library/plant.txt"
+  plant private-path-linux "/home/$(random_chars 8 'a-z')/.config/plant.txt"
   plant private-path-users "/Users/$(random_chars 8 'a-z')/Documents/plant.txt"
   mkdir -p "$dir/nested/deeper"
   printf 'x %s y\n' "ghp_$(random_chars 36 "$alnum")" > "$dir/nested/deeper/token-nested"
-  printf 'Read-only · Live process snapshot\nconnected to 127.0.0.1:2222 as srui\n/Users/Shared/ok\nsession 0123456789abcdef0123456789abcdef\nTest run with 6 tests passed\n' > "$dir/clean"
+  printf 'Read-only · Live process snapshot\nconnected to 127.0.0.1:2222 as srui\n/Users/Shared/ok\nsrtop listening on /home/srui/run/srtop.sock\nsession 0123456789abcdef0123456789abcdef\nTest run with 6 tests passed\n' > "$dir/clean"
   printf 'bin\000ary %s\000tail\n' "ghp_$(random_chars 36 "$alnum")" > "$dir/binary-token"
   printf 'bin\000ary %s\000tail\n' "${HOME:-/Users/nobody}/src/main.swift" > "$dir/binary-path"
 
-  check() { # name expected-class-or-clean target
+  check() { # name expected-class-or-clean target [home]
     cases=$((cases + 1))
     set +e
-    output=$(bash "$self" "$3" 2>&1)
+    output=$(HOME=${4:-$HOME} bash "$self" "$3" 2>&1)
     status=$?
     set -e
     if [ "$2" = clean ]; then
@@ -191,7 +203,7 @@ self_test() {
   }
   for name in private-key-openssh private-key-rsa private-key-putty token-github token-github-pat \
               token-gitlab token-aws token-slack token-openai token-jwt token-bearer \
-              password-flag password-json password-url private-path-home private-path-users; do
+              password-flag password-json password-url private-path-users private-path-linux; do
     expected=${name%%-*}
     case "$name" in
       private-key-*) expected=private-key ;;
@@ -199,6 +211,7 @@ self_test() {
     esac
     check "$name" "$expected" "$dir/$name"
   done
+  check private-path-home private-path "$dir/private-path-home" "$other_home"
   check nested-directory token "$dir/nested"
   check clean-file clean "$dir/clean"
   check binary-token token "$dir/binary-token"

@@ -822,7 +822,8 @@
       "depends_on": [
         "PX-026",
         "PX-068",
-        "PX-010-G01"
+        "PX-010-G01",
+        "PX-026-G02"
       ],
       "file": "tickets/PX-026-G01-r1-package.md",
       "refs": "D1 §§18, 20, 25–27, 29, 32; D2 T23–T24, T32–T34",

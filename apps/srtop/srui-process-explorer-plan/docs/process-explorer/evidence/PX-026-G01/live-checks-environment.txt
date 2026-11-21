@@ -1,5 +1,5 @@
-date_utc: 2026-11-21T18:28:02Z
-revision_under_test: fad6c345a3304c9a94a0d0b7b3d367e0989597a4
+date_utc: 2026-11-21T19:51:40Z
+revision_under_test: 9ace08b8bbd81c83f197320bc1985fc53e2d004a
 image: srtop-devbox:latest id sha256:8a5bc9156f8e8ef1310ee56d3cba7beb4bad02a887f96baa634faedca735f7b5 label org.srui.revision=fad6c345a3304c9a94a0d0b7b3d367e0989597a4
 image_bases: FROM rust:1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS build FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 box_kernel: Linux 6.10.14-linuxkit aarch64

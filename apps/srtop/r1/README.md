@@ -106,10 +106,10 @@ environment:
 | Script | What it proves | Needs |
 | --- | --- | --- |
 | `selftest.sh` | The privacy audit's self-test. The install script's refusals, update, retention, rollback and precise uninstall. The walkthrough's root refusal, its sandboxed dry run (no write outside the throwaway home), its self-validating result and its FAIL propagation. | nothing (runs in `apps/srtop/test.sh`) |
-| `live-checks.sh` | Against the devbox: compatible and incompatible profiles and core versions, unknown and changed host keys, an unauthorized key, reconnect, server replacement, no process-changing action, labels and keyboard, and a command-line secret that reaches no log. Records the exact environment. | Docker, the devbox |
+| `live-checks.sh` | Against the devbox: compatible and incompatible profiles and core versions, unknown and changed host keys, an unauthorized key, reconnect, server replacement, no process-changing action, labels and keyboard, a command-line secret that reaches no log, and a saved-connections file written by the real client store. Records the exact environment. `theServerRefusesAnIncompatibleClientWithItsReason` needs PX-026-G02's server and fails before it. | Docker, the devbox |
 | `privacy-audit.sh PATH...` | No key material, token, password or private path in the given files or directories. `--self-test` plants one secret of each class. | nothing |
-| `clean-account-walkthrough.sh` | The whole install, connect, use, update, rollback, uninstall cycle in a fresh account, with one self-validating result file. See [CLEAN_ACCOUNT_WALKTHROUGH.md](CLEAN_ACCOUNT_WALKTHROUGH.md). | a fresh macOS account, Docker |
-| `checklist-session.sh` | Sets up [voiceover-keyboard-checklist.md](voiceover-keyboard-checklist.md), the manual VoiceOver and keyboard check. | Docker |
+| `clean-account-walkthrough.sh` | The whole install, connect, use, update, rollback, uninstall cycle in a fresh account, with one self-validating result file. It refuses, before any write, an account that already holds an R1 install, saved connections, devbox state or a `srtop-devbox` container, and stops after a failed preflight or prerequisites step. See [CLEAN_ACCOUNT_WALKTHROUGH.md](CLEAN_ACCOUNT_WALKTHROUGH.md). | a fresh macOS account, Docker |
+| `checklist-session.sh` | Sets up [voiceover-keyboard-checklist.md](voiceover-keyboard-checklist.md), the manual VoiceOver and keyboard check. It edits `~/.ssh/config` only through `ssh-config-alias.sh`, which refuses a symbolic-link config and restores the file byte for byte, with its mode, when the session ends. | Docker |
 
 Run the live checks under `caffeinate -u -d`, so the display stays awake for the native tests:
 `caffeinate -u -d apps/srtop/r1/live-checks.sh`.

@@ -8,6 +8,23 @@ account's home and in the checkout it runs from. The script's header lists every
 It takes about 30 to 45 minutes, most of it the two release builds, the devbox image and the native
 test build.
 
+**Run it only on a revision that includes PX-026-G02.** That ticket makes the server explain why
+it refuses an incompatible client. Before it, the walkthrough's `r1-live-checks` step fails, and
+the run ends `SUMMARY FAIL`.
+
+The script runs only in a fresh account. It refuses, before writing anything, an account that
+already has any of these:
+
+- an R1 install (`~/.local/share/srui-r1`);
+- saved connections (`~/Library/Application Support/SRUI/saved-connections.json` or its
+  `.unreadable` backup);
+- devbox state (`~/.codex/srtop-devbox`);
+- a `srtop-devbox` Docker container.
+
+That is why it must not run in your usual account. `--allow-existing-srui-data` overrides the
+refusal and is dangerous: the run then replaces and removes the existing install and container.
+It is meant for throwaway accounts only, and this walkthrough does not need it.
+
 ## 1. Prepare, in your usual account
 
 1. Quit Docker Desktop in your usual account, so the new account's Docker can start and use port
@@ -59,9 +76,13 @@ CHECKSUM sha256=...
 The walkthrough passed. Send back: ~/srui-r1-walkthrough-<UTC time>.txt
 ```
 
-If a step fails, it keeps going to the end, so the uninstall and the data check still run. The
-step logs stay in `~/srui-r1-walkthrough/logs` for you to look at. Running it again starts from the
-beginning.
+If the preflight or the prerequisites step fails, the run stops there, before anything is
+planted, built or installed. It ends with `STOPPED after …` and `SUMMARY FAIL`; fix what that step
+names and run it again.
+
+If a later step fails, the run keeps going to the end, so the uninstall and the data check still
+run. The step logs stay in `~/srui-r1-walkthrough/logs` for you to look at. Running it again
+starts from the beginning.
 
 ## 4. Send back
 

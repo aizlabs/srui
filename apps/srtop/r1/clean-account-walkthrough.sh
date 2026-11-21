@@ -13,6 +13,15 @@
 #   clean-account-walkthrough.sh --verify FILE   re-check a result file's checksum and summary
 #   --output FILE        the result file (default ~/srui-r1-walkthrough-<UTC time>.txt)
 #   --previous-rev REV   the release updated from and rolled back to (default the PX-026 merge)
+#   --allow-existing-srui-data
+#                        DANGEROUS. Without it the script refuses, before writing anything, an
+#                        account that already has an R1 install (~/.local/share/srui-r1), saved
+#                        connections (~/Library/Application Support/SRUI/saved-connections.json or
+#                        its .unreadable backup), devbox state (~/.codex/srtop-devbox) or a
+#                        srtop-devbox container. With it, the run replaces and then UNINSTALLS the
+#                        existing R1 install, and replaces and then REMOVES the existing srtop-devbox
+#                        container. It still never removes saved connections or devbox state it did
+#                        not create. Use it only in a throwaway account.
 #
 # Writes only: the result file; ~/srui-r1-walkthrough/ (logs, the previous release's source, the
 # run's TMPDIR); ~/.local/share/srui-r1/ (the install, through srui-r1-install.sh); ~/.codex/
@@ -20,7 +29,9 @@
 # the account's Docker; ~/Library/Application Support/SRUI/ (only a sentinel file this script plants
 # and removes); four sentinel files listed in the result; the checkout's own .build directories;
 # SwiftPM's and Docker's caches under ~/Library; and the /tmp/srui-* fixture directories the
-# native tests create and remove. Never sudo, never ~/.ssh, never a system setting.
+# native tests create and remove. Never sudo, never ~/.ssh, never a system setting. A failed
+# preflight or prerequisites step ends the run there, before anything is planted, built or
+# installed.
 #
 # The result file holds timestamps, commands, exit codes and versions, with the home directory
 # written as ~ and the host name as <host>; never a key, a token or an environment dump. Every
@@ -38,13 +49,15 @@ MODE=real
 OUTPUT=""
 PREVIOUS_REV=$DEFAULT_PREVIOUS_REV
 VERIFY=""
+ALLOW_EXISTING=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run) MODE=dry-run; shift ;;
     --output) OUTPUT=${2:?--output needs a file}; shift 2 ;;
     --previous-rev) PREVIOUS_REV=${2:?--previous-rev needs a revision}; shift 2 ;;
     --verify) VERIFY=${2:?--verify needs a file}; shift 2 ;;
-    -h|--help) sed -n '2,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --allow-existing-srui-data) ALLOW_EXISTING=1; shift ;;
+    -h|--help) sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "clean-account-walkthrough: unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -110,6 +123,33 @@ INSTALL=$SCRIPT_DIR/srui-r1-install.sh
 AUDIT=$SCRIPT_DIR/privacy-audit.sh
 DEVBOX=$REPO_ROOT/apps/srtop/devbox/devbox.sh
 HOST_NAME=$(hostname -s 2>/dev/null || true)
+
+# ---------------------------------------------------------------------------------------------
+# Only in a fresh account (PX-026-G01 round 2, verifier F3): the run installs, then uninstalls and
+# removes what it finds under its own names, so anything already there under those names would be
+# lost. Checked before the first write; a refusal writes nothing at all.
+# ---------------------------------------------------------------------------------------------
+EXISTING=""
+note_existing() { EXISTING="$EXISTING
+  $1"; }
+[ -e "$PREFIX" ] || [ -L "$PREFIX" ] && note_existing "$PREFIX (an SRUI R1 install)"
+for name in saved-connections.json saved-connections.json.unreadable; do
+  [ -e "$SETTINGS/$name" ] && note_existing "$SETTINGS/$name (saved connections)"
+done
+[ -e "$STATE" ] && note_existing "$STATE (devbox keypair and known_hosts)"
+CONTAINER_EXISTED=0
+if command -v docker >/dev/null 2>&1 && docker ps -aq --filter "name=^/$NAME\$" 2>/dev/null | grep -q .; then
+  CONTAINER_EXISTED=1
+  note_existing "a Docker container named $NAME"
+fi
+SAVED_PREEXISTED=0
+[ -e "$SETTINGS/saved-connections.json" ] || [ -e "$SETTINGS/saved-connections.json.unreadable" ] && SAVED_PREEXISTED=1
+if [ -n "$EXISTING" ] && [ -z "$ALLOW_EXISTING" ]; then
+  echo "clean-account-walkthrough: this is not a fresh account; refusing before writing anything." >&2
+  echo "These already exist, and the walkthrough would replace or remove them:$EXISTING" >&2
+  echo "Run it in a newly created macOS account (see CLEAN_ACCOUNT_WALKTHROUGH.md)." >&2
+  exit 4
+fi
 
 mkdir -p "$LOGS" "$EVIDENCE" "$TMPDIR" || exit 2
 : > "$OUTPUT" || exit 2
@@ -246,6 +286,14 @@ $HOME/.local/share/srui-r1-unrelated-sentinel.txt"
   done
   STATE_PREEXISTED=0
   [ -e "$STATE" ] && STATE_PREEXISTED=1
+  # What the settings directory held before (only with --allow-existing-srui-data can it hold
+  # anything), so the check after the uninstall expects exactly that plus the sentinel.
+  SETTINGS_BEFORE=$(ls -A "$SETTINGS" 2>/dev/null)
+  SAVED_SUMS=""
+  for file in "$SETTINGS/saved-connections.json" "$SETTINGS/saved-connections.json.unreadable"; do
+    [ -f "$file" ] && SAVED_SUMS="$SAVED_SUMS$file $(sha_of "$file")
+"
+  done
   local IFS='
 '
   for file in $SENTINELS; do
@@ -430,7 +478,12 @@ step_uninstall() {
       fact "kept the image $IMAGE, which existed before the walkthrough"
     fi
   fi
-  "$INSTALL" uninstall --purge-settings || status=1
+  if [ "$SAVED_PREEXISTED" = 0 ]; then
+    "$INSTALL" uninstall --purge-settings || status=1
+  else
+    "$INSTALL" uninstall || status=1
+    fact "kept the saved connections, which existed before the walkthrough"
+  fi
   if [ "${STATE_PREEXISTED:-1}" = 0 ] && [ -d "$STATE" ]; then
     case "$STATE" in
       "$HOME"/.codex/srtop-devbox) rm -rf "$STATE" && fact "removed the devbox state $STATE this walkthrough created" ;;
@@ -454,8 +507,20 @@ step_verify_unrelated() {
   if [ "$have" = "${PREFIX_SENTINEL_SUM:-missing}" ]; then fact "intact: $PREFIX/notes-unrelated.txt"; else fact "FAIL: $PREFIX/notes-unrelated.txt changed or removed"; ok=1; fi
   left=$(ls -A "$PREFIX" 2>/dev/null | tr '\n' ' ')
   [ "$left" = "notes-unrelated.txt " ] && fact "the install prefix holds only the planted file" || { fact "FAIL: the install prefix still holds: $left"; ok=1; }
-  left=$(ls -A "$SETTINGS" 2>/dev/null | tr '\n' ' ')
-  [ "$left" = "srui-r1-unrelated-sentinel.txt " ] && fact "the settings directory holds only the planted file" || { fact "FAIL: the settings directory still holds: $left"; ok=1; }
+  local want_left
+  want_left=$(printf '%s\n%s\n' "$SETTINGS_BEFORE" srui-r1-unrelated-sentinel.txt | grep . | LC_ALL=C sort | tr '\n' ' ')
+  left=$(ls -A "$SETTINGS" 2>/dev/null | LC_ALL=C sort | tr '\n' ' ')
+  [ "$left" = "$want_left" ] && fact "the settings directory holds what it held before, plus the planted file" \
+    || { fact "FAIL: the settings directory holds: $left (expected: $want_left)"; ok=1; }
+  local IFS='
+'
+  for line in $SAVED_SUMS; do
+    file=${line% *}
+    want=${line##* }
+    [ "$(sha_of "$file")" = "$want" ] && fact "intact: $file (it existed before the walkthrough)" \
+      || { fact "FAIL: $file existed before the walkthrough and changed or was removed"; ok=1; }
+  done
+  unset IFS
   [ "$(sha_of "$HOME/.ssh/known_hosts")" = "$SSH_KNOWN_HOSTS_BEFORE" ] && [ "$(sha_of "$HOME/.ssh/config")" = "$SSH_CONFIG_BEFORE" ] \
     && fact "~/.ssh/known_hosts and ~/.ssh/config unchanged" || { fact "FAIL: ~/.ssh changed"; ok=1; }
   if [ "$MODE" = real ]; then
@@ -481,12 +546,44 @@ step_final_audit() {
   "$AUDIT" "$OUTPUT"
 }
 
+# The summary follows from the STEP lines alone; --verify recomputes it.
+finish_run() {
+  local verdict
+  if [ "$FAILS" -gt 0 ]; then verdict=FAIL
+  elif [ "$MODE" = dry-run ]; then verdict=DRY-RUN-OK
+  elif [ "$SKIPS" -gt 0 ]; then verdict=FAIL
+  else verdict=PASS
+  fi
+  out "finished $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  out "SUMMARY $verdict mode=$MODE steps=$STEP_NO pass=$PASSES fail=$FAILS skip=$SKIPS"
+  printf 'CHECKSUM sha256=%s\n' "$(shasum -a 256 "$OUTPUT" | awk '{print $1}')" | tee -a "$OUTPUT"
+  if [ "$verdict" = PASS ] && [ "$MODE" = real ]; then
+    rm -rf "$WROOT"
+    echo "The walkthrough passed. Send back: $OUTPUT"
+  else
+    echo "The walkthrough's verdict is $verdict. Send back: $OUTPUT (the step logs are in $LOGS)"
+  fi
+  [ "$verdict" = PASS ] || [ "$verdict" = DRY-RUN-OK ]
+  exit $?
+}
+
+# A failed preflight or prerequisites step ends the run: nothing is planted, built or installed.
+stop_run() { # step
+  out "STOPPED after $1 failed: no later step ran, and nothing was planted, built or installed"
+  finish_run
+}
+
 # ---------------------------------------------------------------------------------------------
 out "SRUI R1 clean-account walkthrough (PX-026-G01)"
 out "started $(date -u +%Y-%m-%dT%H:%M:%SZ) mode=$MODE"
+if [ -n "$EXISTING" ]; then
+  out "WARNING --allow-existing-srui-data: not a fresh account; existing:$(printf '%s' "$EXISTING" | tr '\n' ';')"
+fi
 HEAD_REV=unknown
 run_step preflight step_preflight
+[ "$FAILS" -eq 0 ] || stop_run preflight
 run_step prerequisites step_prerequisites
+[ "$FAILS" -eq 0 ] || stop_run prerequisites
 run_step plant-unrelated step_plant_unrelated
 if [ "$MODE" = real ]; then
   run_step build-client step_build_client
@@ -516,18 +613,4 @@ run_step uninstall step_uninstall
 run_step verify-unrelated-data step_verify_unrelated
 run_step final-output-audit step_final_audit
 
-if [ "$FAILS" -gt 0 ]; then verdict=FAIL
-elif [ "$MODE" = dry-run ]; then verdict=DRY-RUN-OK
-elif [ "$SKIPS" -gt 0 ]; then verdict=FAIL
-else verdict=PASS
-fi
-out "finished $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-out "SUMMARY $verdict mode=$MODE steps=$STEP_NO pass=$PASSES fail=$FAILS skip=$SKIPS"
-printf 'CHECKSUM sha256=%s\n' "$(shasum -a 256 "$OUTPUT" | awk '{print $1}')" | tee -a "$OUTPUT"
-if [ "$verdict" = PASS ] && [ "$MODE" = real ]; then
-  rm -rf "$WROOT"
-  echo "The walkthrough passed. Send back: $OUTPUT"
-else
-  echo "The walkthrough's verdict is $verdict. Send back: $OUTPUT (the step logs are in $LOGS)"
-fi
-[ "$verdict" = PASS ] || [ "$verdict" = DRY-RUN-OK ]
+finish_run

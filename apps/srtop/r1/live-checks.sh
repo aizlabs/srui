@@ -28,8 +28,10 @@ PORT=${SRTOP_DEVBOX_PORT:-2222}
 REV=${SRTOP_DEVBOX_REV:-HEAD}
 TIMEOUT=${SRUI_R1_TEST_TIMEOUT:-1200}
 SUITE=ProcessExplorerR1DevboxTests
-# One evidence line per test in the suite; a run with fewer did not run every check.
-EXPECTED_TESTS=6
+# One evidence line per test in the suite; a run with fewer did not run every check. One of them,
+# theServerRefusesAnIncompatibleClientWithItsReason, needs a server that sends SERVER
+# HANDSHAKE_REFUSED with its reason (PX-026-G02) and fails against one that does not.
+EXPECTED_TESTS=7
 IMAGE_INPUTS=(
   apps/srtop/Cargo.toml apps/srtop/Cargo.lock apps/srtop/src server-rust protocol
   apps/srtop/devbox/Dockerfile apps/srtop/devbox/entrypoint.sh apps/srtop/devbox/sshd_config
@@ -142,10 +144,11 @@ if [ "$evidence_lines" -ne "$EXPECTED_TESTS" ] \
 fi
 
 # Every application log the run collected (the box's srtop and sshd output, the client's unified
-# log) and the environment record must hold no credential or private path. The test runner's own
+# log), the saved-connections file the real client store wrote, and the environment record must
+# hold no credential or private path. The test runner's own
 # log is the developer's build output, with its source paths; it is kept, not audited.
 audited=("$evidence/environment.txt" "$evidence/devbox-srtop.log" "$evidence/devbox-container.log"
-         "$evidence/client-unified.log")
+         "$evidence/client-unified.log" "$evidence/saved-connections.json")
 if ! "$R1_DIR/privacy-audit.sh" "${audited[@]}"; then
   echo "live-checks: the privacy audit found something in $evidence" >&2
   [ "$status" -eq 0 ] && status=1

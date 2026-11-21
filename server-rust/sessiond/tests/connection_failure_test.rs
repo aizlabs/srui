@@ -2,7 +2,8 @@
 //!
 //! Covers timeout, shutdown, EOF, malformed framing, unexpected first messages,
 //! capability negotiation edge cases, `ServerWelcome` field population, core-version
-//! negotiation, and unresponsive clients that stop draining the outbound stream.
+//! negotiation, the wire refusal of incompatible clients (PX-026-G02), and unresponsive clients
+//! that stop draining the outbound stream.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +14,8 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
 use srui_protocol::{
-    srui_message, ClientHello, Event, FramingError, SruiCodec, SruiMessage, Transaction,
+    srui_message, ClientHello, ClientResume, Event, FramingError, HandshakeRefusalReason,
+    ServerHandshakeRefused, SruiCodec, SruiMessage, Transaction,
 };
 use srui_semantic_tree::{
     CapabilitySet, NegotiationError, Profile, ServerCapabilities, DEFAULT_MAX_NODE_COUNT,
@@ -457,11 +459,11 @@ async fn handshake_negotiation_failure_is_session_error() {
         other => panic!("expected SessionError::Negotiation, got {:?}", other),
     }
 
-    // Assert the peer receives no envelope before stream close
-    let next_msg = client_framed_read.next().await;
-    assert!(
-        next_msg.is_none(),
-        "peer must receive no envelopes when negotiation fails"
+    // PX-026-G02: the peer receives exactly one refusal naming the missing profile, then close.
+    let refusal = expect_only_refusal(&mut client_framed_read).await;
+    assert_eq!(
+        refusal.detail,
+        "client offer does not satisfy required profiles: [org.srui.standard-widgets/1]"
     );
 }
 
@@ -528,8 +530,15 @@ async fn a_client_that_never_reads_is_detached_by_the_write_deadline() {
 
 #[tokio::test]
 async fn an_incompatible_core_version_fails_the_handshake() {
-    for requested in ["", "1.0.0", "0.4.0", "garbage", "0"] {
-        let session = Arc::new(Session::new("core-version"));
+    for (requested, echoed) in [
+        ("", "(none)"),
+        ("1.0.0", "1.0.0"),
+        ("0.4.0", "0.4.0"),
+        ("garbage", "garbage"),
+        ("0", "0"),
+    ] {
+        // Populated, so a compatible client would be sent a catch-up snapshot (§18).
+        let session = Arc::new(populated_session("core-version"));
         let shutdown = CancellationToken::new();
         let (client_io, server_io) = duplex(4096);
         let handle = spawn_server(server_io, Arc::clone(&session), shutdown).await;
@@ -557,9 +566,11 @@ async fn an_incompatible_core_version_fails_the_handshake() {
             ),
             "core_version {requested:?} must be refused, got {result:?}"
         );
-        assert!(
-            framed_read.next().await.is_none(),
-            "a refused core version must not receive a WELCOME"
+        // PX-026-G02: exactly one refusal, before any WELCOME or snapshot frame, then close.
+        let refusal = expect_only_refusal(&mut framed_read).await;
+        assert_eq!(
+            refusal.detail,
+            format!("unsupported core protocol version {echoed} (this server serves 0.5)")
         );
     }
 }
@@ -596,4 +607,300 @@ async fn a_compatible_patch_level_is_accepted() {
 
     shutdown.cancel();
     let _ = handle.await.expect("server task join");
+}
+
+// ---------------------------------------------------------------------------
+// Incompatible clients are refused on the wire (PX-026-G02; §15, §18, §26)
+// ---------------------------------------------------------------------------
+
+type ClientRead = FramedRead<tokio::io::ReadHalf<tokio::io::DuplexStream>, SruiCodec>;
+type ClientWrite = FramedWrite<tokio::io::WriteHalf<tokio::io::DuplexStream>, SruiCodec>;
+
+/// A session at revision 1 with a retained journal entry, so a compatible fresh client would be
+/// sent a snapshot and a compatible same-session resume a replay (§18, §21).
+fn populated_session(session_id: &str) -> Session {
+    let session = Session::new(session_id);
+    session
+        .commit_transaction(Transaction {
+            base_revision: 0,
+            new_revision: 1,
+            priority: 1,
+            operations: vec![],
+        })
+        .expect("commit initial transaction");
+    session
+}
+
+fn sample_client_resume(session_id: &str, core_version: &str, profiles: &[&str]) -> ClientResume {
+    ClientResume {
+        core_version: core_version.to_string(),
+        profiles: profiles.iter().map(|s| (*s).to_string()).collect(),
+        session_id: session_id.to_string(),
+        client_instance_id: vec![1, 2, 3],
+        last_applied_revision: 0,
+        last_acked_event_seq: 0,
+        terminal_stream_offsets: Default::default(),
+        limits: None,
+        known_resource_hashes: vec![],
+        pending_text_edits: vec![],
+    }
+}
+
+/// Sends `first` as the handshake and returns the server task plus the client's read half.
+async fn handshake_with(
+    session: Arc<Session>,
+    first: srui_message::Msg,
+) -> (
+    tokio::task::JoinHandle<Result<(), ConnectionError>>,
+    ClientRead,
+    ClientWrite,
+    CancellationToken,
+) {
+    let shutdown = CancellationToken::new();
+    // Large enough that a multi-megabyte hostile handshake does not need a concurrent reader.
+    let (client_io, server_io) = duplex(64 * 1024);
+    let handle = spawn_server(server_io, session, shutdown.clone()).await;
+    let (client_read, client_write) = tokio::io::split(client_io);
+    let mut framed_write = FramedWrite::new(client_write, SruiCodec::new());
+    framed_write
+        .send(SruiMessage { msg: Some(first) })
+        .await
+        .expect("send handshake");
+    // The caller keeps the write half open: the refusal, not a client EOF, must end the stream.
+    (
+        handle,
+        FramedRead::new(client_read, SruiCodec::new()),
+        framed_write,
+        shutdown,
+    )
+}
+
+/// The refusal must be the first and only frame, followed by close (§18): no WELCOME, RESUME_OK,
+/// RESYNC_REQUIRED, snapshot, replay, resource or Terminal frame precedes or follows it.
+async fn expect_only_refusal(framed_read: &mut ClientRead) -> ServerHandshakeRefused {
+    let first = tokio::time::timeout(Duration::from_secs(5), framed_read.next())
+        .await
+        .expect("the refusal must arrive promptly")
+        .expect("a refused handshake must carry a SERVER HANDSHAKE_REFUSED frame")
+        .expect("decode refusal");
+    let refusal = match first.msg {
+        Some(srui_message::Msg::ServerHandshakeRefused(refusal)) => refusal,
+        other => panic!("the refusal must be the first frame, got {other:?}"),
+    };
+    assert_eq!(
+        refusal.reason,
+        HandshakeRefusalReason::Unspecified as i32,
+        "an incompatible client is refused with the existing UNSPECIFIED reason"
+    );
+    let after = tokio::time::timeout(Duration::from_secs(5), framed_read.next())
+        .await
+        .expect("the server must close right after the refusal");
+    assert!(
+        after.is_none(),
+        "no frame may follow the refusal, got {after:?}"
+    );
+    refusal
+}
+
+#[tokio::test]
+async fn a_resume_with_an_incompatible_core_version_is_refused_before_any_catch_up() {
+    // Same incarnation (would replay) and a replaced one (would resync with a snapshot).
+    for session_id in ["resume-core-version", "a-replaced-incarnation"] {
+        let session = Arc::new(populated_session("resume-core-version"));
+        let (handle, mut framed_read, _write, _shutdown) = handshake_with(
+            Arc::clone(&session),
+            srui_message::Msg::ClientResume(sample_client_resume(
+                session_id,
+                "1.5.0",
+                &["org.srui.standard-widgets/1"],
+            )),
+        )
+        .await;
+
+        let refusal = expect_only_refusal(&mut framed_read).await;
+        assert_eq!(
+            refusal.detail,
+            "unsupported core protocol version 1.5.0 (this server serves 0.5)"
+        );
+        let result = handle.await.expect("server task join");
+        assert!(
+            matches!(
+                result,
+                Err(ConnectionError::Session(
+                    SessionError::UnsupportedCoreVersion { .. }
+                ))
+            ),
+            "got {result:?}"
+        );
+        assert_eq!(session.attached_count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_resume_without_a_required_profile_is_refused_before_any_catch_up() {
+    for session_id in ["resume-profiles", "a-replaced-incarnation"] {
+        let session = Arc::new(populated_session("resume-profiles"));
+        let (handle, mut framed_read, _write, _shutdown) = handshake_with(
+            Arc::clone(&session),
+            srui_message::Msg::ClientResume(sample_client_resume(
+                session_id,
+                "0.5.0",
+                &["org.srui.terminal/1"],
+            )),
+        )
+        .await;
+
+        let refusal = expect_only_refusal(&mut framed_read).await;
+        assert_eq!(
+            refusal.detail,
+            "client offer does not satisfy required profiles: [org.srui.standard-widgets/1]"
+        );
+        let result = handle.await.expect("server task join");
+        assert!(
+            matches!(
+                result,
+                Err(ConnectionError::Session(SessionError::Negotiation(_)))
+            ),
+            "got {result:?}"
+        );
+    }
+}
+
+/// A hostile `core_version` is neither reflected verbatim nor allowed to grow the detail (§26).
+#[tokio::test]
+async fn a_hostile_core_version_yields_a_bounded_sanitized_detail() {
+    let hostile = format!("9.9\n\u{202e}<script>\0{}", "\u{1f600}x".repeat(512 * 1024));
+    for resume in [false, true] {
+        let session = Arc::new(populated_session("hostile-version"));
+        let first = if resume {
+            srui_message::Msg::ClientResume(sample_client_resume(
+                "hostile-version",
+                &hostile,
+                &["org.srui.standard-widgets/1"],
+            ))
+        } else {
+            let mut hello = sample_client_hello(&["org.srui.standard-widgets/1"]);
+            hello.core_version = hostile.clone();
+            srui_message::Msg::ClientHello(hello)
+        };
+        let (handle, mut framed_read, _write, _shutdown) = handshake_with(session, first).await;
+
+        let refusal = expect_only_refusal(&mut framed_read).await;
+        assert_eq!(
+            refusal.detail,
+            "unsupported core protocol version 9.9???script???x?x?x?x?x?x?x?x?x... \
+             (this server serves 0.5)"
+        );
+        assert!(refusal.detail.len() <= 256);
+        assert!(refusal.detail.bytes().all(|b| (0x20..0x7f).contains(&b)));
+        let _ = handle.await.expect("server task join");
+    }
+}
+
+/// The detail names the server's missing required profiles, never the client's own offer, so a
+/// huge or hostile offer cannot enlarge it.
+#[tokio::test]
+async fn a_huge_hostile_profile_offer_does_not_enlarge_the_detail() {
+    let offer: Vec<String> = (0..2_000)
+        .map(|i| format!("evil\n{i}{}/1", "A".repeat(1024)))
+        .collect();
+    let offer: Vec<&str> = offer.iter().map(String::as_str).collect();
+    for resume in [false, true] {
+        let session = Arc::new(populated_session("hostile-offer"));
+        let first = if resume {
+            srui_message::Msg::ClientResume(sample_client_resume("hostile-offer", "0.5.0", &offer))
+        } else {
+            srui_message::Msg::ClientHello(sample_client_hello(&offer))
+        };
+        let (handle, mut framed_read, _write, _shutdown) = handshake_with(session, first).await;
+
+        let refusal = expect_only_refusal(&mut framed_read).await;
+        assert_eq!(
+            refusal.detail,
+            "client offer does not satisfy required profiles: [org.srui.standard-widgets/1]"
+        );
+        let _ = handle.await.expect("server task join");
+    }
+}
+
+/// A server requiring many (or very long) profiles still sends a bounded list (§26).
+#[tokio::test]
+async fn many_missing_required_profiles_are_listed_within_the_bound() {
+    let many: Vec<String> = (0..20).map(|i| format!("org.srui.x{i:02}/1")).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    let long = format!("org.srui.{}/1", "l".repeat(4096));
+    for (required, expected) in [
+        (
+            many.clone(),
+            Some(
+                "client offer does not satisfy required profiles: [org.srui.x00/1, org.srui.x01/1, \
+                 org.srui.x02/1, org.srui.x03/1, org.srui.x04/1, org.srui.x05/1, org.srui.x06/1, \
+                 org.srui.x07/1, +12 more]",
+            ),
+        ),
+        (vec![long.as_str()], None),
+    ] {
+        let session = Arc::new(Session::with_capabilities(
+            "many-required",
+            ServerCapabilities::new(
+                CapabilitySet::from_str_slice(&required).unwrap(),
+                CapabilitySet::new(),
+            ),
+        ));
+        let (handle, mut framed_read, _write, _shutdown) = handshake_with(
+            session,
+            srui_message::Msg::ClientHello(sample_client_hello(&["org.srui.standard-widgets/1"])),
+        )
+        .await;
+
+        let refusal = expect_only_refusal(&mut framed_read).await;
+        assert!(refusal.detail.len() <= 256, "{} bytes", refusal.detail.len());
+        assert!(refusal
+            .detail
+            .starts_with("client offer does not satisfy required profiles: ["));
+        if let Some(expected) = expected {
+            assert_eq!(refusal.detail, expected);
+        }
+        let _ = handle.await.expect("server task join");
+    }
+}
+
+/// A compatible client is unaffected: its first frame is still WELCOME or RESUME_OK (§15, §18).
+#[tokio::test]
+async fn a_compatible_client_is_never_sent_a_refusal() {
+    let session = Arc::new(populated_session("compatible"));
+    let (handle, mut framed_read, _write, shutdown) = handshake_with(
+        Arc::clone(&session),
+        srui_message::Msg::ClientHello(sample_client_hello(&["org.srui.standard-widgets/1"])),
+    )
+    .await;
+    let first = framed_read.next().await.expect("frame").expect("decode");
+    assert!(
+        matches!(first.msg, Some(srui_message::Msg::ServerWelcome(_))),
+        "got {first:?}"
+    );
+    let snapshot = framed_read.next().await.expect("frame").expect("decode");
+    assert!(matches!(
+        snapshot.msg,
+        Some(srui_message::Msg::Transaction(_))
+    ));
+    shutdown.cancel();
+    assert!(handle.await.expect("server task join").is_ok());
+
+    let (handle, mut framed_read, _write, shutdown) = handshake_with(
+        Arc::clone(&session),
+        srui_message::Msg::ClientResume(sample_client_resume(
+            "compatible",
+            "0.5.7",
+            &["org.srui.standard-widgets/1"],
+        )),
+    )
+    .await;
+    let first = framed_read.next().await.expect("frame").expect("decode");
+    assert!(
+        matches!(first.msg, Some(srui_message::Msg::ServerResumeOk(_))),
+        "got {first:?}"
+    );
+    shutdown.cancel();
+    assert!(handle.await.expect("server task join").is_ok());
 }

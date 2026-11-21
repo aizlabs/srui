@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-026",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Semantic inspection and in-process automation of the Process Explorer through the existing T35 API (D1 §22.9, §7.7, §18.2; D2 T24, T35): controls located by semantic identity, role, label or text over real SSH into the unchanged generic client; harmless view actions (Pause view/Resume view, Refresh now, a row selection) invoked through EventOutbox and proved at the wire identical in frame shape, logical channel, event_seq space and ServerEventAck settlement to native clicks; disabled and unsupported controls refused identically with no frame; a selection-plus-inspection scenario; a developer-only semantic inspection report naming no AppKit type; lsof proof that no listener is opened. Test-only change: no client, SDK, runtime, protocol, registry, srtop or generated-file change, and no XPC, TCP or unix-socket endpoint",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX026-001",
+      "feature": "Pause view and Resume view located through T35 SemanticInspector.findAll(role: .button, label:) while the native button is hidden and untitled, so neither a native-view lookup nor a coordinate hit test can find it; native, automated, automated, native activations of the same node give four ACTIVATE frames of one shape (every field but event_seq, event_id and observed_revision equal; no arguments; edit_seq 0) on the same logical class (input), with contiguous event_seq, the automated observed_revision equal to the handle's snapshot revision and the native one within the revisions published around the click; each settled by a PROCESSED ServerEventAck of one shape that echoes event_id and client_instance_id, names the live session and has revision_after_effect at or past the observed revision; the outbox ends empty with last_acked_event_seq at the fourth event",
+      "scope": "PX-026/client-macos Tests/SRUITests/ProcessExplorerAutomationTests.swift automationLocatesControlsSemanticallyAndTakesTheNativeClicksWireAndSettlementPath",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-026",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-026.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX026-002",
+      "feature": "A disabled control refuses automation exactly as it refuses a native click: with the view paused, Refresh now is enabled=false in the semantic snapshot and the native button; activate() throws nodeDisabled, a native click sends no action, and the same interaction delivered to the client (renderer.onInteraction) is refused by the same validation, silently in both cases; a Text line activated semantically and natively gives the same unsupportedAction (the native one reported through the client's diagnostic hook); none of the refusals sends a frame or consumes an event_seq, the server stays paused, and the next allowed actions take event_seq +1 and +2 and settle PROCESSED",
+      "scope": "PX-026/client-macos Tests/SRUITests/ProcessExplorerAutomationTests.swift aDisabledOrUnsupportedControlRefusesAutomationExactlyAsItRefusesANativeClick",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-026",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-026.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX026-003",
+      "feature": "Selection plus inspection: the one Table is found by role, PID 4102's row ItemId is read from the semantic model the table binds (never from the native table), SemanticNodeHandle.select sends a SELECTION_CHANGED of the same shape, logical class and settlement as a native row selection (event_seq +1), and the inspector, found by its first line's text and its parent's children, reads the selected process's four lines and its command-line text",
+      "scope": "PX-026/client-macos Tests/SRUITests/ProcessExplorerAutomationTests.swift automationSelectsAProcessRowAndReadsTheInspectorSemantically",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-026",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-026.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX026-004",
+      "feature": "Developer-only semantic inspection output (test output, written to PX026_EVIDENCE_DIR when set): one line per node with its semantic ID, registry role, label, text, value, accessible description, non-default state, accepted standard events, server-advertised actions, action key, shortcut and child count, built only from the T35 snapshot; it names none of the native classes the renderer built, matches no NS* type or pointer pattern, and a bounded reflection walk of the snapshot reaches no NSObject",
+      "scope": "PX-026/client-macos Tests/SRUITests/ProcessExplorerAutomationTests.swift SemanticInspectionReport, AutomationClient.expectNoNativeType",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-026",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-026.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX026-005",
+      "feature": "No external automation endpoint: lsof (-F field output) of the test process before the inspector is made and after every automated action lists no new TCP LISTEN, UDP or path-bound unix socket (measured: no socket at all either time); a TCP and a unix control listener opened, listed and closed by the test prove the listing would see one; the diff adds no listener API outside that test control and changes no client, SDK, runtime or srtop source",
+      "scope": "PX-026/client-macos Tests/SRUITests/ProcessExplorerAutomationTests.swift AutomationEndpoints",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-026",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-026.md"
+      ]
+    }
+  ]
+}

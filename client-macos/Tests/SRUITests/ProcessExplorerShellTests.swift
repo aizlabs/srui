@@ -3648,7 +3648,9 @@ struct ProcessExplorerShellTests {
         return text
     }
 
-    private struct Harness {
+    // Internal, not private: PX-026's automation tests (ProcessExplorerAutomationTests.swift)
+    // extend this suite and launch the same fixture.
+    struct Harness {
         let temp: URL
         /// The app server; PX-022 replaces it with a restarted instance on the same socket.
         var server: Process
@@ -3659,7 +3661,7 @@ struct ProcessExplorerShellTests {
     /// Builds the app, an ephemeral authenticated localhost sshd and a transport
     /// configuration for it. Missing prerequisites fail; nothing is skipped.
     @MainActor
-    private static func launch(
+    static func launch(
         binary: String = "apps/srtop/target/debug/srtop", arguments: [String], serverLog: URL? = nil
     ) async throws -> Harness {
         let root = URL(fileURLWithPath: #filePath)
@@ -3741,7 +3743,7 @@ struct ProcessExplorerShellTests {
         }
     }
 
-    private static func shutDown(_ harness: Harness) {
+    static func shutDown(_ harness: Harness) {
         if harness.server.isRunning { kill(harness.server.processIdentifier, SIGINT) }
         harness.server.waitUntilExit()
         SSHTestSupport.terminate(harness.sshd)

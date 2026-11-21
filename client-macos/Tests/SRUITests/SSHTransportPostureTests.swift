@@ -277,6 +277,10 @@ struct SSHTransportPostureTests {
         #expect(effective["userknownhostsfile"] == "/tmp/px023-known-hosts")
         #expect(effective["connecttimeout"] == "5")
         #expect(effective["proxycommand"] == nil || effective["proxycommand"] == "none")
-        #expect(effective["compression"] == "yes", "a harmless extra option still applies")
+        // The default prints `compression no`. For `Compression=yes`, this Mac's OpenSSH 10.2 prints
+        // `yes`, but the macOS 15 CI runner's `/usr/bin/ssh -G` prints `UNKNOWN`. So the test checks
+        // that the extra moved the value away from the default, not that it reads exactly `yes`.
+        #expect(effective["compression"] != nil, "ssh -G printed no compression line: \(effective)")
+        #expect(effective["compression"] != "no", "a harmless extra option still applies")
     }
 }

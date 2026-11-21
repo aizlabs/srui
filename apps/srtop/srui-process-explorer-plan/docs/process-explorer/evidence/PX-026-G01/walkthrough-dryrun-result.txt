@@ -1,0 +1,104 @@
+SRUI R1 clean-account walkthrough (PX-026-G01)
+started 2026-11-21T18:27:28Z mode=dry-run
+BEGIN 1 preflight 2026-11-21T18:27:28Z
+  command: step_preflight
+  FACT mode: dry-run
+  FACT script: <checkout>/apps/srtop/r1/clean-account-walkthrough.sh
+  FACT checkout: <checkout> at fad6c345a3304c9a94a0d0b7b3d367e0989597a4 (9 changed paths)
+  FACT previous release revision: e549ee8ac965f17cc4290330c3f1fda5733bf50c
+  FACT user id: 501 (not root)
+  FACT result file: ~/srui-r1-walkthrough-dryrun.txt
+STEP 1 preflight PASS exit=0 seconds=0
+BEGIN 2 prerequisites 2026-11-21T18:27:28Z
+  command: step_prerequisites
+  FACT macOS: 26.4.1 (25E253) arm64
+  FACT developer directory: /Applications/Xcode.app/Contents/Developer
+  FACT xcode: Xcode 26.2 Build version 17C52
+  FACT swift: swift-driver version: 1.127.14.1 Apple Swift version 6.2.3 (swiftlang-6.2.3.3.21 clang-1700.6.3.2)
+  FACT git: git version 2.51.2
+  FACT ssh: OpenSSH_10.2p1, LibreSSL 3.3.6
+  FACT docker client: 29.0.2
+  FACT docker server: 28.3.2 6.10.14-linuxkit linux/arm64
+  FACT rust (optional; the Linux server is built inside the devbox image): absent / absent
+STEP 2 prerequisites PASS exit=0 seconds=1
+BEGIN 3 plant-unrelated 2026-11-21T18:27:29Z
+  command: step_plant_unrelated
+  FACT planted ~/Documents/srui-r1-unrelated-sentinel.txt sha256=e32820aae1d49f09c27ca3de47f2af0ee81f46ded7d84967b6a9e4d7fdeaefc5
+  FACT planted ~/.codex/srui-r1-unrelated-sentinel.txt sha256=e32820aae1d49f09c27ca3de47f2af0ee81f46ded7d84967b6a9e4d7fdeaefc5
+  FACT planted ~/Library/Application Support/SRUI/srui-r1-unrelated-sentinel.txt sha256=e32820aae1d49f09c27ca3de47f2af0ee81f46ded7d84967b6a9e4d7fdeaefc5
+  FACT planted ~/.local/share/srui-r1-unrelated-sentinel.txt sha256=e32820aae1d49f09c27ca3de47f2af0ee81f46ded7d84967b6a9e4d7fdeaefc5
+  FACT ~/.ssh/known_hosts before: absent; ~/.ssh/config before: absent (stat only)
+  FACT devbox state ~/.codex/srtop-devbox existed before: 0
+STEP 3 plant-unrelated PASS exit=0 seconds=0
+BEGIN 4 build-client 2026-11-21T18:27:29Z
+  command (not run): swift build -c release --package-path client-macos --product RendererDemoApp
+  skipped: dry run
+STEP 4 build-client SKIP exit=- seconds=0
+BEGIN 5 build-previous 2026-11-21T18:27:29Z
+  command (not run): swift build -c release (git archive e549ee8ac965f17cc4290330c3f1fda5733bf50c client-macos)
+  skipped: dry run
+STEP 5 build-previous SKIP exit=- seconds=0
+BEGIN 6 stand-ins 2026-11-21T18:27:29Z
+  command: step_stand_ins
+  FACT dry run: stand-in executables, not builds
+STEP 6 stand-ins PASS exit=0 seconds=0
+BEGIN 7 install-previous 2026-11-21T18:27:29Z
+  command: step_install_previous
+  FACT current release sha256=511fc82507f1ca8a5fb73a1af66ee44fa0480d6078cb3a795533d140e395a57f (expected the previous client, 511fc82507f1ca8a5fb73a1af66ee44fa0480d6078cb3a795533d140e395a57f)
+STEP 7 install-previous PASS exit=0 seconds=0
+BEGIN 8 update-to-r1 2026-11-21T18:27:29Z
+  command: step_update
+  FACT current release sha256=a552222395fc380946a80274f8b34e483bf0939fe74e2596af41ce566ebf4486 (expected the R1 client, a552222395fc380946a80274f8b34e483bf0939fe74e2596af41ce566ebf4486)
+  FACT planted ~/.local/share/srui-r1/notes-unrelated.txt sha256=71da4dc5580e109da95f63674fd1956a1a558d636cad5bbcfc83352bdf6c03f3
+STEP 8 update-to-r1 PASS exit=0 seconds=1
+BEGIN 9 devbox-up 2026-11-21T18:27:30Z
+  command (not run): <checkout>/apps/srtop/devbox/devbox.sh up
+  skipped: dry run
+STEP 9 devbox-up SKIP exit=- seconds=0
+BEGIN 10 connect 2026-11-21T18:27:30Z
+  command (not run): ~/.local/share/srui-r1/bin/srui-client --ssh 127.0.0.1 --port 2222 ...
+  skipped: dry run
+STEP 10 connect SKIP exit=- seconds=0
+BEGIN 11 use-r0-scenario 2026-11-21T18:27:30Z
+  command (not run): apps/srtop/devbox/r0-scenario.sh
+  skipped: dry run
+STEP 11 use-r0-scenario SKIP exit=- seconds=0
+BEGIN 12 r1-live-checks 2026-11-21T18:27:30Z
+  command (not run): apps/srtop/r1/live-checks.sh
+  skipped: dry run
+STEP 12 r1-live-checks SKIP exit=- seconds=0
+BEGIN 13 rollback 2026-11-21T18:27:30Z
+  command: step_rollback
+  FACT current release sha256=511fc82507f1ca8a5fb73a1af66ee44fa0480d6078cb3a795533d140e395a57f (expected the previous client, 511fc82507f1ca8a5fb73a1af66ee44fa0480d6078cb3a795533d140e395a57f)
+  FACT dry run: the rolled-back client is not launched
+STEP 13 rollback PASS exit=0 seconds=0
+BEGIN 14 roll-forward 2026-11-21T18:27:30Z
+  command: step_roll_forward
+  FACT current release sha256=a552222395fc380946a80274f8b34e483bf0939fe74e2596af41ce566ebf4486 (expected the R1 client, a552222395fc380946a80274f8b34e483bf0939fe74e2596af41ce566ebf4486)
+STEP 14 roll-forward PASS exit=0 seconds=0
+BEGIN 15 privacy-audit 2026-11-21T18:27:30Z
+  command: step_privacy_audit
+  FACT audited: ~/srui-r1-walkthrough-dryrun.txt ~/.local/share/srui-r1 ~/Library/Application Support/SRUI
+STEP 15 privacy-audit PASS exit=0 seconds=1
+BEGIN 16 uninstall 2026-11-21T18:27:31Z
+  command: step_uninstall
+STEP 16 uninstall PASS exit=0 seconds=0
+BEGIN 17 verify-unrelated-data 2026-11-21T18:27:31Z
+  command: step_verify_unrelated
+  FACT intact: ~/Documents/srui-r1-unrelated-sentinel.txt
+  FACT intact: ~/.codex/srui-r1-unrelated-sentinel.txt
+  FACT intact: ~/Library/Application Support/SRUI/srui-r1-unrelated-sentinel.txt
+  FACT intact: ~/.local/share/srui-r1-unrelated-sentinel.txt
+  FACT intact: ~/.local/share/srui-r1/notes-unrelated.txt
+  FACT the install prefix holds only the planted file
+  FACT the settings directory holds only the planted file
+  FACT ~/.ssh/known_hosts and ~/.ssh/config unchanged
+  FACT no process from the install prefix is running
+  FACT removed the sentinel files
+STEP 17 verify-unrelated-data PASS exit=0 seconds=0
+BEGIN 18 final-output-audit 2026-11-21T18:27:31Z
+  command: step_final_audit
+STEP 18 final-output-audit PASS exit=0 seconds=0
+finished 2026-11-21T18:27:31Z
+SUMMARY DRY-RUN-OK mode=dry-run steps=18 pass=12 fail=0 skip=6
+CHECKSUM sha256=9a882287dc9042c7be8cc38080a1e71c104532c74b93d51d3a24633961cc0568

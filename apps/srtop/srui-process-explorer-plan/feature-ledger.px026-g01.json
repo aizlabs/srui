@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-026-G01",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "The installable-R1 package gate (D1 §§15, 18, 19.1, 20, 25–27, 29, 32; D2 T23–T24, T32–T34): a build-from-source package of srtop and the bridge (in the devbox, base images pinned by digest) and the generic macOS client (ad-hoc linker signature, no notarization), user-owned install/update/rollback/uninstall, live checks against the devbox of protocol compatibility, host keys, authentication, reconnect and replacement, a package with no process-changing action that is labelled and keyboard-operable, a repeatable privacy audit, a clean-account walkthrough and a VoiceOver checklist for the user to run, and the R1 notes with the PX-010-G01 support envelope. Test, script and documentation change only: no client, SDK, runtime, protocol, registry, srtop or generated-file change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX026G01-001",
+      "feature": "Reproducible build and install: the devbox Dockerfile pins rust:1-bookworm@sha256:e6f2cff3… (rustc 1.99.1) and debian:bookworm-slim@sha256:734a72b3… (Debian 12.15); srtop and srui-ssh-bridge build --locked from a git archive of the revision, the image labelled with it; the macOS client builds with swift build -c release under the pinned toolchain (Xcode 26.2, Swift 6.2.3, macOS 14 minimum, swift-protobuf 1.38.1 locked) and carries only the linker's ad-hoc signature (Signature=adhoc, flags adhoc,linker-signed); apps/srtop/r1/srui-r1-install.sh installs it under ~/.local/share/srui-r1 with current and previous releases, update, rollback, status and an uninstall that removes only the files it wrote (and, with --purge-settings, only saved-connections.json and its .unreadable backup), refusing root, a prefix outside the home directory and a foreign non-empty directory; the installed release binary connected to the devbox (its bridge started in the box as srui) and was stopped by its PID; selftest.sh covers every refusal, update, retention, rollback and the precise uninstall",
+      "scope": "PX-026-G01/apps/srtop/devbox/Dockerfile; apps/srtop/r1/srui-r1-install.sh; apps/srtop/r1/selftest.sh; apps/srtop/r1/README.md",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-026-G01",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-026-G01.md"]
+    },
+    {
+      "feature_id": "SRUI-PX026G01-002",
+      "feature": "Compatible and incompatible protocol profiles and core versions against the live devbox srtop: a standard-widgets/1 client reaches the data plane (core 0.5.0 both sides); a client requiring a profile the server lacks, a client offering only standard-widgets/2, a client of core 1.5.0 (its CLIENT HELLO rewritten in flight, same length) and a server of core 1.5.0 (its SERVER WELCOME rewritten) each fail at the handshake with revision 0, no dispatch and a failure, and the connection manager shows a blocking Connection Failed alert; the client-side refusals name the profile or version, the server-side refusals close without a reason (a known gap, a protocol prerequisite); a mutant that accepts any WELCOME core version is killed by this test and by HandshakeNegotiationTests",
+      "scope": "PX-026-G01/client-macos Tests/SRUITests/ProcessExplorerShellTests.swift ProcessExplorerR1DevboxTests.compatibleProfilesConnectAndEveryIncompatiblePairingFailsAtTheHandshake, HandshakeRewritingTransport",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-026-G01",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-026-G01.md"]
+    },
+    {
+      "feature_id": "SRUI-PX026G01-003",
+      "feature": "Unknown and changed host keys and an unauthorized key against the live devbox sshd, through the connection manager with the production known-hosts hint: each ends sshFailedBeforeStream before any SRUI byte with a blocking Connection Failed alert quoting ssh (No ED25519 host key is known … Host key verification failed; Permission denied (publickey)) and saying SRUI never adds or changes host keys, with no trust-anyway path; the known_hosts files are byte-for-byte unchanged; the argv carries StrictHostKeyChecking=yes, BatchMode=yes and UpdateHostKeys=no",
+      "scope": "PX-026-G01/client-macos Tests/SRUITests/ProcessExplorerShellTests.swift ProcessExplorerR1DevboxTests.anUnknownOrChangedHostKeyIsRefusedAndKnownHostsIsNeverWritten, aKeyTheBoxDoesNotAuthorizeFailsAuthenticationClearly",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-026-G01",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-026-G01.md"]
+    },
+    {
+      "feature_id": "SRUI-PX026G01-004",
+      "feature": "Reconnect and server replacement against the live devbox: the box's srui-ssh-bridge killed by its confirmed PID leaves the window subtitled disconnected — showing data from revision N (stale) and the next attempt resumes the same session with RESUME_OK (connecting, ready); srtop stopped by SIGTERM and started again on the same socket gives connecting, replaced, ready, a new session ID, the Session Replaced alert naming it, the subtitle session replaced — rebuilding and a new window built from the new snapshot; devbox.sh drop-bridges and restart-srtop do the same for the manual checklist",
+      "scope": "PX-026-G01/client-macos Tests/SRUITests/ProcessExplorerShellTests.swift ProcessExplorerR1DevboxTests.aDroppedTransportResumesAndARestartedServerIsReportedAsReplaced; apps/srtop/devbox/devbox.sh drop-bridges, restart-srtop",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-026-G01",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-026-G01.md"]
+    },
+    {
+      "feature_id": "SRUI-PX026G01-005",
+      "feature": "The live package offers no process-changing action and is labelled and keyboard-operable: all 41 event-accepting nodes of the T35 snapshot (views, queries, columns, follow, tree, threads, tags) and every native button title are checked against a kill/terminate/signal/renice/priority/affinity/suspend/ptrace/limit pattern; every one has a native accessibility label and role; PX-016's 18 shortcuts are bound with no diagnostic, announced by label and shortcut help, in published reading order; ⌘F, ⌥⌘F, ⌘L, Down (the inspector follows the selected PID over the wire) and ⌘I work against live data",
+      "scope": "PX-026-G01/client-macos Tests/SRUITests/ProcessExplorerShellTests.swift ProcessExplorerR1DevboxTests.theLivePackageOffersNoProcessChangingActionAndIsLabelledAndKeyboardOperable",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-026-G01",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-026-G01.md"]
+    },
+    {
+      "feature_id": "SRUI-PX026G01-006",
+      "feature": "Repeatable privacy and disclosure audit: apps/srtop/r1/privacy-audit.sh scans files or directories for private keys, GitHub/GitLab/AWS/Slack/OpenAI-style tokens, JWTs, bearer credentials, password assignments, URL credentials and private paths, printing only class and location; --self-test plants one secret of each class (built at run time) and passes 21 of 21 cases; live: a worker's --api-token=ghp_… and --password=… arguments are shown on selection and appear in none of srtop's log, the box's sshd output and the client's unified log, which the audit then passes; mutants that drop the token or the private-key rule are killed",
+      "scope": "PX-026-G01/apps/srtop/r1/privacy-audit.sh; ProcessExplorerR1DevboxTests.aSecretInAProcessCommandLineReachesNoLog; apps/srtop/r1/live-checks.sh",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-026-G01",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-026-G01.md"]
+    },
+    {
+      "feature_id": "SRUI-PX026G01-007",
+      "feature": "The clean-account walkthrough script: refuses root and sudo before writing anything; writes one self-validating result file (STEP lines with exit codes and durations, SUMMARY derived from them, CHECKSUM of every line before it, --verify re-checks both; home as ~, checkout as <checkout>, host as <host>); its sandbox-exec dry run, allowed to write only inside a throwaway HOME, runs install, update, rollback, roll-forward, privacy audit, uninstall and the unrelated-data check against stand-ins and ends DRY-RUN-OK; a failing prerequisite makes its step and the summary FAIL; an edited result fails --verify; mutants that report PASS on a failed command or ignore failures in the summary are killed",
+      "scope": "PX-026-G01/apps/srtop/r1/clean-account-walkthrough.sh; apps/srtop/r1/selftest.sh; apps/srtop/r1/CLEAN_ACCOUNT_WALKTHROUGH.md",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-026-G01",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-026-G01.md"]
+    },
+    {
+      "feature_id": "SRUI-PX026G01-008",
+      "feature": "BLOCKED: awaiting user evidence. The clean-account walkthrough run by the user in a freshly created macOS account (install, connect, use, update, rollback, uninstall, unrelated data intact) and its returned result file. Not run by the implementer, who cannot create accounts; no result is claimed",
+      "scope": "PX-026-G01/the user's run of apps/srtop/r1/clean-account-walkthrough.sh",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-026-G01",
+      "status": "planned",
+      "blocked": "awaiting user evidence",
+      "evidence": ["docs/process-explorer/completions/PX-026-G01.md"]
+    },
+    {
+      "feature_id": "SRUI-PX026G01-009",
+      "feature": "BLOCKED: awaiting user evidence. The VoiceOver and keyboard checklist run by the user on the R1 build: VoiceOver announcing the window subtitle on disconnect and reconnect, a stale click not moving the highlight, the Session Replaced alert when srtop restarts, host;id refused and a known host connecting in the Connect form, labels, roles and shortcut help. Not run by the implementer; no result is claimed",
+      "scope": "PX-026-G01/the user's run of apps/srtop/r1/voiceover-keyboard-checklist.md with apps/srtop/r1/checklist-session.sh",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-026-G01",
+      "status": "planned",
+      "blocked": "awaiting user evidence",
+      "evidence": ["docs/process-explorer/completions/PX-026-G01.md"]
+    },
+    {
+      "feature_id": "SRUI-PX026G01-010",
+      "feature": "R1 notes: scope, out of scope (htop parity, process actions, privileged helper, external automation, advanced diagnostics, signed or notarized distribution), pinned environments with versions and digests, the PX-010-G01 measurements quoted as recorded beside the budgets the tests enforce, no bandwidth claim, the compatibility, security and privacy results, the two blocked user items, known gaps and the known follow-ups",
+      "scope": "PX-026-G01/docs/process-explorer/releases/R1.md",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-026-G01",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/releases/R1.md"]
+    }
+  ]
+}

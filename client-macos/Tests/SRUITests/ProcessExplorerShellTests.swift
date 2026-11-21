@@ -10,6 +10,7 @@ import Protocol
 import TransportSSH
 import RendererAppKit
 import Collections
+import Accessibility
 
 /// Serialized as a suite, not per test: `.serialized` on a non-parameterized test function is a
 /// no-op (the compiler warns), and each test here launches its own sshd, srtop and NSWindow. Two of
@@ -4366,6 +4367,691 @@ struct ProcessExplorerDevboxScenarioTests {
     private static func isMeasuredOverallCPU(_ text: String) -> Bool {
         text.range(of: #"^Overall CPU \(100% = all [0-9]+ logical CPUs\): [0-9]+\.[0-9]%$"#,
                    options: .regularExpression) != nil
+    }
+}
+
+// MARK: - PX-026-G01: the installable-R1 live checks against the devbox
+
+/// PX-026-G01, the R1 package gate's live checks (D1 §§15, 18, 19.1, 25–27; D2 T23–T24, T32–T34):
+/// the devbox's `srtop --live-source` behind the real `srui-ssh-bridge` subsystem and the box's own
+/// OpenSSH, with the unchanged generic client. Compatible and incompatible protocol profiles and
+/// core versions; an unknown and a changed host key; a key the box does not authorize; a dropped
+/// transport that resumes and a restarted srtop reported as a replacement; a package that offers
+/// no process-changing action and is labelled and operable from the keyboard; and a secret in a
+/// process's command line that reaches no log. Opt-in, because it needs Docker:
+/// `apps/srtop/r1/live-checks.sh` starts the box and runs this suite with the box's coordinates in
+/// the environment (the same variables `r0-scenario.sh` exports). Without them the suite is
+/// reported as skipped, never as passed. Every test ends by printing one
+/// `PX-026-G01 R1 live evidence:` line, and the script requires one per test.
+@Suite(.serialized, .enabled(if: DevboxScenario.fromEnvironment() != nil,
+                             "needs the srtop devbox: run apps/srtop/r1/live-checks.sh"))
+struct ProcessExplorerR1DevboxTests {
+    static let socket = "/home/srui/run/srtop.sock"
+    static let evidencePrefix = "PX-026-G01 R1 live evidence:"
+
+    // MARK: Compatibility
+
+    /// How one handshake with the live box ended.
+    struct HandshakeOutcome: CustomStringConvertible {
+        let complete: Bool
+        let dispatchEnabled: Bool
+        let revision: UInt64
+        let negotiated: [String]
+        let failure: String?
+        var description: String {
+            "complete=\(complete) dispatch=\(dispatchEnabled) revision=\(revision) negotiated=\(negotiated) "
+                + "failure=\(failure.map { "\"\($0)\"" } ?? "none")"
+        }
+    }
+
+    @MainActor
+    private static func handshake(
+        over transport: any Transport,
+        clientCapabilities: CapabilitySet = [Profile.standardWidgetsV1, Profile.terminalV1],
+        requiredServerProfiles: CapabilitySet = []
+    ) async throws -> HandshakeOutcome {
+        let applier = TransactionApplier()
+        let controller = SessionController(
+            transport: transport, applier: applier, outbox: EventOutbox(),
+            clientCapabilities: clientCapabilities, requiredServerProfiles: requiredServerProfiles)
+        let failure = ManagedAtomic<String?>(nil)
+        controller.onFailure = { failure.store(String(describing: $0)) }
+        do {
+            try await controller.start()
+        } catch {
+            failure.store("start failed: \(error)")
+        }
+        try await AsyncTestSupport.eventually(timeout: .seconds(20), description: "the handshake's outcome") {
+            (controller.isHandshakeComplete && applier.lastAppliedRevision.value >= 1) || failure.load() != nil
+        }
+        if failure.load() != nil {
+            // A refused session must stay refused: nothing applied, nothing enabled, a moment later too.
+            try await Task.sleep(for: .milliseconds(500))
+        }
+        let outcome = HandshakeOutcome(
+            complete: controller.isHandshakeComplete, dispatchEnabled: controller.isEventDispatchEnabled,
+            revision: applier.lastAppliedRevision.value,
+            negotiated: (controller.negotiatedCapabilities.map { Array($0) } ?? []).map(\.description).sorted(),
+            failure: failure.load())
+        await controller.stop()
+        return outcome
+    }
+
+    /// A compatible client reaches the live data plane; every incompatible pairing — a profile the
+    /// server lacks, a newer major of the required profile, a newer client core version, a newer
+    /// server core version — fails at the handshake with nothing applied and nothing enabled, and
+    /// the connection manager says so in a blocking alert. The first two refusals are the client's
+    /// own §15 checks against the real WELCOME; the other two are the real server's §15 fail-closed
+    /// check and the client's core-version check, each met by rewriting one handshake field of the
+    /// live exchange (to a version string of the same length, so no byte count moves).
+    @Test(.timeLimit(.minutes(3)))
+    @MainActor
+    func compatibleProfilesConnectAndEveryIncompatiblePairingFailsAtTheHandshake() async throws {
+        let box = try #require(DevboxScenario.fromEnvironment())
+        _ = NSApplication.shared
+        let newerCore = "1.5.0"
+        try #require(newerCore.utf8.count == SRUICoreVersion.utf8.count, "same-length rewrite")
+
+        let compatible = try await Self.handshake(over: SSHTransport(configuration: box.configuration))
+        #expect(compatible.complete && compatible.dispatchEnabled && compatible.revision >= 1 && compatible.failure == nil,
+                "compatible: \(compatible)")
+        #expect(compatible.negotiated.contains(Profile.standardWidgetsV1.description), "compatible: \(compatible)")
+
+        func refused(_ outcome: HandshakeOutcome, _ name: String) {
+            #expect(!outcome.complete && !outcome.dispatchEnabled && outcome.revision == 0 && outcome.failure != nil,
+                    "\(name) was not refused: \(outcome)")
+            #expect(outcome.failure?.contains("superseded") != true, "\(name): \(outcome)")
+        }
+        let absent = try Profile(name: "org.srui.r1-absent-profile", version: 1)
+        let clientRequires = try await Self.handshake(
+            over: SSHTransport(configuration: box.configuration),
+            clientCapabilities: [Profile.standardWidgetsV1, absent], requiredServerProfiles: [absent])
+        refused(clientRequires, "a client requiring a profile the server lacks")
+        #expect(clientRequires.failure?.contains("Server does not satisfy client required profiles") == true,
+                "\(clientRequires)")
+
+        let widgetsV2 = try Profile(name: StandardProfiles.standardWidgets, version: 2)
+        let newerWidgets = try await Self.handshake(
+            over: SSHTransport(configuration: box.configuration), clientCapabilities: [widgetsV2])
+        refused(newerWidgets, "a client offering only standard-widgets/2")
+
+        let helloRewrite = HandshakeRewritingTransport(
+            inner: SSHTransport(configuration: box.configuration), rewrite: .clientHelloCoreVersion(newerCore))
+        let newerClient = try await Self.handshake(over: helloRewrite)
+        #expect(helloRewrite.rewrites == 1, "the CLIENT HELLO carried core_version \(newerCore)")
+        refused(newerClient, "a client of core version \(newerCore)")
+
+        let welcomeRewrite = HandshakeRewritingTransport(
+            inner: SSHTransport(configuration: box.configuration), rewrite: .serverWelcomeCoreVersion(newerCore))
+        let newerServer = try await Self.handshake(over: welcomeRewrite)
+        #expect(welcomeRewrite.rewrites == 1, "the SERVER WELCOME carried core_version \(newerCore)")
+        #expect(welcomeRewrite.originalServerCoreVersion == SRUICoreVersion,
+                "the live server speaks \(welcomeRewrite.originalServerCoreVersion ?? "nothing")")
+        refused(newerServer, "a server of core version \(newerCore)")
+        #expect(newerServer.failure?.contains("core_version") == true, "\(newerServer)")
+
+        // What a user of the connection manager is told, for both directions of a version skew.
+        var alerts: [String] = []
+        for rewrite in [HandshakeRewritingTransport.Rewrite.clientHelloCoreVersion(newerCore),
+                        .serverWelcomeCoreVersion(newerCore)] {
+            let temp = try TestFixtureDirectory.make(prefix: "srui-r1-compat")
+            defer { TestFixtureDirectory.release(temp) }
+            let configuration = box.configuration
+            let manager = ConnectionManager(
+                store: SavedConnectionStore(url: temp.appendingPathComponent("connections.json")),
+                attemptFactory: { request in
+                    ConnectionManager.makeSessionControllerAttempt(
+                        request: request,
+                        transport: HandshakeRewritingTransport(
+                            inner: SSHTransport(configuration: configuration), rewrite: rewrite))
+                })
+            let id = try #require(manager.connect(ConnectDraft(label: "devbox", host: "127.0.0.1", port: String(configuration.port ?? 22), user: "srui")))
+            try await AsyncTestSupport.eventually(timeout: .seconds(20), description: "the alert for \(rewrite)") {
+                manager.alert != nil
+            }
+            let alert = try #require(manager.alert)
+            #expect(alert.title == "Connection Failed", "\(rewrite): \(alert.title)")
+            #expect(manager.status(for: id) != .connected)
+            alerts.append("\(rewrite) -> \"\(alert.title)\": \"\(alert.message)\"")
+            await manager.shutdown()
+        }
+        print("\(Self.evidencePrefix) compatibility: compatible \(compatible); client-required absent profile \(clientRequires); "
+            + "standard-widgets/2 only \(newerWidgets); client core \(newerCore) \(newerClient); "
+            + "server core \(newerCore) (live server spoke \(welcomeRewrite.originalServerCoreVersion ?? "?")) \(newerServer); "
+            + "alerts \(alerts)")
+    }
+
+    // MARK: Host keys and authentication
+
+    /// The box with a known_hosts file and an identity of the test's choosing.
+    private static func configuration(_ box: DevboxScenario, knownHosts: String, identity: String? = nil) -> SSHConfiguration {
+        SSHConfiguration(
+            host: "127.0.0.1", port: box.configuration.port, user: "srui", subsystem: "srui",
+            identityFile: identity ?? box.configuration.identityFile, knownHostsFile: knownHosts,
+            strictHostKeyChecking: .yes, batchMode: true, connectTimeout: 10)
+    }
+
+    /// One attempt through the connection manager with `configuration`; its alert, and the attempt
+    /// events. The production known-hosts hint runs, reading only the files `configuration` names.
+    @MainActor
+    private static func managedAttempt(_ configuration: SSHConfiguration, in temp: URL) async throws -> (alert: ConnectionAlert, events: [String], status: ConnectionStatus) {
+        let recorder = ContinuityRecorder()
+        let manager = ConnectionManager(
+            store: SavedConnectionStore(url: temp.appendingPathComponent("connections.json")),
+            attemptFactory: { request in
+                let generation = recorder.adopt(request.context)
+                return RecordingConnectionAttempt(
+                    inner: ConnectionManager.makeSessionControllerAttempt(
+                        request: request, transport: SSHTransport(configuration: configuration)),
+                    generation: generation, recorder: recorder)
+            })
+        defer { recorder.closeWindows() }
+        let id = try #require(manager.connect(ConnectDraft(label: "devbox", host: "127.0.0.1", port: String(configuration.port ?? 22), user: "srui")))
+        try await AsyncTestSupport.eventually(timeout: .seconds(30), description: "the attempt's alert") {
+            manager.alert != nil
+        }
+        let alert = try #require(manager.alert)
+        let status = manager.status(for: id)
+        #expect(recorder.applier?.lastAppliedRevision.value ?? 0 == 0, "nothing was applied")
+        #expect(recorder.renderer?.registry.handle(for: NodeId(1))?.window == nil, "no session window was built")
+        await manager.shutdown()
+        return (alert, recorder.allEvents, status)
+    }
+
+    /// An unknown host key and a changed one are each refused by OpenSSH's strict checking before a
+    /// single SRUI byte, with a blocking "Connection Failed" alert that offers no way to trust the
+    /// key; the known_hosts file is byte-for-byte what it was (`UpdateHostKeys=no`, no prompt, no
+    /// accept-new). The posture flags are on the argv the attempt ran.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func anUnknownOrChangedHostKeyIsRefusedAndKnownHostsIsNeverWritten() async throws {
+        let box = try #require(DevboxScenario.fromEnvironment())
+        _ = NSApplication.shared
+        let temp = try TestFixtureDirectory.make(prefix: "srui-r1-hostkey")
+        defer { TestFixtureDirectory.release(temp) }
+
+        let unknown = temp.appendingPathComponent("unknown_known_hosts")
+        try Data().write(to: unknown)
+        let arguments = Self.configuration(box, knownHosts: unknown.path).buildArguments()
+        for flag in ["StrictHostKeyChecking=yes", "BatchMode=yes", "UpdateHostKeys=no", "UserKnownHostsFile=\(unknown.path)"] {
+            #expect(arguments.contains(flag), "\(flag) in \(arguments)")
+        }
+        let unknownResult = try await Self.managedAttempt(Self.configuration(box, knownHosts: unknown.path), in: temp)
+        #expect(unknownResult.alert.title == "Connection Failed")
+        #expect(unknownResult.alert.message.hasPrefix("SRUI could not connect to"), "\(unknownResult.alert.message)")
+        #expect(unknownResult.alert.message.contains("SRUI never adds or changes host keys"), "\(unknownResult.alert.message)")
+        #expect(unknownResult.events.contains { $0.hasSuffix(":sshFailedBeforeStream") }, "\(unknownResult.events)")
+        #expect(try Data(contentsOf: unknown).isEmpty, "the unknown key was not recorded")
+
+        // A key for the same name and port that is not the box's: the box's key has "changed".
+        let other = temp.appendingPathComponent("other_host_key")
+        let generated = try await runToCompletion("/usr/bin/ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-C", "r1-other", "-f", other.path])
+        try #require(generated.status == 0, "\(generated.output)")
+        let otherPublic = try String(contentsOf: other.appendingPathExtension("pub"), encoding: .utf8)
+            .split(separator: " ").prefix(2).joined(separator: " ")
+        let changed = temp.appendingPathComponent("changed_known_hosts")
+        let changedBytes = Data("[127.0.0.1]:\(box.configuration.port ?? 22) \(otherPublic)\n".utf8)
+        try changedBytes.write(to: changed)
+        let changedResult = try await Self.managedAttempt(Self.configuration(box, knownHosts: changed.path), in: temp)
+        #expect(changedResult.alert.title == "Connection Failed")
+        #expect(changedResult.alert.message.contains("SRUI never adds or changes host keys") || changedResult.alert.message.contains("ssh reported"),
+                "\(changedResult.alert.message)")
+        #expect(changedResult.events.contains { $0.hasSuffix(":sshFailedBeforeStream") }, "\(changedResult.events)")
+        #expect(try Data(contentsOf: changed) == changedBytes, "the changed key was not replaced")
+        print("\(Self.evidencePrefix) host keys: unknown -> \(unknownResult.events) status=\(unknownResult.status) "
+            + "\"\(unknownResult.alert.title)\": \"\(unknownResult.alert.message)\"; known_hosts still 0 B; "
+            + "changed -> \(changedResult.events) status=\(changedResult.status) \"\(changedResult.alert.title)\": "
+            + "\"\(changedResult.alert.message)\"; known_hosts unchanged (\(changedBytes.count) B); argv posture \(arguments.filter { $0.contains("=") })")
+    }
+
+    /// A key the box does not authorize fails authentication before a single SRUI byte, with the
+    /// same blocking alert quoting `ssh`'s own words; the box's correct known_hosts is not touched.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func aKeyTheBoxDoesNotAuthorizeFailsAuthenticationClearly() async throws {
+        let box = try #require(DevboxScenario.fromEnvironment())
+        _ = NSApplication.shared
+        let temp = try TestFixtureDirectory.make(prefix: "srui-r1-auth")
+        defer { TestFixtureDirectory.release(temp) }
+        let stranger = temp.appendingPathComponent("id_stranger")
+        let generated = try await runToCompletion("/usr/bin/ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-C", "r1-stranger", "-f", stranger.path])
+        try #require(generated.status == 0, "\(generated.output)")
+        let knownHosts = temp.appendingPathComponent("known_hosts")
+        let boxKnownHosts = try Data(contentsOf: URL(fileURLWithPath: try #require(box.configuration.knownHostsFile)))
+        try boxKnownHosts.write(to: knownHosts)
+
+        let result = try await Self.managedAttempt(
+            Self.configuration(box, knownHosts: knownHosts.path, identity: stranger.path), in: temp)
+        #expect(result.alert.title == "Connection Failed")
+        #expect(result.alert.message.contains("Permission denied"), "ssh's own verdict is quoted: \(result.alert.message)")
+        #expect(result.events.contains { $0.hasSuffix(":sshFailedBeforeStream") }, "\(result.events)")
+        #expect(try Data(contentsOf: knownHosts) == boxKnownHosts)
+        print("\(Self.evidencePrefix) authentication: unauthorized key -> \(result.events) status=\(result.status) "
+            + "\"\(result.alert.title)\": \"\(result.alert.message)\"; known_hosts unchanged")
+    }
+
+    // MARK: Continuity
+
+    /// PIDs of processes named `comm` in the box.
+    private static func boxPIDs(_ box: DevboxScenario, comm: String) async throws -> [String] {
+        let listed = try await runToCompletion(box.docker, ["exec", box.container, "ps", "-eo", "pid=,comm="])
+        try #require(listed.status == 0, "\(listed.output)")
+        return listed.output.split(whereSeparator: \.isNewline).compactMap { line in
+            let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+            return fields.count == 2 && fields[1] == comm ? String(fields[0]) : nil
+        }
+    }
+
+    /// Signals one PID in the box after confirming, with `ps -p PID -o comm=`, that it is `comm`.
+    private static func signal(_ box: DevboxScenario, pid: String, comm: String, _ signal: String) async throws {
+        let confirmed = try await runToCompletion(box.docker, ["exec", box.container, "ps", "-p", pid, "-o", "comm="])
+        try #require(confirmed.status == 0 && confirmed.output == comm, "PID \(pid) in the box is \"\(confirmed.output)\", not \(comm)")
+        let sent = try await runToCompletion(box.docker, ["exec", box.container, "kill", "-\(signal)", pid])
+        try #require(sent.status == 0, "\(sent.output)")
+    }
+
+    private static func socketExists(_ box: DevboxScenario) async throws -> Bool {
+        try await runToCompletion(box.docker, ["exec", box.container, "test", "-S", socket]).status == 0
+    }
+
+    /// A dropped transport (the box's bridge killed) leaves the window up and marked stale, and the
+    /// next attempt resumes the same session (`RESUME_OK`, no snapshot). A restarted srtop is a new
+    /// incarnation: the next attempt is told REPLACED, the "Session Replaced" alert is up, the window
+    /// says it is rebuilding, and it is live again from the new incarnation's snapshot.
+    @Test(.timeLimit(.minutes(3)))
+    @MainActor
+    func aDroppedTransportResumesAndARestartedServerIsReportedAsReplaced() async throws {
+        let box = try #require(DevboxScenario.fromEnvironment())
+        _ = NSApplication.shared
+        let temp = try TestFixtureDirectory.make(prefix: "srui-r1-continuity")
+        defer { TestFixtureDirectory.release(temp) }
+        let configuration = box.configuration
+        let recorder = ContinuityRecorder()
+        let manager = ConnectionManager(
+            store: SavedConnectionStore(url: temp.appendingPathComponent("connections.json")),
+            attemptFactory: { request in
+                let generation = recorder.adopt(request.context)
+                return RecordingConnectionAttempt(
+                    inner: ConnectionManager.makeSessionControllerAttempt(
+                        request: request, transport: SSHTransport(configuration: configuration)),
+                    generation: generation, recorder: recorder)
+            })
+        var managerShutDown = false
+        defer {
+            recorder.closeWindows()
+            if !managerShutDown { Task { @MainActor in await manager.shutdown() } }
+        }
+        func window() -> NSWindow? { recorder.renderer?.registry.handle(for: NodeId(1))?.window }
+        func rows() -> Int {
+            ((recorder.renderer?.registry.handle(for: NodeId(5))?.view as? NSScrollView)?.documentView as? NSTableView)?.numberOfRows ?? 0
+        }
+        func status(_ id: SavedConnection.ID) -> ConnectionStatus { manager.status(for: id) }
+        func waitFor(_ description: String, _ condition: @MainActor () -> Bool) async throws {
+            try await AsyncTestSupport.eventually(timeout: .seconds(30), description: description) {
+                recorder.watch(window())
+                return condition()
+            }
+        }
+
+        let id = try #require(manager.connect(ConnectDraft(label: "devbox", host: "127.0.0.1", port: String(configuration.port ?? 22), user: "srui")))
+        try await waitFor("the first connection") { status(id) == .connected && rows() > 0 }
+        #expect(manager.open(id: id))
+        let first = try #require(window())
+        SurfacePresentation.forHostApplication().present(first)
+        let session = try #require(manager.entries.first?.sessionID)
+        #expect(first.subtitle == "")
+
+        // Dropped: the box's bridge for this connection is killed, the session lives on.
+        let bridges = try await Self.boxPIDs(box, comm: "srui-ssh-bridge")
+        try #require(bridges.count == 1, "one bridge serves this one connection: \(bridges)")
+        try await Self.signal(box, pid: bridges[0], comm: "srui-ssh-bridge", "KILL")
+        try await waitFor("disconnected") { status(id) == .disconnected(resumeAvailable: true) }
+        let detached = recorder.applier?.lastAppliedRevision.value ?? 0
+        let staleSubtitle = "disconnected — showing data from revision \(detached) (stale)"
+        #expect(first.subtitle == staleSubtitle && first.accessibilityHelp() == staleSubtitle, "\(first.subtitle)")
+
+        manager.connect(id: id)
+        try await waitFor("resumed") { status(id) == .connected && window()?.subtitle == "" }
+        #expect(recorder.events(of: 2) == ["connecting", "ready"], "RESUME_OK needs no resync: \(recorder.events(of: 2))")
+        #expect(manager.entries.first?.sessionID == session)
+        let sameWindow = window() === first
+        try await waitFor("newer samples after the resume") { (recorder.applier?.lastAppliedRevision.value ?? 0) > detached }
+
+        // Replaced: srtop itself restarts on the same socket, a new incarnation.
+        let servers = try await Self.boxPIDs(box, comm: "srtop")
+        try #require(servers.count == 1, "one srtop: \(servers)")
+        try await Self.signal(box, pid: servers[0], comm: "srtop", "TERM")
+        try await waitFor("disconnected by the restart") { status(id) == .disconnected(resumeAvailable: true) }
+        try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(10), description: "the stopped srtop's socket removed") {
+            !((try? await Self.socketExists(box)) ?? true)
+        }
+        let restart = try await runToCompletion(box.docker, [
+            "exec", "-d", box.container, "sh", "-c",
+            "exec setpriv --reuid=srui --regid=srui --init-groups /usr/local/bin/srtop --socket \(Self.socket) $SRTOP_ARGS >>/var/log/srtop.log 2>&1",
+        ])
+        try #require(restart.status == 0, "\(restart.output)")
+        try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(10), description: "the restarted srtop's socket") {
+            (try? await Self.socketExists(box)) ?? false
+        }
+        let beforeReplacement = try #require(window())
+        manager.connect(id: id)
+        try await waitFor("rebuilt from the new incarnation") {
+            status(id) == .connected && window()?.subtitle == "" && rows() > 0 && window() !== beforeReplacement
+        }
+        #expect(recorder.events(of: 3) == ["connecting", "replaced", "ready"], "\(recorder.events(of: 3))")
+        let replacement = try #require(manager.entries.first?.sessionID)
+        #expect(replacement != session)
+        #expect(manager.alert?.kind == .sessionReplaced, "the Session Replaced alert is up")
+        #expect(manager.alert?.message.contains(replacement) == true, "\(manager.alert?.message ?? "no alert")")
+        #expect(!beforeReplacement.isVisible, "the old incarnation's window is closed")
+        let replacedSubtitles = recorder.subtitles.map(\.subtitle)
+        #expect(replacedSubtitles.contains("session replaced — rebuilding"), "\(replacedSubtitles)")
+        print("\(Self.evidencePrefix) continuity: session \(session) dropped at revision \(detached) -> subtitle \"\(staleSubtitle)\"; "
+            + "resumed \(recorder.events(of: 2)) same session (same NSWindow: \(sameWindow)); srtop restarted -> \(recorder.events(of: 3)) new session \(replacement); "
+            + "alert \"\(manager.alert?.title ?? "")\": \"\(manager.alert?.message ?? "")\"; subtitles \(replacedSubtitles); attempts \(recorder.allEvents)")
+        managerShutDown = true
+        await manager.shutdown()
+    }
+
+    // MARK: The package
+
+    /// Nothing the live package offers can change a process: every control that accepts an event is
+    /// a view, query or presentation control, by label, action and action key. Every one of them is
+    /// labelled for VoiceOver with a role; PX-016's shortcuts are all bound, none refused, read in the
+    /// published order; and the basic workflow runs from the keyboard against live data — ⌘F to the
+    /// search field, ⌥⌘F to the filter, ⌘L to the table, Down to select a process, whose inspector
+    /// follows over the wire, and ⌘I to its command line.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func theLivePackageOffersNoProcessChangingActionAndIsLabelledAndKeyboardOperable() async throws {
+        let box = try #require(DevboxScenario.fromEnvironment())
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = ProcessExplorerShellTests.genericClient(SSHTransport(configuration: box.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(20), description: "the live explorer") {
+            applier.lastAppliedRevision.value >= 1 && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(ProcessExplorerShellTests.inspectorCommandID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        SurfacePresentation.forHostApplication().present(window)
+        window.contentView?.layoutSubtreeIfNeeded()
+        let table = try #require((renderer.registry.handle(for: NodeId(5))?.view as? NSScrollView)?.documentView as? NSTableView)
+        try await AsyncTestSupport.eventually(timeout: .seconds(20), description: "live rows") { table.numberOfRows > 0 }
+
+        // Every control that accepts an event, as the T35 snapshot describes it.
+        let tree = controller.makeSemanticInspector().snapshot()
+        let interactive = tree.nodes.filter { !$0.supportedEventTypes.isEmpty || !$0.actions.isEmpty }
+        try #require(interactive.count >= Self.minimumInteractiveControls, "\(interactive.count) interactive nodes")
+        let processChanging = try Regex(
+            #"(?i)kill|terminat|signal|\bsig[a-z]{2,}\b|renice|\bnice\b|priorit|affinit|suspend|\bstop (the )?process|continue process|resume process|end process|force quit|ptrace|trace process|rlimit|ulimit|cgroup|freeze|thaw"#)
+        var described: [String] = []
+        var unlabelled: [String] = []
+        for node in interactive {
+            let words = [node.label, node.actionKey].compactMap { $0 } + node.actions
+            #expect(!words.contains { $0.contains(processChanging) }, "node \(node.id.value) could change a process: \(words)")
+            described.append("\(node.id.value):\(node.label ?? "-")\(node.actions.isEmpty ? "" : " \(node.actions)")")
+            guard let view = renderer.registry.handle(for: node.id)?.view else { continue }
+            let label = view.accessibilityLabel() ?? (view as? NSButton)?.title ?? ""
+            if label.isEmpty || view.accessibilityRole() == nil { unlabelled.append("\(node.id.value):\(node.label ?? "-")") }
+        }
+        #expect(unlabelled.isEmpty, "controls VoiceOver cannot name: \(unlabelled)")
+        for button in window.contentView.map(Self.buttons(under:)) ?? [] {
+            #expect(!button.title.contains(processChanging), "native button \"\(button.title)\"")
+        }
+
+        // PX-016's shortcuts on the live package, in reading order.
+        var reading: [NSObject] = []
+        for binding in ProcessExplorerShellTests.keyboardShortcuts {
+            let handle = try #require(renderer.registry.handle(for: NodeId(binding.id)), "node \(binding.id)")
+            #expect(handle.shortcutDiagnostic == nil, "\(binding.label): \(String(describing: handle.shortcutDiagnostic))")
+            #expect(handle.shortcutBinding?.shortcut.canonical == binding.shortcut, "\(binding.label)")
+            #expect(handle.view.accessibilityLabel() == binding.label, "\(binding.label) is announced by its label")
+            #expect(handle.view.accessibilityHelp()?.hasSuffix("Keyboard shortcut \(binding.display)") == true, "\(binding.label)")
+            reading.append(handle.view)
+        }
+        #expect(renderer.registry.allHandles.allSatisfy { $0.shortcutDiagnostic == nil }, "no shortcut is refused")
+        let order = ProcessExplorerShellTests.accessibilityOrder(of: reading, under: try #require(window.contentView))
+        #expect(order == Array(reading.indices), "reading order \(order)")
+
+        // The workflow from the keyboard, against live data.
+        let router = renderer.layoutRenderer.shortcutRouter
+        router.isWindowKey = { $0 === window }
+        func field(_ id: UInt64) throws -> NSTextField {
+            try #require(renderer.registry.handle(for: NodeId(id))?.view as? NSTextField, "node \(id)")
+        }
+        #expect(window.performKeyEquivalent(with: try ProcessExplorerShellTests.keyEvent("f", [.command], keyCode: 3, in: window)))
+        #expect((window.firstResponder as? NSTextView)?.delegate === (try field(ProcessExplorerShellTests.searchInputID)), "⌘F: the search field")
+        #expect(window.performKeyEquivalent(with: try ProcessExplorerShellTests.keyEvent("f", [.command, .option], keyCode: 3, in: window)))
+        #expect((window.firstResponder as? NSTextView)?.delegate === (try field(ProcessExplorerShellTests.filterInputID)), "⌥⌘F: the filter field")
+        #expect(window.performKeyEquivalent(with: try ProcessExplorerShellTests.keyEvent("l", [.command], keyCode: 37, in: window)))
+        #expect(window.firstResponder === table, "⌘L: the table")
+        let down = try ProcessExplorerShellTests.keyEvent(
+            ProcessExplorerShellTests.functionKey(NSDownArrowFunctionKey), [.numericPad, .function], keyCode: 125, in: window)
+        table.keyDown(with: down)
+        try #require(table.selectedRow >= 0, "Down selects a process")
+        let selectedPID = ProcessExplorerShellTests.nativeRows(table)[table.selectedRow][0]
+        let inspectorStatus = try field(ProcessExplorerShellTests.inspectorLineIDs[0])
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on PID \(selectedPID)") {
+            inspectorStatus.stringValue.hasPrefix("Selected process: PID \(selectedPID) ")
+        }
+        #expect(window.performKeyEquivalent(with: try ProcessExplorerShellTests.keyEvent("i", [.command], keyCode: 34, in: window)))
+        let commandText = (renderer.registry.handle(for: NodeId(ProcessExplorerShellTests.inspectorCommandID))?.view as? NSScrollView)?.documentView
+        #expect(commandText != nil && window.firstResponder === commandText, "⌘I: the command line")
+        print("\(Self.evidencePrefix) package: \(interactive.count) controls accept events, none process-changing: \(described); "
+            + "all labelled with a role; \(reading.count) shortcuts bound in reading order; keyboard: ⌘F search, ⌥⌘F filter, "
+            + "⌘L table, Down -> PID \(selectedPID) -> \"\(inspectorStatus.stringValue)\", ⌘I command line")
+        await controller.stop()
+    }
+
+    /// The fewest event-accepting controls the explorer publishes; a vacuous snapshot fails.
+    static let minimumInteractiveControls = 20
+
+    @MainActor
+    private static func buttons(under view: NSView) -> [NSButton] {
+        ((view as? NSButton).map { [$0] } ?? []) + view.subviews.flatMap { buttons(under: $0) }
+    }
+
+    // MARK: Privacy
+
+    /// A worker in the box carries a token and a password in its arguments. Selecting it shows them
+    /// in the inspector, as `ps` would show them to the same reader (D1 §27: read on demand, for the
+    /// one selected instance, never logged); and neither appears in srtop's log, the box's sshd and
+    /// start-up output, or the client's unified log. The logs are written to `PX026G01_EVIDENCE_DIR`
+    /// for `apps/srtop/r1/privacy-audit.sh`, whose token rule matches the planted token's shape.
+    @Test(.timeLimit(.minutes(3)))
+    @MainActor
+    func aSecretInAProcessCommandLineReachesNoLog() async throws {
+        let box = try #require(DevboxScenario.fromEnvironment())
+        _ = NSApplication.shared
+        let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+        let token = "ghp_" + String((0..<36).map { _ in alphabet.randomElement()! })
+        let password = "r1pw-" + String((0..<16).map { _ in alphabet.randomElement()! })
+        let started = Date()
+        let prepare = try await runToCompletion(box.docker, ["exec", "-u", "srui", box.container, "ln", "-sf", "/bin/bash", "/home/srui/r1-canary"])
+        try #require(prepare.status == 0, "\(prepare.output)")
+        // The trailing builtin keeps bash from exec'ing `sleep` in its own place, so the worker keeps
+        // its argument vector for its whole life, which ends by itself after 30 s.
+        let spawn = try await runToCompletion(box.docker, [
+            "exec", "-d", "-u", "srui", box.container, "/home/srui/r1-canary", "-c",
+            "sleep 30; :", "r1-canary",
+            "--api-token=\(token)", "--password=\(password)",
+        ])
+        try #require(spawn.status == 0, "\(spawn.output)")
+
+        let (controller, applier, renderer) = ProcessExplorerShellTests.genericClient(SSHTransport(configuration: box.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(20), description: "the canary's row") {
+            controller.isEventDispatchEnabled
+                && ((renderer.registry.handle(for: NodeId(5))?.view as? NSScrollView)?.documentView as? NSTableView)
+                    .map { ProcessExplorerShellTests.nativeRows($0).contains { $0[1] == "r1-canary" } } == true
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        let table = try #require((renderer.registry.handle(for: NodeId(5))?.view as? NSScrollView)?.documentView as? NSTableView)
+        let row = try #require(ProcessExplorerShellTests.nativeRows(table).firstIndex { $0[1] == "r1-canary" })
+        table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        let commandText = try #require((renderer.registry.handle(for: NodeId(ProcessExplorerShellTests.inspectorCommandID))?.view as? NSScrollView)?.documentView as? NSTextView)
+        try await AsyncTestSupport.eventually(timeout: .seconds(20), description: "the canary's command line in the inspector") {
+            commandText.string.contains(token) && commandText.string.contains(password)
+        }
+        _ = applier
+        await controller.stop()
+
+        let temp = try TestFixtureDirectory.make(prefix: "srui-r1-privacy")
+        defer { TestFixtureDirectory.release(temp) }
+        let evidence = ProcessInfo.processInfo.environment["PX026G01_EVIDENCE_DIR"].map { URL(fileURLWithPath: $0) } ?? temp
+        try FileManager.default.createDirectory(at: evidence, withIntermediateDirectories: true)
+        let seconds = Int(Date().timeIntervalSince(started)) + 60
+        let sources: [(name: String, executable: String, arguments: [String])] = [
+            ("devbox-srtop.log", box.docker, ["exec", box.container, "cat", "/var/log/srtop.log"]),
+            ("devbox-container.log", box.docker, ["logs", box.container]),
+            ("client-unified.log", "/usr/bin/log", ["show", "--style", "compact", "--last", "\(seconds)s",
+                                                    "--predicate", #"subsystem BEGINSWITH "org.srui""#]),
+        ]
+        var sizes: [String] = []
+        for source in sources {
+            let file = evidence.appendingPathComponent(source.name)
+            let status = try await runToFile(source.executable, source.arguments, output: file)
+            #expect(status == 0, "\(source.name): exit \(status)")
+            let bytes = try Data(contentsOf: file)
+            let text = String(decoding: bytes, as: UTF8.self)
+            #expect(!text.contains(token) && !text.contains(password), "\(source.name) holds the planted secret")
+            sizes.append("\(source.name) \(bytes.count) B")
+        }
+        print("\(Self.evidencePrefix) privacy: a worker with --api-token=ghp_… and --password=… in its arguments; "
+            + "the inspector showed both on selection; absent from \(sizes) (written to \(evidence.lastPathComponent))")
+    }
+}
+
+/// PX-026-G01: a pass-through transport that rewrites one handshake field of a live exchange, so the
+/// real server meets a client of another core version, or the client a server of one. Only the
+/// one frame is re-encoded, to a value of the same length; every other byte and every
+/// acknowledgement passes through unchanged, so flow control stays the inner transport's own.
+fileprivate final class HandshakeRewritingTransport: Transport, @unchecked Sendable {
+    enum Rewrite: Sendable, CustomStringConvertible {
+        case clientHelloCoreVersion(String)
+        case serverWelcomeCoreVersion(String)
+        var description: String {
+            switch self {
+            case .clientHelloCoreVersion(let version): return "CLIENT HELLO core_version \(version)"
+            case .serverWelcomeCoreVersion(let version): return "SERVER WELCOME core_version \(version)"
+            }
+        }
+    }
+
+    private let inner: any Transport
+    private let rewrite: Rewrite
+    private let lock = NSLock()
+    private var rewritten = 0
+    private var serverCoreVersion: String?
+
+    init(inner: any Transport, rewrite: Rewrite) {
+        self.inner = inner
+        self.rewrite = rewrite
+    }
+
+    var rewrites: Int { lock.withLock { rewritten } }
+    var originalServerCoreVersion: String? { lock.withLock { serverCoreVersion } }
+
+    func send(data: Data, logicalClass: LogicalChannelClass) async throws {
+        guard case .clientHelloCoreVersion(let version) = rewrite,
+              var message = try? decodeFramedMessage(from: data),
+              case .clientHello(var hello) = message.msg else {
+            try await inner.send(data: data, logicalClass: logicalClass)
+            return
+        }
+        hello.coreVersion = version
+        message.clientHello = hello
+        let encoded = try SRUIFraming.encodeFramed(message)
+        precondition(encoded.count == data.count, "a same-length rewrite keeps the frame's size")
+        lock.withLock { rewritten += 1 }
+        try await inner.send(data: encoded, logicalClass: logicalClass)
+    }
+
+    func receiveStream() -> AsyncThrowingStream<Data, Error> {
+        let inner = self.inner
+        guard case .serverWelcomeCoreVersion(let version) = rewrite else { return inner.receiveStream() }
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                var pending = Data()
+                var passing = false
+                do {
+                    for try await chunk in inner.receiveStream() {
+                        if passing {
+                            continuation.yield(chunk)
+                            continue
+                        }
+                        pending.append(chunk)
+                        guard let (length, header) = Self.lengthPrefix(pending), pending.count >= header + length else { continue }
+                        let base = pending.startIndex
+                        let frame = pending.subdata(in: base..<(base + header + length))
+                        let rest = pending.subdata(in: (base + header + length)..<pending.endIndex)
+                        var out = frame
+                        if var message = try? decodeFramedMessage(from: frame), case .serverWelcome(var welcome) = message.msg {
+                            self.lock.withLock { self.serverCoreVersion = welcome.coreVersion }
+                            welcome.coreVersion = version
+                            message.serverWelcome = welcome
+                            let encoded = try SRUIFraming.encodeFramed(message)
+                            if encoded.count == frame.count {
+                                out = encoded
+                                self.lock.withLock { self.rewritten += 1 }
+                            }
+                        }
+                        passing = true
+                        continuation.yield(out + rest)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    func close() async {
+        await inner.close()
+    }
+
+    func acknowledgeReceived(byteCount: Int) async {
+        await inner.acknowledgeReceived(byteCount: byteCount)
+    }
+
+    private static func lengthPrefix(_ data: Data) -> (length: Int, header: Int)? {
+        var value = 0
+        for (index, byte) in data.prefix(10).enumerated() {
+            value |= Int(byte & 0x7f) << (7 * index)
+            if byte & 0x80 == 0 { return (value, index + 1) }
+        }
+        return nil
+    }
+}
+
+/// Runs a fixed argument vector with its standard output and error written to `output`, and returns
+/// its status. For output too large for `runToCompletion`'s pipe, which is read only at exit.
+fileprivate func runToFile(_ executable: String, _ arguments: [String], output: URL) async throws -> Int32 {
+    FileManager.default.createFile(atPath: output.path, contents: nil)
+    let handle = try FileHandle(forWritingTo: output)
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    process.standardInput = FileHandle.nullDevice
+    process.standardOutput = handle
+    process.standardError = handle
+    return try await withCheckedThrowingContinuation { continuation in
+        process.terminationHandler = { finished in
+            try? handle.close()
+            continuation.resume(returning: finished.terminationStatus)
+        }
+        do {
+            try process.run()
+        } catch {
+            process.terminationHandler = nil
+            try? handle.close()
+            continuation.resume(throwing: error)
+        }
     }
 }
 

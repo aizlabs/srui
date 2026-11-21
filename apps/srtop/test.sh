@@ -18,5 +18,9 @@ swift test --package-path client-macos --filter ProcessExplorerShellTests
 # run's other suites open listeners of their own); the static check holds either way.
 bash scripts/run-px026-isolated-endpoint-check.sh
 bash scripts/check-client-no-listener-api.sh
+# PX-026-G01: the R1 package scripts' self-tests: the privacy audit's planted secrets, the user-owned
+# install/update/rollback/uninstall, and the clean-account walkthrough's sandboxed dry run. No build,
+# no Docker, no SSH; the live R1 checks against the devbox are apps/srtop/r1/live-checks.sh.
+bash apps/srtop/r1/selftest.sh
 # PX-025: local versus remote latency at 0/100/300/600 ms RTT, and wire bytes versus render cadence.
 swift test --package-path client-macos --filter ProcessExplorerLatencyTests

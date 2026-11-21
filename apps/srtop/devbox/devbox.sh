@@ -5,6 +5,8 @@
 #   apps/srtop/devbox/devbox.sh up        build the image if needed and start it
 #   apps/srtop/devbox/devbox.sh client    build and launch the macOS client at it
 #   apps/srtop/devbox/devbox.sh spawn 30  run `sleep 30` inside the box
+#   apps/srtop/devbox/devbox.sh drop-bridges   cut every client connection; srtop keeps its session
+#   apps/srtop/devbox/devbox.sh restart-srtop  stop srtop and start a new one: a new session
 #   apps/srtop/devbox/devbox.sh down      stop and remove the container
 #
 # State (keypair, known_hosts, build context) lives outside every checkout, in
@@ -105,6 +107,54 @@ cmd_ssh() {
     -o UserKnownHostsFile="$KNOWN_HOSTS" -o BatchMode=yes srui@127.0.0.1 "$@"
 }
 
+# PIDs of the processes named exactly $1 inside the box, one per line.
+box_pids() {
+  docker exec "$NAME" ps -eo pid=,comm= | awk -v comm="$1" '$2 == comm { print $1 }'
+}
+
+# Sends signal $3 to PID $1 inside the box, only after `ps -p PID -o comm=` confirms it is $2.
+signal_in_box() {
+  local pid=$1 comm=$2 signal=$3 actual
+  actual=$(docker exec "$NAME" ps -p "$pid" -o comm= 2>/dev/null || true)
+  [ "$actual" = "$comm" ] || die "PID $pid in the box is '$actual', not $comm; nothing was sent"
+  docker exec "$NAME" kill "-$signal" "$pid"
+}
+
+socket_present() {
+  docker exec "$NAME" test -S /home/srui/run/srtop.sock
+}
+
+# PX-026-G01: what the manual checklist needs to see a disconnect. Each connected client has one
+# srui-ssh-bridge in the box; killing it ends that client's transport, while srtop and its session
+# (and so the client's resume) live on.
+cmd_drop_bridges() {
+  local pids count=0
+  pids=$(box_pids srui-ssh-bridge)
+  [ -n "$pids" ] || { echo "devbox: no srui-ssh-bridge is running (no client is connected)"; return 0; }
+  for pid in $pids; do
+    signal_in_box "$pid" srui-ssh-bridge KILL
+    count=$((count + 1))
+  done
+  echo "devbox: dropped $count client connection(s); srtop and its session keep running"
+}
+
+# PX-026-G01: what the manual checklist needs to see a replacement. srtop removes its own socket
+# on SIGTERM; the new one is started exactly as entrypoint.sh starts the first, so it is a new
+# incarnation of the same endpoint and a reconnecting client is told REPLACED.
+cmd_restart_srtop() {
+  local pids
+  pids=$(box_pids srtop)
+  [ "$(printf '%s\n' "$pids" | grep -c .)" -eq 1 ] || die "expected one srtop in the box, found: ${pids:-none}"
+  signal_in_box "$pids" srtop TERM
+  for _ in $(seq 1 50); do socket_present || break; sleep 0.2; done
+  ! socket_present || die "the stopped srtop's socket is still there"
+  # shellcheck disable=SC2016 # $SRTOP_ARGS is the container's own environment.
+  docker exec -d "$NAME" sh -c 'exec setpriv --reuid=srui --regid=srui --init-groups /usr/local/bin/srtop --socket /home/srui/run/srtop.sock $SRTOP_ARGS >>/var/log/srtop.log 2>&1'
+  for _ in $(seq 1 50); do socket_present && break; sleep 0.2; done
+  socket_present || die "the restarted srtop never bound its socket; see devbox.sh ssh 'cat /var/log/srtop.log'"
+  echo "devbox: srtop restarted, a new session; a connected client is told the session was replaced"
+}
+
 cmd_down() {
   docker rm -f "$NAME" >/dev/null 2>&1 && echo "devbox: $NAME removed" \
     || echo "devbox: $NAME was not running"
@@ -116,6 +166,8 @@ case "${1:-}" in
   client) cmd_client ;;
   spawn) shift; cmd_spawn "$@" ;;
   ssh) shift; cmd_ssh "$@" ;;
+  drop-bridges) cmd_drop_bridges ;;
+  restart-srtop) cmd_restart_srtop ;;
   logs) docker logs -f "$NAME" ;;
   status)
     docker ps --filter "name=$NAME" --format '{{.Names}} {{.Status}} {{.Ports}}'
@@ -123,7 +175,7 @@ case "${1:-}" in
     ;;
   down) cmd_down ;;
   *)
-    sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

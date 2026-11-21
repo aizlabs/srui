@@ -47,6 +47,17 @@ bash apps/srtop/test.sh
 
 The native entry point builds the app and SSH bridge, then runs `ProcessExplorerShellTests` through the existing Swift client test target over an ephemeral authenticated localhost SSH subsystem, checking both empty and fake-source cases, actual native cell values, the native summary labels and progress bars, and retained handles. A sort test clicks the native sort buttons over the same path and checks the new order in the same native table, the relabelled buttons and a native selection that stays on its process. A second native test drives `--fake-sequence` over the same real SSH path and records every published state: the native table shows the insertion, the deletion, the rename, the retained rows of the failed scan and the recovery, the unchanged row keeps its item ID, the failed scan keeps the summary under a collector error naming the last successful sample, the table, status and summary controls are the same objects throughout, and one five-tick cycle of the script costs exactly five transactions — one per tick, because each step's sample time is now on screen. Missing prerequisites fail; they are never silently skipped.
 
+## Install it (R1 package)
+
+PX-026-G01 packages R1 from source. It uses the same SSH subsystem and same-user socket as R0, and
+adds a user-owned install with update and rollback (`apps/srtop/r1/srui-r1-install.sh`). It pins
+the tested toolchains and environment, and adds the scripted live checks against the devbox
+(`apps/srtop/r1/live-checks.sh`). There is a repeatable privacy audit
+(`apps/srtop/r1/privacy-audit.sh`), a clean-account walkthrough that you run in a new macOS
+account, and a manual VoiceOver checklist. Nothing is signed beyond the linker's ad-hoc signature,
+nothing is notarized, and no step needs `sudo`. See [r1/README.md](r1/README.md) and the
+[R1 notes](srui-process-explorer-plan/docs/process-explorer/releases/R1.md).
+
 ## System summary
 
 Between the status line and the table the shell publishes a summary (PX-007), built from standard `Text` and `Progress` nodes in a `Column` with one `Row` per bar: no custom graph, no image and no drawing instruction, rendered by the unchanged generic client as native labels and `NSProgressIndicator` bars. Every figure becomes text once, on the server, in integer arithmetic; each bar is filled to exactly the truncated share its line prints, and the client derives nothing. Each figure is read through the scanned root — `<root>/stat`, `<root>/meminfo`, `<root>/uptime`, `<root>/loadavg` — so a fixture tree states its own and is deterministic on any host, and each file is read, and can fail, on its own.

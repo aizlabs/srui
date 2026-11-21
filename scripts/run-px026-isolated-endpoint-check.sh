@@ -38,8 +38,10 @@ cat "$log"
 
 problems=()
 [ "$status" -eq 0 ] || problems+=("the run exited $status")
-grep -q "Test run with ${#tests[@]} tests in 1 suite passed" "$log" \
-    || problems+=("the run was not exactly ${#tests[@]} passing tests in 1 suite")
+# swift-testing's summary omits "in 1 suite" on some toolchains (the macOS 15 CI runner prints
+# "Test run with 3 tests passed after …"); the suite set is enforced separately below.
+grep -qE "Test run with ${#tests[@]} tests( in 1 suite)? passed" "$log" \
+    || problems+=("the run was not exactly ${#tests[@]} passing tests")
 # Every swift-testing suite that started or finished in this process, display names included.
 suites=$(grep -oE '(◇|✔|✘) Suite ("[^"]*"|[^ ]+) (started|passed|failed)' "$log" \
     | sed -E 's/^[^ ]+ Suite //; s/ (started|passed|failed)$//' | sort -u | tr '\n' ' ')

@@ -338,8 +338,11 @@ struct ConnectionManagerTests {
         #expect(replacedContents.map(\.lastPathComponent) == ["connections.json"])
     }
 
-    @Test("cold relaunch emits CLIENT_RESUME from revision zero")
-    func coldRelaunchResumesFromRevisionZero() async throws {
+    /// PX-024 round 2: a context in which no session has been ready holds no committed replica, so
+    /// a saved session is attached with CLIENT_HELLO and the fresh identity (§18's documented
+    /// attach path), never a revision-0 CLIENT_RESUME whose RESUME_OK would be ready before replay.
+    @Test("cold relaunch attaches with CLIENT_HELLO, never a revision-zero resume")
+    func coldRelaunchAttachesWithHello() async throws {
         let connection = SavedConnection(
             label: "Saved",
             host: "server.example",
@@ -361,6 +364,8 @@ struct ConnectionManagerTests {
             context: context,
             isWarmReconnect: false
         )
+        #expect(request.requestedSessionID == "saved-session")
+        #expect(request.resumeSessionID == nil)
         let transport = ConnectionManagerCaptureTransport()
         let attempt = ConnectionManager.makeSessionControllerAttempt(
             request: request,
@@ -370,16 +375,431 @@ struct ConnectionManagerTests {
         try await attempt.start()
         let frame = try #require(await transport.frame(at: 0))
         let message = try decodeFramedMessage(from: frame)
-        guard case .clientResume(let resume) = message.msg else {
-            Issue.record("cold saved connection did not emit CLIENT_RESUME")
+        guard case .clientHello(let hello) = message.msg else {
+            Issue.record("a cold saved connection did not attach with CLIENT_HELLO: \(String(describing: message.msg))")
             await attempt.stop()
             return
         }
-        #expect(resume.sessionID == "saved-session")
-        #expect(resume.lastAppliedRevision == 0)
+        #expect(hello.clientInstanceID == context.outbox.clientInstanceId.bytes)
         #expect(request.resumeRevision == 0)
 
         await attempt.stop()
+    }
+
+    /// PX-024: two manager instances over one saved-connections file, as two launches of the app.
+    /// Each attaches through the production `beginAttempt` path with CLIENT_HELLO and its own new
+    /// client identity; the remembered revision is shown, never sent (§18: a persisted last-known
+    /// revision is presentation metadata, not resume authority).
+    @Test("a relaunched manager attaches the saved session with a fresh client identity")
+    func relaunchedManagerAttachesWithFreshIdentity() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Remembered",
+            host: "remembered.example",
+            user: "alice",
+            sessionID: "saved-session",
+            lastKnownRevision: 900
+        )
+        try await temporary.store.save([saved])
+
+        func launch() async throws -> (hello: SRUIClientHello, identity: ClientInstanceId) {
+            let harness = ConnectionControllerHarness()
+            let manager = ConnectionManager(
+                store: temporary.store,
+                attemptFactory: { harness.makeAttempt($0) }
+            )
+            await manager.load()
+            #expect(manager.entries == [saved])
+            #expect(manager.status(for: saved.id) == .unknown)
+            #expect(saved.sessionCaption == "Session saved-session · last seen at revision 900")
+            manager.connect(id: saved.id)
+            let request = try #require(harness.requests.first)
+            #expect(request.isWarmReconnect == false)
+            let message = try await waitForFrame(0, from: try #require(harness.transports.first))
+            await manager.shutdown()
+            guard case .clientHello(let hello) = message.msg else {
+                Issue.record("a relaunch did not attach with CLIENT_HELLO: \(String(describing: message.msg))")
+                throw CancellationError()
+            }
+            return (hello, request.context.outbox.clientInstanceId)
+        }
+
+        let first = try await launch()
+        let second = try await launch()
+        for (hello, identity) in [first, second] {
+            #expect(hello.clientInstanceID == identity.bytes)
+        }
+        #expect(first.identity != second.identity, "a relaunch never reuses a client identity")
+        // Never ready, so the shutdowns kept the remembered metadata as it was.
+        #expect(try await temporary.store.load() == [saved])
+    }
+
+    private func welcome(sessionID: String, initialRevision: UInt64 = 1) -> SRUIMessage {
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = sessionID
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.initialRevision = initialRevision
+        var message = SRUIMessage()
+        message.serverWelcome = welcome
+        return message
+    }
+
+    /// PX-024 round 2: the server attaches a HELLO to the one session it serves. The saved ID is
+    /// kept, silently, when that is the saved session; any other session is the saved one's
+    /// replacement, saved and alerted before its snapshot is shown, as a REPLACED decision is.
+    @Test("a cold attach keeps the saved session silently, or reports and saves its replacement", arguments: [false, true])
+    func coldAttachDetectsReplacement(replaced: Bool) async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(label: "Saved", host: "saved.example", user: "alice",
+                                    sessionID: "saved-session", lastKnownRevision: 40)
+        try await temporary.store.save([saved])
+        let harness = ConnectionControllerHarness()
+        let manager = ConnectionManager(store: temporary.store, attemptFactory: { harness.makeAttempt($0) })
+        await manager.load()
+        manager.connect(id: saved.id)
+        let transport = try #require(harness.transports.first)
+        guard case .clientHello = try await waitForFrame(0, from: transport).msg else {
+            Issue.record("a cold attach did not send CLIENT_HELLO")
+            await manager.shutdown()
+            return
+        }
+        let attached = replaced ? "replacement-session" : "saved-session"
+        try await transport.receive(welcome(sessionID: attached))
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "the WELCOME decision") {
+            manager.status(for: saved.id) == .resynchronizing
+        }
+        let context = try #require(harness.requests.first?.context)
+        if replaced {
+            // Saved and alerted before the snapshot is applied or shown.
+            try await AsyncTestSupport.eventuallyAsync(timeout: .roundTrip, description: "the replacement saved and alerted") {
+                (try? await temporary.store.load().first?.sessionID) == "replacement-session"
+                    && manager.alert?.kind == .sessionReplaced
+            }
+            #expect(manager.entries.first?.sessionID == "replacement-session")
+            #expect(manager.entries.first?.lastKnownRevision == 0)
+            let alert = try #require(manager.alert)
+            #expect(alert.kind == .sessionReplaced)
+            #expect(alert.message.contains("saved-session") && alert.message.contains("replacement-session"))
+            #expect(context.renderer.sessionWindowStatus == ConnectionStatus.sessionReplacedWindowStatus)
+        }
+        #expect(context.applier.currentSnapshot.store.rootIDs.isEmpty, "nothing shown before the snapshot")
+
+        try await transport.receive(textSnapshot(value: "current"))
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "ready after the snapshot") {
+            manager.status(for: saved.id) == .connected
+                && context.renderer.textEditingSession.lastKnownAuthoritative(for: NodeId(2)) == "current"
+        }
+        #expect(manager.entries.first?.sessionID == attached)
+        #expect(manager.entries.first?.lastKnownRevision == 1)
+        #expect((manager.alert?.kind == .sessionReplaced) == replaced)
+        await manager.shutdown()
+        #expect(try await temporary.store.load().first?.sessionID == attached)
+    }
+
+    /// PX-024 round 2: once a session has been ready in a context, its replica and outbox are this
+    /// process's continuity checkpoint, and a reconnect resumes them exactly as before (§18 warm).
+    @Test("a context that has been ready resumes with CLIENT_RESUME at its committed revision")
+    func readyContextResumes() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(label: "Warm", host: "warm.example", user: "alice",
+                                    sessionID: "original-session", lastKnownRevision: 7)
+        try await temporary.store.save([saved])
+        let harness = ConnectionControllerHarness()
+        let manager = ConnectionManager(store: temporary.store, attemptFactory: { harness.makeAttempt($0) })
+        await manager.load()
+        try await mountOriginalSession(manager: manager, harness: harness, connectionID: saved.id)
+        let first = try #require(harness.transports.first)
+        guard case .clientHello = try await waitForFrame(0, from: first).msg else {
+            Issue.record("the cold attach did not send CLIENT_HELLO")
+            await manager.shutdown()
+            return
+        }
+        await first.close()
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "the first attempt released") {
+            !manager.hasActiveAttemptForTesting(saved.id)
+        }
+        manager.connect(id: saved.id)
+        let request = try #require(harness.requests.last)
+        #expect(request.resumeSessionID == "original-session")
+        guard case .clientResume(let resume) = try await waitForFrame(0, from: try #require(harness.transports.last)).msg else {
+            Issue.record("a warm reconnect did not resume")
+            await manager.shutdown()
+            return
+        }
+        #expect(resume.sessionID == "original-session")
+        #expect(resume.lastAppliedRevision == 1)
+        #expect(resume.clientInstanceID == request.context.outbox.clientInstanceId.bytes)
+        await manager.shutdown()
+    }
+
+    /// PX-024 round 2 (F2): a superseded attempt whose replaced and ready events arrive only after
+    /// the newer attempt has saved its session can change neither the row nor the file.
+    @Test("a superseded attempt's late replaced and ready never reach the row or the file")
+    func supersededAttemptCannotWriteTheStore() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(label: "Race", host: "race.example", user: "alice", sessionID: "old-session")
+        try await temporary.store.save([saved])
+        let firstGate = AsyncGate()
+        let harness = ConnectionAttemptHarness()
+        harness.startPlans = [.init(gate: firstGate), .init()]
+        let manager = ConnectionManager(store: temporary.store, attemptFactory: { harness.makeAttempt($0) })
+        await manager.load()
+
+        manager.connect(id: saved.id)
+        await firstGate.waitUntilPaused()
+        manager.connect(id: saved.id)
+        let first = try #require(harness.attempts.first)
+        let second = try #require(harness.attempts.last)
+        await second.emit(.ready(sessionID: "new-session", revision: 4))
+        try await AsyncTestSupport.eventuallyAsync(timeout: .roundTrip, description: "the newer attempt saved") {
+            let stored = try? await temporary.store.load().first
+            return stored?.sessionID == "new-session" && stored?.lastKnownRevision == 4
+        }
+
+        await first.emit(.replaced(previousSessionID: "old-session", newSessionID: "stale-session"))
+        await first.emit(.ready(sessionID: "stale-session", revision: 9))
+        await firstGate.release()
+        try await AsyncTestSupport.eventuallyAsync(timeout: .roundTrip, description: "the superseded attempt stopped") {
+            await first.stopCount() > 0
+        }
+        try await Task.sleep(for: .milliseconds(200))
+        await manager.waitForPersistenceForTesting()
+        #expect(manager.status(for: saved.id) == .connected)
+        #expect(manager.entries.first?.sessionID == "new-session")
+        #expect(manager.entries.first?.lastKnownRevision == 4)
+        #expect(manager.alert == nil)
+        let stored = try #require(try await temporary.store.load().first)
+        #expect(stored.sessionID == "new-session" && stored.lastKnownRevision == 4)
+        await manager.shutdown()
+    }
+
+    /// PX-024 round 2 (F2): a forgotten entry stays forgotten even when its still-running session
+    /// later becomes ready; nothing brings the row or its file record back.
+    @Test("a forgotten entry is not brought back when its running session becomes ready")
+    func forgottenEntryStaysForgotten() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(label: "Forget", host: "forget.example", user: "alice", sessionID: "kept-session")
+        try await temporary.store.save([saved])
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(store: temporary.store, attemptFactory: { harness.makeAttempt($0) })
+        await manager.load()
+        manager.connect(id: saved.id)
+        let attempt = try #require(harness.attempts.first)
+        let context = try #require(harness.requests.first?.context)
+        try await AsyncTestSupport.eventuallyAsync(timeout: .roundTrip, description: "attempt start") {
+            await attempt.startCount() == 1
+        }
+        manager.remove(id: saved.id)
+        await manager.waitForPersistenceForTesting()
+        #expect(try await temporary.store.load().isEmpty)
+
+        await attempt.emit(.connecting)
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "the removed entry's window connecting") {
+            context.renderer.sessionWindowStatus != nil
+        }
+        await attempt.emit(.ready(sessionID: "kept-session", revision: 3))
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "the removed entry's window live") {
+            context.renderer.sessionWindowStatus == nil
+        }
+        await manager.waitForPersistenceForTesting()
+        #expect(manager.entries.isEmpty)
+        #expect(manager.status(for: saved.id) == .unknown)
+        #expect(try await temporary.store.load().isEmpty)
+        await manager.shutdown()
+        #expect(try await temporary.store.load().isEmpty)
+    }
+
+    // MARK: - The saved-connections file (PX-024 round 2, F3 and F4)
+
+    enum UnreadableFile: String, CaseIterable, Sendable {
+        case truncated, wrongShape, revisionPastUInt64, negativeRevision, unknownVersion, empty
+
+        func contents(id: UUID) -> String {
+            let entry = { (revision: String) in
+                "{\"id\":\"\(id.uuidString)\",\"label\":\"L\",\"host\":\"h.example\",\"user\":\"u\",\"lastKnownRevision\":\(revision)}"
+            }
+            switch self {
+            case .truncated: return "[\(entry("3").dropLast(5))"
+            case .wrongShape: return "{\"schemaVersion\":2,\"entries\":[\(entry("3"))]}"
+            case .revisionPastUInt64: return "[\(entry("18446744073709551616"))]"
+            case .negativeRevision: return "[\(entry("-1"))]"
+            case .unknownVersion: return "{\"version\":2,\"connections\":[\(entry("3"))]}"
+            case .empty: return ""
+            }
+        }
+    }
+
+    @Test("an unreadable saved file is moved aside, named in the alert, and never written over",
+          arguments: UnreadableFile.allCases)
+    func unreadableFileIsMovedAsideNotDestroyed(_ kind: UnreadableFile) async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        try FileManager.default.createDirectory(at: temporary.directory, withIntermediateDirectories: true)
+        let original = Data(kind.contents(id: UUID()).utf8)
+        try original.write(to: temporary.file)
+        let backup = temporary.store.backupURL
+        #expect(backup.lastPathComponent == "connections.json.unreadable")
+
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(store: temporary.store, attemptFactory: { harness.makeAttempt($0) })
+        await manager.load()
+        #expect(manager.entries.isEmpty)
+        let alert = try #require(manager.alert)
+        #expect(alert.kind == .persistenceFailed && alert.title == "Couldn’t Load Connections")
+        #expect(alert.message.contains(backup.path), "\(alert.message)")
+        #expect(try Data(contentsOf: backup) == original)
+        #expect(!FileManager.default.fileExists(atPath: temporary.file.path))
+
+        // Launch, connect something new, quit: a fresh file is written beside the kept backup.
+        let id = try #require(manager.connect(ConnectDraft(label: "New", host: "new.example", user: "bob")))
+        await harness.attempts.first?.emit(.ready(sessionID: "new-session", revision: 2))
+        try await AsyncTestSupport.observed("the new connection ready") { manager.status(for: id) == .connected }
+        await manager.shutdown()
+        #expect(try Data(contentsOf: backup) == original, "the unreadable file survives every later save")
+        #expect(try await SavedConnectionStore(url: temporary.file).load().map(\.id) == [id])
+        let written = try String(contentsOf: temporary.file, encoding: .utf8)
+        #expect(written.contains("\"version\" : 1"), "\(written)")
+    }
+
+    @Test("a later unreadable file replaces the one backup; nothing accumulates")
+    func laterUnreadableFileReplacesTheBackup() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        try FileManager.default.createDirectory(at: temporary.directory, withIntermediateDirectories: true)
+        for contents in ["[{\"first\"", "{\"version\":99,\"connections\":[]}"] {
+            try Data(contents.utf8).write(to: temporary.file)
+            await #expect(throws: SavedConnectionStore.LoadError.self) { try await temporary.store.load() }
+            #expect(try String(contentsOf: temporary.store.backupURL, encoding: .utf8) == contents)
+        }
+        let names = try FileManager.default.contentsOfDirectory(atPath: temporary.directory.path)
+        #expect(names == ["connections.json.unreadable"])
+    }
+
+    @Test("an unreadable file that cannot be moved aside is left in place and never saved over")
+    func unmovableUnreadableFileBlocksSaves() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer {
+            chmod(temporary.directory.path, 0o700)
+            temporary.cleanUp()
+        }
+        try FileManager.default.createDirectory(at: temporary.directory, withIntermediateDirectories: true)
+        let original = Data("[{\"truncated\"".utf8)
+        try original.write(to: temporary.file)
+        #expect(chmod(temporary.directory.path, 0o500) == 0)
+        do {
+            _ = try await temporary.store.load()
+            Issue.record("an unreadable file loaded")
+        } catch let error as SavedConnectionStore.LoadError {
+            guard case .leftInPlace(_, let file) = error else {
+                Issue.record("expected leftInPlace, got \(error)")
+                return
+            }
+            #expect(file == temporary.file)
+            #expect(error.description.contains(temporary.file.path))
+        }
+        await #expect(throws: SavedConnectionStore.UnreadableFileInPlace.self) {
+            try await temporary.store.save([SavedConnection(label: "X", host: "x.example", user: "u")])
+        }
+        #expect(try Data(contentsOf: temporary.file) == original)
+    }
+
+    @Test("a pre-versioned array file loads as version 1 and is rewritten versioned")
+    func legacyArrayFileLoads() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        try FileManager.default.createDirectory(at: temporary.directory, withIntermediateDirectories: true)
+        let entries = [SavedConnection(label: "Old", host: "old.example", port: 2222, user: "alice",
+                                       sessionID: "0123456789abcdef0123456789abcdef", lastKnownRevision: 12)]
+        try JSONEncoder().encode(entries).write(to: temporary.file)
+        #expect(try await temporary.store.load() == entries)
+        try await temporary.store.save(entries)
+        #expect(try String(contentsOf: temporary.file, encoding: .utf8).contains("\"connections\""))
+        #expect(try await temporary.store.load() == entries)
+        #expect(!FileManager.default.fileExists(atPath: temporary.store.backupURL.path))
+    }
+
+    /// F4: the bound is `SavedConnection.maximumSessionIDScalars` (128; sessiond mints 32 hex).
+    @Test("a saved session ID with a control or invisible scalar, or past the bound, is dropped, not the entry")
+    func invalidSavedSessionIDsAreDropped() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let bound = SavedConnection.maximumSessionIDScalars
+        #expect(bound == 128)
+        let cases: [(String, Bool)] = [
+            ("0123456789abcdef0123456789abcdef", true),
+            ("evil\u{0}x", false),
+            ("line\nbreak", false),
+            ("esc\u{1B}[31mSRUI verified this host", false),
+            ("zero\u{200B}width", false),
+            ("", false),
+            (String(repeating: "a", count: 2_000_000), false),
+            (String(repeating: "b", count: bound), true),
+            (String(repeating: "c", count: bound + 1), false),
+            (String(repeating: "é", count: bound), true),
+            (String(repeating: "é", count: bound + 1), false),
+        ]
+        let entries = cases.enumerated().map { index, item in
+            SavedConnection(label: "Entry \(index)", host: "h\(index).example", user: "u", sessionID: item.0, lastKnownRevision: 9)
+        }
+        try await temporary.store.save(entries)
+        let loaded = try await temporary.store.load()
+        #expect(loaded.count == entries.count)
+        for (index, (sessionID, kept)) in cases.enumerated() {
+            #expect(loaded[index].label == entries[index].label && loaded[index].host == entries[index].host)
+            #expect(loaded[index].sessionID == (kept ? sessionID : nil), "case \(index)")
+            #expect(loaded[index].lastKnownRevision == (kept ? 9 : 0), "case \(index)")
+            #expect((loaded[index].sessionCaption != nil) == kept, "case \(index)")
+        }
+    }
+
+    @Test("a server-reported session ID that fails the rule is neither stored nor shown")
+    func invalidServerSessionIDsAreNotStored() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(label: "Server", host: "server.example", user: "alice", sessionID: "good-session")
+        try await temporary.store.save([saved])
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(store: temporary.store, attemptFactory: { harness.makeAttempt($0) })
+        await manager.load()
+        manager.connect(id: saved.id)
+        let attempt = try #require(harness.attempts.first)
+        let hostile = "evil\u{0}\n\u{1B}[31mtrusted"
+        await attempt.emit(.replaced(previousSessionID: "good-session", newSessionID: hostile))
+        try await AsyncTestSupport.observed("the replacement alert") { manager.alert?.kind == .sessionReplaced }
+        #expect(manager.entries.first?.sessionID == nil)
+        #expect(manager.alert?.message.contains("\u{1B}") == false && manager.alert?.message.contains("\u{0}") == false)
+        await attempt.emit(.ready(sessionID: String(repeating: "x", count: SavedConnection.maximumSessionIDScalars + 1), revision: 5))
+        try await AsyncTestSupport.observed("ready") { manager.status(for: saved.id) == .connected }
+        #expect(manager.entries.first?.sessionID == nil && manager.entries.first?.lastKnownRevision == 0)
+        await manager.waitForPersistenceForTesting()
+        #expect(try await temporary.store.load().first?.sessionID == nil)
+        await manager.shutdown()
+    }
+
+    @Test("duplicate entry IDs load as one row, and one remove deletes exactly one row")
+    func duplicateEntryIDsAreDropped() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let shared = UUID()
+        let first = SavedConnection(id: shared, label: "First", host: "first.example", user: "alice")
+        let duplicate = SavedConnection(id: shared, label: "Duplicate", host: "dup.example", user: "mallory")
+        let other = SavedConnection(label: "Other", host: "other.example", user: "bob")
+        try await temporary.store.save([first, duplicate, other])
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(store: temporary.store, attemptFactory: { harness.makeAttempt($0) })
+        await manager.load()
+        #expect(manager.entries == [first, other])
+        manager.remove(id: shared)
+        #expect(manager.entries == [other])
+        await manager.waitForPersistenceForTesting()
+        #expect(try await temporary.store.load() == [other])
+        await manager.shutdown()
     }
 
     private func mountOriginalSession(
@@ -436,10 +856,10 @@ struct ConnectionManagerTests {
     }
 
     @Test(
-        "interrupted replacement resumes the new session from an empty replica",
+        "interrupted replacement reattaches with HELLO from a fresh context, ready only with the snapshot",
         arguments: [false, true]
     )
-    func interruptedReplacementResumesFromEmptyReplica(duringResume: Bool) async throws {
+    func interruptedReplacementReattachesWithHello(duringResume: Bool) async throws {
         let temporary = TemporaryConnectionStore()
         defer { temporary.cleanUp() }
         let saved = SavedConnection(label: "Replacement", host: "replacement.example", user: "alice")
@@ -484,34 +904,47 @@ struct ConnectionManagerTests {
         try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "replacement attempt released") {
             !manager.hasActiveAttemptForTesting(saved.id)
         }
+        // PX-024 round 3 (R2-1): the context has been ready, but its replica is now empty, so the
+        // reconnect starts from a fresh context and attaches with CLIENT_HELLO: a revision-0
+        // CLIENT_RESUME would be RESUME_OK'd and declared ready before its replay (an empty window
+        // reading live). The server below answers whichever handshake arrives as srtop would.
         manager.connect(id: saved.id)
+        let reconnect = try #require(harness.requests.last)
         let resumedTransport = try #require(harness.transports.last)
-        let resumeMessage = try await waitForFrame(0, from: resumedTransport)
-        guard case .clientResume(let resume) = resumeMessage.msg else {
-            Issue.record("replacement reconnect did not send CLIENT_RESUME")
+        let handshake = try await waitForFrame(0, from: resumedTransport)
+        switch handshake.msg {
+        case .clientHello(let hello):
+            #expect(hello.clientInstanceID == reconnect.context.outbox.clientInstanceId.bytes)
+            try await resumedTransport.receive(welcome(sessionID: "replacement-session"))
+            try await resumedTransport.receive(textSnapshot(value: "replacement value"))
+        case .clientResume:
+            var resumed = SRUIServerResumeOk()
+            resumed.sessionID = "replacement-session"
+            resumed.replayFromRevision = 0
+            resumed.requiredProfiles = ["org.srui.standard-widgets/1"]
+            message.serverResumeOk = resumed
+            try await resumedTransport.receive(message)
+        default:
+            Issue.record("unexpected handshake \(String(describing: handshake.msg))")
+        }
+        // The moment the reconnect is ready, its replica already holds the current state.
+        try await AsyncTestSupport.observed("the reconnect ready") { manager.status(for: saved.id) == .connected }
+        let readyContext = reconnect.context
+        #expect(!readyContext.applier.currentSnapshot.store.rootIDs.isEmpty, "ready over an empty replica")
+        #expect(readyContext.applier.lastAppliedRevision == Revision(1))
+        guard case .clientHello = handshake.msg else {
+            Issue.record("an empty-replica reconnect sent \(String(describing: handshake.msg)), not CLIENT_HELLO")
+            try await resumedTransport.receive(textSnapshot(value: "replacement value"))
             await manager.shutdown()
             return
         }
-        #expect(resume.sessionID == "replacement-session")
-        #expect(resume.lastAppliedRevision == 0)
-        #expect(resume.pendingTextEdits.isEmpty)
-        #expect(resume.terminalStreamOffsets.isEmpty)
-
-        // Both sessions use revision 1. A correct revision-zero request makes the server replay
-        // the new session's first transaction instead of accepting the old replica as current.
-        var resumed = SRUIServerResumeOk()
-        resumed.sessionID = "replacement-session"
-        resumed.replayFromRevision = 1
-        resumed.requiredProfiles = ["org.srui.standard-widgets/1"]
-        message.serverResumeOk = resumed
-        try await resumedTransport.receive(message)
-        try await resumedTransport.receive(textSnapshot(value: "replacement value"))
-        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "replacement replay mounted") {
-            manager.status(for: saved.id) == .connected
-                && context.renderer.textEditingSession.lastKnownAuthoritative(for: NodeId(2))
-                    == "replacement value"
+        #expect(readyContext !== context, "an emptied context is replaced by a fresh one")
+        #expect(readyContext.outbox.clientInstanceId != context.outbox.clientInstanceId,
+                "a fresh identity, as for a cold relaunch")
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "replacement snapshot mounted") {
+            readyContext.renderer.textEditingSession.lastKnownAuthoritative(for: NodeId(2)) == "replacement value"
         }
-        #expect(context.applier.lastAppliedRevision == Revision(1))
+        #expect(manager.entries.first?.sessionID == "replacement-session")
         await manager.shutdown()
     }
 

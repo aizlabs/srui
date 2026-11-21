@@ -4403,9 +4403,10 @@ private final class RenderWaiter {
     }
 }
 
-/// What the PX-022 test saw of a connection manager's attempts and session windows.
+/// What the PX-022 test saw of a connection manager's attempts and session windows. Internal so
+/// PX-024's relaunch test records its attempts the same way.
 @MainActor
-fileprivate final class ContinuityRecorder {
+final class ContinuityRecorder {
     struct Subtitle {
         let subtitle: String
         let revision: UInt64
@@ -4415,6 +4416,9 @@ fileprivate final class ContinuityRecorder {
     private(set) var applier: TransactionApplier?
     private(set) var allEvents: [String] = []
     private(set) var subtitles: [Subtitle] = []
+    /// The revision each generation's ready event reported: the replica's revision when the
+    /// controller declared it ready (PX-024 round 2).
+    private(set) var readyRevisions: [Int: UInt64] = [:]
     private var eventsByGeneration: [Int: [String]] = [:]
     private var generation = 0
     private var heldGeneration: Int?
@@ -4488,6 +4492,9 @@ fileprivate final class ContinuityRecorder {
         }
         eventsByGeneration[generation, default: []].append(name)
         allEvents.append("\(generation):\(name)")
+        if case .ready(_, let revision) = event {
+            readyRevisions[generation] = revision
+        }
         if case .ready = event, heldGeneration == generation {
             await withCheckedContinuation { held.append($0) }
         }
@@ -4520,7 +4527,7 @@ fileprivate final class ContinuityRecorder {
 
 /// A real connection attempt whose events the PX-022 test records, and whose ready event it can
 /// hold.
-fileprivate actor RecordingConnectionAttempt: ConnectionAttempt {
+actor RecordingConnectionAttempt: ConnectionAttempt {
     nonisolated let events: AsyncStream<ConnectionAttemptEvent>
     private let continuation: AsyncStream<ConnectionAttemptEvent>.Continuation
     private let inner: any ConnectionAttempt

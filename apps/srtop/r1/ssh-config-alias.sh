@@ -6,9 +6,10 @@
 #                                                          (cp -p), then append the block in place
 #   ssh-config-alias.sh remove STATE_DIR                  put ~/.ssh/config back as it was
 #
-# add refuses a symbolic-link config (a dotfile manager's), a config that already holds the block,
-# and a config that already defines a host named srtop-devbox. It writes in place, so the file
-# keeps its inode and mode; a config it creates is mode 0600 in a 0700 ~/.ssh.
+# add refuses a symbolic-link config or ~/.ssh (a dotfile manager's), a config that already holds
+# the block, and a config whose Host or Match line already names srtop-devbox (names_srtop_devbox
+# below). It writes in place, so the file keeps its inode and mode; a config it creates is mode 0600
+# in a 0700 ~/.ssh.
 #
 # remove restores the original byte for byte, in place and with its mode, whenever the file is
 # still exactly the original plus the block: an originally absent file is removed (and a ~/.ssh it
@@ -24,6 +25,39 @@ END_MARK="# <<< srui-r1 checklist alias <<<"
 die() { echo "ssh-config-alias: $*" >&2; exit 1; }
 sha() { shasum -a 256 "$1" | awk '{print $1}'; }
 
+# Whether the ssh_config file $1 has a Host or Match line naming srtop-devbox, read as OpenSSH reads
+# it (ssh_config(5)): the keyword in any case after any leading blanks, then blanks and/or one "=",
+# then arguments separated by blanks (and, for Match, commas), optionally double-quoted. A host
+# name is compared case-insensitively, as ssh lowercases it before matching. Only the exact name
+# counts: srtop-devbox2 does not. A wildcard pattern that would also match (Host *, srtop-*) is
+# not refused: such blocks are common global defaults, and OpenSSH applies the first value of each
+# option, which for a Host * block placed before ours could override some of ours. The checklist
+# names the host it uses, so a person sees what connects.
+names_srtop_devbox() {
+  awk '
+    {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      if (line == "" || substr(line, 1, 1) == "#") next
+      if (!match(line, /^[A-Za-z]+/)) next
+      keyword = tolower(substr(line, 1, RLENGTH))
+      rest = substr(line, RLENGTH + 1)
+      if (keyword != "host" && keyword != "match") next
+      # A separator must follow the keyword: blanks, "=", or both. "Hostname" is another keyword.
+      if (rest !~ /^[ \t=]/) next
+      sub(/^[ \t]*=?[ \t]*/, "", rest)
+      # A string, not a regex literal: in a conditional, awk would match a /regex/ against $0.
+      separator = keyword == "match" ? "[ \t,]+" : "[ \t]+"
+      count = split(rest, words, separator)
+      for (i = 1; i <= count; i++) {
+        word = tolower(words[i])
+        gsub(/"/, "", word)
+        if (word == "srtop-devbox") found = 1
+      }
+    }
+    END { exit found ? 0 : 1 }' "$1"
+}
+
 block() { # port devbox-state
   printf '%s\n' "$BEGIN_MARK" "Host srtop-devbox" "  HostName 127.0.0.1" "  Port $1" \
     "  IdentityFile $2/id_ed25519" "  IdentitiesOnly yes" "  UserKnownHostsFile $2/known_hosts" "$END_MARK"
@@ -37,8 +71,8 @@ cmd_add() {
   if [ -e "$CONFIG" ]; then
     [ -f "$CONFIG" ] || die "~/.ssh/config is not a regular file"
     ! grep -qxF "$BEGIN_MARK" "$CONFIG" || die "~/.ssh/config already holds a srui-r1 checklist alias; remove that block first"
-    ! grep -qiE '^[[:space:]]*Host[[:space:]].*(^|[[:space:]])srtop-devbox([[:space:]]|$)' "$CONFIG" \
-      || die "~/.ssh/config already defines a host named srtop-devbox; it is left alone"
+    ! names_srtop_devbox "$CONFIG" \
+      || die "~/.ssh/config already has a Host or Match line naming srtop-devbox; it is left alone"
     cp -p "$CONFIG" "$state/config.original"
     echo present > "$state/config.state"
   else

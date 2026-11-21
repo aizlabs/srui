@@ -186,6 +186,13 @@ check "walkthrough: the summary is FAIL" grep -q '^SUMMARY FAIL mode=dry-run ' "
 ok=1; grep -q '^STOPPED after prerequisites failed' "$W/result-fail.txt" && ! grep -q '^STEP 3 ' "$W/result-fail.txt" \
   && [ -z "$(cd "$W" && find . -name 'srui-r1-unrelated-sentinel.txt')" ] && [ ! -e "$W/.local/share/srui-r1" ] && ok=0
 check "walkthrough: a failed prerequisite stops the run before anything is planted or installed" [ "$ok" -eq 0 ]
+# A failed preflight (a previous release revision the clone lacks) stops before the prerequisites.
+sandboxed_walk "$STUBS/pass" "$W/result-preflight.txt" --previous-rev 0000000000000000000000000000000000000000 >"$ROOT/walk-preflight.log" 2>&1
+status=$?
+ok=1; [ "$status" -ne 0 ] && grep -q '^STEP 1 preflight FAIL exit=1 ' "$W/result-preflight.txt" \
+  && grep -q '^STOPPED after preflight failed' "$W/result-preflight.txt" && ! grep -q '^STEP 2 ' "$W/result-preflight.txt" \
+  && grep -q '^SUMMARY FAIL mode=dry-run steps=1 pass=0 fail=1 skip=0$' "$W/result-preflight.txt" && ok=0
+check "walkthrough: a failed preflight stops the run with SUMMARY FAIL (exit $status)" [ "$ok" -eq 0 ]
 ok=1; walk "$STUBS/pass" --verify "$W/result-fail.txt" >"$ROOT/verify-fail.log" 2>&1 || ok=0
 grep -q '^verify: OK checksum matches; SUMMARY FAIL ' "$ROOT/verify-fail.log" || ok=1
 check "walkthrough --verify: the failed result's checksum holds and its verdict fails" [ "$ok" -eq 0 ]
@@ -234,7 +241,7 @@ BEGIN_MARK="# >>> srui-r1 checklist alias (added by apps/srtop/r1/checklist-sess
 config_state() { # home: existence, mode and digest of ~/.ssh and ~/.ssh/config
   local c=$1/.ssh/config
   if [ -L "$c" ]; then echo "link $(readlink "$c") $(sha "$1/real-config") $(stat -f '%Lp' "$1/real-config")"
-  elif [ -f "$c" ]; then echo "file $(stat -f '%Lp' "$c") $(sha "$c") dir=$([ -d "$1/.ssh" ] && echo yes)"
+  elif [ -f "$c" ]; then echo "file $(stat -f '%Lp' "$c") $(sha "$c") inode=$(stat -f '%i' "$c") dir=$([ -d "$1/.ssh" ] && echo yes)"
   else echo "absent dir=$([ -d "$1/.ssh" ] && echo yes || echo no)"; fi
 }
 alias_cycle() { # name setup-command...
@@ -269,11 +276,23 @@ refused_alias() { # name setup-command...
   HOME=$home bash "$ALIAS" remove "$state" >/dev/null 2>&1
   after=$(config_state "$home")
   ok=1; [ "$status" -ne 0 ] && [ "$before" = "$after" ] && ok=0
-  check "ssh-config-alias: refuses $name, nothing changed ($(head -1 "$ROOT/alias-$name.log"))" [ "$ok" -eq 0 ]
+  check "ssh-config-alias: refuses ${REFUSED_LABEL:-$name}, nothing changed ($(head -1 "$ROOT/alias-$name.log"))" [ "$ok" -eq 0 ]
 }
 refused_alias a-symlinked-config sh -c 'mkdir -m 700 .ssh && printf "Host a\n" > real-config && ln -s ../real-config .ssh/config'
 refused_alias an-existing-block sh -c "mkdir -m 700 .ssh && printf '%s\n' 'Host a' '$BEGIN_MARK' > .ssh/config"
-refused_alias an-existing-srtop-devbox-host sh -c 'mkdir -m 700 .ssh && printf "Host other srtop-devbox\n  Port 1\n" > .ssh/config'
+refused_alias a-symlinked-ssh-directory sh -c 'mkdir -m 700 real-ssh && printf "Host a\n" > real-ssh/config && ln -s real-ssh .ssh'
+# Every way ssh_config(5) lets a Host or Match line name srtop-devbox is refused (round 4, V2-F1).
+host_case=0
+for line in 'Host srtop-devbox' 'Host\tsrtop-devbox' 'host srtop-devbox' '  Host srtop-devbox' \
+            'Host srtop-devbox other' 'Host other srtop-devbox' 'Host=srtop-devbox' 'Host = srtop-devbox' \
+            'HOST SRTOP-DEVBOX' 'Host "srtop-devbox"' 'Match host srtop-devbox' 'Match host a,srtop-devbox'; do
+  host_case=$((host_case + 1))
+  REFUSED_LABEL="the line [$line]" refused_alias "host-line-$host_case" sh -c 'mkdir -m 700 .ssh && printf "Host a\n  User x\n$1\n  Port 1\n" > .ssh/config' _ "$line"
+done
+# Near misses are not srtop-devbox: the alias is added and removed again byte for byte.
+alias_cycle near-miss-srtop-devbox2 sh -c 'mkdir -m 700 .ssh && printf "Host srtop-devbox2\n  Port 1\n" > .ssh/config'
+alias_cycle near-miss-hostname-option sh -c 'mkdir -m 700 .ssh && printf "Host a\n  HostName srtop-devbox\n" > .ssh/config'
+alias_cycle near-miss-comment sh -c 'mkdir -m 700 .ssh && printf "# Host srtop-devbox\nHost a\n" > .ssh/config'
 
 # Edited during the session: only the block goes, the user's own later lines stay.
 E=$ROOT/alias-edited

@@ -134,8 +134,13 @@ audit() {
 }
 
 random_chars() { # count alphabet
-  # head closing the pipe ends tr with SIGPIPE; that is the expected end, not a failure.
-  LC_ALL=C tr -dc "$2" </dev/urandom | head -c "$1" || true
+  # Bounded input, never an endless `tr </dev/urandom | head`: that one stops only on SIGPIPE, and
+  # under a parent that ignores SIGPIPE it never stops (PX-026-G01 round 4, verifier V2-F2).
+  local out=""
+  while [ "${#out}" -lt "$1" ]; do
+    out="$out$(head -c 1024 /dev/urandom | LC_ALL=C tr -dc "$2")"
+  done
+  printf '%s' "$out" | cut -c "1-$1"
 }
 
 self_test() {

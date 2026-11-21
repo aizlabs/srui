@@ -43,8 +43,7 @@ public struct KnownHostsHint: Equatable, Sendable {
         switch presence {
         case .absent(let checkedFiles):
             let files = checkedFiles.isEmpty ? "none of them exists yet" : checkedFiles.joined(separator: ", ")
-            return "\(name) is not in your known_hosts files (\(files)). SRUI never adds or changes host keys. "
-                + "If you mean to trust this host, verify its key fingerprint out of band, then add the key with ssh yourself."
+            return "\(name) is not in your known_hosts files (\(files)). SRUI never adds or changes host keys."
         case .present(let file):
             return "A key for \(name) is in \(file). SRUI will not change it."
         }
@@ -146,10 +145,13 @@ public struct SSHKnownHostsLookup: KnownHostsLookup {
 /// termination handler and stdout is drained on its own thread while the child runs (PX-023 round
 /// 6: read only at exit, a child writing more than one pipe buffer blocked until the deadline).
 ///
-/// The result is `nil` (and the child is stopped) when it cannot be launched, outlives `timeout`,
-/// or writes more than `maximumOutputBytes`. Stopping sends SIGTERM to the child's exact PID, then
-/// SIGKILL to the same PID after `killGrace` if it has not exited, so a child that ignores SIGTERM
-/// cannot outlive the lookup.
+/// A result is delivered only once **both** the exit and the end of the drain have been seen, so
+/// it is never a truncated read (round 7). The result is `nil` (and the child is stopped) when it
+/// cannot be launched, outlives `timeout`, or writes more than `maximumOutputBytes`. Stopping sends
+/// SIGTERM to the child's exact PID, then SIGKILL to the same PID after `killGrace` if it has not
+/// exited, so a child that ignores SIGTERM cannot outlive the lookup; neither signal is sent once
+/// the exit is recorded. The deadline task is cancelled as soon as the run ends, so the `Process`
+/// and its `Pipe` are released at once rather than when the deadline would have expired.
 enum BoundedProcess {
     struct Result: Sendable, Equatable {
         let status: Int32
@@ -162,6 +164,19 @@ enum BoundedProcess {
     /// How long a child gets between SIGTERM and SIGKILL.
     static let killGrace: Duration = .milliseconds(500)
 
+    /// Sends a signal; `kill(2)` in production, a recorder in tests.
+    typealias Signal = @Sendable (pid_t, Int32) -> Int32
+
+    /// Test seams. `beforeRead` runs on the drain thread before every read, the one that sees EOF
+    /// included, so a test can hold the drain back after the child has exited. `launched` sees the
+    /// launched `Process` (and its `Pipe`) so a test can check they are released.
+    struct Hooks: Sendable {
+        var beforeRead: (@Sendable () -> Void)?
+        var launched: (@Sendable (Process, Pipe?) -> Void)?
+
+        static let none = Hooks()
+    }
+
     /// Shared between the termination handler, the stdout drain and the deadline; every field is
     /// read and written under `lock`, and the continuation is resumed exactly once.
     private final class Run: @unchecked Sendable {
@@ -171,6 +186,7 @@ enum BoundedProcess {
         private var output = Data()
         private var drained: Bool
         private var exited = false
+        private var deadline: Task<Void, Never>?
 
         init(continuation: CheckedContinuation<Result?, Never>, drains: Bool) {
             self.continuation = continuation
@@ -181,6 +197,16 @@ enum BoundedProcess {
             lock.lock()
             defer { lock.unlock() }
             return exited
+        }
+
+        /// Keeps the deadline task so the end of the run can cancel it; cancels it at once if the
+        /// run has already ended.
+        func setDeadline(_ task: Task<Void, Never>) {
+            lock.lock()
+            let ended = continuation == nil
+            if ended == false { deadline = task }
+            lock.unlock()
+            if ended { task.cancel() }
         }
 
         /// Appends drained bytes; false once the cap is exceeded.
@@ -196,7 +222,7 @@ enum BoundedProcess {
             drained = true
             let ready = takeIfComplete()
             lock.unlock()
-            ready?.0.resume(returning: ready?.1)
+            finish(ready)
         }
 
         func exit(_ code: Int32) {
@@ -205,7 +231,7 @@ enum BoundedProcess {
             status = code
             let ready = takeIfComplete()
             lock.unlock()
-            ready?.0.resume(returning: ready?.1)
+            finish(ready)
         }
 
         /// Ends the run with no result (deadline, cap or launch failure); true if this call did.
@@ -214,31 +240,46 @@ enum BoundedProcess {
             lock.lock()
             let taken = continuation
             continuation = nil
+            let task = deadline
+            deadline = nil
             lock.unlock()
+            task?.cancel()
             taken?.resume(returning: nil)
             return taken != nil
         }
 
-        private func takeIfComplete() -> (CheckedContinuation<Result?, Never>, Result)? {
+        private func finish(_ ready: (CheckedContinuation<Result?, Never>, Result, Task<Void, Never>?)?) {
+            guard let ready else { return }
+            ready.2?.cancel()
+            ready.0.resume(returning: ready.1)
+        }
+
+        /// Called with `lock` held: the result exists only once both the exit and the end of the
+        /// drain are recorded.
+        private func takeIfComplete() -> (CheckedContinuation<Result?, Never>, Result, Task<Void, Never>?)? {
             guard drained, let status, let taken = continuation else { return nil }
             continuation = nil
-            return (taken, Result(status: status, output: output))
+            let task = deadline
+            deadline = nil
+            return (taken, Result(status: status, output: output), task)
         }
     }
 
-    /// SIGTERM now, SIGKILL after `grace` unless the child has exited.
+    /// SIGTERM now, SIGKILL after `grace`, each only while the child's exit is unrecorded and
+    /// `Process` still reports it running.
     // lc-debt: Foundation reaps the child before calling the termination handler, so between that
-    // reap and `exit(_:)` recording it a SIGKILL could reach a recycled PID (a window of
-    // microseconds, after the child already ignored SIGTERM for `grace`); upgrade path: launch
-    // with posix_spawn and reap with our own waitpid so the PID stays ours until we have signalled.
-    private static func stop(_ process: Process, run: Run, grace: Duration) {
+    // reap and `exit(_:)` recording it a signal could reach a recycled PID. The window is
+    // microseconds and applies to both the first SIGTERM and the later SIGKILL; `isRunning` narrows
+    // it (it turns false at the reap) but cannot close it. Upgrade path: launch with posix_spawn and
+    // reap with our own waitpid, so the PID stays ours until we have finished signalling.
+    private static func stop(_ process: Process, run: Run, grace: Duration, signal: @escaping Signal) {
         let pid = process.processIdentifier
-        guard pid > 0, run.hasExited == false else { return }
-        kill(pid, SIGTERM)
+        guard pid > 0, run.hasExited == false, process.isRunning else { return }
+        _ = signal(pid, SIGTERM)
         Task.detached {
             try? await Task.sleep(for: grace)
-            if run.hasExited == false {
-                kill(pid, SIGKILL)
+            if run.hasExited == false, process.isRunning {
+                _ = signal(pid, SIGKILL)
             }
         }
     }
@@ -251,7 +292,9 @@ enum BoundedProcess {
         timeout: Duration,
         captureOutput: Bool = true,
         maximumOutputBytes: Int = maximumOutputBytes,
-        killGrace: Duration = killGrace
+        killGrace: Duration = killGrace,
+        signal: @escaping Signal = { kill($0, $1) },
+        hooks: Hooks = .none
     ) async -> Result? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
@@ -273,16 +316,18 @@ enum BoundedProcess {
                 run.fail()
                 return
             }
+            hooks.launched?(process, pipe)
             if let reader = pipe?.fileHandleForReading {
                 // Its own thread, so a blocking read never occupies the cooperative pool. It ends
                 // at EOF, which the child's exit (or its SIGKILL) delivers.
                 let drain = Thread {
                     while true {
+                        hooks.beforeRead?()
                         guard let chunk = try? reader.read(upToCount: 64 * 1024), chunk.isEmpty == false else {
                             break
                         }
                         if run.append(chunk, cap: maximumOutputBytes) == false {
-                            if run.fail() { stop(process, run: run, grace: killGrace) }
+                            if run.fail() { stop(process, run: run, grace: killGrace, signal: signal) }
                             break
                         }
                     }
@@ -291,10 +336,11 @@ enum BoundedProcess {
                 drain.name = "org.srui.ConnectionManager.BoundedProcess.stdout"
                 drain.start()
             }
-            Task.detached {
+            run.setDeadline(Task.detached {
                 try? await Task.sleep(for: timeout)
-                if run.fail() { stop(process, run: run, grace: killGrace) }
-            }
+                guard Task.isCancelled == false else { return }
+                if run.fail() { stop(process, run: run, grace: killGrace, signal: signal) }
+            })
         }
     }
 }

@@ -632,8 +632,8 @@ struct LocalFactAlertTests {
     @Test("the hint states only the local fact, with no trust-changing advice")
     func hintText() {
         let absent = KnownHostsHint(name: "[h.example]:2222", presence: .absent(checkedFiles: ["/k1", "/k2"]))
-        #expect(absent.text == "[h.example]:2222 is not in your known_hosts files (/k1, /k2). SRUI never adds or changes host keys. "
-            + "If you mean to trust this host, verify its key fingerprint out of band, then add the key with ssh yourself.")
+        // Facts only (round 7): no guidance sentence.
+        #expect(absent.text == "[h.example]:2222 is not in your known_hosts files (/k1, /k2). SRUI never adds or changes host keys.")
         let none = KnownHostsHint(name: "h.example", presence: .absent(checkedFiles: []))
         #expect(none.text.hasPrefix("h.example is not in your known_hosts files (none of them exists yet)."))
         let present = KnownHostsHint(name: "h.example", presence: .present(file: "/Users/a/.ssh/known_hosts"))
@@ -706,7 +706,7 @@ struct KnownHostsLookupTests {
         let directory = try TestFixtureDirectory.make(prefix: "px023-kh")
         defer { TestFixtureDirectory.release(directory) }
         let key = directory.appendingPathComponent("host_key").path
-        try SSHTestSupport.generateEd25519Key(at: key)
+        try await BoundedProcessTestSupport.generateEd25519Key(at: key)
         let plain = directory.appendingPathComponent("plain_known_hosts").path
         try (try Self.entry("[127.0.0.1]:2222", key: key) + Self.entry("alias.example", key: key))
             .write(toFile: plain, atomically: true, encoding: .utf8)
@@ -832,7 +832,7 @@ struct KnownHostsLookupTests {
         let directory = try TestFixtureDirectory.make(prefix: "px023-khn")
         defer { TestFixtureDirectory.release(directory) }
         let key = directory.appendingPathComponent("host_key").path
-        try SSHTestSupport.generateEd25519Key(at: key)
+        try await BoundedProcessTestSupport.generateEd25519Key(at: key)
         let line = try Self.entry("[127.0.0.1]:2222", key: key)
         let knownHosts = directory.appendingPathComponent("known_hosts").path
         // Past one 64 KiB pipe buffer of `ssh-keygen -F` output at 500 entries, far past at 3000.
@@ -883,6 +883,158 @@ struct BoundedProcessTests {
     }
 }
 
+/// Records every signal `BoundedProcess` sends, then delivers it.
+final class SignalRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [Int32] = []
+
+    var signals: [Int32] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorded
+    }
+
+    var signal: BoundedProcess.Signal {
+        { [self] pid, number in
+            lock.lock()
+            recorded.append(number)
+            lock.unlock()
+            return kill(pid, number)
+        }
+    }
+}
+
+/// Weak references to the objects a run launched, to check they are released.
+final class LaunchedObjects: @unchecked Sendable {
+    private let lock = NSLock()
+    private var processes: [() -> AnyObject?] = []
+
+    func add(_ process: Process, _ pipe: Pipe?) {
+        weak var weakProcess = process
+        weak var weakPipe = pipe
+        lock.lock()
+        processes.append { weakProcess }
+        if pipe != nil { processes.append { weakPipe } }
+        lock.unlock()
+    }
+
+    var liveCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return processes.filter { $0() != nil }.count
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return processes.count
+    }
+}
+
+@Suite("Bounded child processes: signals, drain ordering, release (PX-023 round 7)", .serialized, .timeLimit(.minutes(2)))
+struct BoundedProcessLifecycleTests {
+    @Test("a child that exits on SIGTERM receives exactly [SIGTERM]")
+    func exitOnSIGTERMGetsNoSIGKILL() async throws {
+        let recorder = SignalRecorder()
+        let signal = recorder.signal
+        let outcome = await TestDeadline.race(.seconds(20)) {
+            await BoundedProcess.run(
+                "/bin/sh", ["-c", "trap 'kill $!; exit 0' TERM; /bin/sleep 30 & wait"],
+                timeout: .milliseconds(300), killGrace: .milliseconds(300), signal: signal)
+        }
+        #expect(outcome == .some(nil), "the deadline ended the run")
+        // Past the grace period: a SIGKILL, if one were coming, would have been sent by now.
+        try await Task.sleep(for: .milliseconds(900))
+        #expect(recorder.signals == [SIGTERM])
+    }
+
+    @Test("a child that ignores SIGTERM receives [SIGTERM, SIGKILL]")
+    func trappedSIGTERMGetsSIGKILL() async throws {
+        let recorder = SignalRecorder()
+        let signal = recorder.signal
+        let outcome = await TestDeadline.race(.seconds(20)) {
+            await BoundedProcess.run(
+                "/bin/sh", ["-c", "trap '' TERM; exec /bin/sleep 30"],
+                timeout: .milliseconds(300), killGrace: .milliseconds(300), signal: signal)
+        }
+        #expect(outcome == .some(nil))
+        try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(5), description: "SIGKILL sent") {
+            recorder.signals.count >= 2
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(recorder.signals == [SIGTERM, SIGKILL])
+    }
+
+    @Test("no signal at all once the exit is recorded, even if the deadline fires later")
+    func noSignalAfterExit() async throws {
+        let recorder = SignalRecorder()
+        let signal = recorder.signal
+        // The shell exits at once; its background sleep keeps stdout open, so the drain cannot end
+        // and the deadline fires with the exit already recorded.
+        let outcome = await TestDeadline.race(.seconds(20)) {
+            await BoundedProcess.run(
+                "/bin/sh", ["-c", "/bin/sleep 2 & exit 0"],
+                timeout: .milliseconds(300), killGrace: .milliseconds(200), signal: signal)
+        }
+        #expect(outcome == .some(nil), "no complete drain, no result")
+        try await Task.sleep(for: .milliseconds(700))
+        #expect(recorder.signals == [])
+    }
+
+    @Test("the result waits for the end of the drain and is byte-exact", arguments: [1, 65_537, 131_072])
+    func resultWaitsForDrain(_ bytes: Int) async throws {
+        // Every read, the EOF read included, is held back 150 ms, so the child has long exited
+        // before the drain ends. A result delivered at the exit would be short.
+        let hooks = BoundedProcess.Hooks(beforeRead: { usleep(150_000) })
+        let outcome = await TestDeadline.race(.seconds(20)) {
+            await BoundedProcess.run("/usr/bin/head", ["-c", "\(bytes)", "/dev/zero"],
+                                     timeout: .seconds(10), hooks: hooks)
+        }
+        let result = try #require(outcome ?? nil, "a result")
+        #expect(result.status == 0)
+        #expect(result.output.count == bytes)
+        #expect(result.output.allSatisfy { $0 == 0 })
+    }
+
+    @Test("the result for output past the cap is never delivered, however the drain is timed")
+    func overCapNeverDelivered() async throws {
+        let hooks = BoundedProcess.Hooks(beforeRead: { usleep(50_000) })
+        let outcome = await TestDeadline.race(.seconds(20)) {
+            await BoundedProcess.run("/usr/bin/head", ["-c", "\(BoundedProcess.maximumOutputBytes + 1)", "/dev/zero"],
+                                     timeout: .seconds(10), hooks: hooks)
+        }
+        #expect(outcome == .some(nil))
+    }
+
+    private static func openDescriptorCount() -> Int {
+        (try? FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count) ?? 0
+    }
+
+    @Test("a finished run releases its Process, Pipe and descriptors at once, not at the deadline")
+    func releasedPromptly() async throws {
+        let objects = LaunchedObjects()
+        let baseline = Self.openDescriptorCount()
+        let runs = 40
+        for _ in 0..<runs {
+            let hooks = BoundedProcess.Hooks(launched: { objects.add($0, $1) })
+            let outcome = await TestDeadline.race(.seconds(20)) {
+                // A 60 s deadline: if its task kept the run alive, everything would stay held.
+                await BoundedProcess.run("/usr/bin/true", [], timeout: .seconds(60), hooks: hooks)
+            }
+            #expect(outcome??.status == 0)
+        }
+        #expect(objects.count == runs * 2)
+        try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(5), description: "launched objects released") {
+            objects.liveCount == 0
+        }
+        // Tolerance for descriptors other suites open meanwhile; a held run keeps at least one
+        // pipe descriptor each, so a leak shows as 40 or more.
+        try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(5), description: "descriptors back to baseline") {
+            Self.openDescriptorCount() < baseline + runs / 2
+        }
+    }
+}
+
 /// Races `operation` against a test-side deadline without awaiting the loser: if the code under
 /// test never resumes (a missing production deadline), the test fails in `limit` instead of
 /// hanging the runner (a `.timeLimit` cannot cancel a continuation that is never resumed).
@@ -917,6 +1069,14 @@ enum TestDeadline {
 
 /// Runs a fixture command to completion without blocking a thread on its exit.
 enum BoundedProcessTestSupport {
+    /// `SSHTestSupport.generateEd25519Key` without its `waitUntilExit()`, which services the
+    /// calling thread's run loop: on the main actor that nests the executor's run loop, and on a
+    /// cooperative thread it holds a thread every test shares (PX-023 round 7).
+    static func generateEd25519Key(at path: String) async throws {
+        let status = try await run("/usr/bin/ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", path])
+        guard status == 0 else { throw SSHTestSupportError.keyGenerationFailed(path) }
+    }
+
     static func run(_ path: String, _ arguments: [String]) async throws -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)

@@ -229,8 +229,7 @@ struct ConnectionFakeSSHServerTests {
             .filter { FileManager.default.isReadableFile(atPath: $0) }
         let files = ([knownHosts] + globals).joined(separator: ", ")
         return "SRUI could not connect to alice@127.0.0.1:\(port).\n\n"
-            + "[127.0.0.1]:\(port) is not in your known_hosts files (\(files)). SRUI never adds or changes host keys. "
-            + "If you mean to trust this host, verify its key fingerprint out of band, then add the key with ssh yourself."
+            + "[127.0.0.1]:\(port) is not in your known_hosts files (\(files)). SRUI never adds or changes host keys."
     }
 
     @Test("every peer behaviour gets the same title and app text as a benign failure", arguments: Case.allCases)

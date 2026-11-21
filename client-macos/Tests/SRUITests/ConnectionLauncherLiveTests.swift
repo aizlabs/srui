@@ -83,8 +83,8 @@ struct LiveSSHD: @unchecked Sendable {
         let config = directory.appendingPathComponent("sshd_config")
         let server = app.map { _ in Process() }
         do {
-            try SSHTestSupport.generateEd25519Key(at: hostKey)
-            try SSHTestSupport.generateEd25519Key(at: userKey)
+            try await BoundedProcessTestSupport.generateEd25519Key(at: hostKey)
+            try await BoundedProcessTestSupport.generateEd25519Key(at: userKey)
             try Data(contentsOf: URL(fileURLWithPath: "\(userKey).pub")).write(to: authorizedKeys)
             let port = SSHTestSupport.findFreePort()
             switch mode {
@@ -93,7 +93,7 @@ struct LiveSSHD: @unchecked Sendable {
             case .empty:
                 try Data().write(to: URL(fileURLWithPath: knownHosts))
             case .spoofed:
-                try SSHTestSupport.generateEd25519Key(at: otherKey)
+                try await BoundedProcessTestSupport.generateEd25519Key(at: otherKey)
                 try SSHTestSupport.writeKnownHosts(port: port, hostPublicKeyPath: otherKey, to: knownHosts)
             }
 
@@ -178,14 +178,19 @@ struct LiveSSHD: @unchecked Sendable {
         FileManager.default.fileExists(atPath: directory.appendingPathComponent("subsystem-ran").path)
     }
 
-    /// Tears the fixture down on a detached task. `shutDown()` waits with `Process.waitUntilExit()`,
+    /// Tears the fixture down on a dedicated thread. `shutDown()` waits with `Process.waitUntilExit()`,
     /// which services the calling thread's run loop: on the main actor that nests the main-actor
-    /// executor's own run loop, and one PX-023 run parked there for 27 minutes with sshd already
-    /// gone (`impl3-wedge-sample.txt`). The wait never runs on the main actor; whatever is still
-    /// running when the test process exits is killed by `SSHDRegistry`'s exit hook.
+    /// executor's own run loop (one PX-023 run parked there for 27 minutes, `impl3-wedge-sample.txt`),
+    /// and on a cooperative-pool thread it occupies a thread the whole test process shares (PX-023
+    /// round 7: two such waits, this one and `SSHTransportHostKeyTests`', held the only two
+    /// cooperative threads and parked a focused run for an hour, `impl7-wedge-sample.txt`). A plain
+    /// `Thread` can block without stalling any test; whatever is still running when the test
+    /// process exits is killed by `SSHDRegistry`'s exit hook.
     func shutDownOffMainActor() {
         let fixture = self
-        Task.detached { fixture.shutDown() }
+        let thread = Thread { fixture.shutDown() }
+        thread.name = "org.srui.tests.LiveSSHD.shutDown"
+        thread.start()
     }
 
     func shutDown() {
@@ -305,8 +310,7 @@ struct ConnectionLauncherLiveTests {
             let globals = ["/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"]
                 .filter { FileManager.default.isReadableFile(atPath: $0) }
             text += "\(name) is not in your known_hosts files (\(([live.knownHosts] + globals).joined(separator: ", "))). "
-                + "SRUI never adds or changes host keys. "
-                + "If you mean to trust this host, verify its key fingerprint out of band, then add the key with ssh yourself."
+                + "SRUI never adds or changes host keys."
         }
         return text
     }
@@ -380,7 +384,7 @@ struct ConnectionLauncherLiveTests {
         var identity = live.userKey
         if bannerCase == .authenticationFails {
             identity = live.directory.appendingPathComponent("stranger_key").path
-            try SSHTestSupport.generateEd25519Key(at: identity)
+            try await BoundedProcessTestSupport.generateEd25519Key(at: identity)
         }
 
         let probe = LauncherProbe()

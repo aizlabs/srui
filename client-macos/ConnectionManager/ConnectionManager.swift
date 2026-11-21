@@ -24,11 +24,14 @@
 // only a `KnownHostsHint` computed from the local known_hosts files. The app writes no host-key
 // verdict and no trust-changing advice.
 //
-// PX-024: the saved-connections file holds only the endpoint, its local label, the last session ID
-// and that revision as presentation metadata. Nothing in it is continuity state: a relaunched
-// manager builds a fresh `ConnectionSessionContext` (new outbox, so a new `client_instance_id`
-// and event frontier 0; an empty replica at revision 0), so the server's continuity decision
-// rebuilds the complete current state. Removing an entry forgets it locally and sends nothing.
+// PX-024: the saved-connections file (versioned; an unreadable one is moved aside, never written
+// over) holds only the endpoint, its local label, the last session ID (validated on load and
+// before any server-reported ID is stored) and that revision as presentation metadata. Nothing
+// in it is continuity state: a relaunched manager builds a fresh `ConnectionSessionContext` (new
+// outbox, so a new `client_instance_id`; an empty replica). Until a session has been ready in a
+// context, it attaches with `CLIENT_HELLO`, so ready follows the WELCOME catch-up snapshot and
+// the window shows the complete current state; a WELCOME naming another session is reported as
+// the saved session's replacement. Removing an entry forgets it locally and sends nothing.
 //
 
 import Foundation
@@ -73,6 +76,27 @@ public struct SavedConnection: Identifiable, Codable, Hashable, Sendable {
     /// so the caption says when the session was last seen and never offers it as a resume point.
     var sessionCaption: String? {
         sessionID.map { "Session \($0) · last seen at revision \(lastKnownRevision)" }
+    }
+
+    /// The most Unicode scalars a session ID may have to be stored, shown or compared (PX-024
+    /// round 2). `session_id` is an opaque token (§17); `srui-sessiond` mints 32 lowercase hex
+    /// characters (`mint_session_id`). The bound leaves four times that for another server's
+    /// format (a 36-character UUID string, a prefixed token) and refuses anything longer.
+    static let maximumSessionIDScalars = 128
+
+    /// `id` if it may be stored, shown in the caption and sent back as a session ID, else `nil`:
+    /// non-empty, at most `maximumSessionIDScalars` scalars, and free of every control or
+    /// invisible scalar `ConnectionEndpoint` refuses in a field (NUL, newline, ESC, format,
+    /// separator, surrogate, private-use, unassigned). Applied to the saved file on load and to
+    /// every session ID the server reports before it is stored or shown.
+    static func validSessionID(_ id: String) -> String? {
+        guard !id.isEmpty,
+              id.utf8.count <= ConnectionEndpoint.maximumRawFieldBytes,
+              id.unicodeScalars.count <= maximumSessionIDScalars,
+              ConnectionEndpoint.firstDisallowedScalar(in: id) == nil else {
+            return nil
+        }
+        return id
     }
 }
 
@@ -263,15 +287,125 @@ public actor SavedConnectionStore {
         self.beforeSave = beforeSave
     }
 
+    /// The file this build writes (PX-024 round 2): `{"connections": [...], "version": 1}`. A
+    /// file that is a bare JSON array is the pre-versioned form of version 1 and still loads.
+    public static let currentVersion = 1
+
+    /// Why `load()` refused the file. Nothing is ever written over a file `load()` refused: it is
+    /// first moved aside to `backupURL`, replacing any earlier backup (one file, never more).
+    public enum LoadError: Error, CustomStringConvertible, Equatable, Sendable {
+        /// The file was moved to `backup`; the next save writes a fresh file in its place.
+        case movedAside(reason: String, backup: URL)
+        /// The move itself failed, so the file is still at `file` and this store refuses to save.
+        case leftInPlace(reason: String, file: URL)
+
+        public var description: String {
+            switch self {
+            case .movedAside(let reason, let backup):
+                return "The saved connections file could not be read (\(reason)). It was moved to "
+                    + "\(backup.path) and SRUI will not write over it; SRUI starts with no saved connections."
+            case .leftInPlace(let reason, let file):
+                return "The saved connections file could not be read (\(reason)) and could not be moved "
+                    + "aside, so SRUI will not save connections over \(file.path). Move it away and relaunch."
+            }
+        }
+    }
+
+    /// Refused by `save` while an unreadable file could not be moved aside.
+    public struct UnreadableFileInPlace: Error, CustomStringConvertible, Sendable {
+        public let file: URL
+        public var description: String {
+            "\(file.path) could not be read or moved aside; SRUI will not write over it."
+        }
+    }
+
+    /// The single fixed backup name next to the file (`<name>.unreadable`).
+    public nonisolated var backupURL: URL {
+        url.appendingPathExtension("unreadable")
+    }
+
+    private var unreadableFileInPlace = false
+
+    private struct VersionedFile: Codable {
+        var version: Int
+        var connections: [SavedConnection]
+    }
+
+    private struct VersionHeader: Decodable {
+        var version: Int
+    }
+
+    private struct FormatError: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    /// The saved entries, normalised (`normalized(_:)`). A file that cannot be read as saved
+    /// connections (truncated, another shape, an out-of-range number, an unknown version) is
+    /// moved aside before this throws, so no later save can destroy it.
     public func load() throws -> [SavedConnection] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [] }
-        let data = try Data(contentsOf: url)
-        return try JSONDecoder().decode([SavedConnection].self, from: data)
+        let loaded: [SavedConnection]
+        do {
+            loaded = try Self.decode(Data(contentsOf: url))
+        } catch {
+            let reason = String(String(describing: error).prefix(400))
+            if Self.moveAside(url, to: backupURL) {
+                unreadableFileInPlace = false
+                throw LoadError.movedAside(reason: reason, backup: backupURL)
+            }
+            unreadableFileInPlace = true
+            throw LoadError.leftInPlace(reason: reason, file: url)
+        }
+        unreadableFileInPlace = false
+        return Self.normalized(loaded)
+    }
+
+    /// One `rename(2)`: atomic, and it replaces an earlier backup, so at most one is kept.
+    private static func moveAside(_ file: URL, to backup: URL) -> Bool {
+        rename(file.path, backup.path) == 0
+    }
+
+    static func decode(_ data: Data) throws -> [SavedConnection] {
+        let isJSONWhitespace: (UInt8) -> Bool = { $0 == 0x20 || $0 == 0x09 || $0 == 0x0A || $0 == 0x0D }
+        let decoder = JSONDecoder()
+        switch data.first(where: { !isJSONWhitespace($0) }) {
+        case UInt8(ascii: "["):
+            return try decoder.decode([SavedConnection].self, from: data)
+        case UInt8(ascii: "{"):
+            let version = try decoder.decode(VersionHeader.self, from: data).version
+            guard version == currentVersion else {
+                throw FormatError(description: "version \(version) is not one this build reads (\(currentVersion))")
+            }
+            return try decoder.decode(VersionedFile.self, from: data).connections
+        default:
+            throw FormatError(description: "not a saved-connections file")
+        }
+    }
+
+    /// Loaded entries as the manager may use them: the first entry of each ID is kept and later
+    /// duplicates are dropped (two rows must never share one session context or one removal),
+    /// and a session ID `SavedConnection.validSessionID` refuses is dropped with its revision,
+    /// so the entry keeps its endpoint and label and has no remembered session.
+    static func normalized(_ loaded: [SavedConnection]) -> [SavedConnection] {
+        var seen = Set<SavedConnection.ID>()
+        var result: [SavedConnection] = []
+        for var entry in loaded {
+            guard seen.insert(entry.id).inserted else { continue }
+            if let sessionID = entry.sessionID, SavedConnection.validSessionID(sessionID) == nil {
+                entry.sessionID = nil
+                entry.lastKnownRevision = 0
+            }
+            result.append(entry)
+        }
+        return result
     }
 
     public func save(_ connections: [SavedConnection]) async throws {
         if let beforeSave {
             await beforeSave(connections)
+        }
+        guard unreadableFileInPlace == false else {
+            throw UnreadableFileInPlace(file: url)
         }
 
         let directory = url.deletingLastPathComponent()
@@ -281,7 +415,7 @@ public actor SavedConnectionStore {
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(connections)
+        let data = try encoder.encode(VersionedFile(version: Self.currentVersion, connections: connections))
         try data.write(to: url, options: .atomic)
     }
 }
@@ -329,6 +463,12 @@ final class ConnectionSessionContext {
     let continuityContext = SessionContinuityContext()
     let renderer = AppKitRenderer()
     var hasStartedAttempt = false
+    /// Whether a session has ever been ready in this context (PX-024 round 2). Only then are its
+    /// replica and outbox this process's own continuity checkpoint (§18, warm reconnect), so only
+    /// then does a reconnect send `CLIENT_RESUME`. A context without one (a cold relaunch, or
+    /// attempts that never became ready) attaches with `CLIENT_HELLO`, whose WELCOME catch-up
+    /// snapshot is applied before ready, as for any fresh attach.
+    private(set) var hasBeenReady = false
 
     private var revisionReadySessionID: String?
 
@@ -338,6 +478,7 @@ final class ConnectionSessionContext {
 
     func markPersistableRevisionReady(for sessionID: String) {
         revisionReadySessionID = sessionID
+        hasBeenReady = true
     }
 
     func persistableRevision(for sessionID: String?) -> UInt64? {
@@ -355,8 +496,22 @@ struct ConnectionAttemptRequest {
     let context: ConnectionSessionContext
     let isWarmReconnect: Bool
 
+    /// The saved session this attempt reattaches to, if any.
     var requestedSessionID: String? {
         connection.sessionID
+    }
+
+    /// The session ID the controller resumes (`CLIENT_RESUME`), or `nil` for `CLIENT_HELLO`.
+    ///
+    /// PX-024 round 2: a saved session is resumed only from a context that has been ready, where
+    /// a real committed replica and its outbox exist. Without one, `RESUME_OK` would replay from
+    /// revision 1 after a `ready` emitted at revision 0, so the window would read as live over an
+    /// empty, then historical, replica; `ServerResumeOk` carries no replay target to wait for.
+    /// The documented attach path is used instead (§18 allows, not requires, the cold resume):
+    /// HELLO with the fresh identity, ready only after the WELCOME snapshot. A different session
+    /// in the WELCOME is reported as a replacement of the saved one.
+    var resumeSessionID: String? {
+        context.hasBeenReady ? connection.sessionID : nil
     }
 
     var resumeRevision: UInt64 {
@@ -374,10 +529,18 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
     /// The transport when it is `ssh`: its exit before the stream triggers the known_hosts hint.
     private let sshTransport: SSHTransport?
     private let knownHostsLookup: any KnownHostsLookup
+    /// The saved session a `CLIENT_HELLO` attach stands in for (PX-024 round 2), or `nil`.
+    private let rememberedSessionID: String?
     private var forwardingTask: Task<Void, Never>?
     private var stopTask: Task<Void, Never>?
 
-    init(controller: SessionController, sshTransport: SSHTransport?, knownHostsLookup: any KnownHostsLookup) {
+    init(
+        controller: SessionController,
+        sshTransport: SSHTransport?,
+        knownHostsLookup: any KnownHostsLookup,
+        rememberedSessionID: String? = nil
+    ) {
+        self.rememberedSessionID = rememberedSessionID
         let pair = AsyncStream.makeStream(
             of: ConnectionAttemptEvent.self,
             bufferingPolicy: .bufferingNewest(16)
@@ -397,22 +560,39 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
         let sshTransport = self.sshTransport
         let knownHostsLookup = self.knownHostsLookup
         let continuation = self.continuation
+        let remembered = self.rememberedSessionID
         forwardingTask = Task {
+            // A HELLO attach of a remembered session: the server attaches this client to the one
+            // session it serves. A different ID is a replacement of the saved one, reported as
+            // such before its snapshot is ready, exactly as a REPLACED resume decision is (§18).
+            var attached = false
+            func attach(_ sessionID: String) -> Bool {
+                defer { attached = true }
+                guard !attached, let remembered, remembered != sessionID else { return false }
+                continuation.yield(.replaced(previousSessionID: remembered, newSessionID: sessionID))
+                return true
+            }
             lifecycleLoop: for await event in lifecycleEvents {
                 switch event {
                 case .connecting:
                     continuation.yield(.connecting)
                 case .resynchronizing(let resynchronization):
                     switch resynchronization {
-                    case .fresh(_), .sameSession(_):
+                    case .fresh(let sessionID):
+                        if !attach(sessionID) {
+                            continuation.yield(.resynchronizing)
+                        }
+                    case .sameSession(_):
                         continuation.yield(.resynchronizing)
                     case .replaced(let previousSessionID, let newSessionID):
+                        attached = true
                         continuation.yield(.replaced(
                             previousSessionID: previousSessionID,
                             newSessionID: newSessionID
                         ))
                     }
                 case .ready(let sessionID, let revision):
+                    _ = attach(sessionID)
                     continuation.yield(.ready(sessionID: sessionID, revision: revision))
                 case .failed(let failure):
                     if let local = await SSHFailedBeforeStream.check(sshTransport, lookup: knownHostsLookup) {
@@ -712,7 +892,7 @@ public final class ConnectionManager {
             outbox: request.context.outbox,
             renderer: request.context.renderer,
             resourceCache: request.context.resourceCache,
-            sessionId: request.requestedSessionID,
+            sessionId: request.resumeSessionID,
             continuityContext: request.context.continuityContext,
             transactionIngressGate: request.context.transactionIngressGate
         )
@@ -721,7 +901,8 @@ public final class ConnectionManager {
         return SessionControllerConnectionAttempt(
             controller: controller,
             sshTransport: transport as? SSHTransport,
-            knownHostsLookup: knownHostsLookup
+            knownHostsLookup: knownHostsLookup,
+            rememberedSessionID: request.resumeSessionID == nil ? request.requestedSessionID : nil
         )
     }
 
@@ -905,17 +1086,20 @@ public final class ConnectionManager {
 
         case .replaced(let previousSessionID, let newSessionID):
             contexts[connectionID]?.invalidatePersistableRevision()
-            entries[index].sessionID = newSessionID
+            // A server-reported ID is stored and shown only if it passes the saved file's rule.
+            let replacement = SavedConnection.validSessionID(newSessionID)
+            entries[index].sessionID = replacement
             entries[index].lastKnownRevision = 0
             setStatus(.resynchronizing, for: connectionID, replaced: true)
             let persistenceError = await save(entries)
             guard activeTokens[connectionID] == token else { return true }
 
+            let newName = replacement ?? "a session with an invalid ID"
             var message: String
-            if let previousSessionID {
-                message = "Remote session \(previousSessionID) was replaced by \(newSessionID). "
+            if let previous = previousSessionID.flatMap(SavedConnection.validSessionID) {
+                message = "Remote session \(previous) was replaced by \(newName). "
             } else {
-                message = "The saved remote session was replaced by \(newSessionID). "
+                message = "The saved remote session was replaced by \(newName). "
             }
             message += "SRUI is rebuilding from authoritative state."
             if let persistenceError {
@@ -930,8 +1114,9 @@ public final class ConnectionManager {
             return false
 
         case .ready(let sessionID, let revision):
-            entries[index].sessionID = sessionID
-            entries[index].lastKnownRevision = revision
+            let stored = SavedConnection.validSessionID(sessionID)
+            entries[index].sessionID = stored
+            entries[index].lastKnownRevision = stored == nil ? 0 : revision
             contexts[connectionID]?.markPersistableRevisionReady(for: sessionID)
             pendingFirstSuccess.remove(connectionID)
             setStatus(.connected, for: connectionID)

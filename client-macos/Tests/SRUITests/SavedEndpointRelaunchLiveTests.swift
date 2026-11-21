@@ -9,9 +9,9 @@
 // A "launch" is a `ConnectionManager` with its own attempt factory over the one saved-connections
 // file, and a "quit" is its `shutdown()`: nothing but that file passes from one launch to the
 // next, exactly as across an app relaunch. The file holds the endpoint, its label, the session ID
-// and the last revision as presentation metadata only. A relaunched client therefore resumes with
-// an empty replica at revision 0, frontier 0 and a fresh `client_instance_id`, and the server's
-// continuity decision rebuilds the complete current state (§18).
+// and the last revision as presentation metadata only. A relaunched client has no committed
+// replica, so it attaches with CLIENT_HELLO and a fresh `client_instance_id`, and is ready only
+// once the WELCOME catch-up snapshot holds the complete current state (§18, PX-024 round 2).
 //
 // Every fixture process is stopped from a dedicated `Thread`, never the main actor or the
 // cooperative pool (PX-023 round 7), and every spawned process has its stdio set before `run()`.
@@ -108,13 +108,10 @@ private final class ClientLaunch {
     var renderer: AppKitRenderer? { contexts.last?.renderer }
     var revision: UInt64 { applier?.lastAppliedRevision.value ?? 0 }
 
-    /// The CLIENT_RESUME attempt `index` put on the wire, if its first frame was one.
-    func resume(of index: Int) async throws -> SRUIClientResume? {
-        guard log.transports.indices.contains(index),
-              case .clientResume(let resume)? = try await log.transports[index].firstMessage()?.msg else {
-            return nil
-        }
-        return resume
+    /// The first message attempt `index` put on the wire.
+    func firstMessage(of index: Int) async throws -> SRUIMessage? {
+        guard log.transports.indices.contains(index) else { return nil }
+        return try await log.transports[index].firstMessage()
     }
 
     func view<T>(_ id: UInt64, as _: T.Type = T.self) -> T? {
@@ -217,6 +214,32 @@ private func storeDirectory() -> URL {
         .appendingPathComponent("srui-px024-live-\(UUID().uuidString)", isDirectory: true)
 }
 
+/// Every launch a test made, so a failed expectation still closes their windows.
+@MainActor
+private final class Launches {
+    private(set) var all: [ClientLaunch] = []
+
+    func make(_ live: LiveSSHD, store url: URL) -> ClientLaunch {
+        let launch = ClientLaunch(live, store: url)
+        all.append(launch)
+        return launch
+    }
+
+    func closeWindows() {
+        all.forEach { $0.closeWindows() }
+    }
+}
+
+/// What the first launch left behind: its saved entry, and the paused state srtop still holds.
+private struct FirstLaunch {
+    let id: SavedConnection.ID
+    let session: String
+    let identity: ClientInstanceId
+    let frozenRevision: UInt64
+    let frozenRows: [[String]]
+    let frozenIDs: [UInt64]
+}
+
 /// Serialized: each test runs its own sshd, srtop and native windows on the one main actor.
 @Suite("Saved endpoints reattach after a client relaunch (PX-024, §§17-18.2)", .serialized, .timeLimit(.minutes(3)))
 @MainActor
@@ -228,11 +251,62 @@ struct SavedEndpointRelaunchLiveTests {
         try await AsyncTestSupport.eventually(timeout: .seconds(30), description: description, condition: condition)
     }
 
+    /// The first launch: connect through the form, watch srtop update, pause it (this client's
+    /// event 1, acknowledged) so its state stays put, and quit. The file then holds the entry.
+    private func firstLaunchPausesAndQuits(
+        _ live: LiveSSHD, store storeURL: URL, launches: Launches
+    ) async throws -> FirstLaunch {
+        let first = launches.make(live, store: storeURL)
+        await first.manager.load()
+        let id = try #require(first.manager.connect(ConnectDraft(
+            label: "Explorer", host: "127.0.0.1", port: "\(live.port)", user: NSUserName())))
+        try await waitFor("the first launch connected") { first.manager.status(for: id) == .connected && first.showsRows }
+        let connectedAt = first.revision
+        try await waitFor("srtop updates reached the first launch") { first.revision >= connectedAt + 3 }
+        NativeActivation.click(try #require(first.view(Self.samplingPauseID, as: NSButton.self)))
+        try await waitFor("the first launch paused srtop") {
+            first.text(Self.samplingStatusID).hasPrefix("Paused at ")
+                && first.view(Self.samplingPauseID, as: NSButton.self)?.title == "Resume view"
+        }
+        let outbox = try #require(first.context?.outbox)
+        try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(30), description: "the pause acknowledged") {
+            await outbox.lastAckedEventSeq == 1
+        }
+        // Let a scan already running when the pause landed return and be discarded.
+        try await Task.sleep(for: .milliseconds(400))
+        let state = FirstLaunch(
+            id: id,
+            session: try #require(first.manager.entries.first?.sessionID),
+            identity: outbox.clientInstanceId,
+            frozenRevision: first.revision,
+            frozenRows: first.modelRows(),
+            frozenIDs: first.itemIDs())
+        await first.manager.shutdown()
+        first.closeWindows()
+
+        let saved = try #require(try await SavedConnectionStore(url: storeURL).load().first)
+        #expect(saved.id == id && saved.label == "Explorer" && saved.host == "127.0.0.1" && saved.port == live.port)
+        #expect(saved.sessionID == state.session)
+        #expect(saved.lastKnownRevision == state.frozenRevision && state.frozenRevision > 0)
+        return state
+    }
+
+    /// The CLIENT_HELLO attempt `index` of `launch` put on the wire: a cold relaunch attaches with
+    /// the fresh identity, never a revision-0 resume (PX-024 round 2).
+    private func expectHello(_ launch: ClientLaunch, attempt index: Int, identity: ClientInstanceId) async throws {
+        let message = try await launch.firstMessage(of: index)
+        guard case .clientHello(let hello)? = message?.msg else {
+            Issue.record("attempt \(index + 1) did not attach with CLIENT_HELLO: \(String(describing: message?.msg))")
+            return
+        }
+        #expect(hello.clientInstanceID == identity.bytes)
+    }
+
     /// Quit after updates, relaunch from the saved entry alone, and reattach through two overlapping
-    /// connects: the restored explorer is srtop's complete current state, built by a
-    /// `RESYNC_REQUIRED{SAME_SESSION}` snapshot for a fresh client identity, never a resume from the
-    /// remembered revision. That identity's first event is processed (no sequence collision), and
-    /// forgetting the entry afterwards leaves the session alive for every other client.
+    /// connects: at the moment the newer attempt is ready, its window already holds srtop's complete
+    /// current state, from the WELCOME catch-up snapshot of a fresh attach with a fresh client
+    /// identity. That identity's first event is processed (no sequence collision), and forgetting
+    /// the entry afterwards leaves the session alive for every other client.
     @Test("a relaunch rebuilds srtop's complete current state with a fresh identity, and forgetting leaves the session alive")
     func relaunchRebuildsCompleteStateAndForgettingIsLocal() async throws {
         let live = try await LiveSSHD.launch(
@@ -245,54 +319,36 @@ struct SavedEndpointRelaunchLiveTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let storeURL = directory.appendingPathComponent("connections.json")
         _ = NSApplication.shared
-        var launches: [ClientLaunch] = []
-        defer { launches.forEach { $0.closeWindows() } }
+        let launches = Launches()
+        defer { launches.closeWindows() }
 
-        // First launch: connect through the form, watch srtop update, pause it (this client's
-        // event 1), and quit.
-        let first = ClientLaunch(live, store: storeURL)
-        launches.append(first)
-        await first.manager.load()
-        let id = try #require(first.manager.connect(ConnectDraft(
-            label: "Explorer", host: "127.0.0.1", port: "\(live.port)", user: NSUserName())))
-        try await waitFor("the first launch connected") { first.manager.status(for: id) == .connected && first.showsRows }
-        let connectedAt = first.revision
-        try await waitFor("srtop updates reached the first launch") { first.revision >= connectedAt + 3 }
-        NativeActivation.click(try #require(first.view(Self.samplingPauseID, as: NSButton.self)))
-        try await waitFor("the first launch paused srtop") {
-            first.text(Self.samplingStatusID).hasPrefix("Paused at ")
-                && first.view(Self.samplingPauseID, as: NSButton.self)?.title == "Resume view"
-        }
-        let firstOutbox = try #require(first.context?.outbox)
-        try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(30), description: "the pause acknowledged") {
-            await firstOutbox.lastAckedEventSeq == 1
-        }
-        // Let a scan already running when the pause landed return and be discarded.
-        try await Task.sleep(for: .milliseconds(400))
-        let frozenRevision = first.revision
-        let frozenRows = first.modelRows()
-        let frozenIDs = first.itemIDs()
-        let session = try #require(first.manager.entries.first?.sessionID)
-        let firstIdentity = firstOutbox.clientInstanceId
-        await first.manager.shutdown()
-        first.closeWindows()
-
+        let first = try await firstLaunchPausesAndQuits(live, store: storeURL, launches: launches)
+        let id = first.id, session = first.session
         let saved = try #require(try await SavedConnectionStore(url: storeURL).load().first)
-        #expect(saved.id == id && saved.label == "Explorer" && saved.host == "127.0.0.1" && saved.port == live.port)
-        #expect(saved.sessionID == session)
-        #expect(saved.lastKnownRevision == frozenRevision && frozenRevision > 0)
 
         // Relaunch: a new manager over the same file and nothing else. Two connects overlap: the
-        // first is held after its CLIENT_RESUME is on the wire, before it can read the answer.
-        let relaunched = ClientLaunch(live, store: storeURL)
-        launches.append(relaunched)
+        // first is held after its handshake is on the wire, before it can read the answer, and the
+        // newer one is held at ready so its window can be read before the chrome clears.
+        let relaunched = launches.make(live, store: storeURL)
         await relaunched.manager.load()
         #expect(relaunched.manager.entries == [saved])
         #expect(relaunched.manager.status(for: id) == .unknown)
         relaunched.recorder.holdHandshake(of: 1)
         relaunched.manager.connect(id: id)
-        try await waitFor("the first reattach held with its resume sent") { relaunched.recorder.isHoldingHandshake }
+        try await waitFor("the first reattach held with its handshake sent") { relaunched.recorder.isHoldingHandshake }
+        relaunched.recorder.holdReady(of: 2)
         relaunched.manager.connect(id: id)
+        try await waitFor("the newer reattach held at ready") { relaunched.recorder.isHoldingReady }
+        #expect(relaunched.recorder.events(of: 2) == ["connecting", "resynchronizing", "ready"])
+        // Complete current state at ready, not an empty replica waiting for later deltas: srtop is
+        // paused, so nothing has been published since the first launch quit.
+        #expect(relaunched.recorder.readyRevisions[2] == first.frozenRevision, "ready only once the snapshot is in")
+        #expect(relaunched.modelRows() == first.frozenRows)
+        #expect(relaunched.itemIDs() == first.frozenIDs)
+        // Drawing is paced by the renderer, not by commits (§12.2): the table catches up while held.
+        try await waitFor("the snapshot drawn while held at ready") { relaunched.showsRows && relaunched.recorder.isHoldingReady }
+        #expect(relaunched.manager.status(for: id) != .connected, "not live until ready is handled")
+        relaunched.recorder.releaseReady()
         try await waitFor("the newer reattach ready") {
             relaunched.manager.status(for: id) == .connected && relaunched.showsRows
         }
@@ -300,19 +356,11 @@ struct SavedEndpointRelaunchLiveTests {
                 "both attempts of one launch share its one session context")
         let relaunchedOutbox = try #require(relaunched.context?.outbox)
         let relaunchedIdentity = relaunchedOutbox.clientInstanceId
-        #expect(relaunchedIdentity != firstIdentity, "a relaunch never reuses the former client identity")
-        for index in 0..<2 {
-            let resume = try #require(try await relaunched.resume(of: index), "attempt \(index + 1) sent CLIENT_RESUME")
-            #expect(resume.sessionID == session)
-            #expect(resume.lastAppliedRevision == 0, "the remembered revision \(frozenRevision) is not resume authority")
-            #expect(resume.lastAckedEventSeq == 0)
-            #expect(resume.clientInstanceID == relaunchedIdentity.bytes)
-            #expect(resume.pendingTextEdits.isEmpty && resume.terminalStreamOffsets.isEmpty)
-        }
-        // Revision 0 is outside a one-commit journal, so the same session sends a snapshot.
-        #expect(relaunched.recorder.events(of: 2) == ["connecting", "resynchronizing", "ready"])
+        #expect(relaunchedIdentity != first.identity, "a relaunch never reuses the former client identity")
+        try await expectHello(relaunched, attempt: 0, identity: relaunchedIdentity)
+        try await expectHello(relaunched, attempt: 1, identity: relaunchedIdentity)
         #expect(relaunched.manager.entries.first?.sessionID == session)
-        #expect(relaunched.manager.alert == nil)
+        #expect(relaunched.manager.alert == nil, "the same session is no replacement")
 
         // The superseded attempt is released and runs to its end: it never becomes ready, and
         // nothing it reads reaches the status, the window or the replica.
@@ -325,15 +373,11 @@ struct SavedEndpointRelaunchLiveTests {
         #expect(relaunched.manager.alert == nil, "\(relaunched.manager.alert?.message ?? "")")
         #expect(relaunched.revision >= readyRevision)
         #expect(relaunched.renderer?.registry.handle(for: NodeId(1))?.window?.subtitle == "")
-
-        // Complete current state, not an empty replica waiting for later deltas: srtop is paused,
-        // so nothing has been published since the first launch quit, yet every row and identity is
-        // there, and the whole tree equals what a fresh attach of another client receives.
-        #expect(relaunched.modelRows() == frozenRows)
-        #expect(relaunched.itemIDs() == frozenIDs)
+        #expect(relaunched.modelRows() == first.frozenRows && relaunched.itemIDs() == first.frozenIDs)
         #expect(relaunched.text(Self.samplingStatusID).hasPrefix("Paused at "))
-        let observer = ClientLaunch(live, store: directory.appendingPathComponent("observer.json"))
-        launches.append(observer)
+
+        // The whole tree equals what a fresh attach of another client receives.
+        let observer = launches.make(live, store: directory.appendingPathComponent("observer.json"))
         let observerID = try #require(observer.manager.connect(ConnectDraft(
             label: "Observer", host: "127.0.0.1", port: "\(live.port)", user: NSUserName())))
         try await waitFor("an independent fresh attach") {
@@ -359,7 +403,8 @@ struct SavedEndpointRelaunchLiveTests {
 
         // Forgetting is local: the entry and its file record go, nothing is sent, and the session,
         // still attached through this launch's open transport, keeps publishing to it and to the
-        // observer. A copy of the file taken before the forget still resumes the same incarnation.
+        // observer. A copy of the file taken before the forget still reattaches to the same
+        // incarnation.
         let copyURL = directory.appendingPathComponent("before-forget.json")
         try FileManager.default.copyItem(at: storeURL, to: copyURL)
         let forgottenAt = relaunched.revision
@@ -376,8 +421,7 @@ struct SavedEndpointRelaunchLiveTests {
         await relaunched.manager.shutdown()
         relaunched.closeWindows()
 
-        let fromCopy = ClientLaunch(live, store: copyURL)
-        launches.append(fromCopy)
+        let fromCopy = launches.make(live, store: copyURL)
         await fromCopy.manager.load()
         fromCopy.manager.connect(id: id)
         try await waitFor("the saved copy reattached") { fromCopy.manager.status(for: id) == .connected && fromCopy.showsRows }
@@ -385,25 +429,87 @@ struct SavedEndpointRelaunchLiveTests {
                 "the same incarnation, not a replacement")
         #expect(fromCopy.manager.entries.first?.sessionID == session)
         #expect(fromCopy.manager.alert == nil)
-        let copyResume = try #require(try await fromCopy.resume(of: 0))
-        #expect(copyResume.sessionID == session && copyResume.lastAppliedRevision == 0)
         let copyIdentity = try #require(fromCopy.context?.outbox.clientInstanceId)
-        #expect(copyResume.clientInstanceID == copyIdentity.bytes)
-        #expect(copyIdentity != firstIdentity && copyIdentity != relaunchedIdentity)
+        try await expectHello(fromCopy, attempt: 0, identity: copyIdentity)
+        #expect(copyIdentity != first.identity && copyIdentity != relaunchedIdentity)
 
-        print("PX-024 native evidence: session=\(session) frozenRevision=\(frozenRevision) "
-            + "rows=\(frozenRows.map { $0.prefix(2).joined(separator: " ") }) relaunchedReady=\(readyRevision) "
-            + "identities=\(firstIdentity)/\(relaunchedIdentity)/\(copyIdentity) "
+        print("PX-024 native evidence: session=\(session) frozenRevision=\(first.frozenRevision) "
+            + "rows=\(first.frozenRows.map { $0.prefix(2).joined(separator: " ") }) readyRevision=\(relaunched.recorder.readyRevisions[2] ?? 0) "
+            + "identities=\(first.identity)/\(relaunchedIdentity)/\(copyIdentity) "
             + "attempts=\(relaunched.recorder.allEvents) copy=\(fromCopy.recorder.allEvents) "
             + "treeNodes=\(observer.tree().count)")
         await fromCopy.manager.shutdown()
         await observer.manager.shutdown()
     }
 
+    /// PX-024 round 2 (F1): srtop with its DEFAULT journal still holds every commit since revision
+    /// 0, which a revision-0 resume would replay after a `ready` at revision 0 (the window live over
+    /// an empty, then historical, replica). The relaunch attaches with CLIENT_HELLO instead, so the
+    /// moment it is ready its window already equals srtop's current state and a fresh attach's.
+    @Test("with srtop's default journal, a relaunch is ready only once it shows the complete current state")
+    func relaunchWithDefaultJournalIsReadyOnlyWithCompleteState() async throws {
+        let live = try await LiveSSHD.launch(
+            prefix: "px024-journal", knownHosts: .trusted,
+            app: (srtopBinary, ["--fake-sequence", "--refresh-interval-ms", "200"], FixtureBinaries.srtopRefusal))
+        let fixture = OwnedFixture(live)
+        defer { fixture.shutDownOffMainActor() }
+        let directory = storeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let storeURL = directory.appendingPathComponent("connections.json")
+        _ = NSApplication.shared
+        let launches = Launches()
+        defer { launches.closeWindows() }
+
+        let first = try await firstLaunchPausesAndQuits(live, store: storeURL, launches: launches)
+        let relaunched = launches.make(live, store: storeURL)
+        await relaunched.manager.load()
+        relaunched.recorder.holdReady(of: 1)
+        relaunched.manager.connect(id: first.id)
+        try await waitFor("the relaunch held at ready") { relaunched.recorder.isHoldingReady }
+        #expect(relaunched.recorder.events(of: 1) == ["connecting", "resynchronizing", "ready"])
+        #expect(relaunched.recorder.readyRevisions[1] == first.frozenRevision,
+                "ready reported revision \(relaunched.recorder.readyRevisions[1] ?? 0), not the current \(first.frozenRevision)")
+        #expect(relaunched.modelRows() == first.frozenRows)
+        #expect(relaunched.itemIDs() == first.frozenIDs)
+        // Drawing is paced by the renderer, not by commits (§12.2): the table catches up while held.
+        try await waitFor("the snapshot drawn while held at ready") {
+            relaunched.showsRows && relaunched.text(Self.samplingStatusID).hasPrefix("Paused at ")
+        }
+
+        // Still held at ready: the whole tree already equals a fresh attach of another client.
+        let observer = launches.make(live, store: directory.appendingPathComponent("observer.json"))
+        let observerID = try #require(observer.manager.connect(ConnectDraft(
+            label: "Observer", host: "127.0.0.1", port: "\(live.port)", user: NSUserName())))
+        try await waitFor("an independent fresh attach") {
+            observer.manager.status(for: observerID) == .connected && observer.showsRows
+        }
+        try await waitFor("the relaunch at ready equals a fresh attach") {
+            relaunched.revision == observer.revision && relaunched.tree() == observer.tree()
+                && relaunched.modelRows() == observer.modelRows() && relaunched.itemIDs() == observer.itemIDs()
+        }
+        #expect(relaunched.recorder.isHoldingReady)
+        #expect(relaunched.tree().count > 10)
+
+        relaunched.recorder.releaseReady()
+        try await waitFor("the relaunch connected") { relaunched.manager.status(for: first.id) == .connected }
+        #expect(relaunched.manager.alert == nil)
+        #expect(relaunched.manager.entries.first?.sessionID == first.session)
+        let identity = try #require(relaunched.context?.outbox.clientInstanceId)
+        #expect(identity != first.identity)
+        try await expectHello(relaunched, attempt: 0, identity: identity)
+        await relaunched.manager.waitForPersistenceForTesting()
+        #expect(try await SavedConnectionStore(url: storeURL).load().first?.lastKnownRevision == first.frozenRevision)
+        print("PX-024 native evidence (default journal): session=\(first.session) frozenRevision=\(first.frozenRevision) "
+            + "readyRevision=\(relaunched.recorder.readyRevisions[1] ?? 0) attempts=\(relaunched.recorder.allEvents) "
+            + "treeNodes=\(observer.tree().count)")
+        await relaunched.manager.shutdown()
+        await observer.manager.shutdown()
+    }
+
     /// Quit, restart srtop (a new incarnation on the same endpoint), and relaunch: the saved
-    /// session ID is stale. The server says REPLACED, the client says so in a blocking alert,
-    /// rebuilds from the new incarnation's snapshot, and the saved entry is updated to the new
-    /// session ID as soon as the decision arrives, before the snapshot is ready.
+    /// session ID is stale. The WELCOME names another session, so the client reports a
+    /// replacement in a blocking alert, rebuilds from the new incarnation's snapshot, and the saved
+    /// entry is updated to the new session ID as soon as the WELCOME arrives, before ready.
     @Test("a relaunch against a restarted srtop surfaces the replacement and updates the saved session ID")
     func relaunchAgainstRestartedServerUpdatesTheSavedSession() async throws {
         let arguments = ["--fake-sequence", "--refresh-interval-ms", "200"]
@@ -416,11 +522,10 @@ struct SavedEndpointRelaunchLiveTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let storeURL = directory.appendingPathComponent("connections.json")
         _ = NSApplication.shared
-        var launches: [ClientLaunch] = []
-        defer { launches.forEach { $0.closeWindows() } }
+        let launches = Launches()
+        defer { launches.closeWindows() }
 
-        let first = ClientLaunch(live, store: storeURL)
-        launches.append(first)
+        let first = launches.make(live, store: storeURL)
         await first.manager.load()
         let id = try #require(first.manager.connect(ConnectDraft(
             label: "Explorer", host: "127.0.0.1", port: "\(live.port)", user: NSUserName())))
@@ -446,8 +551,7 @@ struct SavedEndpointRelaunchLiveTests {
         fixture.replacement = replacement
         try await waitFor("the restarted srtop's socket") { FileManager.default.fileExists(atPath: socket) }
 
-        let relaunched = ClientLaunch(live, store: storeURL)
-        launches.append(relaunched)
+        let relaunched = launches.make(live, store: storeURL)
         await relaunched.manager.load()
         relaunched.recorder.holdReady(of: 1)
         relaunched.manager.connect(id: id)
@@ -461,18 +565,21 @@ struct SavedEndpointRelaunchLiveTests {
         let alert = try #require(relaunched.manager.alert)
         #expect(alert.title == "Session Replaced" && alert.message.contains(session) && alert.message.contains(replacementSession))
         let atDecision = try #require(try await SavedConnectionStore(url: storeURL).load().first)
-        #expect(atDecision.sessionID == replacementSession, "the stale session ID is replaced before the snapshot is ready")
+        #expect(atDecision.sessionID == replacementSession, "the stale session ID is replaced before ready")
         #expect(atDecision.lastKnownRevision == 0)
         #expect(relaunched.renderer?.registry.handle(for: NodeId(1))?.window?.subtitle
             == ConnectionStatus.sessionReplacedWindowStatus)
+        #expect(!relaunched.modelRows().isEmpty, "the new incarnation's snapshot is in at ready")
+        // Drawing is paced by the renderer, not by commits (§12.2): the table catches up while held.
+        try await waitFor("the snapshot drawn while held at ready") { relaunched.showsRows && relaunched.recorder.isHoldingReady }
 
         relaunched.recorder.releaseReady()
         try await waitFor("rebuilt from the new incarnation") {
             relaunched.manager.status(for: id) == .connected && relaunched.showsRows
         }
-        let resume = try #require(try await relaunched.resume(of: 0))
-        #expect(resume.sessionID == session && resume.lastAppliedRevision == 0 && resume.lastAckedEventSeq == 0)
-        #expect(resume.clientInstanceID != firstIdentity.bytes)
+        let identity = try #require(relaunched.context?.outbox.clientInstanceId)
+        #expect(identity != firstIdentity)
+        try await expectHello(relaunched, attempt: 0, identity: identity)
         try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(30), description: "the ready revision saved") {
             let stored = try? await SavedConnectionStore(url: storeURL).load().first
             return stored?.sessionID == replacementSession && (stored?.lastKnownRevision ?? 0) > 0

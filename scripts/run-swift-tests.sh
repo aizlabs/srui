@@ -24,6 +24,14 @@ package=client-macos
 # reaper's guards keep it off anything a live run owns, here or in another checkout.
 "$repo_root/scripts/reap-test-servers.sh" || echo "note: pre-test sweep failed; continuing" >&2
 
+# ProcessExplorerLatencyTests (PX-025) runs `srtop-demo relay`, which no other entry point builds
+# for a bare run of this script. A no-op when it is already up to date; a build failure fails the run
+# before any test, rather than as a missing-fixture failure inside it.
+if ! cargo build --locked --manifest-path apps/srtop/demo/Cargo.toml; then
+    echo "error: could not build apps/srtop/demo (srtop-demo, needed by ProcessExplorerLatencyTests)." >&2
+    exit 1
+fi
+
 # Job control puts the test run in its own process group. Everything a fixture spawns inherits
 # that group, and — crucially — a process keeps its group when it is orphaned and reparented to
 # init. So the group is an exact handle on "processes this invocation created", which a

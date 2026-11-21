@@ -105,11 +105,8 @@ impl Drop for Srtop {
 #[test]
 fn remote_results_are_delayed_by_the_injected_rtt() {
     let srtop = Srtop::start(&["--fake-repeated-names"]);
-    // This run's 0 ms floor for each kind of result: its fastest result
-    // without injected delay, at most 30 ms. Set by the first RTT, which is 0;
-    // the filter and the search each have their own.
-    assert_eq!(RTTS_MS[0], 0);
-    let mut floors: [Option<Duration>; 2] = [None, None];
+    // The narrowest margin under the ceiling at each nonzero RTT, for the record.
+    let mut margins = Vec::new();
     // Every RTT is measured and every violation reported, so a regression
     // shows at each RTT it affects rather than at the first one only.
     let mut violations = Vec::new();
@@ -122,10 +119,7 @@ fn remote_results_are_delayed_by_the_injected_rtt() {
             5,
         )
         .unwrap();
-        for (index, (kind, samples)) in [("filter", &report.filter), ("search", &report.search)]
-            .into_iter()
-            .enumerate()
-        {
+        for (kind, samples) in [("filter", &report.filter), ("search", &report.search)] {
             assert_eq!(samples.len(), 5);
             for sample in samples.iter() {
                 if *sample < rtt {
@@ -137,18 +131,21 @@ fn remote_results_are_delayed_by_the_injected_rtt() {
             if median(samples) >= rtt + Duration::from_millis(400) {
                 violations.push(format!("rtt {rtt_ms}: {kind} p50 {:?}", median(samples)));
             }
-            // Not one round trip more: the fastest result is within 1.5 RTT
-            // plus the 0 ms floor plus 5 ms, while a result that waited an
-            // extra RTT takes at least 2 RTT. Only at a nonzero RTT: at 0 ms
-            // the floor is this very measurement.
+            // Not one round trip more: the fastest result is under 2 RTT.
+            // The relay never releases a chunk before its delay, so a result
+            // that waited one extra RTT takes at least 2 RTT and fails this
+            // whatever the noise, while an honest one has the whole extra RTT
+            // (at least 100 ms) of margin for srtop and scheduling.
             let fastest = *samples.iter().min().unwrap();
-            let floor =
-                *floors[index].get_or_insert_with(|| fastest.min(Duration::from_millis(30)));
-            let ceiling = rtt + rtt / 2 + floor + Duration::from_millis(5);
-            if rtt_ms > 0 && fastest >= ceiling {
-                violations.push(format!(
-                    "rtt {rtt_ms}: the fastest {kind} result took {fastest:?}, past {ceiling:?}"
-                ));
+            if rtt_ms > 0 {
+                let ceiling = rtt * 2;
+                if fastest >= ceiling {
+                    violations.push(format!(
+                        "rtt {rtt_ms}: the fastest {kind} result took {fastest:?}, past {ceiling:?}"
+                    ));
+                } else {
+                    margins.push((rtt_ms, kind, ceiling - fastest));
+                }
             }
         }
         // The handshake crosses the relay too.
@@ -157,6 +154,9 @@ fn remote_results_are_delayed_by_the_injected_rtt() {
         }
         assert!(report.traffic.up > 0 && report.traffic.down > 0);
         println!("PX-025 remote result evidence: {}", report.to_json());
+    }
+    if let Some((rtt_ms, kind, margin)) = margins.iter().min_by_key(|entry| entry.2) {
+        println!("PX-025 remote ceiling margin: narrowest {margin:?} ({kind} at {rtt_ms} ms RTT); all {margins:?}");
     }
     assert!(violations.is_empty(), "{}", violations.join("\n"));
 }

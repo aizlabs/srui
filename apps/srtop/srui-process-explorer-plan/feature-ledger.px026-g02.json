@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-026-G02",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "A generic srui-sessiond fix that PX-026-G01's incompatible-version criterion needs. A HELLO or RESUME with a core_version this build does not serve, or an offer lacking a required profile, is refused with the existing ServerHandshakeRefused{UNSPECIFIED, bounded detail} before the close (§15, §18, §19.2, §26). The generic client shows that detail. There is no proto, registry, codegen, enum, ConnectionManager or srtop change.",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX026G02-001",
+      "feature": "When bootstrap_fresh_client or bootstrap_resume fails with SessionError::UnsupportedCoreVersion or SessionError::Negotiation, handle_connection writes exactly one ServerHandshakeRefused{reason: HANDSHAKE_REFUSAL_REASON_UNSPECIFIED, detail} within WRITE_TIMEOUT and then closes. Both errors are raised before the connection is subscribed and before any WELCOME, RESUME_OK, RESYNC_REQUIRED, snapshot, replay, resource or Terminal frame. The detail is deterministic, at most 256 bytes, and names only versions and profiles. It echoes at most 32 characters of the client's core_version, with characters outside [A-Za-z0-9.+_-] shown as ? and an absent version shown as (none). It lists at most 8 missing required server profiles, then +N more, and never echoes the client's offer. Every other handshake failure still closes without a frame.",
+      "scope": "PX-026-G02/server-rust sessiond src/connection.rs handshake_refusal, refuse_handshake; tests/connection_failure_test.rs; protocol/README.md; protocol/conformance-vectors/suites/manifest.json suite 7 Rust runner",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-026-G02",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-026-G02.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX026G02-002",
+      "feature": "The generic SessionController reports a SERVER HANDSHAKE_REFUSED with reason UNSPECIFIED as handshakeRefused(detail). The user sees 'server refused the handshake: <detail>' with no 'reason 0:' prefix, the log says 'Reconnecting will not recover', and the client sends no further HELLO or RESUME. Against a live srui-sessiond over a Unix socket, the native client shows the server's profile refusal, and a raw HELLO with core_version 1.5.0 receives exactly one refusal before the close.",
+      "scope": "PX-026-G02/client-macos Session/SessionController.swift serverHandshakeRefused case; Tests/SRUITests/HandshakeNegotiationTests.swift unspecifiedRefusalReportsDetailWithoutRetry; Tests/SRUITests/HandshakeRefusalSocketIntegrationTests.swift",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-026-G02",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-026-G02.md"
+      ]
+    }
+  ]
+}

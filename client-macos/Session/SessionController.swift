@@ -3123,14 +3123,19 @@ public final class SessionController: @unchecked Sendable {
         case .serverHandshakeRefused(let refusal):
             switch phase {
             case .idle, .awaitingWelcome, .awaitingResume:
-                let reason: String
+                let detail = boundedRefusalDetail(refusal.detail)
+                let description: String
                 switch refusal.reason {
                 case .snapshotUndeliverable:
-                    reason = "snapshot undeliverable"
+                    description = "snapshot undeliverable: \(detail)"
+                case .unspecified:
+                    // The detail is the whole diagnosis, e.g. an unsupported core version or a
+                    // missing required profile (PX-026-G02); a bare "reason 0" says nothing.
+                    description = detail.isEmpty ? "no reason given" : detail
                 default:
-                    reason = "reason \(refusal.reason.rawValue)"
+                    description = "reason \(refusal.reason.rawValue): \(detail)"
                 }
-                await reportFailure(.handshakeRefused("\(reason): \(boundedRefusalDetail(refusal.detail))"))
+                await reportFailure(.handshakeRefused(description))
             case .active, .awaitingSnapshot, .failed:
                 await reportFailure(.protocolViolation(
                     "Received SERVER HANDSHAKE_REFUSED after the handshake was answered"

@@ -132,6 +132,34 @@ consecutive `Transaction` envelopes instead; the frame limit itself is never rai
   paths reject any oversized string) and still reports the refusal. A reconnect with
   the same limits reproduces the refusal, so the client surfaces it rather than retrying.
 
+### Incompatible clients are refused, not silently closed (PX-026-G02)
+
+§18 requires a server to fail closed when a HELLO or RESUME `core_version` is absent or
+incompatible (compatibility is decided on `major.minor`, §15) or when the offer does not satisfy
+the session's required profiles. `srui-sessiond` fails closed by sending the same
+`ServerHandshakeRefused` message, with the existing `reason = UNSPECIFIED` and a diagnostic
+`detail`, and then closing. No proto, registry or enum value changes.
+
+- The refusal is the only frame on the connection. Both checks run before the connection is
+  subscribed and before any WELCOME, RESUME_OK, RESYNC_REQUIRED, snapshot, replay, resource or
+  Terminal frame is written (§18).
+- `detail` is short, fixed in form, and bounded to 256 bytes. It names only versions and
+  profiles: `unsupported core protocol version 1.5.0 (this server serves 0.5)` or
+  `client offer does not satisfy required profiles: [org.srui.standard-widgets/1]`.
+  - The client's own `core_version` is echoed as at most 32 characters. Any character outside
+    `[A-Za-z0-9.+_-]` becomes `?`, and an absent version reads `(none)`.
+  - The profile list names the server's missing required profiles, at most 8 of them followed
+    by `+N more`. It never echoes the client's offer.
+- Every other handshake failure still closes without a frame: timeout, EOF, malformed framing,
+  an unexpected first message, an invalid `client_instance_id` or resume map, a server
+  namespace misconfiguration, and internal errors.
+- Compatibility:
+  - Clients since PX-004-G01 already decode `ServerHandshakeRefused` and fail with
+    `handshakeRefused` instead of reconnecting. They show `server refused the handshake: reason 0:
+    <detail>`; since PX-026-G02 the client drops the `reason 0:` prefix for `UNSPECIFIED`.
+  - A client older than PX-004-G01 cannot decode the message as a refusal. It still ends on the
+    same close it sees today.
+
 ---
 
 ## Native text editing (§18.3, §22.6)

@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-025",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Bounded demonstration workloads and repeatable latency scenarios for the Process Explorer (D1 §12.2, §31.3, §31.4; D2 T28–T29, T34): an opt-in test-owned worker binary (CPU, memory, thread, short-lived-process modes) with cleanup handles, hard limits and self-termination; a userspace RTT relay (RTT/2 each way, no root) in the real SSH path; scenarios at 0/100/300/600 ms RTT, a transport interruption and a collector failure composed from srtop's existing fixtures and the runtime's own resume; native proof that local interaction gains no RTT while remote results are delayed by it; and wire bytes independent of renderer cadence. A separate package (apps/srtop/demo) so srtop's PX-008 no-process-control audit is unchanged; no srtop source, SDK, runtime, protocol, registry, proto or generated-file change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX025-001",
+      "feature": "Opt-in demonstration worker srtop-demo-worker with bounded cpu (1–4 spinning threads), memory (1–256 MiB, every page touched), threads (1–64 parked) and short-lived (1–64 children, 1–2000 ms each, 10–1000 ms apart, at most 8 alive) modes and a 1 ms–60 s deadline; every value past a limit is refused (exit 2), never clamped, and accepted at the bound; a worker refuses to start without an owner token srtop-demo-[a-z0-9-] in both --srtop-test-owner and SRTOP_DEMO_WORKER_OWNER, and the token stays in its and its children's argument vectors; it exits 0 at its deadline enforced by its main thread whatever its workload does, 20 on stop, 21 when its stdin lifeline closes (owner gone), 22 on --fail-after-ms; it touches no other process",
+      "scope": "PX-025/apps/srtop/demo src/worker.rs, src/bin/srtop-demo-worker.rs; tests/worker_test.rs",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-025",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-025.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX025-002",
+      "feature": "Cleanup handles: DemoWorker owns each worker's unreaped Child and lifeline; dropping it kills and reaps the worker, so a failing test cleans up as it unwinds; a failing worker's children end with it; interrupting the srtop-demo workers harness with SIGINT, SIGTERM or SIGKILL (none of which runs its code) ends every worker and short-lived child through the closed lifelines, measured gone within ~45 ms on macOS and Linux; cleanup is checked by the run's unique owner token in /proc cmdline (Linux) or ps argv (macOS), never by a process name, and only the tests' own unreaped children are signalled",
+      "scope": "PX-025/apps/srtop/demo src/harness.rs (DemoWorker, processes_with_owner), src/bin/srtop-demo.rs workers; tests/worker_test.rs",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-025",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-025.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX025-003",
+      "feature": "Userspace RTT injection without root, tc, dnctl or pfctl: DelayRelay (srtop-demo relay) listens on an owner-only Unix socket and joins each client to srtop's socket; each direction is a delay line releasing every chunk RTT/2 after it was read, in order and without accumulating; it counts bytes each way and cut ends every live connection while it keeps accepting; RTT at most 10 s (accepted at the bound, refused past it); in the SSH path the bridge's subsystem socket is the relay's",
+      "scope": "PX-025/apps/srtop/demo src/relay.rs, src/bin/srtop-demo.rs relay; tests/relay_test.rs",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-025",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-025.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX025-004",
+      "feature": "Repeatable scenarios against real srtop fixtures through the relay (srtop-demo scenarios prints one JSON report): filter and search results after a TEXT_EDIT arrive no sooner than one RTT and their median tracks 0/100/300/600 ms; a cut transport resumes through the same relay with the runtime's CLIENT_RESUME (RESUME_OK) at every RTT and the replay catches the client up; the scripted collector failure reaches a 300 ms client as a failure (status and freshness line say why, all three rows kept with their values, recovery moves no row); on Linux srtop's live /proc source shows the memory worker's resident size and the CPU worker's CPU; no retry protocol is added",
+      "scope": "PX-025/apps/srtop/demo src/scenario.rs, src/wire.rs, src/bin/srtop-demo.rs scenarios; tests/scenario_test.rs",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-025",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-025.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX025-005",
+      "feature": "Native local versus remote latency over real SSH with the relay between the bridge and srtop, at 0/100/300/600 ms RTT, in the unchanged generic client: typing into the filter field through the field editor's keyDown, moving its caret and scrolling rows the client already holds each complete in under 50 ms with a median within 25 ms of 0 ms RTT, and every keystroke's echo is complete while its server result is still outstanding; the committed filter status for the same typing arrives no sooner than one RTT in every sample, and its median within RTT + 1 s",
+      "scope": "PX-025/client-macos Tests/SRUITests/ProcessExplorerLatencyTests.swift localInteractionGainsNoRTTWhileRemoteResultsAreDelayedByIt",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-025",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-025.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX025-006",
+      "feature": "Wire bytes are independent of renderer cadence: two generic clients of one --fake-sequence srtop session behind a 100 ms relay, one presenting every commit and one presenting every fourth after 40 ms of extra render cost, receive byte-identical frames for the same twelve revisions and send the same bytes (zero) while only rendering, while their present passes differ",
+      "scope": "PX-025/client-macos Tests/SRUITests/ProcessExplorerLatencyTests.swift wireBytesForTheSameFakeStreamAreIndependentOfRendererCadence",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-025",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-025.md"
+      ]
+    }
+  ]
+}

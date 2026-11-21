@@ -1,0 +1,25 @@
+# PX-025: opt-in demonstration workloads and latency scenarios for the Process
+# Explorer (D1 §31.4; D2 T34). This is a separate package on purpose: srtop's own
+# package is audited by PX-008 (`tests/no_process_control_test.rs`) to contain no
+# process creation, signalling or outbound socket, and these tools do all three
+# for processes and sockets they own. Nothing here is linked into `srtop`.
+[package]
+name = "srtop-demo"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+srui-process-explorer = { path = ".." }
+srui-protocol = { path = "../../../server-rust/protocol" }
+srui-semantic-tree = { path = "../../../server-rust/semantic-tree" }
+srui-sessiond = { path = "../../../server-rust/sessiond" }
+
+[[bin]]
+name = "srtop-demo-worker"
+path = "src/bin/srtop-demo-worker.rs"
+
+[[bin]]
+name = "srtop-demo"
+path = "src/bin/srtop-demo.rs"

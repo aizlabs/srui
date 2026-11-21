@@ -102,6 +102,30 @@ class SelectionTests(unittest.TestCase):
                       [item.argv for item in commands])
         self.assertNotIn(["bash", "apps/srtop/test.sh"], [item.argv for item in commands])
 
+    def test_demo_package_is_checked_with_the_app_on_both_systems(self):
+        # PX-025: apps/srtop/demo is its own Cargo package, so the app profile names it.
+        fmt = ["cargo", "fmt", "--manifest-path", checks.DEMO_MANIFEST, "-p", "srtop-demo", "--check"]
+        clippy = ["cargo", "clippy", "--locked", "--manifest-path", checks.DEMO_MANIFEST,
+                  "--all-targets", "--", "-D", "warnings"]
+        test = ["cargo", "test", "--locked", "--manifest-path", checks.DEMO_MANIFEST,
+                "--no-fail-fast"]
+        srtop_test = ["cargo", "test", "--locked", "--manifest-path", "apps/srtop/Cargo.toml"]
+        for path in ("apps/srtop/demo/src/relay.rs", "apps/srtop/src/main.rs"):
+            self.assertEqual(self.profiles([path]), {"srtop"})
+            for system in ("Darwin", "Linux"):
+                with self.subTest(path=path, system=system):
+                    argv = [item.argv for item in
+                            checks.commands(checks.classify([path]), [path], [], [], system)]
+                    self.assertIn(fmt, argv)
+                    self.assertIn(clippy, argv)
+                    if system == "Darwin":
+                        # apps/srtop/test.sh runs the demo tests after building srtop.
+                        self.assertIn(["bash", "apps/srtop/test.sh"], argv)
+                        self.assertNotIn(test, argv)
+                    else:
+                        # After srtop's tests, which build the binary the scenarios drive.
+                        self.assertGreater(argv.index(test), argv.index(srtop_test))
+
     def test_linux_native_changes_select_syntax_check_only_when_needed(self):
         paths = [checks.NATIVE_TEST]
         commands = checks.commands(checks.classify(paths), paths, [], [], "Linux")
@@ -347,6 +371,10 @@ class GitFixture(unittest.TestCase):
         self.assertIn("fmt --manifest-path apps/srtop/Cargo.toml", executed)
         self.assertIn("clippy --locked --manifest-path apps/srtop/Cargo.toml", executed)
         self.assertIn("test --locked --manifest-path apps/srtop/Cargo.toml", executed)
+        self.assertIn("fmt --manifest-path apps/srtop/demo/Cargo.toml -p srtop-demo --check", executed)
+        self.assertIn("clippy --locked --manifest-path apps/srtop/demo/Cargo.toml", executed)
+        self.assertIn("test --locked --manifest-path apps/srtop/demo/Cargo.toml --no-fail-fast",
+                      executed)
         self.assertNotIn("Benchmarks", executed)
         self.assertEqual(subprocess.check_output(
             ["git", "--git-dir", str(bare), "rev-parse", "refs/heads/codex/app-change"],

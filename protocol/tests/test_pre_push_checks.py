@@ -342,6 +342,11 @@ class GitFixture(unittest.TestCase):
             shutil.copyfile(ROOT / name, destination)
         (self.repo / ".githooks/pre-push").chmod(0o755)
         self.write("scripts/check-test-process-stdio.sh", "#!/bin/sh\nexit 0\n")
+        # PX-026: test.sh runs the isolated endpoint check and the client listener gate; the
+        # stubs record that the srtop profile reaches them.
+        for script in ("scripts/run-px026-isolated-endpoint-check.sh",
+                       "scripts/check-client-no-listener-api.sh"):
+            self.write(script, "#!/bin/sh\nprintf '%s\\n' \"$0\" >> \"$SRUI_HOOK_TEST_LOG\"\n")
         self.write(".githooks/pre-push-full", "#!/bin/sh\nexit 99\n")
         self.write("apps/srtop/src/main.rs", "// base\n")
         self.save()
@@ -376,6 +381,10 @@ class GitFixture(unittest.TestCase):
         self.assertIn("test --locked --manifest-path apps/srtop/demo/Cargo.toml --no-fail-fast",
                       executed)
         self.assertNotIn("Benchmarks", executed)
+        if sys.platform == "darwin":
+            # Only the macOS srtop profile runs apps/srtop/test.sh (and so these two scripts).
+            self.assertIn("scripts/run-px026-isolated-endpoint-check.sh", executed)
+            self.assertIn("scripts/check-client-no-listener-api.sh", executed)
         self.assertEqual(subprocess.check_output(
             ["git", "--git-dir", str(bare), "rev-parse", "refs/heads/codex/app-change"],
             text=True).strip(), self.git("rev-parse", "HEAD"))

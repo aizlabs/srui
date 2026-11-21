@@ -344,6 +344,10 @@ jobs:
         run: swift test --package-path client-macos/LogicalChannelScheduling
       - name: Verify Accessibility API boundary (§22.9, §32.11)
         run: scripts/check-accessibility-api-boundary.sh
+      # §22.9: inspection and automation stay in-process; no client source may open a listener
+      # or IPC endpoint (PX-026).
+      - name: Verify the client opens no listener or IPC endpoint (§22.9)
+        run: bash scripts/check-client-no-listener-api.sh
       # Tests must never nest a CFRunLoop activation on the main run loop: under Swift 6.2 that
       # run loop *is* the main-actor executor, so nesting inside it either strands every
       # `@MainActor` test (the suite parks at 0% CPU) or lets the executor's own CFRunLoopStop
@@ -357,6 +361,12 @@ jobs:
       # account for every test it started.
       - name: Build and test client-macos
         run: scripts/assert-swift-test-run-complete.sh
+      # PX-026: the full run above shares one test process between suites that open listeners,
+      # so the automation test there only reports its lsof listener diff. Run those three tests
+      # alone with the strict diff on; the script fails unless the run was isolated. Reuses the
+      # build above and the srtop and bridge binaries built earlier in this job.
+      - name: PX-026 isolated endpoint check (§22.9)
+        run: bash scripts/run-px026-isolated-endpoint-check.sh
       - name: Verify committed generated protocol outputs are fresh
         run: |
           ./protocol/generate_proto.sh
@@ -390,3 +400,5 @@ jobs:
         run: bash scripts/test_assert_swift_test_run_complete.sh
       - name: Reaper selection rules
         run: bash scripts/test_reap_test_servers.sh
+      - name: Client listener/IPC API gate self-test
+        run: bash scripts/test_check_client_no_listener_api.sh

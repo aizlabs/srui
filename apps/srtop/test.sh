@@ -14,5 +14,9 @@ cargo build --locked --manifest-path server-rust/Cargo.toml -p srui-ssh-bridge
 # PX-008's release gate runs the counter example through the same generic client as the explorer.
 cargo build --locked --manifest-path examples/counter/Cargo.toml
 swift test --package-path client-macos --filter ProcessExplorerShellTests
+# PX-026: the automation tests' strict listener diff runs only alone in its test process (a full
+# run's other suites open listeners of their own); the static check holds either way.
+bash scripts/run-px026-isolated-endpoint-check.sh
+bash scripts/check-client-no-listener-api.sh
 # PX-025: local versus remote latency at 0/100/300/600 ms RTT, and wire bytes versus render cadence.
 swift test --package-path client-macos --filter ProcessExplorerLatencyTests

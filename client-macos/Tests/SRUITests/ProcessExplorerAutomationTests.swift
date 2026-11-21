@@ -176,8 +176,19 @@ extension ProcessExplorerShellTests {
             // each kind, opened and closed here, shows the listing would have seen one.
             let endpointsAfter = try await AutomationEndpoints.listing()
             try await AutomationEndpoints.expectListingDetectsAControlListener()
-            #expect(endpointsAfter.listeners.subtracting(endpointsBefore.listeners).isEmpty,
-                    "new listeners: \(endpointsAfter.listeners.subtracting(endpointsBefore.listeners))")
+            // The diff is asserted only where nothing else shares this process: a full run's other
+            // suites open their own listeners concurrently (ConnectionFakeSSHServerTests,
+            // TransportTests). scripts/run-px026-isolated-endpoint-check.sh runs these tests alone
+            // with SRUI_PX026_ISOLATED_ENDPOINT_CHECK=1 and checks that the run was isolated;
+            // scripts/check-client-no-listener-api.sh is the static guarantee either way.
+            let newListeners = endpointsAfter.listeners.subtracting(endpointsBefore.listeners)
+            if ProcessInfo.processInfo.environment["SRUI_PX026_ISOLATED_ENDPOINT_CHECK"] == "1" {
+                #expect(newListeners.isEmpty, "new listeners: \(newListeners.sorted())")
+                print("PX-026 isolated endpoint check: strict process-wide listener diff asserted; new listeners=\(newListeners.sorted())")
+            } else {
+                print("PX-026 endpoint check: process-wide listener diff NOT asserted in a shared test process "
+                    + "(run scripts/run-px026-isolated-endpoint-check.sh for the strict check); new listeners seen=\(newListeners.sorted())")
+            }
             print("PX-026 wire evidence: origins=\(origins) seqs=\(events.map(\.wire.eventSeq)) observed=\(events.map(\.wire.observedRevision)) class=\(events.map { "\($0.logicalClass)" }) acks=\(acks.map { "\($0.settledEventSeq):\($0.status)@\($0.revisionAfterEffect)" }) session=\(client.controller.sessionId ?? "-")")
             print("PX-026 retention evidence: \(retention)")
             print("PX-026 endpoint evidence: listeners before=\(endpointsBefore.listeners.sorted()) after=\(endpointsAfter.listeners.sorted()); sockets before=\(endpointsBefore.socketCount) after=\(endpointsAfter.socketCount)")

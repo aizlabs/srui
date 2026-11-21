@@ -8,7 +8,7 @@ cargo test --locked --manifest-path apps/srtop/Cargo.toml
 cargo build --locked --manifest-path apps/srtop/Cargo.toml
 # PX-025: the demonstration workers, the delay relay and the latency scenarios are their own
 # package (srtop's must stay free of process control); the scenarios drive the srtop just built.
-cargo test --locked --manifest-path apps/srtop/demo/Cargo.toml
+cargo test --locked --manifest-path apps/srtop/demo/Cargo.toml --no-fail-fast
 cargo build --locked --manifest-path apps/srtop/demo/Cargo.toml
 cargo build --locked --manifest-path server-rust/Cargo.toml -p srui-ssh-bridge
 # PX-008's release gate runs the counter example through the same generic client as the explorer.

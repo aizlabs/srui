@@ -46,6 +46,10 @@ run "benchmarks: Rust driver tests" \
 	cargo test --locked --manifest-path server-rust/Cargo.toml -p srui-benchmark-driver
 run "rust: Process Explorer test" cargo test --locked --manifest-path apps/srtop/Cargo.toml
 run "rust: Process Explorer clippy" cargo clippy --locked --manifest-path apps/srtop/Cargo.toml --all-targets -- -D warnings
+# PX-025's demo workers, relay and scenarios are their own package; its scenario tests drive the
+# srtop binary the Process Explorer test above built.
+run "rust: Process Explorer demo test" cargo test --locked --no-fail-fast --manifest-path apps/srtop/demo/Cargo.toml
+run "rust: Process Explorer demo clippy" cargo clippy --locked --manifest-path apps/srtop/demo/Cargo.toml --all-targets -- -D warnings
 run "rust: examples test" cargo test --manifest-path examples/process-monitor/Cargo.toml
 run "rust: examples clippy" cargo clippy --manifest-path examples/process-monitor/Cargo.toml --all-targets -- -D warnings
 run "rust: ui-gallery test" cargo test --manifest-path examples/ui-gallery/Cargo.toml
@@ -97,6 +101,8 @@ if [ "$(uname -s)" = Darwin ]; then
 	run "swift: build example servers" cargo build --manifest-path examples/counter/Cargo.toml
 	run "swift: build coding-agent demo" cargo build --manifest-path examples/coding-agent-demo/Cargo.toml
 	run "swift: build Process Explorer" cargo build --locked --manifest-path apps/srtop/Cargo.toml
+	# ProcessExplorerLatencyTests puts `srtop-demo relay` in the SSH path (PX-025).
+	run "swift: build Process Explorer demo tools" cargo build --locked --manifest-path apps/srtop/demo/Cargo.toml
 	# The client-macos suite can park: 0% CPU, no output, nothing printed, never returns, with
 	# every test already passed (see `scripts/run-swift-tests.sh`'s header, and branch
 	# `codex/swift-suite-park` for the current instance). A bare `swift test` here turned that park

@@ -6,7 +6,13 @@
 //! at *t* + RTT/2, in order, so a request and its answer together cross the
 //! relay one RTT later than they would without it, and a server push
 //! arrives RTT/2 later. Nothing waits for a chunk to be written before the
-//! next one is read, so the delay never accumulates and never throttles.
+//! next one is read, so the delay never accumulates.
+//!
+//! Each direction holds at most [`DEFAULT_IN_FLIGHT`] bytes (or the budget
+//! given to [`DelayRelay::start_with_budget`]) read but not yet written on.
+//! When that budget is full its reader stops reading, so the sender's socket
+//! fills and the sender blocks, exactly as it would on a socket to the far
+//! side directly: a client that stops reading still pushes back on srtop.
 //!
 //! It needs no privilege: no `tc`, `dnctl`, `pfctl` or root. In the SSH path
 //! it stands between the SSH bridge and srtop (the bridge's subsystem socket is
@@ -26,7 +32,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Condvar, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -34,6 +40,22 @@ use std::{
 
 /// The largest RTT a relay injects.
 pub const MAX_RTT: Duration = Duration::from_secs(10);
+
+/// The bytes one direction of one connection may hold in its delay line by
+/// default. It bounds what a stalled reader can make the relay buffer, while
+/// leaving the scenarios unthrottled: a delay line must hold what its sender
+/// sends during RTT/2 (the bandwidth-delay product), and 4 MiB sustains
+/// about 13 MiB/s at 600 ms RTT (300 ms one way) and 0.8 MiB/s at the
+/// 10 s maximum, against srtop's largest burst here of about 20 KiB (a
+/// 60-row snapshot). It is twice SSH's 2 MiB default channel window, the
+/// next hop's own in-flight bound.
+pub const DEFAULT_IN_FLIGHT: usize = 4 << 20;
+
+/// The largest in-flight budget a relay accepts.
+pub const MAX_IN_FLIGHT: usize = 64 << 20;
+
+/// The largest single read: also the largest chunk a delay line holds.
+const READ_CHUNK: usize = 64 * 1024;
 
 /// Byte counts of everything a relay carried, both directions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -46,6 +68,14 @@ pub struct Traffic {
 
 struct Inner {
     upstream: PathBuf,
+    /// The in-flight budget of each direction of each connection.
+    budget: usize,
+    /// Bytes read but not yet written on, over every connection, each way.
+    in_flight_up: AtomicU64,
+    in_flight_down: AtomicU64,
+    /// The most any one direction of one connection held at once, each way.
+    peak_up: AtomicU64,
+    peak_down: AtomicU64,
     up_delay: Duration,
     down_delay: Duration,
     stopping: AtomicBool,
@@ -68,6 +98,23 @@ impl DelayRelay {
     /// Listens on `listen` (which must not exist) and joins each client to
     /// `upstream`, adding `rtt / 2` in each direction.
     pub fn start(listen: &Path, upstream: &Path, rtt: Duration) -> io::Result<Self> {
+        Self::start_with_budget(listen, upstream, rtt, DEFAULT_IN_FLIGHT)
+    }
+
+    /// As [`Self::start`], holding at most `budget` bytes (1 to
+    /// [`MAX_IN_FLIGHT`]) in each direction of each connection.
+    pub fn start_with_budget(
+        listen: &Path,
+        upstream: &Path,
+        rtt: Duration,
+        budget: usize,
+    ) -> io::Result<Self> {
+        if budget == 0 || budget > MAX_IN_FLIGHT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("an in-flight budget of 1..={MAX_IN_FLIGHT} bytes, not {budget}"),
+            ));
+        }
         if rtt > MAX_RTT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -85,6 +132,11 @@ impl DelayRelay {
         let one_way = rtt / 2;
         let inner = Arc::new(Inner {
             upstream: upstream.to_path_buf(),
+            budget,
+            in_flight_up: AtomicU64::new(0),
+            in_flight_down: AtomicU64::new(0),
+            peak_up: AtomicU64::new(0),
+            peak_down: AtomicU64::new(0),
             up_delay: one_way,
             down_delay: rtt - one_way,
             stopping: AtomicBool::new(false),
@@ -126,6 +178,27 @@ impl DelayRelay {
             up: self.inner.up.load(Ordering::SeqCst),
             down: self.inner.down.load(Ordering::SeqCst),
         }
+    }
+
+    /// Bytes read but not yet written on, each way, over every connection.
+    pub fn in_flight(&self) -> Traffic {
+        Traffic {
+            up: self.inner.in_flight_up.load(Ordering::SeqCst),
+            down: self.inner.in_flight_down.load(Ordering::SeqCst),
+        }
+    }
+
+    /// The most one direction of one connection has held at once.
+    pub fn peak_in_flight(&self) -> Traffic {
+        Traffic {
+            up: self.inner.peak_up.load(Ordering::SeqCst),
+            down: self.inner.peak_down.load(Ordering::SeqCst),
+        }
+    }
+
+    /// The in-flight budget of each direction of each connection.
+    pub fn budget(&self) -> usize {
+        self.inner.budget
     }
 
     /// How many connections were accepted.
@@ -236,6 +309,51 @@ enum Direction {
     Down,
 }
 
+/// One direction's in-flight byte budget: the reader admits a chunk only
+/// while it fits, the writer releases it once written, and a writer that has
+/// ended closes it so a waiting reader gives up.
+struct Budget {
+    state: Mutex<(usize, bool)>,
+    room: Condvar,
+    limit: usize,
+}
+
+impl Budget {
+    fn new(limit: usize) -> Self {
+        Self {
+            state: Mutex::new((0, false)),
+            room: Condvar::new(),
+            limit,
+        }
+    }
+
+    /// Waits until `bytes` more fit; returns the bytes then held, or `None`
+    /// once the writer has ended.
+    fn admit(&self, bytes: usize) -> Option<usize> {
+        let mut state = self.state.lock().unwrap();
+        while !state.1 && state.0 + bytes > self.limit {
+            state = self.room.wait(state).unwrap();
+        }
+        if state.1 {
+            return None;
+        }
+        state.0 += bytes;
+        Some(state.0)
+    }
+
+    fn release(&self, bytes: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.0 -= bytes;
+        self.room.notify_all();
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.1 = true;
+        self.room.notify_all();
+    }
+}
+
 /// One direction's delay line: a reader that timestamps each chunk and a
 /// writer that releases it `delay` after it was read.
 fn pump(
@@ -246,9 +364,13 @@ fn pump(
     direction: Direction,
     id: u64,
 ) -> io::Result<()> {
+    // The channel itself is unbounded; what it may hold is bounded by `budget`.
     let (line, queue) = mpsc::channel::<Option<(Instant, Vec<u8>)>>();
+    let budget = Arc::new(Budget::new(inner.budget));
     let writer = {
         let from = from.try_clone()?;
+        let budget = Arc::clone(&budget);
+        let inner = Arc::clone(&inner);
         thread::Builder::new()
             .name("relay-write".into())
             .spawn(move || {
@@ -257,16 +379,29 @@ fn pump(
                     if due > now {
                         thread::sleep(due - now);
                     }
-                    if to.write_all(&chunk).is_err() {
+                    let written = to.write_all(&chunk);
+                    budget.release(chunk.len());
+                    let (counter, in_flight) = match direction {
+                        Direction::Up => (&inner.up, &inner.in_flight_up),
+                        Direction::Down => (&inner.down, &inner.in_flight_down),
+                    };
+                    in_flight.fetch_sub(chunk.len() as u64, Ordering::SeqCst);
+                    if written.is_err() {
                         let _ = from.shutdown(Shutdown::Both);
                         let _ = to.shutdown(Shutdown::Both);
                         break;
                     }
-                    let counter = match direction {
-                        Direction::Up => &inner.up,
-                        Direction::Down => &inner.down,
-                    };
                     counter.fetch_add(chunk.len() as u64, Ordering::SeqCst);
+                }
+                // A reader waiting for room must not wait for a writer that ended.
+                budget.close();
+                // What the line still held is dropped with it.
+                while let Ok(Some((_, chunk))) = queue.try_recv() {
+                    let in_flight = match direction {
+                        Direction::Up => &inner.in_flight_up,
+                        Direction::Down => &inner.in_flight_down,
+                    };
+                    in_flight.fetch_sub(chunk.len() as u64, Ordering::SeqCst);
                 }
                 // The reader saw end of file (or the far side failed): pass it on.
                 let _ = to.shutdown(Shutdown::Write);
@@ -279,13 +414,26 @@ fn pump(
     thread::Builder::new()
         .name("relay-read".into())
         .spawn(move || {
-            let mut buffer = vec![0_u8; 64 * 1024];
+            let mut buffer = vec![0_u8; READ_CHUNK.min(inner.budget)];
+            let (in_flight, peak) = match direction {
+                Direction::Up => (&inner.in_flight_up, &inner.peak_up),
+                Direction::Down => (&inner.in_flight_down, &inner.peak_down),
+            };
             loop {
                 match from.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
+                        // Stop reading while the line is full: the sender's
+                        // socket then fills and the sender blocks.
+                        let Some(held) = budget.admit(read) else {
+                            break;
+                        };
+                        peak.fetch_max(held as u64, Ordering::SeqCst);
+                        in_flight.fetch_add(read as u64, Ordering::SeqCst);
+                        // Timed from when the chunk entered the line.
                         let due = Instant::now() + delay;
                         if line.send(Some((due, buffer[..read].to_vec()))).is_err() {
+                            in_flight.fetch_sub(read as u64, Ordering::SeqCst);
                             break;
                         }
                     }

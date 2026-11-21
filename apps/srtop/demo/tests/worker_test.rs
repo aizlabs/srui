@@ -383,6 +383,66 @@ fn a_worker_whose_owner_vanished_ends_at_once() {
     none_live(&owner, Duration::from_secs(1));
 }
 
+/// One `srtop-demo workers` run starts at most one worker per workload: each
+/// of the four once is accepted (the bound), and any flag given twice is
+/// refused before anything starts (just past it).
+#[test]
+fn the_workers_harness_runs_one_worker_per_workload_and_refuses_a_repeat() {
+    let run = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_srtop-demo"))
+            .args(["workers", "--duration-ms", "300"])
+            .args(extra)
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap()
+    };
+    let every = [
+        "--cpu-threads",
+        "1",
+        "--memory-mib",
+        "1",
+        "--threads",
+        "1",
+        "--short-lived",
+        "1",
+    ];
+    let at_bound = run(&every);
+    assert!(at_bound.status.success(), "{at_bound:?}");
+    let stdout = String::from_utf8_lossy(&at_bound.stdout);
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("worker "))
+            .count(),
+        4
+    );
+    let owner = stdout
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("owner ")
+        .unwrap()
+        .to_string();
+    none_live(&owner, Duration::from_secs(2));
+    for repeated in [
+        &["--threads", "1", "--threads", "1"][..],
+        &["--cpu-threads", "1", "--cpu-threads", "1"],
+        &["--memory-mib", "1", "--memory-mib", "1"],
+        &["--short-lived", "1", "--short-lived", "1"],
+        &["--threads", "1", "--duration-ms", "300"],
+    ] {
+        let refused = run(repeated);
+        assert_eq!(refused.status.code(), Some(2), "{repeated:?}");
+        assert!(
+            refused.stdout.is_empty(),
+            "{repeated:?} started something: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("given twice"));
+    }
+}
+
 /// The `srtop-demo workers` harness, started with every mode and read until
 /// it has named its owner token and every worker.
 fn start_harness() -> (Child, String, Vec<(String, u32)>) {

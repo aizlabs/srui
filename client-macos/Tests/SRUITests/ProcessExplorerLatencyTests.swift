@@ -91,6 +91,7 @@ struct ProcessExplorerLatencyTests {
         await harness.shutDown()
 
         let baseline = try #require(evidence.first)
+        let floor = min(try #require(baseline.remote.min()), .milliseconds(30))
         for run in evidence {
             let rtt = Duration.milliseconds(run.rtt)
             for (kind, samples, base) in [
@@ -117,10 +118,14 @@ struct ProcessExplorerLatencyTests {
             for sample in run.remote {
                 #expect(sample >= rtt, "a remote result at \(run.rtt) ms RTT arrived after \(sample)")
             }
-            // Every sample is at least one RTT (above); and not held far past it. A shift against
-            // the 0 ms median is not asserted: under a loaded parallel run that median alone can
-            // exceed 100 ms, while the per-sample lower bound holds whatever the load.
-            #expect(Self.median(run.remote) < rtt + .milliseconds(1_000))
+            // And not one more round trip: the fastest result arrives within 1.5 RTT plus this
+            // run's own 0 ms floor (its fastest 0 ms result, at most 30 ms) plus 5 ms. A result
+            // that waited an extra RTT takes at least 2 RTT, past this bound at every nonzero
+            // RTT. The minimum, not the median: under a loaded parallel run the 0 ms median alone
+            // exceeded 150 ms while the fastest samples stayed near the floor.
+            let ceiling = rtt + rtt / 2 + floor + .milliseconds(5)
+            #expect(run.remote.min()! < ceiling,
+                    "the fastest remote result at \(run.rtt) ms RTT took \(run.remote.min()!), past \(ceiling)")
             print("PX-025 native latency evidence: rtt \(run.rtt) ms; typing \(Self.list(run.typing)); caret \(Self.list(run.caret)); scrolling \(Self.list(run.scrolling)); remote filter result \(Self.list(run.remote)); held at local completion \(run.heldAtLocalCompletion)/\(run.typing.count); bytes sent during caret+scroll \(run.sentDuringCaretAndScroll)")
         }
     }
@@ -228,9 +233,10 @@ struct ProcessExplorerLatencyTests {
         return run
     }
 
-    /// §12.2, §31.3: two clients of one srtop session, one presenting every commit at once and
-    /// one presenting slowly and in batches, receive the same bytes for every revision of the same
-    /// deterministic stream and send the same bytes; only their present passes differ.
+    /// §12.2, §31.3: two clients of one srtop session, one rendering and presenting every commit
+    /// at once and one so slow that it falls behind the stream and renders a third as often,
+    /// receive the same bytes for every revision of the same deterministic stream and send the
+    /// same bytes; only their render and present counts differ.
     @Test(.timeLimit(.minutes(2)))
     @MainActor
     func wireBytesForTheSameFakeStreamAreIndependentOfRendererCadence() async throws {
@@ -268,8 +274,10 @@ struct ProcessExplorerLatencyTests {
                 self.renderCost = renderCost
             }
         }
+        // The stream commits every 150 ms. The slow client spends 450 ms more on every render,
+        // so it falls behind the stream and renders about a third as often over the same window.
         let cadences = [Cadence(name: "every commit", batch: 1, renderCost: .zero),
-                        Cadence(name: "slow batches", batch: 4, renderCost: .milliseconds(40))]
+                        Cadence(name: "slow batches", batch: 2, renderCost: .milliseconds(450))]
         var clients: [(Cadence, WireTap, SessionController, TransactionApplier, AppKitRenderer)] = []
         for cadence in cadences {
             let tap = WireTap(inner: SSHTransport(configuration: harness.configuration))
@@ -298,12 +306,26 @@ struct ProcessExplorerLatencyTests {
                 clients.allSatisfy { $0.3.lastAppliedRevision.value >= 1 && $0.2.isEventDispatchEnabled }
             }
             let sentAtReady = clients.map { $0.1.sentBytes }
-            let start = clients.map { $0.3.lastAppliedRevision.value }.max() ?? 0
-            // Twelve more commits of the script: more than two cycles, failed scan included.
-            try await AsyncTestSupport.eventually(timeout: .seconds(30), description: "twelve commits on both clients") {
-                clients.allSatisfy { $0.3.lastAppliedRevision.value >= start + 12 }
-            }
+            let rendersAtStart = cadences.map { cadence in cadence.lock.withLock { cadence.renders } }
+            let presentsAtStart = cadences.map { cadence in cadence.lock.withLock { cadence.presents } }
+            // The fast client is current; the window is its next twelve commits of the script:
+            // more than two cycles, failed scan included.
+            let start = clients[0].3.lastAppliedRevision.value
             let end = start + 12
+            // The fast client has rendered each of them (a render ends after its apply, so the
+            // applied revision alone can run one render ahead), and both have received them.
+            try await AsyncTestSupport.eventually(timeout: .seconds(30), description: "twelve commits rendered by the fast client and received by both") {
+                clients[0].3.lastAppliedRevision.value >= end
+                    && cadences[0].lock.withLock { cadences[0].renders } - rendersAtStart[0] >= 12
+                    && clients.allSatisfy { $0.1.transactions(in: (start + 1)...end).count == 12 }
+            }
+            let renders = cadences.enumerated().map { index, cadence in
+                cadence.lock.withLock { cadence.renders } - rendersAtStart[index]
+            }
+            let presents = cadences.enumerated().map { index, cadence in
+                cadence.lock.withLock { cadence.presents } - presentsAtStart[index]
+            }
+            let slowApplied = clients[1].3.lastAppliedRevision.value
             let streams = clients.map { $0.1.transactions(in: (start + 1)...end) }
             let sent = clients.enumerated().map { $0.element.1.sentBytes - sentAtReady[$0.offset] }
             for (index, stream) in streams.enumerated() {
@@ -313,12 +335,13 @@ struct ProcessExplorerLatencyTests {
             #expect(streams[0].map(\.bytes) == streams[1].map(\.bytes),
                     "the same revisions arrived as different bytes at different render cadences")
             #expect(sent[0] == sent[1], "the clients sent \(sent) bytes while only rendering")
-            let presents = cadences.map { cadence in cadence.lock.withLock { cadence.presents } }
-            let renders = cadences.map { cadence in cadence.lock.withLock { cadence.renders } }
-            // Not vacuous: the cadence really differed.
-            #expect(presents[0] > presents[1], "present passes \(presents) did not differ")
+            // Not vacuous: over the same window the slow client genuinely rendered (and presented)
+            // far fewer times, and was behind the stream, while it received every byte.
+            #expect(renders[1] * 2 <= renders[0], "renders \(renders) did not differ materially")
+            #expect(presents[1] * 2 <= presents[0], "present passes \(presents) did not differ")
+            #expect(slowApplied < end, "the slow client kept up (applied \(slowApplied) of \(end))")
             let bytes = streams.map { $0.reduce(0) { $0 + $1.bytes.count } }
-            print("PX-025 render cadence evidence: revisions \(start + 1)...\(end); bytes received \(bytes) (identical per revision: \(streams[0].map(\.bytes) == streams[1].map(\.bytes))); bytes sent after ready \(sent); renders \(renders); present passes \(presents)")
+            print("PX-025 render cadence evidence: revisions \(start + 1)...\(end); bytes received \(bytes) (identical per revision: \(streams[0].map(\.bytes) == streams[1].map(\.bytes))); bytes sent in the window \(sent); renders in the window \(renders); present passes \(presents); slow client applied \(slowApplied) of \(end)")
         } catch {
             for (_, _, controller, _, _) in clients { await controller.stop() }
             throw error
@@ -486,6 +509,11 @@ private final class LatencyHarness: @unchecked Sendable {
     func shutDown() async {
         let server = self.server
         let sshd = self.sshd
+        // lc-debt: as PX-023's KnownHostsHint.stop, Foundation reaps a child before `isRunning`
+        // turns false, so between that reap and this signal a recycled PID could be hit. Every
+        // `isRunning`-then-`kill` in this file (srtop here and in `launch`, the relay in
+        // `RelayProcess.stop`) shares that microsecond window. Upgrade path: posix_spawn and our
+        // own waitpid, so the PID stays ours until we have finished signalling.
         if server.isRunning { kill(server.processIdentifier, SIGINT) }
         await onThread {
             server.waitUntilExit()

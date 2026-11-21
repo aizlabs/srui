@@ -9,7 +9,7 @@
 use srui_process_explorer::MODEL;
 use srui_protocol::{
     decode_framed, encode_framed, srui_message::Msg, ClientHello, ClientResume, SessionContinuity,
-    SruiMessage,
+    SruiMessage, DEFAULT_MAX_FRAME_SIZE,
 };
 use srui_semantic_tree::{
     EditSeq, Event as DomainEvent, NodeId, PropertyRef, ResyncSnapshot, SemanticStore, Value,
@@ -26,6 +26,40 @@ use std::{
 pub type Result<T> = std::result::Result<T, String>;
 
 const PROFILE: &str = "org.srui.standard-widgets/1";
+
+/// The length of the first frame in `buffer` (its varint prefix plus its
+/// payload), once `buffer` holds all of it: `Ok(None)` while more is needed.
+/// A declared payload longer than `max_frame` bytes (§26), a prefix longer
+/// than ten bytes or one that does not fit 64 bits is an error at once, so a
+/// hostile length is never buffered, and no sum can overflow.
+pub fn frame_extent(buffer: &[u8], max_frame: usize) -> Result<Option<usize>> {
+    let mut length: u64 = 0;
+    for (index, byte) in buffer.iter().take(10).enumerate() {
+        let bits = u64::from(byte & 0x7f);
+        let shift = 7 * index as u32;
+        // The tenth byte may carry only the 64th bit.
+        if index == 9 && bits > 1 {
+            return Err("a frame length prefix that does not fit 64 bits".into());
+        }
+        length |= bits << shift;
+        if byte & 0x80 == 0 {
+            let payload = usize::try_from(length)
+                .ok()
+                .filter(|payload| *payload <= max_frame)
+                .ok_or_else(|| {
+                    format!("a frame of {length} bytes exceeds the {max_frame}-byte limit (§26)")
+                })?;
+            let extent = (index + 1)
+                .checked_add(payload)
+                .ok_or("a frame length that overflows")?;
+            return Ok((buffer.len() >= extent).then_some(extent));
+        }
+    }
+    if buffer.len() >= 10 {
+        return Err("a frame length prefix longer than ten bytes".into());
+    }
+    Ok(None)
+}
 
 /// How a server answered a `CLIENT_RESUME` (§18).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,23 +218,13 @@ impl Replica {
         Ok(message)
     }
 
-    /// The next framed message, not applied.
+    /// The next framed message, not applied. A frame whose declared length
+    /// exceeds the §26 limit is refused before any of it is buffered.
     pub fn next_raw(&mut self) -> Result<SruiMessage> {
         loop {
-            let mut value = 0_usize;
-            let mut prefix = None;
-            for (index, byte) in self.buffer.iter().take(10).enumerate() {
-                value |= usize::from(byte & 0x7f) << (7 * index);
-                if byte & 0x80 == 0 {
-                    prefix = Some(index + 1);
-                    break;
-                }
-            }
-            if let Some(prefix) = prefix {
-                if self.buffer.len() >= prefix + value {
-                    let frame: Vec<u8> = self.buffer.drain(..prefix + value).collect();
-                    return decode_framed(&frame).map_err(|error| error.to_string());
-                }
+            if let Some(extent) = frame_extent(&self.buffer, DEFAULT_MAX_FRAME_SIZE)? {
+                let frame: Vec<u8> = self.buffer.drain(..extent).collect();
+                return decode_framed(&frame).map_err(|error| error.to_string());
             }
             let mut chunk = [0_u8; 64 * 1024];
             let read = self

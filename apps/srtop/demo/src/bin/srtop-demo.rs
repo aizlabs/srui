@@ -9,8 +9,9 @@
 //!
 //! srtop-demo workers --duration-ms MS [--cpu-threads N] [--memory-mib N]
 //!     [--threads N] [--short-lived COUNT]
-//!     Starts one worker per requested mode under one fresh owner token,
-//!     prints `owner TOKEN` and `worker MODE PID`, and waits for them all to
+//!     Starts one worker per requested mode under one fresh owner token (each
+//!     flag at most once, so at most four workers), prints `owner TOKEN` and
+//!     `worker MODE PID`, and waits for them all to
 //!     end. However this process ends — normally, SIGINT, SIGTERM or SIGKILL —
 //!     its workers end with it (their lifelines close).
 //!
@@ -115,7 +116,14 @@ fn workers(args: &[String]) -> Result<()> {
     let owner = fresh_owner();
     let mut duration = None;
     let mut modes = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     for (flag, value) in flag_values(args)? {
+        // One worker per named workload: a repeated flag would multiply the
+        // per-worker limits, so a run is at most one worker of each mode.
+        if seen.contains(&flag) {
+            return Err(format!("{flag} given twice: one worker per workload"));
+        }
+        seen.push(flag.clone());
         let value = number(&flag, &value)?;
         let small = u32::try_from(value).map_err(|_| format!("{flag} is out of range"))?;
         match flag.as_str() {

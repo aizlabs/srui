@@ -33,6 +33,8 @@ HOOK_FILES = {
     "protocol/tests/test_pre_push_checks.py",
 }
 NATIVE_TEST = "client-macos/Tests/SRUITests/ProcessExplorerShellTests.swift"
+# PX-025's demonstration tools: a separate Cargo package under apps/srtop.
+DEMO_MANIFEST = "apps/srtop/demo/Cargo.toml"
 
 LOCK_FILE = "srui-pre-push.lock"
 # One full-profile run (uv sync + cargo + swift) takes several minutes, so the wait has
@@ -200,6 +202,7 @@ def commands(profiles: dict[str, list[str]], paths: list[str],
         ])
     elif "srtop" in profiles:
         manifest = ["--locked", "--manifest-path", "apps/srtop/Cargo.toml"]
+        demo_manifest = ["--locked", "--manifest-path", DEMO_MANIFEST]
         checks.extend([
             Check("Process Explorer formatting", [
                 "cargo", "fmt", "--manifest-path", "apps/srtop/Cargo.toml",
@@ -207,6 +210,13 @@ def commands(profiles: dict[str, list[str]], paths: list[str],
             ], builds=True),
             Check("Process Explorer Clippy",
                   ["cargo", "clippy", *manifest, "--all-targets", "--", "-D", "warnings"],
+                  builds=True),
+            # PX-025: the demo workers, relay and scenarios are a separate package.
+            Check("Process Explorer demo formatting", [
+                "cargo", "fmt", "--manifest-path", DEMO_MANIFEST, "-p", "srtop-demo", "--check",
+            ], builds=True),
+            Check("Process Explorer demo Clippy",
+                  ["cargo", "clippy", *demo_manifest, "--all-targets", "--", "-D", "warnings"],
                   builds=True),
             Check("test process stdio", ["bash", "scripts/check-test-process-stdio.sh"]),
         ])
@@ -224,6 +234,9 @@ def commands(profiles: dict[str, list[str]], paths: list[str],
                 ]))
             checks.append(Check("Process Explorer Rust tests",
                                 ["cargo", "test", *manifest], builds=True))
+            # After srtop's tests, which build the srtop binary its scenarios drive.
+            checks.append(Check("Process Explorer demo tests",
+                                ["cargo", "test", *demo_manifest, "--no-fail-fast"], builds=True))
     return checks
 
 

@@ -105,6 +105,13 @@ impl Drop for Srtop {
 #[test]
 fn remote_results_are_delayed_by_the_injected_rtt() {
     let srtop = Srtop::start(&["--fake-repeated-names"]);
+    // This run's 0 ms floor: its fastest result without injected delay, at
+    // most 30 ms. Set by the first RTT, which is 0.
+    assert_eq!(RTTS_MS[0], 0);
+    let mut floor = None;
+    // Every RTT is measured and every violation reported, so a regression
+    // shows at each RTT it affects rather than at the first one only.
+    let mut violations = Vec::new();
     for rtt_ms in RTTS_MS {
         let rtt = Duration::from_millis(rtt_ms);
         let report = remote_results(
@@ -117,26 +124,35 @@ fn remote_results_are_delayed_by_the_injected_rtt() {
         for (kind, samples) in [("filter", &report.filter), ("search", &report.search)] {
             assert_eq!(samples.len(), 5);
             for sample in samples.iter() {
-                assert!(
-                    *sample >= rtt,
-                    "rtt {rtt_ms}: a {kind} result arrived after {sample:?}, sooner than one RTT"
-                );
+                if *sample < rtt {
+                    violations.push(format!(
+                        "rtt {rtt_ms}: a {kind} result arrived after {sample:?}, sooner than one RTT"
+                    ));
+                }
             }
-            assert!(
-                median(samples) < rtt + Duration::from_millis(400),
-                "rtt {rtt_ms}: {kind} p50 {:?}",
-                median(samples)
-            );
+            if median(samples) >= rtt + Duration::from_millis(400) {
+                violations.push(format!("rtt {rtt_ms}: {kind} p50 {:?}", median(samples)));
+            }
+            // Not one round trip more: the fastest result is within 1.5 RTT
+            // plus the 0 ms floor plus 5 ms, while a result that waited an
+            // extra RTT takes at least 2 RTT.
+            let fastest = *samples.iter().min().unwrap();
+            let floor = *floor.get_or_insert_with(|| fastest.min(Duration::from_millis(30)));
+            let ceiling = rtt + rtt / 2 + floor + Duration::from_millis(5);
+            if fastest >= ceiling {
+                violations.push(format!(
+                    "rtt {rtt_ms}: the fastest {kind} result took {fastest:?}, past {ceiling:?}"
+                ));
+            }
         }
         // The handshake crosses the relay too.
-        assert!(
-            report.attach >= rtt,
-            "rtt {rtt_ms}: attach {:?}",
-            report.attach
-        );
+        if report.attach < rtt {
+            violations.push(format!("rtt {rtt_ms}: attach {:?}", report.attach));
+        }
         assert!(report.traffic.up > 0 && report.traffic.down > 0);
         println!("PX-025 remote result evidence: {}", report.to_json());
     }
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
 }
 
 /// A cut transport is resumed through the same relay with the runtime's own

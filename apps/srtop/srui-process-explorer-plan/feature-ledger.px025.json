@@ -27,7 +27,7 @@
     },
     {
       "feature_id": "SRUI-PX025-002",
-      "feature": "Cleanup handles: DemoWorker owns each worker's unreaped Child and lifeline; dropping it kills and reaps the worker, so a failing test cleans up as it unwinds; a failing worker's children end with it; interrupting the srtop-demo workers harness with SIGINT, SIGTERM or SIGKILL (none of which runs its code) ends every worker and short-lived child through the closed lifelines, measured gone within ~45 ms on macOS and Linux; cleanup is checked by the run's unique owner token in /proc cmdline (Linux) or ps argv (macOS), never by a process name, and only the tests' own unreaped children are signalled",
+      "feature": "Cleanup handles: DemoWorker owns each worker's unreaped Child and lifeline; dropping it kills and reaps the worker, so a failing test cleans up as it unwinds; a failing worker's children end with it; interrupting the srtop-demo workers harness with SIGINT, SIGTERM or SIGKILL (none of which runs its code) ends every worker and short-lived child through the closed lifelines, measured gone within ~45 ms on macOS and Linux; cleanup is checked by the run's unique owner token in /proc cmdline (Linux) or ps argv (macOS), never by a process name, and only the tests' own unreaped children are signalled; round 2 (verifier F4): srtop-demo workers accepts each workload flag at most once (four workers at most per run) and refuses a repeated one (exit 2) before anything starts, tested at the bound and just past it",
       "scope": "PX-025/apps/srtop/demo src/harness.rs (DemoWorker, processes_with_owner), src/bin/srtop-demo.rs workers; tests/worker_test.rs",
       "source_refs": [
         "D1",
@@ -41,8 +41,8 @@
     },
     {
       "feature_id": "SRUI-PX025-003",
-      "feature": "Userspace RTT injection without root, tc, dnctl or pfctl: DelayRelay (srtop-demo relay) listens on an owner-only Unix socket and joins each client to srtop's socket; each direction is a delay line releasing every chunk RTT/2 after it was read, in order and without accumulating; it counts bytes each way and cut ends every live connection while it keeps accepting; RTT at most 10 s (accepted at the bound, refused past it); in the SSH path the bridge's subsystem socket is the relay's",
-      "scope": "PX-025/apps/srtop/demo src/relay.rs, src/bin/srtop-demo.rs relay; tests/relay_test.rs",
+      "feature": "Userspace RTT injection without root, tc, dnctl or pfctl: DelayRelay (srtop-demo relay) listens on an owner-only Unix socket and joins each client to srtop's socket; each direction is a delay line releasing every chunk RTT/2 after it was read, in order and without accumulating; it counts bytes each way and cut ends every live connection while it keeps accepting; RTT at most 10 s (accepted at the bound, refused past it); in the SSH path the bridge's subsystem socket is the relay's; round 2 (verifier F3): each direction of each connection holds at most 4 MiB in flight (DEFAULT_IN_FLIGHT; start_with_budget takes 1 byte to 64 MiB); a full budget stops the reader, so a client that never reads blocks the sender (tested: a 256 KiB budget holds exactly 256 KiB and not a byte more, and a server offering 64 MiB to a non-reading client hands off at most the budget plus kernel buffers); the in-flight and peak bytes are observable",
+      "scope": "PX-025/apps/srtop/demo src/relay.rs, src/bin/srtop-demo.rs relay; tests/relay_test.rs; round 2 tests/relay_test.rs budget tests",
       "source_refs": [
         "D1",
         "D2"
@@ -55,8 +55,8 @@
     },
     {
       "feature_id": "SRUI-PX025-004",
-      "feature": "Repeatable scenarios against real srtop fixtures through the relay (srtop-demo scenarios prints one JSON report): filter and search results after a TEXT_EDIT arrive no sooner than one RTT and their median tracks 0/100/300/600 ms; a cut transport resumes through the same relay with the runtime's CLIENT_RESUME (RESUME_OK) at every RTT and the replay catches the client up; the scripted collector failure reaches a 300 ms client as a failure (status and freshness line say why, all three rows kept with their values, recovery moves no row); on Linux srtop's live /proc source shows the memory worker's resident size and the CPU worker's CPU; no retry protocol is added",
-      "scope": "PX-025/apps/srtop/demo src/scenario.rs, src/wire.rs, src/bin/srtop-demo.rs scenarios; tests/scenario_test.rs",
+      "feature": "Repeatable scenarios against real srtop fixtures through the relay (srtop-demo scenarios prints one JSON report): filter and search results after a TEXT_EDIT arrive no sooner than one RTT and their median tracks 0/100/300/600 ms; a cut transport resumes through the same relay with the runtime's CLIENT_RESUME (RESUME_OK) at every RTT and the replay catches the client up; the scripted collector failure reaches a 300 ms client as a failure (status and freshness line say why, all three rows kept with their values, recovery moves no row); on Linux srtop's live /proc source shows the memory worker's resident size and the CPU worker's CPU; no retry protocol is added; round 2: the scenario's fastest result at each RTT must be under 1.5 RTT plus the run's 0 ms floor (at most 30 ms) plus 5 ms, so one extra round trip fails at 100, 300 and 600 ms (verifier F5), and every RTT's violations are reported together; the replica refuses a frame declared past the 16 MiB §26 limit, an overlong or overflowing length prefix, before buffering any of it (F7); the demo package is built, tested and linted by the pre-push hooks and built by scripts/run-swift-tests.sh (F2)",
+      "scope": "PX-025/apps/srtop/demo src/scenario.rs, src/wire.rs, src/bin/srtop-demo.rs scenarios; tests/scenario_test.rs; round 2 tests/wire_test.rs; .githooks/pre-push-full, scripts/run-swift-tests.sh, scripts/pre_push_checks.py, protocol/tests/test_pre_push_checks.py",
       "source_refs": [
         "D1",
         "D2"
@@ -69,7 +69,7 @@
     },
     {
       "feature_id": "SRUI-PX025-005",
-      "feature": "Native local versus remote latency over real SSH with the relay between the bridge and srtop, at 0/100/300/600 ms RTT, in the unchanged generic client: typing into the filter field through the field editor's keyDown, moving its caret and scrolling rows the client already holds each complete in under 50 ms with a median within 25 ms of 0 ms RTT, and every keystroke's echo is complete while its server result is still outstanding; the committed filter status for the same typing arrives no sooner than one RTT in every sample, and its median within RTT + 1 s",
+      "feature": "Native local versus remote latency over real SSH with the relay between the bridge and srtop, at 0/100/300/600 ms RTT, in the unchanged generic client: typing into the filter field through the field editor's keyDown, moving its caret and scrolling rows the client already holds each complete in under 50 ms with a median within 25 ms of 0 ms RTT, and every keystroke's echo is complete while its server result is still outstanding; the committed filter status for the same typing arrives no sooner than one RTT in every sample, and its median within RTT + 1 s; round 2 (verifier F5): the remote result's fastest sample must also be under 1.5 RTT plus the run's 0 ms floor (at most 30 ms) plus 5 ms, which an extra round trip exceeds at every nonzero RTT",
       "scope": "PX-025/client-macos Tests/SRUITests/ProcessExplorerLatencyTests.swift localInteractionGainsNoRTTWhileRemoteResultsAreDelayedByIt",
       "source_refs": [
         "D1",
@@ -83,7 +83,7 @@
     },
     {
       "feature_id": "SRUI-PX025-006",
-      "feature": "Wire bytes are independent of renderer cadence: two generic clients of one --fake-sequence srtop session behind a 100 ms relay, one presenting every commit and one presenting every fourth after 40 ms of extra render cost, receive byte-identical frames for the same twelve revisions and send the same bytes (zero) while only rendering, while their present passes differ",
+      "feature": "Wire bytes are independent of renderer cadence: two generic clients of one --fake-sequence srtop session behind a 100 ms relay, one rendering and presenting every commit and one slowed renderer, receive byte-identical frames for the same twelve revisions and send the same bytes (zero) while only rendering, while their render and present counts differ; round 2 (verifier F6): the slow client adds 450 ms to every render against a 150 ms commit interval, so it falls behind the stream and renders about a quarter as often over the same window (12 vs 3 in the measured runs, asserted at most half), while it receives byte-identical frames for every revision and sends the same bytes",
       "scope": "PX-025/client-macos Tests/SRUITests/ProcessExplorerLatencyTests.swift wireBytesForTheSameFakeStreamAreIndependentOfRendererCadence",
       "source_refs": [
         "D1",

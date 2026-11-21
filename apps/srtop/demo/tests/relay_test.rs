@@ -3,7 +3,7 @@
 //! every connection while the relay keeps accepting, and the `srtop-demo relay`
 //! command that the native client's tests put in front of srtop.
 
-use srtop_demo::relay::{DelayRelay, Traffic, MAX_RTT};
+use srtop_demo::relay::{DelayRelay, Traffic, DEFAULT_IN_FLIGHT, MAX_IN_FLIGHT, MAX_RTT};
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
@@ -14,8 +14,8 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc, Arc,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -135,7 +135,20 @@ fn the_delay_neither_accumulates_nor_reorders() {
     let rtt = Duration::from_millis(200);
     let relay = DelayRelay::start(&scratch.path("r.sock"), &upstream, rtt).unwrap();
     let client = connect(relay.listen_path());
-    let mut reader = client.try_clone().unwrap();
+    // Echoes are read and stamped as they arrive, while the sends go on, so
+    // each is timed against its own send and nothing else.
+    let reader = {
+        let mut reader = client.try_clone().unwrap();
+        thread::spawn(move || {
+            (0..20)
+                .map(|_| {
+                    let mut byte = [0_u8; 1];
+                    reader.read_exact(&mut byte).unwrap();
+                    (byte[0], Instant::now())
+                })
+                .collect::<Vec<_>>()
+        })
+    };
     let sends: Vec<Instant> = {
         let mut writer = client;
         (0..20_u8)
@@ -147,12 +160,13 @@ fn the_delay_neither_accumulates_nor_reorders() {
             })
             .collect()
     };
-    let mut echoed = Vec::new();
-    while echoed.len() < sends.len() {
-        let mut byte = [0_u8; 1];
-        reader.read_exact(&mut byte).unwrap();
-        echoed.push((byte[0], Instant::now()));
-    }
+    let echoed = reader.join().unwrap();
+    // Not a queue: the sends span longer than one RTT, so a delay that
+    // accumulated would push the later echoes well past it.
+    assert!(
+        *sends.last().unwrap() - sends[0] >= Duration::from_millis(190),
+        "the sends overlap the delay"
+    );
     for (index, (byte, at)) in echoed.iter().enumerate() {
         assert_eq!(usize::from(*byte), index, "in order");
         let round_trip = *at - sends[index];
@@ -243,6 +257,188 @@ fn an_rtt_is_accepted_at_the_bound_and_refused_past_it() {
     )
     .is_err());
     assert!(!scratch.path("b.sock").exists());
+}
+
+/// An upstream that writes `first` bytes to its one client as soon as it
+/// connects, then `then` more once `go` is set, counting what its writes
+/// have handed to the kernel.
+struct Pusher {
+    written: Arc<AtomicUsize>,
+    first_done: Arc<AtomicBool>,
+    all_done: Arc<AtomicBool>,
+    go: Arc<AtomicBool>,
+}
+
+impl Pusher {
+    fn start(socket: &std::path::Path, first: usize, then: usize) -> Self {
+        let listener = UnixListener::bind(socket).unwrap();
+        let pusher = Pusher {
+            written: Arc::new(AtomicUsize::new(0)),
+            first_done: Arc::new(AtomicBool::new(false)),
+            all_done: Arc::new(AtomicBool::new(false)),
+            go: Arc::new(AtomicBool::new(false)),
+        };
+        let (written, first_done, all_done, go) = (
+            Arc::clone(&pusher.written),
+            Arc::clone(&pusher.first_done),
+            Arc::clone(&pusher.all_done),
+            Arc::clone(&pusher.go),
+        );
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut push = |mut left: usize| {
+                let chunk = [0x5a_u8; 16 * 1024];
+                while left > 0 {
+                    let size = left.min(chunk.len());
+                    match stream.write(&chunk[..size]) {
+                        Ok(0) | Err(_) => return false,
+                        Ok(sent) => {
+                            written.fetch_add(sent, Ordering::SeqCst);
+                            left -= sent;
+                        }
+                    }
+                }
+                true
+            };
+            if !push(first) {
+                return;
+            }
+            first_done.store(true, Ordering::SeqCst);
+            while !go.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if push(then) {
+                all_done.store(true, Ordering::SeqCst);
+            }
+        });
+        pusher
+    }
+}
+
+fn wait_for(what: &str, timeout: Duration, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The delay line holds its budget exactly: with every chunk held for its
+/// delay, `budget` bytes from the server all enter it and the server's write
+/// completes; one byte more does not enter it.
+#[test]
+fn the_delay_line_holds_exactly_its_budget_and_not_a_byte_more() {
+    let scratch = Scratch::new();
+    let upstream = scratch.path("push.sock");
+    let budget = 256 * 1024;
+    let pusher = Pusher::start(&upstream, budget, 1);
+    // 3 s each way: nothing is released while this test looks.
+    let relay = DelayRelay::start_with_budget(
+        &scratch.path("r.sock"),
+        &upstream,
+        Duration::from_secs(6),
+        budget,
+    )
+    .unwrap();
+    assert_eq!(relay.budget(), budget);
+    // A client that never reads.
+    let _client = connect(relay.listen_path());
+    wait_for("the server's first write", Duration::from_secs(2), || {
+        pusher.first_done.load(Ordering::SeqCst)
+    });
+    // At the bound: all of it is in the line.
+    wait_for("the budget to fill", Duration::from_secs(2), || {
+        relay.in_flight().down == budget as u64
+    });
+    assert_eq!(relay.peak_in_flight().down, budget as u64);
+    // Just past it: the next byte stays with the sender's socket.
+    pusher.go.store(true, Ordering::SeqCst);
+    wait_for("the server's last byte", Duration::from_secs(2), || {
+        pusher.all_done.load(Ordering::SeqCst)
+    });
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(relay.in_flight().down, budget as u64);
+    assert_eq!(
+        relay.peak_in_flight().down,
+        budget as u64,
+        "the line took a byte past its budget"
+    );
+    assert_eq!(
+        relay.traffic().down,
+        0,
+        "nothing is released before its delay"
+    );
+}
+
+/// Backpressure reaches the server: with a client that never reads and no
+/// delay, the relay holds at most its budget and the server's writes stop,
+/// as they would on a socket to that client directly.
+#[test]
+fn a_client_that_never_reads_blocks_the_server_at_the_budget() {
+    let scratch = Scratch::new();
+    let upstream = scratch.path("push.sock");
+    let budget = 256 * 1024;
+    let offered = 64 << 20;
+    let pusher = Pusher::start(&upstream, offered, 0);
+    let relay =
+        DelayRelay::start_with_budget(&scratch.path("r.sock"), &upstream, Duration::ZERO, budget)
+            .unwrap();
+    let _client = connect(relay.listen_path());
+    thread::sleep(Duration::from_millis(1_500));
+    let written = pusher.written.load(Ordering::SeqCst);
+    assert!(
+        !pusher.first_done.load(Ordering::SeqCst),
+        "the server wrote all {offered} bytes to a client that never reads"
+    );
+    // What the server got rid of: the relay's budget plus the kernel's
+    // buffers on both sockets.
+    assert!(
+        written <= budget + (8 << 20),
+        "{written} bytes left the server"
+    );
+    assert!(relay.peak_in_flight().down <= budget as u64);
+    assert!(relay.in_flight().down <= budget as u64);
+    println!(
+        "PX-025 backpressure evidence: budget {budget}, server wrote {written} of {offered} bytes in 1.5 s, relay holding {} (peak {}), delivered {}",
+        relay.in_flight().down,
+        relay.peak_in_flight().down,
+        relay.traffic().down
+    );
+}
+
+#[test]
+fn an_in_flight_budget_is_accepted_at_its_bounds_and_refused_past_them() {
+    let scratch = Scratch::new();
+    let upstream = scratch.path("echo.sock");
+    let _arrivals = echo_server(&upstream);
+    for (name, budget, accepted) in [
+        ("a.sock", 1, true),
+        ("b.sock", MAX_IN_FLIGHT, true),
+        ("c.sock", 0, false),
+        ("d.sock", MAX_IN_FLIGHT + 1, false),
+    ] {
+        let started =
+            DelayRelay::start_with_budget(&scratch.path(name), &upstream, Duration::ZERO, budget);
+        assert_eq!(started.is_ok(), accepted, "budget {budget}");
+    }
+    // A one-byte budget still carries everything, a byte at a time.
+    let relay =
+        DelayRelay::start_with_budget(&scratch.path("e.sock"), &upstream, Duration::ZERO, 1)
+            .unwrap();
+    let mut client = connect(relay.listen_path());
+    client.write_all(&[1, 2, 3, 4]).unwrap();
+    let mut echo = [0_u8; 4];
+    client.read_exact(&mut echo).unwrap();
+    assert_eq!(echo, [1, 2, 3, 4]);
+    assert_eq!(relay.peak_in_flight().up, 1);
+    assert_eq!(
+        DelayRelay::start(&scratch.path("f.sock"), &upstream, Duration::ZERO)
+            .unwrap()
+            .budget(),
+        DEFAULT_IN_FLIGHT
+    );
 }
 
 /// A relay whose socket path was removed underneath it still stops, and its

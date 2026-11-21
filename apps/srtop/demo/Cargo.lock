@@ -830,6 +830,7 @@ dependencies = [
 name = "srtop-demo"
 version = "0.1.0"
 dependencies = [
+ "socket2",
  "srui-process-explorer",
  "srui-protocol",
  "srui-semantic-tree",

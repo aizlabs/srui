@@ -805,6 +805,152 @@ fn a_half_close_reaches_the_far_end_every_time() {
     assert_eq!(relay.accepted(), 800);
 }
 
+/// Fills the backlog of a listener that is not accepting with raw
+/// non-blocking connects, until the kernel refuses one (`EAGAIN` on Linux,
+/// `ECONNREFUSED` on macOS). Returns the queued sockets and that refusal.
+fn fill_backlog(path: &std::path::Path) -> (Vec<socket2::Socket>, std::io::ErrorKind) {
+    let address = socket2::SockAddr::unix(path).unwrap();
+    let mut queued = Vec::new();
+    for _ in 0..10_000 {
+        let socket =
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        match socket.connect(&address) {
+            Ok(()) => queued.push(socket),
+            Err(error) => return (queued, error.kind()),
+        }
+    }
+    panic!("the backlog never filled");
+}
+
+/// An upstream that is not accepting, with its backlog full, stalls neither
+/// the relay's accept loop nor a stop: `stop()` (and, separately, dropping
+/// the relay) returns within 500 ms, the waiting client sees its end, the
+/// relay's socket is removed and no connection thread is left.
+#[test]
+fn stop_returns_while_the_upstream_backlog_is_full() {
+    let bound = Duration::from_millis(500);
+    for by_drop in [false, true] {
+        let scratch = Scratch::new();
+        let upstream = scratch.path("stuck.sock");
+        let listener = UnixListener::bind(&upstream).unwrap();
+        let (queued, refusal) = fill_backlog(&upstream);
+        let listen = scratch.path("r.sock");
+        let mut relay = DelayRelay::start(&listen, &upstream, Duration::ZERO).unwrap();
+        // Declared after the relay, so dropped first if an assertion fails:
+        // a connect still blocked on it then fails, and nothing hangs.
+        let _listener = listener;
+        let mut client = connect(&listen);
+        wait_for(
+            "the client to wait for the upstream",
+            Duration::from_secs(2),
+            || relay.connecting() == 1,
+        );
+        let threads = relay.pump_threads();
+        let (returned, stopped) = mpsc::channel();
+        let started = Instant::now();
+        let watcher = thread::spawn(move || {
+            if by_drop {
+                drop(relay);
+                let _ = returned.send(None);
+            } else {
+                relay.stop();
+                let _ = returned.send(Some(relay));
+            }
+        });
+        let relay = stopped.recv_timeout(bound).unwrap_or_else(|_| {
+            panic!("drop {by_drop}: stop did not return with the upstream stuck")
+        });
+        watcher.join().unwrap();
+        assert_eq!(threads, 1, "one setup thread was still trying");
+        assert!(!listen.exists(), "the relay removed its socket");
+        match read_until_eof(&mut client, bound) {
+            Ok(_) => {}
+            Err(error) => assert_ne!(error.kind(), std::io::ErrorKind::TimedOut, "{error}"),
+        }
+        if let Some(relay) = relay {
+            wait_for("the setup thread to give up", bound, || {
+                relay.pump_threads() == 0
+            });
+            assert_eq!(relay.connecting(), 0);
+            assert_eq!(relay.live_connections(), 0);
+        }
+        println!(
+            "PX-025 stuck-upstream evidence: backlog full after {} queued ({refusal:?}); {} returned in {:?}",
+            queued.len(),
+            if by_drop { "drop" } else { "stop()" },
+            started.elapsed()
+        );
+    }
+}
+
+/// While the upstream's backlog is full the relay goes on accepting: three
+/// clients all wait for it at once, and once it accepts again each is
+/// joined and served.
+#[test]
+fn a_stuck_upstream_connect_stalls_no_other_client() {
+    let scratch = Scratch::new();
+    let upstream = scratch.path("stuck.sock");
+    let listener = UnixListener::bind(&upstream).unwrap();
+    let (queued, _) = fill_backlog(&upstream);
+    let go = Arc::new(AtomicBool::new(false));
+    {
+        let go = Arc::clone(&go);
+        thread::spawn(move || {
+            while !go.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                thread::spawn(move || {
+                    let mut byte = [0_u8; 1];
+                    while let Ok(1) = stream.read(&mut byte) {
+                        if stream.write_all(&byte).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+    }
+    let relay = DelayRelay::start(&scratch.path("r.sock"), &upstream, Duration::ZERO).unwrap();
+    // Dropped before the relay, also when an assertion fails: the upstream
+    // then accepts, so no relay thread is left waiting for it.
+    struct AcceptOnDrop(Arc<AtomicBool>);
+    impl Drop for AcceptOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let _accept_on_drop = AcceptOnDrop(Arc::clone(&go));
+    let mut clients: Vec<UnixStream> = (0..3_u8)
+        .map(|index| {
+            let mut client = connect(relay.listen_path());
+            client.write_all(&[index]).unwrap();
+            client
+        })
+        .collect();
+    wait_for(
+        "all three clients to be accepted",
+        Duration::from_secs(2),
+        || relay.connecting() == 3,
+    );
+    assert_eq!(
+        relay.accepted(),
+        0,
+        "nothing is joined while the upstream is stuck"
+    );
+    go.store(true, Ordering::SeqCst);
+    for (index, client) in clients.iter_mut().enumerate() {
+        let mut echo = [0_u8; 1];
+        client.read_exact(&mut echo).unwrap();
+        assert_eq!(usize::from(echo[0]), index);
+    }
+    assert_eq!(relay.connecting(), 0);
+    assert_eq!(relay.accepted(), 3);
+    drop(queued);
+}
+
 /// A relay whose socket path was removed underneath it still stops, and its
 /// owner is not left waiting.
 #[test]

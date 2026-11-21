@@ -22,6 +22,7 @@
 //! lost network does, and the relay keeps accepting, so a client can
 //! reconnect through it: that is the transport interruption scenario.
 
+use socket2::{Domain, SockAddr, Socket, Type};
 use std::{
     io::{self, Read, Write},
     net::Shutdown,
@@ -70,7 +71,7 @@ const READ_CHUNK: usize = 64 * 1024;
 /// and is simply made again, which sees the end of file if it is there.
 // lc-debt: an idle direction wakes every 25 ms and a FIN lost by the kernel
 // is forwarded up to 25 ms late; upgrade path: kqueue/poll(2) with EV_EOF,
-// which needs FFI this std-only package avoids.
+// which needs FFI or a poller crate this package avoids (socket2 offers no poll).
 pub const READ_POLL: Duration = Duration::from_millis(25);
 
 /// Byte counts of everything a relay carried, both directions.
@@ -102,6 +103,10 @@ struct Inner {
     pumps: AtomicU64,
     /// Both sockets of every connection not yet cut or closed, by number.
     live: Mutex<Vec<(u64, UnixStream, UnixStream)>>,
+    /// Accepted clients still waiting for the upstream, by setup key. Lock
+    /// order: `live`, then `pending`.
+    pending: Mutex<Vec<(u64, UnixStream)>>,
+    next_pending: AtomicU64,
 }
 
 /// One running relay; stopped and its socket removed on drop.
@@ -163,6 +168,8 @@ impl DelayRelay {
             accepted: AtomicU64::new(0),
             pumps: AtomicU64::new(0),
             live: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
+            next_pending: AtomicU64::new(0),
         });
         let accept = {
             let inner = Arc::clone(&inner);
@@ -225,7 +232,14 @@ impl DelayRelay {
         self.inner.live.lock().unwrap().len()
     }
 
-    /// Delay-line threads still running: four per live connection.
+    /// Accepted clients still waiting for the upstream.
+    pub fn connecting(&self) -> usize {
+        self.inner.pending.lock().unwrap().len()
+    }
+
+    /// The relay's connection threads still running: four delay-line
+    /// threads per live connection, and one setup thread per client still
+    /// waiting for the upstream.
     pub fn pump_threads(&self) -> u64 {
         self.inner.pumps.load(Ordering::SeqCst)
     }
@@ -252,16 +266,26 @@ impl DelayRelay {
         self.inner.accepted.load(Ordering::SeqCst)
     }
 
-    /// Cuts every live connection, both sides, as a lost network does.
-    /// Bytes still in a delay line are lost with it. Returns how many were
-    /// cut; the relay keeps accepting.
+    /// Cuts every live connection, both sides, as a lost network does, and
+    /// every client still waiting for the upstream. Bytes still in a delay
+    /// line are lost with it. Returns how many were cut; the relay keeps
+    /// accepting.
     pub fn cut(&self) -> usize {
-        let live = std::mem::take(&mut *self.inner.live.lock().unwrap());
+        let (live, pending) = {
+            let mut live = self.inner.live.lock().unwrap();
+            let mut pending = self.inner.pending.lock().unwrap();
+            (std::mem::take(&mut *live), std::mem::take(&mut *pending))
+        };
         for (_, client, server) in &live {
             let _ = client.shutdown(Shutdown::Both);
             let _ = server.shutdown(Shutdown::Both);
         }
-        live.len()
+        // A client still waiting for the upstream is cut too: it sees its end
+        // now, and its setup thread gives up at its next attempt.
+        for (_, client) in &pending {
+            let _ = client.shutdown(Shutdown::Both);
+        }
+        live.len() + pending.len()
     }
 
     /// Stops accepting, cuts every connection and removes the socket.
@@ -285,10 +309,19 @@ impl Drop for DelayRelay {
     }
 }
 
+/// How long a client's setup keeps trying to reach the upstream before it
+/// gives up and ends the client: an upstream whose backlog stays full, or
+/// that refuses, for this long is treated as unreachable.
+pub const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
+
+/// The pause between two non-blocking upstream connect attempts, and so
+/// the longest a setup thread outlives a stop or a cut.
+const CONNECT_RETRY: Duration = Duration::from_millis(5);
+
 /// How often an idle accept loop looks at `stopping`.
 // lc-debt: an idle relay wakes every 2 ms (and a new client waits up to 2 ms to be accepted) so
 // that stop() never depends on waking a blocked accept; upgrade path: poll(2) on the listener
-// and a self-pipe, which needs FFI this std-only package avoids.
+// and a self-pipe, which needs FFI or a poller crate this package avoids.
 const ACCEPT_POLL: Duration = Duration::from_millis(2);
 
 fn accept_loop(listener: UnixListener, inner: Arc<Inner>) {
@@ -312,61 +345,157 @@ fn accept_loop(listener: UnixListener, inner: Arc<Inner>) {
         if client.set_nonblocking(false).is_err() {
             continue;
         }
-        let Ok(server) = UnixStream::connect(&inner.upstream) else {
+        // The upstream is reached on the connection's own setup thread, so
+        // this loop never waits for it: an upstream that is not accepting
+        // stalls neither other clients nor a stop.
+        let key = inner.next_pending.fetch_add(1, Ordering::SeqCst);
+        let Ok(copy) = client.try_clone() else {
             let _ = client.shutdown(Shutdown::Both);
             continue;
         };
-        // Every read times out and is made again: see READ_POLL.
-        if client.set_read_timeout(Some(READ_POLL)).is_err()
-            || server.set_read_timeout(Some(READ_POLL)).is_err()
+        inner.pending.lock().unwrap().push((key, copy));
+        let running = PumpThread::start(&inner);
+        let spawned = thread::Builder::new().name("relay-setup".into()).spawn({
+            let inner = Arc::clone(&inner);
+            move || {
+                let _running = running;
+                setup(client, key, &inner);
+            }
+        });
+        if spawned.is_err() {
+            // The client went with the unspawned closure; its copy goes here.
+            if let Some((_, copy)) = take_pending(&inner, key) {
+                let _ = copy.shutdown(Shutdown::Both);
+            }
+        }
+    }
+}
+
+/// Removes `key` from the clients waiting for the upstream, if a cut or a
+/// stop has not taken it already.
+fn take_pending(inner: &Inner, key: u64) -> Option<(u64, UnixStream)> {
+    let mut pending = inner.pending.lock().unwrap();
+    let index = pending.iter().position(|entry| entry.0 == key)?;
+    Some(pending.swap_remove(index))
+}
+
+/// Whether a failed upstream connect is worth another attempt: a full
+/// backlog (`EAGAIN` on Linux, `ECONNREFUSED` on macOS), an upstream not
+/// listening yet, or a signal. A missing or forbidden socket path is not.
+fn worth_retrying(error: &io::Error) -> bool {
+    !matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput
+    )
+}
+
+/// Reaches the upstream without ever blocking: each attempt is a
+/// non-blocking `connect`, made again every [`CONNECT_RETRY`] until it
+/// succeeds, fails for good, [`CONNECT_DEADLINE`] passes, the relay stops or
+/// a cut takes the waiting client (`key`).
+fn connect_upstream(inner: &Inner, key: u64) -> Option<UnixStream> {
+    let address = SockAddr::unix(&inner.upstream).ok()?;
+    let deadline = Instant::now() + CONNECT_DEADLINE;
+    loop {
+        if inner.stopping.load(Ordering::SeqCst)
+            || !inner
+                .pending
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.0 == key)
         {
+            return None;
+        }
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None).ok()?;
+        socket.set_nonblocking(true).ok()?;
+        match socket.connect(&address) {
+            Ok(()) => {
+                socket.set_nonblocking(false).ok()?;
+                return Some(UnixStream::from(socket));
+            }
+            Err(error) if worth_retrying(&error) => {}
+            Err(_) => return None,
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(CONNECT_RETRY);
+    }
+}
+
+/// Joins one accepted client to the upstream, on its own thread.
+fn setup(client: UnixStream, key: u64, inner: &Arc<Inner>) {
+    let Some(server) = connect_upstream(inner, key) else {
+        // Unreachable upstream, a stop or a cut: the client sees its end.
+        let _ = take_pending(inner, key);
+        let _ = client.shutdown(Shutdown::Both);
+        return;
+    };
+    // Every read times out and is made again: see READ_POLL.
+    if client.set_read_timeout(Some(READ_POLL)).is_err()
+        || server.set_read_timeout(Some(READ_POLL)).is_err()
+    {
+        let _ = take_pending(inner, key);
+        let _ = client.shutdown(Shutdown::Both);
+        let _ = server.shutdown(Shutdown::Both);
+        return;
+    }
+    let (Ok(client_copy), Ok(server_copy)) = (client.try_clone(), server.try_clone()) else {
+        let _ = take_pending(inner, key);
+        let _ = client.shutdown(Shutdown::Both);
+        let _ = server.shutdown(Shutdown::Both);
+        return;
+    };
+    // Registered as live in the same step as it stops waiting, under the
+    // `live` lock `cut` takes first: a cut or a stop either finds it among
+    // the waiting clients or among the live connections, never between.
+    let id = {
+        let mut live = inner.live.lock().unwrap();
+        let ours = take_pending(inner, key).is_some();
+        if !ours || inner.stopping.load(Ordering::SeqCst) {
+            drop(live);
             let _ = client.shutdown(Shutdown::Both);
             let _ = server.shutdown(Shutdown::Both);
-            continue;
+            return;
         }
         let id = inner.accepted.fetch_add(1, Ordering::SeqCst);
-        let (Ok(client_copy), Ok(server_copy)) = (client.try_clone(), server.try_clone()) else {
-            continue;
-        };
-        inner
-            .live
-            .lock()
-            .unwrap()
-            .push((id, client_copy, server_copy));
-        // The connection stays registered, so `cut` and `stop` can reach both
-        // of its sockets, until both directions have ended: a half-closed
-        // connection still carries the other direction.
-        let directions = Arc::new(AtomicUsize::new(2));
-        let (Ok(client_up), Ok(server_up)) = (client.try_clone(), server.try_clone()) else {
-            abandon(&inner, id, &client, &server);
-            continue;
-        };
-        let joined = pump(
-            client_up,
-            server_up,
-            inner.up_delay,
-            Arc::clone(&inner),
-            Direction::Up,
+        live.push((id, client_copy, server_copy));
+        id
+    };
+    // The connection stays registered, so `cut` and `stop` can reach both
+    // of its sockets, until both directions have ended: a half-closed
+    // connection still carries the other direction.
+    let directions = Arc::new(AtomicUsize::new(2));
+    let (Ok(client_up), Ok(server_up)) = (client.try_clone(), server.try_clone()) else {
+        abandon(inner, id, &client, &server);
+        return;
+    };
+    let joined = pump(
+        client_up,
+        server_up,
+        inner.up_delay,
+        Arc::clone(inner),
+        Direction::Up,
+        id,
+        Arc::clone(&directions),
+    )
+    .and_then(|()| {
+        pump(
+            server.try_clone()?,
+            client.try_clone()?,
+            inner.down_delay,
+            Arc::clone(inner),
+            Direction::Down,
             id,
-            Arc::clone(&directions),
+            directions,
         )
-        .and_then(|()| {
-            pump(
-                server.try_clone()?,
-                client.try_clone()?,
-                inner.down_delay,
-                Arc::clone(&inner),
-                Direction::Down,
-                id,
-                directions,
-            )
-        });
-        if joined.is_err() {
-            // A thread could not be started: end what was started, which
-            // sees its sockets shut, and forget the connection now, since a
-            // direction that never started will never end it.
-            abandon(&inner, id, &client, &server);
-        }
+    });
+    if joined.is_err() {
+        // A thread could not be started: end what was started, which
+        // sees its sockets shut, and forget the connection now, since a
+        // direction that never started will never end it.
+        abandon(inner, id, &client, &server);
     }
 }
 

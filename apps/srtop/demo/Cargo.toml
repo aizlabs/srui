@@ -15,6 +15,9 @@ srui-process-explorer = { path = ".." }
 srui-protocol = { path = "../../../server-rust/protocol" }
 srui-semantic-tree = { path = "../../../server-rust/semantic-tree" }
 srui-sessiond = { path = "../../../server-rust/sessiond" }
+# Already in this lock (through tokio): a non-blocking AF_UNIX connect, so the
+# relay never blocks on an upstream whose backlog is full (std has none).
+socket2 = "0.6"
 
 [[bin]]
 name = "srtop-demo-worker"

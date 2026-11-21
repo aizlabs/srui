@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-023",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Generic macOS client: the first bounded slice of D2 T38, a minimal Connect form (host, remote user, optional port, optional name) in client-owned chrome, over the existing SSHTransport, OpenSSH known_hosts and credential handling (§19, §19.1, §22.1, §25); endpoint validation before argv, strict non-interactive host-key policy with understandable blocking diagnostics, one launcher path for counter and srtop; no server, SDK, protocol, registry, proto, framing, generated-file or srtop change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX023-001",
+      "feature": "ConnectionEndpoint.parse(host:user:port:): the Connect form's fields become a validated SSH destination; the Host field also takes user@host, host:port, [v6] and user@[v6]:port, and a user or port named twice must agree; hosts are ASCII names/IPv4 ([A-Za-z0-9._-], not starting with - or .) or inet_pton IPv6 literals in brackets with an optional %zone, at most 253 characters; users are [A-Za-z0-9._-], not starting with - or ., at most 64; ports are one to five ASCII digits naming 1-65535; names at most 128; bare IPv6, URLs, whitespace inside a value, shell metacharacters and non-ASCII are rejected with a specific message; ConnectDraft.validationMessage/savedConnection use it and an empty name defaults to the endpoint; round 2: before any per-field rule every field (host, user, port, name) and every saved host/user refuses NUL and any control, format, separator, surrogate, private-use or unassigned scalar (ParseError.controlCharacter); trimming drops only Zs spaces, tab, LF and CR; validateIPv6 refuses a literal with a NUL and calls inet_pton only when strlen equals the UTF-8 length, so it never passes on a prefix; round 3: every bound counts Unicode scalars (host field 326, host 253, user 64, port 5, name 128) and any field over 4096 UTF-8 bytes is refused before it is trimmed or scanned; every ParseError description echoes at most 32 scalars of input then '…'",
+      "scope": "PX-023/client-macos ConnectionManager/ConnectionEndpoint.swift, ConnectionManager/ConnectionManager.swift ConnectDraft; SRUITests ConnectionEndpointTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-023",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-023.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX023-002",
+      "feature": "ConnectionManager.sshConfiguration(for:) is the one SSH configuration every connection uses whatever app serves the srui subsystem (StrictHostKeyChecking=yes, BatchMode=yes, user's own agent/keys/known_hosts, fixed subsystem, -- before the host); connect(id:) re-validates a saved entry before it can become argv, so a tampered saved-connections file never reaches ssh; counter and srtop both connect through connect(_:) over a real localhost sshd and the real srui-ssh-bridge; round 2: validate(savedHost:user:port:) also refuses saved port 0 (65536 cannot be decoded and the file fails to load); pre-PX-023 entries the form would no longer produce are refused with 'Remove it and add it again'",
+      "scope": "PX-023/client-macos ConnectionManager/ConnectionManager.swift sshConfiguration(for:), connect(id:), beginAttempt; SRUITests ConnectionEndpointTests, ConnectionLauncherLiveTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-023",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-023.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX023-003",
+      "feature": "Round 5 (user decision): no alert content is derived from ssh's output. Every SSH failure is a blocking ConnectionAlert 'Connection Failed'; when ssh exits 255 before any SRUI byte (SSHTransport.localFailureBeforeStream(), used only as the trigger) the alert says 'SRUI could not connect to <endpoint>.', adds a KnownHostsHint computed from local files only (SSHKnownHostsLookup: ssh -G with the connection's argv for the known_hosts files and the name host / [host]:port / HostKeyAlias, then ssh-keygen -F per file, argv launches, stdio set, 5 s bound, no hint on any failure), and quotes ssh's stderr verbatim under 'ssh reported (this text can include messages from the server):'; the hint says the host is absent from the listed files, or that a key for it is in a named file and SRUI will not change it; no trust-changing advice is ever generated; the rounds 1-4 stderr classifier, the hostKeyRejected event and alert, and 'Host Key Not Trusted' are removed; kept: LogLevel=INFO pinned, posture options before extraOptions, case-insensitive blocklist; an unknown or changed key never runs the subsystem and leaves known_hosts byte-for-byte unchanged; round 6: BoundedProcess drains stdout concurrently with a 256 KiB cap (exceeding it fails safe to no hint), ssh-keygen -F is read by exit status only (stdout to /dev/null), each child has its own 5 s deadline (worst case 5 s x (1 + readable known_hosts files)), stopping sends SIGTERM then SIGKILL to the exact PID after 500 ms; -o UpdateHostKeys=no is a posture flag and a blocked extra key, so ssh never rewrites known_hosts for SRUI; round 7: signals are sent only while the exit is unrecorded and Process.isRunning (checked before both SIGTERM and SIGKILL, via an injectable signal function), a result is delivered only after both exit and end of drain (deterministic hook test), the deadline task is cancelled when a run ends so Process and Pipe are released at once, and the absent hint states facts only",
+      "scope": "PX-023/client-macos ConnectionManager/KnownHostsHint.swift, ConnectionManager/ConnectionManager.swift SSHFailedBeforeStream, ConnectionAttemptEvent.sshFailedBeforeStream, recordFailure, sshFailureMessage; TransportSSH/SSHTransport.swift localFailureBeforeStream; TransportSSH/SSHConfiguration.swift LogLevel=INFO, option order, blocklist; SRUITests LocalFactAlertTests, KnownHostsLookupTests, ConnectionFakeSSHServerTests, ConnectionLauncherLiveTests, ConnectionManagerTests, SSHTransportLocalFailureTests, SSHTransportPostureTests, BoundedProcessTests, KnownHostsLookupTests deadline/SIGKILL/many-entries cases, BoundedProcessLifecycleTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-023",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-023.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX023-004",
+      "feature": "ConnectSheet: the Connect form as client chrome with Host, Remote User, optional Port and optional Name fields, the validation reason shown inline, Connect disabled and its action guarded until the endpoint is valid, Cancel and Connect as the sheet's cancel and default actions; a native AppKit test types into its NSTextFields and submits with Return; NUL in the host, user and port typed into the native fields never submits",
+      "scope": "PX-023/client-macos ConnectionManager/ConnectionManagerView.swift ConnectSheet, SavedConnectionRow endpoint; SRUITests ConnectSheetNativeTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-023",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-023.md"
+      ]
+    }
+  ]
+}

@@ -61,6 +61,34 @@ private final class StderrAccumulator: @unchecked Sendable {
 
 /// The SSH child's exit status, recorded by its termination handler, so a failed write can report
 /// why the child went away rather than the `EPIPE` its exit caused (§19.1, §25, §4 inv. 13).
+/// Whether the child ever delivered a byte on stdout, the SRUI protocol stream.
+private final class StreamByteRecord: @unchecked Sendable {
+    private let lock = NSLock()
+    private var delivered = false
+
+    var hasDelivered: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return delivered
+    }
+
+    func markDelivered() {
+        lock.lock()
+        defer { lock.unlock() }
+        delivered = true
+    }
+}
+
+/// The `ssh` child's exit before the SRUI stream began, and what it printed: quoted, never interpreted (PX-023).
+public struct SSHLocalFailure: Sendable, Equatable {
+    /// `ssh`'s own error exit status.
+    public static let sshErrorStatus: Int32 = 255
+
+    public let status: Int32
+    /// The child's stderr, as captured (bounded to its last 100 lines).
+    public let stderr: String
+}
+
 private final class ChildExitRecord: @unchecked Sendable {
     private struct Waiter {
         let continuation: CheckedContinuation<Int32?, Never>
@@ -176,6 +204,7 @@ public actor SSHTransport: Transport {
     private var isConnected = false
     private let stderrAccumulator = StderrAccumulator()
     private let childExit = ChildExitRecord()
+    private let streamBytes = StreamByteRecord()
     /// The child's exit failure when the transport closed because the child had already failed
     /// (the stdout reader finishes the stream, whose termination closes the transport). A later
     /// `send` reports it instead of a bare `.closed`; a close made while the child ran keeps `nil`.
@@ -447,6 +476,7 @@ public actor SSHTransport: Transport {
         let accumulator = stderrAccumulator
         let gate = backlogGate
         let childExit = childExit
+        let streamBytes = streamBytes
 
         let thread = Thread {
             var buffer = [UInt8](repeating: 0, count: 65536)
@@ -458,6 +488,7 @@ public actor SSHTransport: Transport {
 
                 switch readAvailable(from: latch, into: &buffer) {
                 case .bytes(let count):
+                    streamBytes.markDelivered()
                     gate.recordDelivered(count)
                     cont.yield(Data(buffer[0..<count]))
                 case .retry:
@@ -488,6 +519,20 @@ public actor SSHTransport: Transport {
         thread.stackSize = 512 * 1024
         stdoutReadThread = thread
         thread.start()
+    }
+
+    /// The child's exit before the stream, or `nil`: non-nil only when the child exited by itself
+    /// with status 255 (`ssh`'s error status) before a single byte of the SRUI stream arrived on
+    /// stdout. It is a trigger, not a diagnosis (PX-023 round 5): `stderr` is what `ssh` printed
+    /// and can contain text a server chose (a disconnect reason, a key-exchange name list, a
+    /// banner), so callers may quote it but must never derive a verdict from it.
+    public func localFailureBeforeStream() -> SSHLocalFailure? {
+        guard streamBytes.hasDelivered == false,
+              let status = childExit.recorded,
+              status == SSHLocalFailure.sshErrorStatus else {
+            return nil
+        }
+        return SSHLocalFailure(status: status, stderr: stderrAccumulator.summary())
     }
 
     /// The one classification of a child exit, shared by the stdout reader and `send`: a non-zero

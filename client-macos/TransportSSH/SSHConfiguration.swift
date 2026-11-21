@@ -16,7 +16,8 @@ public enum StrictHostKeyCheckingMode: String, Sendable, Equatable {
 
 /// Configuration options for establishing an SSH transport session (§19, §19.1, §25).
 public struct SSHConfiguration: Sendable, Equatable {
-    /// OpenSSH `-o` keys that must not appear in `extraOptions` because they can weaken §19.1 posture.
+    /// OpenSSH `-o` keys that must not appear in `extraOptions`, in any case, because they can weaken
+    /// §19.1 posture or change what `ssh` writes to the stderr the client reads as `ssh`'s own.
     public static let blockedExtraOptionKeys: Set<String> = [
         "StrictHostKeyChecking",
         "ClearAllForwardings",
@@ -27,6 +28,8 @@ public struct SSHConfiguration: Sendable, Equatable {
         "DynamicForward",
         "ProxyCommand",
         "PermitLocalCommand",
+        "LogLevel",
+        "UpdateHostKeys",
     ]
 
     /// Remote host name or IP address.
@@ -56,7 +59,8 @@ public struct SSHConfiguration: Sendable, Equatable {
     /// Connection timeout in seconds (`-o ConnectTimeout=N`).
     public var connectTimeout: TimeInterval?
 
-    /// Additional `-o` options. Keys in `blockedExtraOptionKeys` are ignored so posture flags always win.
+    /// Additional `-o` options, emitted after every posture option (OpenSSH keeps the first value).
+    /// Keys in `blockedExtraOptionKeys`, matched case-insensitively, are ignored.
     public var extraOptions: [String: String]
 
     /// Path to system SSH binary (defaults to `/usr/bin/ssh`).
@@ -88,6 +92,13 @@ public struct SSHConfiguration: Sendable, Equatable {
         self.sshBinaryPath = sshBinaryPath
     }
 
+    /// Whether `key` is one of `blockedExtraOptionKeys`. OpenSSH matches option keywords without
+    /// regard to case (`loglevel`, `LOGLEVEL`), so the blocklist does too (PX-023 round 4).
+    public static func isBlockedExtraOptionKey(_ key: String) -> Bool {
+        let folded = key.lowercased()
+        return blockedExtraOptionKeys.contains { $0.lowercased() == folded }
+    }
+
     /// Builds the argument vector for executing `/usr/bin/ssh` conforming strictly to §19.1:
     /// - `-T`: Request no pseudo-terminal (PTY) allocation.
     /// - `-x`: Disable X11 forwarding.
@@ -95,26 +106,30 @@ public struct SSHConfiguration: Sendable, Equatable {
     /// - `-o ClearAllForwardings=yes`: Prevent ad hoc local/remote port forwards.
     /// - `-o ExitOnForwardFailure=yes`: Exit immediately if any forwarding fails.
     /// - `-o StrictHostKeyChecking=...`: Enforce strict host-key verification with fail-closed semantics.
+    /// - `-o LogLevel=INFO`, pinned (PX-023 round 4): `ssh` ends every peer-initiated failure with
+    ///   a line of its own at INFO ("Disconnected from …", "Connection closed by …"), so a
+    ///   server's text is never the last line of `ssh`'s stderr before the stream starts, and the
+    ///   user's `ssh_config` can neither lower it (hiding those lines and the diagnostics they
+    ///   carry) nor raise it (adding debug lines after `ssh`'s verdict).
+    /// - `-o UpdateHostKeys=no` (PX-023 round 6): OpenSSH's default (`yes` when the user's own
+    ///   known_hosts is in use) lets a trusted server's extra or rotated keys be written into
+    ///   known_hosts after login. SRUI's connections never change known_hosts; trust stays explicit.
     /// - `-s <subsystem>`: Request fixed subsystem, preventing shell command interpolation.
     ///
-    /// Normative posture flags are appended **after** filtered `extraOptions` so they cannot be overridden.
+    /// OpenSSH takes the **first** value given for an option. Every posture and configuration
+    /// option is therefore emitted **before** `extraOptions`, which can only add options nothing
+    /// above sets; keys in `blockedExtraOptionKeys` (any case) are dropped outright.
     public func buildArguments() -> [String] {
         var args: [String] = [
             "-T", // §19.1: No PTY for SRUI protocol channel
             "-x", // §19.1: No X11 forwarding
             "-a", // §19.1: No agent forwarding by default
-        ]
-
-        for (key, value) in extraOptions.sorted(by: { $0.key < $1.key }) {
-            guard !Self.blockedExtraOptionKeys.contains(key) else { continue }
-            args.append(contentsOf: ["-o", "\(key)=\(value)"])
-        }
-
-        args.append(contentsOf: [
             "-o", "ClearAllForwardings=yes", // §19.1: No ad hoc port forwards
             "-o", "ExitOnForwardFailure=yes",
             "-o", "StrictHostKeyChecking=\(strictHostKeyChecking.rawValue)", // §19.1: Fail closed on host-key changes
-        ])
+            "-o", "LogLevel=INFO", // pinned: ssh's own final line always ends a peer-initiated failure
+            "-o", "UpdateHostKeys=no", // §25 explicit trust: ssh never rewrites known_hosts for SRUI
+        ]
 
         if let knownHostsFile {
             args.append(contentsOf: ["-o", "UserKnownHostsFile=\(knownHostsFile)"])
@@ -129,6 +144,15 @@ public struct SSHConfiguration: Sendable, Equatable {
             args.append(contentsOf: ["-o", "ConnectTimeout=\(seconds)"])
         }
 
+        if identityFile != nil {
+            args.append(contentsOf: ["-o", "IdentitiesOnly=yes"])
+        }
+
+        for (key, value) in extraOptions.sorted(by: { $0.key < $1.key }) {
+            guard !Self.isBlockedExtraOptionKey(key) else { continue }
+            args.append(contentsOf: ["-o", "\(key)=\(value)"])
+        }
+
         if let port {
             args.append(contentsOf: ["-p", String(port)])
         }
@@ -139,7 +163,6 @@ public struct SSHConfiguration: Sendable, Equatable {
 
         if let identityFile {
             args.append(contentsOf: ["-i", identityFile])
-            args.append(contentsOf: ["-o", "IdentitiesOnly=yes"])
         }
 
         // §19.1: Fixed subsystem request rather than a shell-interpolated command string.

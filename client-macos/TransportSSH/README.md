@@ -121,7 +121,37 @@ Subsystem srui /usr/local/bin/srui-ssh-bridge
 
 ### 2. Client-Side Launch
 
-Launch `RendererDemoApp` over SSH (defaults: `BatchMode=yes`, 30s connect timeout):
+**From the Connections window (PX-023).** Run `RendererDemoApp` with no arguments, click **Add
+Connection**, and enter a host, a remote user and, optionally, a port and a name. The Host field
+also takes `user@host`, `host:port`, `[::1]` and `user@[::1]:2222`; a user or port typed in both
+places must agree. Connect stays disabled, with the reason shown, until the endpoint is a host name,
+an IPv4 address or a bracketed IPv6 address, a user of ASCII letters, digits, `.`, `_` and `-`, and a
+port from 1 through 65535; nothing may start with `-`, and the host is at most 253 characters, the
+user 64 and the name 128. No field may hold a NUL or any other control or invisible character
+(C0, DEL, C1, zero-width, bidi override); only spaces, tabs and line breaks at either end are dropped. The endpoint becomes `-p <port> -l <user> -s -- <host> srui` argv for
+`/usr/bin/ssh`, never a shell command, and a saved entry is checked again before every attempt.
+Every connection uses the same configuration whatever app serves `srui` (counter, srtop):
+`StrictHostKeyChecking=yes`, `BatchMode=yes`, your own agent, keys and `~/.ssh/known_hosts`. An
+unknown or changed host key stops the attempt. Every failure is a blocking **Connection Failed**
+alert, and no part of it is derived from `ssh`'s output, which a server can shape (a disconnect
+reason, a key-exchange name list, a banner). When `ssh` exits 255 before any SRUI byte
+(`SSHTransport.localFailureBeforeStream()`), the alert says only "SRUI could not connect to
+<endpoint>.", adds a hint computed from your own known_hosts files, and then quotes `ssh`'s stderr
+verbatim under "ssh reported (this text can include messages from the server):". To compute the
+hint, SRUI runs `ssh -G` with the same arguments to find the known_hosts files and the name `ssh`
+uses (`host`, `[host]:port` for any port but 22, or `HostKeyAlias`). It then runs
+`ssh-keygen -F <name> -f <file>` on each file, which handles hashed entries. Both run as argument
+vectors, each with its own 5-second limit (SIGTERM, then SIGKILL), and `ssh -G`'s output is read while it runs and capped at 256 KiB. The hint says either that the host is not in those files, or that
+a key for it is in a named file and SRUI will not change it. If the lookup fails, there is no hint.
+SRUI never adds, replaces or removes a host key, never suggests a command that would, and offers no
+way to connect anyway. To trust a new host, check its fingerprint out of band and add it with `ssh`
+yourself. Every `ssh` runs with `-o UpdateHostKeys=no`, so OpenSSH itself never adds a server's rotated keys to known_hosts for SRUI, and with `-o LogLevel=INFO` pinned, so its own final lines ("Disconnected from
+…", "Connection closed by …", timeouts) reach the alert. Posture options come before any
+`extraOptions`, because OpenSSH keeps the first value, and blocked keys are dropped in any case.
+
+**From the command line.** Launch `RendererDemoApp` over SSH (defaults: `BatchMode=yes`, 30s
+connect timeout). This developer path takes its arguments as given and does not use the Connect
+form's validation:
 
 ```bash
 swift run --package-path client-macos RendererDemoApp --ssh remote.host.example.com --user username

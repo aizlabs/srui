@@ -130,13 +130,15 @@ private struct SavedConnectionRow: View {
     }
 
     private var endpoint: String {
-        let portSuffix = entry.port.map { ":\($0)" } ?? ""
-        return "\(entry.user)@\(entry.host)\(portSuffix)"
+        ConnectionEndpoint.displayString(host: entry.host, port: entry.port, user: entry.user)
     }
 }
 
+/// The Connect form (D2 T38, PX-023): host, remote user, optional port and an optional name. It is
+/// client chrome only; no remote app can open it, fill it or choose its destination. Connect stays
+/// disabled, and the reason is shown, until `ConnectionEndpoint` accepts the fields.
 @MainActor
-private struct ConnectSheet: View {
+struct ConnectSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var draft: ConnectDraft
 
@@ -148,42 +150,62 @@ private struct ConnectSheet: View {
     }
 
     var body: some View {
-        NavigationStack {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("New Connection")
+                .font(.headline)
+                .padding([.top, .horizontal])
+
             Form {
-                TextField("Name", text: $draft.label)
-                TextField("Host", text: $draft.host)
-                TextField("Port", text: $draft.port)
+                TextField("Host", text: $draft.host, prompt: Text("host, user@host:port or [::1]"))
+                    .accessibilityIdentifier("connect.host")
                 TextField("Remote User", text: $draft.user)
+                    .accessibilityIdentifier("connect.user")
+                TextField("Port", text: $draft.port, prompt: Text("optional"))
+                    .accessibilityIdentifier("connect.port")
+                TextField("Name", text: $draft.label, prompt: Text("optional"))
+                    .accessibilityIdentifier("connect.name")
 
                 Section {
-                    Text("Authentication and host verification use your existing SSH agent and known_hosts configuration. Credentials are never stored by SRUI.")
+                    if let message = draft.validationMessage {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .accessibilityIdentifier("connect.validation")
+                    }
+                    Text("Authentication and host verification use your existing SSH agent and known_hosts configuration. An unknown or changed host key stops the connection. Credentials are never stored by SRUI.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
             .formStyle(.grouped)
-            .navigationTitle("New Connection")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        dismiss()
-                    }
+
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    dismiss()
                 }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Connect") {
-                        onConnect(draft)
-                        dismiss()
-                    }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!isValid)
+                .keyboardShortcut(.cancelAction)
+                .accessibilityIdentifier("connect.cancel")
+                Button("Connect") {
+                    submit()
                 }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!isValid)
+                .accessibilityIdentifier("connect.submit")
             }
+            .padding()
         }
-        .frame(width: 440, height: 300)
+        .frame(width: 460, height: 360)
     }
 
     private var isValid: Bool {
         draft.validationMessage == nil
+    }
+
+    private func submit() {
+        guard isValid else { return }
+        onConnect(draft)
+        dismiss()
     }
 }
 

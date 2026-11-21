@@ -65,12 +65,41 @@ extension ProcessExplorerShellTests {
             var origins: [String] = []
             var nativeRevisions: [Int: ClosedRange<UInt64>] = [:]
             var automatedEvents: [Int: (handle: SemanticNodeHandle, event: Event)] = [:]
+            var retention: [String] = []
 
+            // Every action runs with the client's inbound stream held: once its frame is on the
+            // wire and srtop's PROCESSED ack has reached the tap, but before the client applies
+            // it, the outbox must still retain exactly that event (its seq allocated, nothing
+            // acknowledged past the one before), so a reconnect could replay it (§18.2). The same
+            // check applies to native and automated actions; releasing the stream settles it.
+            @MainActor func whileSettlementIsHeld(_ origin: String, _ act: @MainActor () async throws -> Void) async throws {
+                let seq = await client.outbox.eventSeq + 1
+                client.tap.holdInbound()
+                try await act()
+                try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "\(origin) event \(seq) sent and acknowledged on the wire, ack held") {
+                    client.tap.events.contains { $0.wire.eventSeq == seq } && client.tap.acknowledgement(settling: seq) != nil
+                }
+                let pending = await client.outbox.pendingCount
+                let acked = await client.outbox.lastAckedEventSeq
+                let allocated = await client.outbox.eventSeq
+                #expect(pending == 1, "\(origin) event \(seq) is retained until its ack is applied")
+                #expect(acked == seq - 1, "\(origin) event \(seq) is not settled before its ack is applied")
+                #expect(allocated == seq)
+                retention.append("\(origin) seq \(seq): pending=\(pending) lastAcked=\(acked) while held")
+                client.tap.releaseInbound()
+                try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(15), description: "\(origin) event \(seq) settled once its ack is applied") {
+                    let pending = await client.outbox.pendingCount
+                    let acked = await client.outbox.lastAckedEventSeq
+                    return pending == 0 && acked == seq
+                }
+            }
             @MainActor func clickNatively(expecting label: String) async throws {
-                let low = client.applier.currentSnapshot.revision.value
-                NativeActivation.click(pauseButton)
-                let high = client.applier.currentSnapshot.revision.value
-                nativeRevisions[origins.count] = low...high
+                try await whileSettlementIsHeld("native") {
+                    let low = client.applier.currentSnapshot.revision.value
+                    NativeActivation.click(pauseButton)
+                    let high = client.applier.currentSnapshot.revision.value
+                    nativeRevisions[origins.count] = low...high
+                }
                 origins.append("native")
                 try await client.waitForLabel(Self.automationPauseID, label)
             }
@@ -78,9 +107,11 @@ extension ProcessExplorerShellTests {
                 let restore = client.concealNativeView(of: Self.automationPauseID)
                 let handle = try client.locate(role: .button, label: current)
                 #expect(handle.id == Self.automationPauseID, "\(current) is the same node")
-                let event = try await handle.activate()
+                try await whileSettlementIsHeld("automation") {
+                    let event = try await handle.activate()
+                    automatedEvents[origins.count] = (handle, event)
+                }
                 restore()
-                automatedEvents[origins.count] = (handle, event)
                 origins.append("automation")
                 try await client.waitForLabel(Self.automationPauseID, label)
             }
@@ -148,6 +179,7 @@ extension ProcessExplorerShellTests {
             #expect(endpointsAfter.listeners.subtracting(endpointsBefore.listeners).isEmpty,
                     "new listeners: \(endpointsAfter.listeners.subtracting(endpointsBefore.listeners))")
             print("PX-026 wire evidence: origins=\(origins) seqs=\(events.map(\.wire.eventSeq)) observed=\(events.map(\.wire.observedRevision)) class=\(events.map { "\($0.logicalClass)" }) acks=\(acks.map { "\($0.settledEventSeq):\($0.status)@\($0.revisionAfterEffect)" }) session=\(client.controller.sessionId ?? "-")")
+            print("PX-026 retention evidence: \(retention)")
             print("PX-026 endpoint evidence: listeners before=\(endpointsBefore.listeners.sorted()) after=\(endpointsAfter.listeners.sorted()); sockets before=\(endpointsBefore.socketCount) after=\(endpointsAfter.socketCount)")
             try SemanticInspectionReport.write(
                 "# lsof -nP -a -p \(getpid()) -i / -U before inspection\n\(endpointsBefore.raw)\n# after\n\(endpointsAfter.raw)",
@@ -338,6 +370,7 @@ extension ProcessExplorerShellTests {
         } catch {
             failure = error
         }
+        client.tap.releaseInbound()
         await client.controller.stop()
         client.closeWindows()
         let fixture = AutomationUnchecked(harness)
@@ -543,6 +576,9 @@ fileprivate final class AutomationWireTap: Transport, @unchecked Sendable {
     private var sent: [SentEvent] = []
     private var acks: [SRUIServerEventAck] = []
     private var pending = Data()
+    private var holding = false
+    private var held: [Data] = []
+    private var heldContinuation: AsyncThrowingStream<Data, Error>.Continuation?
 
     init(inner: any Transport) {
         self.inner = inner
@@ -598,10 +634,12 @@ fileprivate final class AutomationWireTap: Transport, @unchecked Sendable {
                 do {
                     for try await chunk in inner.receiveStream() {
                         self.observe(chunk)
-                        continuation.yield(chunk)
+                        self.deliver(chunk, to: continuation)
                     }
+                    self.releaseInbound()
                     continuation.finish()
                 } catch {
+                    self.releaseInbound()
                     continuation.finish(throwing: error)
                 }
             }
@@ -615,6 +653,34 @@ fileprivate final class AutomationWireTap: Transport, @unchecked Sendable {
 
     func acknowledgeReceived(byteCount: Int) async {
         await inner.acknowledgeReceived(byteCount: byteCount)
+    }
+
+    /// Holds every inbound chunk from the client while still decoding it here, so a test can see a
+    /// `ServerEventAck` on the wire before the client has applied it. `releaseInbound` delivers the
+    /// held chunks in order; the stream's end also releases them, and so does fixture teardown.
+    func holdInbound() {
+        lock.withLock { holding = true }
+    }
+
+    func releaseInbound() {
+        lock.withLock {
+            holding = false
+            if let continuation = heldContinuation {
+                for chunk in held { continuation.yield(chunk) }
+            }
+            held.removeAll()
+        }
+    }
+
+    private func deliver(_ chunk: Data, to continuation: AsyncThrowingStream<Data, Error>.Continuation) {
+        lock.withLock {
+            heldContinuation = continuation
+            if holding {
+                held.append(chunk)
+            } else {
+                continuation.yield(chunk)
+            }
+        }
     }
 
     private func observe(_ chunk: Data) {

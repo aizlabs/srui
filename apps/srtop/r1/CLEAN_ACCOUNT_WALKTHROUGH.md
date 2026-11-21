@@ -10,7 +10,7 @@ test build.
 
 **Run it only on a revision that includes PX-026-G02.** That ticket makes the server explain why
 it refuses an incompatible client. Before it, the walkthrough's `r1-live-checks` step fails, and
-the run ends `SUMMARY FAIL`.
+the run ends `SUMMARY FAIL`. The branch named below includes it.
 
 The script runs only in a fresh account. It refuses, before writing anything, an account that
 already has any of these:

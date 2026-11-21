@@ -2,11 +2,11 @@
   "connections" : [
     {
       "host" : "127.0.0.1",
-      "id" : "0DF718EC-4590-4926-A27E-C0F8EFB8C932",
+      "id" : "E66A046C-F745-4160-862F-227662ED542E",
       "label" : "devbox",
       "lastKnownRevision" : 1,
       "port" : 2222,
-      "sessionID" : "3388580462b3ef165b2c208b19ea12ef",
+      "sessionID" : "81fbc3cde4c9b5946510cda9c63c98be",
       "user" : "srui"
     }
   ],

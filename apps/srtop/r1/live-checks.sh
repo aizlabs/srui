@@ -143,6 +143,10 @@ if [ "$evidence_lines" -ne "$EXPECTED_TESTS" ] \
   [ "$status" -eq 0 ] && status=1
 fi
 
+# Both output streams are in what is audited: the box's entrypoint starts srtop with
+# `>/var/log/srtop.log 2>&1` (and restart-srtop appends the same way), `docker logs` carries the
+# container's stdout and stderr, and the test writes each into one file. sessiond's tracing goes to
+# stdout and srtop's `eprintln!` to stderr, so neither escapes the audit.
 # Every application log the run collected (the box's srtop and sshd output, the client's unified
 # log), the saved-connections file the real client store wrote, and the environment record must
 # hold no credential or private path. The test runner's own

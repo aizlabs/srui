@@ -1,15 +1,15 @@
-# PX-026-G01 live checks against the devbox: the test run's evidence and result lines (apps/srtop/r1/live-checks.sh, round 2, run 5 of 5). theServerRefusesAnIncompatibleClientWithItsReason fails until PX-026-G02's server refusal lands.
-PX-026-G01 R1 live evidence: client-side compatibility: compatible complete=true dispatch=true revision=13 negotiated=["org.srui.standard-widgets/1"] failure=none; client-required absent profile complete=false dispatch=false revision=0 negotiated=[] failure="protocol violation: Server does not satisfy client required profiles: [org.srui.r1-absent-profile/1]"; server core 1.5.0 (live server spoke 0.5.0) complete=false dispatch=false revision=0 negotiated=[] failure="protocol violation: SERVER WELCOME core_version 1.5.0 is not compatible with 0.5.0"; alert SERVER WELCOME core_version 1.5.0 -> "Connection Failed": "protocol violation: SERVER WELCOME core_version 1.5.0 is not compatible with 0.5.0"
-PX-026-G01 R1 live evidence: server-side compatibility: standard-widgets/2 only complete=false dispatch=false revision=0 negotiated=[] failure="transport ended: receive stream closed by peer"; client core 1.5.0 complete=false dispatch=false revision=0 negotiated=[] failure="transport ended: receive stream closed by peer"; alert CLIENT HELLO core_version 1.5.0 -> "Connection Failed": "transport ended: receive stream closed by peer"
+# PX-026-G01 live checks against the devbox: the test run's evidence and result lines (apps/srtop/r1/live-checks.sh, round 3, run 3 of 3, devbox image labelled 7d28360981811e74caa8afa5cda58dad3323f18c, which includes PX-026-G02)
+PX-026-G01 R1 live evidence: client-side compatibility: compatible complete=true dispatch=true revision=14 negotiated=["org.srui.standard-widgets/1"] failure=none; client-required absent profile complete=false dispatch=false revision=0 negotiated=[] failure="protocol violation: Server does not satisfy client required profiles: [org.srui.r1-absent-profile/1]"; server core 1.5.0 (live server spoke 0.5.0) complete=false dispatch=false revision=0 negotiated=[] failure="protocol violation: SERVER WELCOME core_version 1.5.0 is not compatible with 0.5.0"; alert SERVER WELCOME core_version 1.5.0 -> "Connection Failed": "protocol violation: SERVER WELCOME core_version 1.5.0 is not compatible with 0.5.0"
+PX-026-G01 R1 live evidence: server-side compatibility: standard-widgets/2 only complete=false dispatch=false revision=0 negotiated=[] failure="server refused the handshake: client offer does not satisfy required profiles: [org.srui.standard-widgets/1]"; client core 1.5.0 complete=false dispatch=false revision=0 negotiated=[] failure="server refused the handshake: unsupported core protocol version 1.5.0 (this server serves 0.5)"; alert CLIENT HELLO core_version 1.5.0 -> "Connection Failed": "server refused the handshake: unsupported core protocol version 1.5.0 (this server serves 0.5)"
 PX-026-G01 R1 live evidence: host keys: unknown -> ["1:connecting", "1:sshFailedBeforeStream"] status=unknown "Connection Failed": "SRUI could not connect to srui@127.0.0.1:2222.
 
-[127.0.0.1]:2222 is not in your known_hosts files (/tmp/srui-r1-hostkey-63753-58BB9833/unknown_known_hosts). SRUI never adds or changes host keys.
+[127.0.0.1]:2222 is not in your known_hosts files (/tmp/srui-r1-hostkey-55862-B2E75138/unknown_known_hosts). SRUI never adds or changes host keys.
 
 ssh reported (this text can include messages from the server):
 No ED25519 host key is known for [127.0.0.1]:2222 and you have requested strict checking.
 Host key verification failed."; known_hosts still 0 B; changed -> ["1:connecting", "1:sshFailedBeforeStream"] status=unknown "Connection Failed": "SRUI could not connect to srui@127.0.0.1:2222.
 
-A key for [127.0.0.1]:2222 is in /tmp/srui-r1-hostkey-63753-58BB9833/changed_known_hosts. SRUI will not change it.
+A key for [127.0.0.1]:2222 is in /tmp/srui-r1-hostkey-55862-B2E75138/changed_known_hosts. SRUI will not change it.
 
 ssh reported (this text can include messages from the server):
 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
@@ -21,49 +21,45 @@ It is also possible that a host key has just been changed.
 The fingerprint for the ED25519 key sent by the remote host is
 SHA256:W1WR9hcAn3hNz5Iv/1vaaF5Y7CQVRAVLZXEzZcmkvv4.
 Please contact your system administrator.
-Add correct host key in /tmp/srui-r1-hostkey-63753-58BB9833/changed_known_hosts to get rid of this message.
-Offending ED25519 key in /tmp/srui-r1-hostkey-63753-58BB9833/changed_known_hosts:1
+Add correct host key in /tmp/srui-r1-hostkey-55862-B2E75138/changed_known_hosts to get rid of this message.
+Offending ED25519 key in /tmp/srui-r1-hostkey-55862-B2E75138/changed_known_hosts:1
 Host key for [127.0.0.1]:2222 has changed and you have requested strict checking.
-Host key verification failed."; known_hosts unchanged (98 B); argv posture ["ClearAllForwardings=yes", "ExitOnForwardFailure=yes", "StrictHostKeyChecking=yes", "LogLevel=INFO", "UpdateHostKeys=no", "UserKnownHostsFile=/tmp/srui-r1-hostkey-63753-58BB9833/unknown_known_hosts", "BatchMode=yes", "ConnectTimeout=10", "IdentitiesOnly=yes"]
+Host key verification failed."; known_hosts unchanged (98 B); argv posture ["ClearAllForwardings=yes", "ExitOnForwardFailure=yes", "StrictHostKeyChecking=yes", "LogLevel=INFO", "UpdateHostKeys=no", "UserKnownHostsFile=/tmp/srui-r1-hostkey-55862-B2E75138/unknown_known_hosts", "BatchMode=yes", "ConnectTimeout=10", "IdentitiesOnly=yes"]
 PX-026-G01 R1 live evidence: authentication: unauthorized key -> ["1:connecting", "1:sshFailedBeforeStream"] status=unknown "Connection Failed": "SRUI could not connect to srui@127.0.0.1:2222.
 
-A key for [127.0.0.1]:2222 is in /tmp/srui-r1-auth-63753-26D0A6F1/known_hosts. SRUI will not change it.
+A key for [127.0.0.1]:2222 is in /tmp/srui-r1-auth-55862-22BA46E1/known_hosts. SRUI will not change it.
 
 ssh reported (this text can include messages from the server):
 srui@127.0.0.1: Permission denied (publickey)."; known_hosts unchanged
-PX-026-G01 R1 live evidence: continuity: session ffbfb0e38d020f6b30c5137baf7b1f05 dropped at revision 24 -> subtitle "disconnected — showing data from revision 24 (stale)"; resumed ["connecting", "ready", "failed"] same session (same NSWindow: false); srtop restarted -> ["connecting", "replaced", "ready"] new session 3388580462b3ef165b2c208b19ea12ef; alert "Session Replaced": "Remote session ffbfb0e38d020f6b30c5137baf7b1f05 was replaced by 3388580462b3ef165b2c208b19ea12ef. SRUI is rebuilding from authoritative state."; subtitles ["resynchronizing — showing data from revision 0 (stale)", "", "disconnected — showing data from revision 24 (stale)", "connecting — showing data from revision 24 (stale)", "", "disconnected — showing data from revision 25 (stale)", "connecting — showing data from revision 25 (stale)", "session replaced — rebuilding", ""]; attempts ["1:connecting", "1:resynchronizing", "1:ready", "1:failed", "2:connecting", "2:ready", "2:failed", "3:connecting", "3:replaced", "3:ready"]
+PX-026-G01 R1 live evidence: continuity: session e77d872fd3e64f6c640190092130af3e dropped at revision 23 -> subtitle "disconnected — showing data from revision 23 (stale)"; resumed ["connecting", "ready", "failed"] same session (same NSWindow: false); srtop restarted -> ["connecting", "replaced", "ready"] new session 81fbc3cde4c9b5946510cda9c63c98be; alert "Session Replaced": "Remote session e77d872fd3e64f6c640190092130af3e was replaced by 81fbc3cde4c9b5946510cda9c63c98be. SRUI is rebuilding from authoritative state."; subtitles ["resynchronizing — showing data from revision 0 (stale)", "", "disconnected — showing data from revision 23 (stale)", "connecting — showing data from revision 23 (stale)", "", "disconnected — showing data from revision 24 (stale)", "connecting — showing data from revision 24 (stale)", "session replaced — rebuilding", ""]; attempts ["1:connecting", "1:resynchronizing", "1:ready", "1:failed", "2:connecting", "2:ready", "2:failed", "3:connecting", "3:replaced", "3:ready"]
 PX-026-G01 R1 saved endpoint: the client store wrote 293 B: {
   "connections" : [
     {
       "host" : "127.0.0.1",
-      "id" : "0DF718EC-4590-4926-A27E-C0F8EFB8C932",
+      "id" : "E66A046C-F745-4160-862F-227662ED542E",
       "label" : "devbox",
       "lastKnownRevision" : 1,
       "port" : 2222,
-      "sessionID" : "3388580462b3ef165b2c208b19ea12ef",
+      "sessionID" : "81fbc3cde4c9b5946510cda9c63c98be",
       "user" : "srui"
     }
   ],
   "version" : 1
 }
-PX-026-G01 R1 live evidence: package: 41 controls accept events, none process-changing: ["1:Process Explorer", "62:Pause view", "63:Refresh now", "64:Refresh interval (ms)", "65:Apply interval", "26:Filter processes", "50:Only my processes", "51:All visible users", "52:User", "53:PID set", "43:Find processes", "44:Previous match", "45:Next match", "46:PID to find", "47:Go to PID", "21:Sort by PID", "22:Sort by Name", "23:Sort by Resident", "24:Sort by CPU", "29:Hide PID column", "30:Move PID column left", "31:Move PID column right", "32:Hide Name column", "33:Move Name column left", "34:Move Name column right", "35:Hide Resident column", "36:Move Resident column left", "37:Move Resident column right", "38:Hide CPU column", "39:Move CPU column left", "40:Move CPU column right", "41:Restore default columns", "68:Follow selected process", "71:Show process tree", "75:Show user threads", "76:Show kernel threads", "79:Tag or untag selected", "80:Tag selected and descendants", "81:Clear tags", "5:Processes", "73:Process tree"]; all labelled with a role; 18 shortcuts bound in reading order; keyboard: ⌘F search, ⌥⌘F filter, ⌘L table, Down -> PID 1 -> "Selected process: PID 1 · sshd", ⌘I command line
-PX-026-G01 R1 live evidence: privacy: a worker with --api-token=ghp_… and --password=… in its arguments; the inspector showed both on selection; absent from ["devbox-srtop.log 399 B", "devbox-container.log 3313 B", "client-unified.log 6934 B"] (written to impl2-live-run5)
-✔ Test compatibleProfilesConnectAndTheClientRefusesAnIncompatibleServerClearly() passed after 4.558 seconds.
-✘ Test theServerRefusesAnIncompatibleClientWithItsReason() recorded an issue at ProcessExplorerShellTests.swift:4506:9: Expectation failed: (newerWidgets.failure?.hasPrefix(refusedPrefix) == true → false) && (newerWidgets.failure?.contains(Profile.standardWidgetsV1.description) == true → <not evaluated>)
-↳ the refusal names the required profile: complete=false dispatch=false revision=0 negotiated=[] failure="transport ended: receive stream closed by peer"
-✘ Test theServerRefusesAnIncompatibleClientWithItsReason() recorded an issue at ProcessExplorerShellTests.swift:4515:9: Expectation failed: (newerClient.failure?.hasPrefix(refusedPrefix) == true → false) && (newerClient.failure?.contains(newerCore) == true → <not evaluated>)
-↳ the refusal names the version: complete=false dispatch=false revision=0 negotiated=[] failure="transport ended: receive stream closed by peer"
-✘ Test theServerRefusesAnIncompatibleClientWithItsReason() recorded an issue at ProcessExplorerShellTests.swift:4520:9: Expectation failed: (alert.contains(refusedPrefix) → false) && (alert.contains(newerCore) → <not evaluated>)
-↳ CLIENT HELLO core_version 1.5.0 -> "Connection Failed": "transport ended: receive stream closed by peer"
-✘ Test theServerRefusesAnIncompatibleClientWithItsReason() recorded an issue at ProcessExplorerShellTests.swift:4521:9: Expectation failed: !((alert → "CLIENT HELLO core_version 1.5.0 -> "Connection Failed": "transport ended: receive stream closed by peer"").contains("transport ended") → true)
-↳ CLIENT HELLO core_version 1.5.0 -> "Connection Failed": "transport ended: receive stream closed by peer"
-✘ Test theServerRefusesAnIncompatibleClientWithItsReason() failed after 3.758 seconds with 4 issues.
-✔ Test anUnknownOrChangedHostKeyIsRefusedAndKnownHostsIsNeverWritten() passed after 0.315 seconds.
-✔ Test aKeyTheBoxDoesNotAuthorizeFailsAuthenticationClearly() passed after 0.807 seconds.
-✔ Test aDroppedTransportResumesAndARestartedServerIsReportedAsReplaced() passed after 4.288 seconds.
-✔ Test theLivePackageOffersNoProcessChangingActionAndIsLabelledAndKeyboardOperable() passed after 3.377 seconds.
-✔ Test aSecretInAProcessCommandLineReachesNoLog() passed after 6.485 seconds.
-✘ Suite ProcessExplorerR1DevboxTests failed after 23.593 seconds with 4 issues.
-✘ Test run with 7 tests in 1 suite failed after 23.593 seconds with 4 issues.
+PX-026-G01 R1 live evidence: package: 41 controls accept events, none process-changing: ["1:Process Explorer", "62:Pause view", "63:Refresh now", "64:Refresh interval (ms)", "65:Apply interval", "26:Filter processes", "50:Only my processes", "51:All visible users", "52:User", "53:PID set", "43:Find processes", "44:Previous match", "45:Next match", "46:PID to find", "47:Go to PID", "21:Sort by PID", "22:Sort by Name", "23:Sort by Resident", "24:Sort by CPU", "29:Hide PID column", "30:Move PID column left", "31:Move PID column right", "32:Hide Name column", "33:Move Name column left", "34:Move Name column right", "35:Hide Resident column", "36:Move Resident column left", "37:Move Resident column right", "38:Hide CPU column", "39:Move CPU column left", "40:Move CPU column right", "41:Restore default columns", "68:Follow selected process", "71:Show process tree", "75:Show user threads", "76:Show kernel threads", "79:Tag or untag selected", "80:Tag selected and descendants", "81:Clear tags", "5:Processes", "73:Process tree"]; all labelled with a role; 18 shortcuts bound in reading order; keyboard: ⌘F search, ⌥⌘F filter, ⌘L table, Down -> PID 1 -> "Selected process: PID 1 · sshd · loading details", ⌘I command line
+PX-026-G01 R1 live evidence: privacy: a worker with --api-token=ghp_… and --password=… in its arguments; the inspector showed both on selection; absent from ["devbox-srtop.log 399 B", "devbox-container.log 3313 B", "client-unified.log 7274 B"] (written to impl3-live-run3)
+✔ Test compatibleProfilesConnectAndTheClientRefusesAnIncompatibleServerClearly() passed after 4.394 seconds.
+✔ Test theServerRefusesAnIncompatibleClientWithItsReason() passed after 3.272 seconds.
+✔ Test anUnknownOrChangedHostKeyIsRefusedAndKnownHostsIsNeverWritten() passed after 0.242 seconds.
+✔ Test aKeyTheBoxDoesNotAuthorizeFailsAuthenticationClearly() passed after 0.747 seconds.
+✔ Test aDroppedTransportResumesAndARestartedServerIsReportedAsReplaced() passed after 3.583 seconds.
+✔ Test theLivePackageOffersNoProcessChangingActionAndIsLabelledAndKeyboardOperable() passed after 0.993 seconds.
+✔ Test aSecretInAProcessCommandLineReachesNoLog() passed after 3.921 seconds.
+✔ Suite ProcessExplorerR1DevboxTests passed after 17.156 seconds.
+✔ Test run with 7 tests in 1 suite passed after 17.156 seconds.
 privacy-audit: 5 file(s) scanned (0 binary), 0 finding(s)
 privacy-audit: PASS
+# srtop's own log of the refused connections (stdout and stderr, /var/log/srtop.log):
+srtop: connection ended: session error: capability negotiation error: unsatisfied required capabilities: client did not offer required profile(s): ["org.srui.standard-widgets/1"]
+srtop: connection ended: session error: unsupported core protocol version "1.5.0"; this server speaks "0.5.0"
+srtop: connection ended: session error: unsupported core protocol version "1.5.0"; this server speaks "0.5.0"

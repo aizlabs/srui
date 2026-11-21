@@ -83,7 +83,7 @@
     },
     {
       "feature_id": "SRUI-PX026G01-006",
-      "feature": "Repeatable privacy and disclosure audit: apps/srtop/r1/privacy-audit.sh scans files or directories for private keys, GitHub/GitLab/AWS/Slack/OpenAI-style tokens, JWTs, bearer credentials, password assignments, URL credentials and private paths, printing only class and location; --self-test plants one secret of each class (built at run time) and passes 21 of 21 cases; live: a worker's --api-token=ghp_… and --password=… arguments are shown on selection and appear in none of srtop's log, the box's sshd output and the client's unified log, which the audit then passes; mutants that drop the token or the private-key rule are killed; round 2 (F8): a /home/<name>/ rule (the devbox's throwaway /home/srui excepted) and a $HOME case planted outside /Users and /home, so each path rule has a case only it can find (22 of 22), and mutants that disable either are killed; the live checks also audit the saved-connections file",
+      "feature": "Repeatable privacy and disclosure audit: apps/srtop/r1/privacy-audit.sh scans files or directories for private keys, GitHub/GitLab/AWS/Slack/OpenAI-style tokens, JWTs, bearer credentials, password assignments, URL credentials and private paths, printing only class and location; --self-test plants one secret of each class (built at run time) and passes 21 of 21 cases; live: a worker's --api-token=ghp_… and --password=… arguments are shown on selection and appear in none of srtop's log, the box's sshd output and the client's unified log, which the audit then passes; mutants that drop the token or the private-key rule are killed; round 2 (F8): a /home/<name>/ rule (the devbox's throwaway /home/srui excepted) and a $HOME case planted outside /Users and /home, so each path rule has a case only it can find (22 of 22), and mutants that disable either are killed; the live checks also audit the saved-connections file; round 3: srtop's stderr 'connection ended: {error}' and srui-sessiond's stdout WARN 'Connection ended: {e}' echo the client's requested core version Debug-escaped but unbounded (pre-existing since e549ee8a, recorded in R1.md with a follow-up); the audit captures both streams of the box's logs",
       "scope": "PX-026-G01/apps/srtop/r1/privacy-audit.sh; ProcessExplorerR1DevboxTests.aSecretInAProcessCommandLineReachesNoLog; apps/srtop/r1/live-checks.sh",
       "source_refs": [
         "D1",
@@ -155,15 +155,14 @@
     },
     {
       "feature_id": "SRUI-PX026G01-011",
-      "feature": "BLOCKED: awaiting PX-026-G02. The server's own refusals of an incompatible client must be clear to the user: a client offering only standard-widgets/2 and a client of core 1.5.0 (its CLIENT HELLO rewritten in flight) must each see 'server refused the handshake: ...' naming the profile or the version, and the connection manager's alert must not say 'transport ended'. The live test exists and fails against today's sessiond (5 of 5 runs: 'transport ended: receive stream closed by peer'); PX-026-G02 makes sessiond send the existing ServerHandshakeRefused{UNSPECIFIED, bounded detail} before closing",
-      "scope": "PX-026-G01/client-macos Tests/SRUITests/ProcessExplorerShellTests.swift ProcessExplorerR1DevboxTests.theServerRefusesAnIncompatibleClientWithItsReason; server side in PX-026-G02",
+      "feature": "The server's own refusals of an incompatible client are clear to the user (PX-026-G02 merged, devbox image 7d283609): a client offering only standard-widgets/2 sees 'server refused the handshake: client offer does not satisfy required profiles: [org.srui.standard-widgets/1]', a client of core 1.5.0 (its CLIENT HELLO rewritten in flight) sees 'server refused the handshake: unsupported core protocol version 1.5.0 (this server serves 0.5)', each with revision 0 and no dispatch, and the connection manager's alert is Connection Failed with that text, never 'transport ended'; 3 of 3 live runs green; against the pre-G02 server the same test failed 5 of 5 with 'transport ended: receive stream closed by peer'",
+      "scope": "PX-026-G01/client-macos Tests/SRUITests/ProcessExplorerShellTests.swift ProcessExplorerR1DevboxTests.theServerRefusesAnIncompatibleClientWithItsReason; server side PX-026-G02",
       "source_refs": [
         "D1",
         "D2"
       ],
       "owner": "PX-026-G01",
-      "status": "planned",
-      "blocked": "awaiting PX-026-G02",
+      "status": "in_progress",
       "evidence": [
         "docs/process-explorer/completions/PX-026-G01.md"
       ]

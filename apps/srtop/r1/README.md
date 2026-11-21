@@ -27,7 +27,7 @@ installs a privileged helper.
 | Server dependencies | `apps/srtop/Cargo.lock`, `server-rust/Cargo.lock`, built `--locked` | the lock files as committed |
 | Rust on the Mac | not needed for the R1 path; rustc/cargo 1.98.0 was present on the test Mac | only for `run.sh fake` and the Rust test suites |
 
-The Linux binaries the devbox image ran, built from `fad6c345`, are recorded by
+The Linux binaries the devbox image ran, built from `7d283609` (the merge of PX-026-G02), are recorded by
 `live-checks.sh` in each run's `environment.txt`, with their SHA-256 digests.
 
 ## Build and install the macOS client

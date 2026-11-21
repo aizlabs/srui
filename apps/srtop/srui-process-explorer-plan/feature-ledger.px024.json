@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-024",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Generic macOS client: saved endpoints and reattachment after a client relaunch (D2 T38 saved sessions; §6.3, §17, §18, §18.2), proven against a live srtop over real SSH; the saved-connections file holds no continuity state, a relaunch resumes the saved session ID with a fresh client identity, revision 0 and frontier 0, REPLACED updates the saved session ID, and forgetting an entry is local; no server, SDK, protocol, registry, proto, framing, generated-file or srtop change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX024-001",
+      "feature": "Saved endpoints persist locally in the one existing SavedConnectionStore file (PX-023's; no second store): id, label, host, port, user, the last session ID and the last revision; the revision is presentation metadata only and the Connections row now captions it 'Session <id> · last seen at revision N' (SavedConnection.sessionCaption) rather than as a resume point; a relaunched manager lists the entry with status unknown",
+      "scope": "PX-024/client-macos ConnectionManager/ConnectionManager.swift SavedConnection.sessionCaption, header; ConnectionManager/ConnectionManagerView.swift SavedConnectionRow; SRUITests ConnectionManagerTests, SavedEndpointRelaunchLiveTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-024",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-024.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX024-002",
+      "feature": "Reattach after a client relaunch uses only the existing session APIs: a new ConnectionManager over the saved file builds a fresh ConnectionSessionContext, so CLIENT_RESUME names the saved session ID with a fresh client_instance_id, last_applied_revision 0, last_acked_event_seq 0 and no pending text or terminal offsets, never the remembered revision (§18 cold-relaunch rule); against a live srtop with a one-commit journal the same session answers RESYNC_REQUIRED{SAME_SESSION} and the rebuilt replica equals, node for node and row for row, both the first launch's paused state and an independent fresh attach; the fresh identity's first event is sequence 1 and srtop processes it (no sequence collision)",
+      "scope": "PX-024/client-macos ConnectionManager/ConnectionManager.swift beginAttempt, ConnectionSessionContext (unchanged behaviour, now proven); SRUITests ConnectionManagerTests 'a relaunched manager resumes the saved session from zero with a fresh client identity', SavedEndpointRelaunchLiveTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-024",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-024.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX024-003",
+      "feature": "A double connect after a relaunch respects generation supersession: the first attempt, held after its CLIENT_RESUME is on the wire, is superseded by the second, which becomes ready; the first then runs to its end without ready and changes no status, alert, window subtitle or replica revision",
+      "scope": "PX-024/client-macos ConnectionManager/ConnectionManager.swift attempt tokens (unchanged); SRUITests SavedEndpointRelaunchLiveTests, ConnectionManagerTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-024",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-024.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX024-004",
+      "feature": "Forgetting a saved entry is local only: the entry and its file record go and nothing is sent; the srtop process keeps running, the forgotten entry's open transport keeps receiving commits, another client stays connected to the same session, and a copy of the file taken before the forget still reattaches to the same incarnation (SAME_SESSION, not REPLACED)",
+      "scope": "PX-024/client-macos ConnectionManager/ConnectionManager.swift remove(id:) (unchanged); SRUITests SavedEndpointRelaunchLiveTests, ConnectionManagerTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-024",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-024.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX024-005",
+      "feature": "A relaunch against a restarted srtop surfaces the replacement: the attempt reports connecting, replaced, ready; a blocking 'Session Replaced' alert names the old and new session IDs; the window says 'session replaced — rebuilding'; the saved file's stale session ID is replaced with the new one (revision 0) as soon as the decision arrives, before the snapshot is ready, and the ready revision is saved afterwards",
+      "scope": "PX-024/client-macos ConnectionManager/ConnectionManager.swift handle(.replaced) (unchanged); SRUITests SavedEndpointRelaunchLiveTests, ConnectionManagerTests",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-024",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-024.md"
+      ]
+    }
+  ]
+}

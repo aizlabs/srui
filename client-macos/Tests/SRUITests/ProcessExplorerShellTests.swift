@@ -4403,9 +4403,10 @@ private final class RenderWaiter {
     }
 }
 
-/// What the PX-022 test saw of a connection manager's attempts and session windows.
+/// What the PX-022 test saw of a connection manager's attempts and session windows. Internal so
+/// PX-024's relaunch test records its attempts the same way.
 @MainActor
-fileprivate final class ContinuityRecorder {
+final class ContinuityRecorder {
     struct Subtitle {
         let subtitle: String
         let revision: UInt64
@@ -4520,7 +4521,7 @@ fileprivate final class ContinuityRecorder {
 
 /// A real connection attempt whose events the PX-022 test records, and whose ready event it can
 /// hold.
-fileprivate actor RecordingConnectionAttempt: ConnectionAttempt {
+actor RecordingConnectionAttempt: ConnectionAttempt {
     nonisolated let events: AsyncStream<ConnectionAttemptEvent>
     private let continuation: AsyncStream<ConnectionAttemptEvent>.Continuation
     private let inner: any ConnectionAttempt

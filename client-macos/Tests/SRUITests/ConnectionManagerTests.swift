@@ -382,6 +382,60 @@ struct ConnectionManagerTests {
         await attempt.stop()
     }
 
+    /// PX-024: two manager instances over one saved-connections file, as two launches of the app.
+    /// Each resumes the saved session through the production `beginAttempt` path with an empty
+    /// replica, frontier 0 and its own new client identity; the remembered revision is shown, never
+    /// sent (§18: a persisted last-known revision is presentation metadata, not resume authority).
+    @Test("a relaunched manager resumes the saved session from zero with a fresh client identity")
+    func relaunchedManagerResumesWithFreshIdentity() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Remembered",
+            host: "remembered.example",
+            user: "alice",
+            sessionID: "saved-session",
+            lastKnownRevision: 900
+        )
+        try await temporary.store.save([saved])
+
+        func launch() async throws -> (resume: SRUIClientResume, identity: ClientInstanceId) {
+            let harness = ConnectionControllerHarness()
+            let manager = ConnectionManager(
+                store: temporary.store,
+                attemptFactory: { harness.makeAttempt($0) }
+            )
+            await manager.load()
+            #expect(manager.entries == [saved])
+            #expect(manager.status(for: saved.id) == .unknown)
+            #expect(saved.sessionCaption == "Session saved-session · last seen at revision 900")
+            manager.connect(id: saved.id)
+            let request = try #require(harness.requests.first)
+            #expect(request.isWarmReconnect == false)
+            let message = try await waitForFrame(0, from: try #require(harness.transports.first))
+            await manager.shutdown()
+            guard case .clientResume(let resume) = message.msg else {
+                Issue.record("a saved session did not emit CLIENT_RESUME")
+                throw CancellationError()
+            }
+            return (resume, request.context.outbox.clientInstanceId)
+        }
+
+        let first = try await launch()
+        let second = try await launch()
+        for (resume, identity) in [first, second] {
+            #expect(resume.sessionID == "saved-session")
+            #expect(resume.lastAppliedRevision == 0, "the remembered revision 900 is not resume authority")
+            #expect(resume.lastAckedEventSeq == 0)
+            #expect(resume.pendingTextEdits.isEmpty)
+            #expect(resume.terminalStreamOffsets.isEmpty)
+            #expect(resume.clientInstanceID == identity.bytes)
+        }
+        #expect(first.identity != second.identity, "a relaunch never reuses a client identity")
+        // Never ready, so the shutdowns kept the remembered metadata as it was.
+        #expect(try await temporary.store.load() == [saved])
+    }
+
     private func mountOriginalSession(
         manager: ConnectionManager,
         harness: ConnectionControllerHarness,

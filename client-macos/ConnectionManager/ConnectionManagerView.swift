@@ -92,8 +92,8 @@ private struct SavedConnectionRow: View {
                 Text(endpoint)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
-                if let sessionID = entry.sessionID {
-                    Text("Session \(sessionID) · revision \(entry.lastKnownRevision)")
+                if let caption = entry.sessionCaption {
+                    Text(caption)
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)

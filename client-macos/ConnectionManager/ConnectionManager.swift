@@ -24,6 +24,12 @@
 // only a `KnownHostsHint` computed from the local known_hosts files. The app writes no host-key
 // verdict and no trust-changing advice.
 //
+// PX-024: the saved-connections file holds only the endpoint, its local label, the last session ID
+// and that revision as presentation metadata. Nothing in it is continuity state: a relaunched
+// manager builds a fresh `ConnectionSessionContext` (new outbox, so a new `client_instance_id`
+// and event frontier 0; an empty replica at revision 0), so the server's continuity decision
+// rebuilds the complete current state. Removing an entry forgets it locally and sends nothing.
+//
 
 import Foundation
 import Observation
@@ -60,6 +66,13 @@ public struct SavedConnection: Identifiable, Codable, Hashable, Sendable {
         self.user = user
         self.sessionID = sessionID
         self.lastKnownRevision = lastKnownRevision
+    }
+
+    /// The Connections row's caption for a remembered session (PX-024). `lastKnownRevision` is
+    /// presentation metadata only (§18): after a relaunch no committed replica stands behind it,
+    /// so the caption says when the session was last seen and never offers it as a resume point.
+    var sessionCaption: String? {
+        sessionID.map { "Session \($0) · last seen at revision \(lastKnownRevision)" }
     }
 }
 

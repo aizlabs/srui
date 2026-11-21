@@ -122,10 +122,14 @@ struct ProcessExplorerLatencyTests {
             // run's own 0 ms floor (its fastest 0 ms result, at most 30 ms) plus 5 ms. A result
             // that waited an extra RTT takes at least 2 RTT, past this bound at every nonzero
             // RTT. The minimum, not the median: under a loaded parallel run the 0 ms median alone
-            // exceeded 150 ms while the fastest samples stayed near the floor.
-            let ceiling = rtt + rtt / 2 + floor + .milliseconds(5)
-            #expect(run.remote.min()! < ceiling,
-                    "the fastest remote result at \(run.rtt) ms RTT took \(run.remote.min()!), past \(ceiling)")
+            // exceeded 150 ms while the fastest samples stayed near the floor. Only at a nonzero
+            // RTT: at 0 ms the floor is this run's own measurement, and comparing it with itself
+            // (capped at 30 ms) would fail any run whose fastest 0 ms result is 35 ms or more.
+            if run.rtt > 0 {
+                let ceiling = rtt + rtt / 2 + floor + .milliseconds(5)
+                #expect(run.remote.min()! < ceiling,
+                        "the fastest remote result at \(run.rtt) ms RTT took \(run.remote.min()!), past \(ceiling)")
+            }
             print("PX-025 native latency evidence: rtt \(run.rtt) ms; typing \(Self.list(run.typing)); caret \(Self.list(run.caret)); scrolling \(Self.list(run.scrolling)); remote filter result \(Self.list(run.remote)); held at local completion \(run.heldAtLocalCompletion)/\(run.typing.count); bytes sent during caret+scroll \(run.sentDuringCaretAndScroll)")
         }
     }

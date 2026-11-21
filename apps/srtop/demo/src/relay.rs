@@ -82,6 +82,8 @@ struct Inner {
     up: AtomicU64,
     down: AtomicU64,
     accepted: AtomicU64,
+    /// Delay-line threads (a reader and a writer per direction) still running.
+    pumps: AtomicU64,
     /// Both sockets of every connection not yet cut or closed, by number.
     live: Mutex<Vec<(u64, UnixStream, UnixStream)>>,
 }
@@ -143,6 +145,7 @@ impl DelayRelay {
             up: AtomicU64::new(0),
             down: AtomicU64::new(0),
             accepted: AtomicU64::new(0),
+            pumps: AtomicU64::new(0),
             live: Mutex::new(Vec::new()),
         });
         let accept = {
@@ -199,6 +202,16 @@ impl DelayRelay {
     /// The in-flight budget of each direction of each connection.
     pub fn budget(&self) -> usize {
         self.inner.budget
+    }
+
+    /// Connections not yet cut or closed.
+    pub fn live_connections(&self) -> usize {
+        self.inner.live.lock().unwrap().len()
+    }
+
+    /// Delay-line threads still running: four per live connection.
+    pub fn pump_threads(&self) -> u64 {
+        self.inner.pumps.load(Ordering::SeqCst)
     }
 
     /// How many connections were accepted.
@@ -354,6 +367,23 @@ impl Budget {
     }
 }
 
+/// Counts one delay-line thread for as long as it runs; dropped when the
+/// thread's closure ends (or is dropped unspawned).
+struct PumpThread(Arc<Inner>);
+
+impl PumpThread {
+    fn start(inner: &Arc<Inner>) -> Self {
+        inner.pumps.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(inner))
+    }
+}
+
+impl Drop for PumpThread {
+    fn drop(&mut self) {
+        self.0.pumps.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// One direction's delay line: a reader that timestamps each chunk and a
 /// writer that releases it `delay` after it was read.
 fn pump(
@@ -368,12 +398,14 @@ fn pump(
     let (line, queue) = mpsc::channel::<Option<(Instant, Vec<u8>)>>();
     let budget = Arc::new(Budget::new(inner.budget));
     let writer = {
+        let running = PumpThread::start(&inner);
         let from = from.try_clone()?;
         let budget = Arc::clone(&budget);
         let inner = Arc::clone(&inner);
         thread::Builder::new()
             .name("relay-write".into())
             .spawn(move || {
+                let _running = running;
                 while let Ok(Some((due, chunk))) = queue.recv() {
                     let now = Instant::now();
                     if due > now {
@@ -411,9 +443,10 @@ fn pump(
                 }
             })?
     };
-    thread::Builder::new()
-        .name("relay-read".into())
-        .spawn(move || {
+    thread::Builder::new().name("relay-read".into()).spawn({
+        let running = PumpThread::start(&inner);
+        move || {
+            let _running = running;
             let mut buffer = vec![0_u8; READ_CHUNK.min(inner.budget)];
             let (in_flight, peak) = match direction {
                 Direction::Up => (&inner.in_flight_up, &inner.peak_up),
@@ -441,6 +474,7 @@ fn pump(
             }
             let _ = line.send(None);
             drop(writer);
-        })?;
+        }
+    })?;
     Ok(())
 }

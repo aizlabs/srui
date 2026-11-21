@@ -267,6 +267,8 @@ struct Pusher {
     first_done: Arc<AtomicBool>,
     all_done: Arc<AtomicBool>,
     go: Arc<AtomicBool>,
+    /// The server's writing thread has returned: done, or its write failed.
+    ended: Arc<AtomicBool>,
 }
 
 impl Pusher {
@@ -277,7 +279,9 @@ impl Pusher {
             first_done: Arc::new(AtomicBool::new(false)),
             all_done: Arc::new(AtomicBool::new(false)),
             go: Arc::new(AtomicBool::new(false)),
+            ended: Arc::new(AtomicBool::new(false)),
         };
+        let ended = Arc::clone(&pusher.ended);
         let (written, first_done, all_done, go) = (
             Arc::clone(&pusher.written),
             Arc::clone(&pusher.first_done),
@@ -285,6 +289,13 @@ impl Pusher {
             Arc::clone(&pusher.go),
         );
         thread::spawn(move || {
+            struct Ended(Arc<AtomicBool>);
+            impl Drop for Ended {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _ended = Ended(ended);
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
@@ -438,6 +449,56 @@ fn an_in_flight_budget_is_accepted_at_its_bounds_and_refused_past_them() {
             .unwrap()
             .budget(),
         DEFAULT_IN_FLIGHT
+    );
+}
+
+/// Stopping a relay cuts its live connections: with a client that never
+/// reads and a server blocked writing to it, `stop()` ends the server's write
+/// (an error) and every delay-line thread within RTT/2 + 100 ms.
+#[test]
+fn stop_cuts_a_blocked_connection_and_ends_its_threads() {
+    let scratch = Scratch::new();
+    let upstream = scratch.path("push.sock");
+    let pusher = Pusher::start(&upstream, 64 << 20, 0);
+    let rtt = Duration::from_millis(100);
+    let mut relay =
+        DelayRelay::start_with_budget(&scratch.path("r.sock"), &upstream, rtt, 256 * 1024).unwrap();
+    let _client = connect(relay.listen_path());
+    // Blocked: the line is full and the server has stopped getting rid of bytes.
+    wait_for("the line to fill", Duration::from_secs(2), || {
+        relay.in_flight().down > 0 && relay.pump_threads() == 4
+    });
+    let mut last = pusher.written.load(Ordering::SeqCst);
+    loop {
+        thread::sleep(Duration::from_millis(100));
+        let now = pusher.written.load(Ordering::SeqCst);
+        if now == last {
+            break;
+        }
+        last = now;
+    }
+    assert!(
+        !pusher.ended.load(Ordering::SeqCst),
+        "the server is still blocked"
+    );
+    assert_eq!(relay.live_connections(), 1);
+    let stopped = Instant::now();
+    relay.stop();
+    let bound = rtt / 2 + Duration::from_millis(100);
+    wait_for("the server's write to end", bound, || {
+        pusher.ended.load(Ordering::SeqCst)
+    });
+    assert!(
+        !pusher.first_done.load(Ordering::SeqCst),
+        "the server's write ended by an error, not by completing"
+    );
+    wait_for("every delay-line thread to end", bound, || {
+        relay.pump_threads() == 0
+    });
+    assert_eq!(relay.live_connections(), 0);
+    println!(
+        "PX-025 stop evidence: blocked server and 4 delay-line threads ended {:?} after stop()",
+        stopped.elapsed()
     );
 }
 

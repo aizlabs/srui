@@ -105,10 +105,11 @@ impl Drop for Srtop {
 #[test]
 fn remote_results_are_delayed_by_the_injected_rtt() {
     let srtop = Srtop::start(&["--fake-repeated-names"]);
-    // This run's 0 ms floor: its fastest result without injected delay, at
-    // most 30 ms. Set by the first RTT, which is 0.
+    // This run's 0 ms floor for each kind of result: its fastest result
+    // without injected delay, at most 30 ms. Set by the first RTT, which is 0;
+    // the filter and the search each have their own.
     assert_eq!(RTTS_MS[0], 0);
-    let mut floor = None;
+    let mut floors: [Option<Duration>; 2] = [None, None];
     // Every RTT is measured and every violation reported, so a regression
     // shows at each RTT it affects rather than at the first one only.
     let mut violations = Vec::new();
@@ -121,7 +122,10 @@ fn remote_results_are_delayed_by_the_injected_rtt() {
             5,
         )
         .unwrap();
-        for (kind, samples) in [("filter", &report.filter), ("search", &report.search)] {
+        for (index, (kind, samples)) in [("filter", &report.filter), ("search", &report.search)]
+            .into_iter()
+            .enumerate()
+        {
             assert_eq!(samples.len(), 5);
             for sample in samples.iter() {
                 if *sample < rtt {
@@ -135,11 +139,13 @@ fn remote_results_are_delayed_by_the_injected_rtt() {
             }
             // Not one round trip more: the fastest result is within 1.5 RTT
             // plus the 0 ms floor plus 5 ms, while a result that waited an
-            // extra RTT takes at least 2 RTT.
+            // extra RTT takes at least 2 RTT. Only at a nonzero RTT: at 0 ms
+            // the floor is this very measurement.
             let fastest = *samples.iter().min().unwrap();
-            let floor = *floor.get_or_insert_with(|| fastest.min(Duration::from_millis(30)));
+            let floor =
+                *floors[index].get_or_insert_with(|| fastest.min(Duration::from_millis(30)));
             let ceiling = rtt + rtt / 2 + floor + Duration::from_millis(5);
-            if fastest >= ceiling {
+            if rtt_ms > 0 && fastest >= ceiling {
                 violations.push(format!(
                     "rtt {rtt_ms}: the fastest {kind} result took {fastest:?}, past {ceiling:?}"
                 ));

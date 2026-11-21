@@ -470,6 +470,20 @@ final class ConnectionSessionContext {
     /// snapshot is applied before ready, as for any fresh attach.
     private(set) var hasBeenReady = false
 
+    /// A session has been ready here and its replica still holds a committed revision: the
+    /// process-local continuity checkpoint a `CLIENT_RESUME` stands on (§18, PX-024 round 3).
+    var hasCommittedReplica: Bool {
+        hasBeenReady && applier.lastAppliedRevision > .initial
+    }
+
+    /// A session was ready here, but its replica has since been discarded (a REPLACED decision
+    /// whose snapshot never arrived). Its outbox identity is bound to a session whose frontier the
+    /// client no longer holds a replica for, so the next attempt starts from a fresh context, as a
+    /// cold relaunch does: a new identity, frontier 0, and `CLIENT_HELLO` (PX-024 round 3).
+    var needsFreshContext: Bool {
+        hasBeenReady && applier.lastAppliedRevision == .initial
+    }
+
     private var revisionReadySessionID: String?
 
     func invalidatePersistableRevision() {
@@ -510,8 +524,14 @@ struct ConnectionAttemptRequest {
     /// The documented attach path is used instead (§18 allows, not requires, the cold resume):
     /// HELLO with the fresh identity, ready only after the WELCOME snapshot. A different session
     /// in the WELCOME is reported as a replacement of the saved one.
+    ///
+    /// PX-024 round 3: "has been ready" alone is not enough. A REPLACED decision discards the
+    /// replica (revision 0) and, if the transport then drops before the replacement's snapshot,
+    /// a revision-0 resume would hit the same ready-before-replay gap. So a resume also needs a
+    /// committed replica (`hasCommittedReplica`); `beginAttempt` gives such an emptied context a
+    /// fresh one first (`needsFreshContext`).
     var resumeSessionID: String? {
-        context.hasBeenReady ? connection.sessionID : nil
+        context.hasCommittedReplica ? connection.sessionID : nil
     }
 
     var resumeRevision: UInt64 {
@@ -933,9 +953,14 @@ public final class ConnectionManager {
         let previousToken = activeTokens[connection.id]
 
         let context: ConnectionSessionContext
-        if let existing = contexts[connection.id] {
+        if let existing = contexts[connection.id], existing.needsFreshContext == false {
             context = existing
         } else {
+            // An emptied context is dropped like any other (its windows close); an attempt still
+            // running on it is superseded below and closes them again in its `runAttempt` tail.
+            if let emptied = contexts.removeValue(forKey: connection.id) {
+                closeWindows(of: emptied)
+            }
             let created = ConnectionSessionContext()
             contexts[connection.id] = created
             context = created

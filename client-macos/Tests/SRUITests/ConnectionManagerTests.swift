@@ -856,10 +856,10 @@ struct ConnectionManagerTests {
     }
 
     @Test(
-        "interrupted replacement resumes the new session from an empty replica",
+        "interrupted replacement reattaches with HELLO from a fresh context, ready only with the snapshot",
         arguments: [false, true]
     )
-    func interruptedReplacementResumesFromEmptyReplica(duringResume: Bool) async throws {
+    func interruptedReplacementReattachesWithHello(duringResume: Bool) async throws {
         let temporary = TemporaryConnectionStore()
         defer { temporary.cleanUp() }
         let saved = SavedConnection(label: "Replacement", host: "replacement.example", user: "alice")
@@ -904,34 +904,47 @@ struct ConnectionManagerTests {
         try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "replacement attempt released") {
             !manager.hasActiveAttemptForTesting(saved.id)
         }
+        // PX-024 round 3 (R2-1): the context has been ready, but its replica is now empty, so the
+        // reconnect starts from a fresh context and attaches with CLIENT_HELLO: a revision-0
+        // CLIENT_RESUME would be RESUME_OK'd and declared ready before its replay (an empty window
+        // reading live). The server below answers whichever handshake arrives as srtop would.
         manager.connect(id: saved.id)
+        let reconnect = try #require(harness.requests.last)
         let resumedTransport = try #require(harness.transports.last)
-        let resumeMessage = try await waitForFrame(0, from: resumedTransport)
-        guard case .clientResume(let resume) = resumeMessage.msg else {
-            Issue.record("replacement reconnect did not send CLIENT_RESUME")
+        let handshake = try await waitForFrame(0, from: resumedTransport)
+        switch handshake.msg {
+        case .clientHello(let hello):
+            #expect(hello.clientInstanceID == reconnect.context.outbox.clientInstanceId.bytes)
+            try await resumedTransport.receive(welcome(sessionID: "replacement-session"))
+            try await resumedTransport.receive(textSnapshot(value: "replacement value"))
+        case .clientResume:
+            var resumed = SRUIServerResumeOk()
+            resumed.sessionID = "replacement-session"
+            resumed.replayFromRevision = 0
+            resumed.requiredProfiles = ["org.srui.standard-widgets/1"]
+            message.serverResumeOk = resumed
+            try await resumedTransport.receive(message)
+        default:
+            Issue.record("unexpected handshake \(String(describing: handshake.msg))")
+        }
+        // The moment the reconnect is ready, its replica already holds the current state.
+        try await AsyncTestSupport.observed("the reconnect ready") { manager.status(for: saved.id) == .connected }
+        let readyContext = reconnect.context
+        #expect(!readyContext.applier.currentSnapshot.store.rootIDs.isEmpty, "ready over an empty replica")
+        #expect(readyContext.applier.lastAppliedRevision == Revision(1))
+        guard case .clientHello = handshake.msg else {
+            Issue.record("an empty-replica reconnect sent \(String(describing: handshake.msg)), not CLIENT_HELLO")
+            try await resumedTransport.receive(textSnapshot(value: "replacement value"))
             await manager.shutdown()
             return
         }
-        #expect(resume.sessionID == "replacement-session")
-        #expect(resume.lastAppliedRevision == 0)
-        #expect(resume.pendingTextEdits.isEmpty)
-        #expect(resume.terminalStreamOffsets.isEmpty)
-
-        // Both sessions use revision 1. A correct revision-zero request makes the server replay
-        // the new session's first transaction instead of accepting the old replica as current.
-        var resumed = SRUIServerResumeOk()
-        resumed.sessionID = "replacement-session"
-        resumed.replayFromRevision = 1
-        resumed.requiredProfiles = ["org.srui.standard-widgets/1"]
-        message.serverResumeOk = resumed
-        try await resumedTransport.receive(message)
-        try await resumedTransport.receive(textSnapshot(value: "replacement value"))
-        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "replacement replay mounted") {
-            manager.status(for: saved.id) == .connected
-                && context.renderer.textEditingSession.lastKnownAuthoritative(for: NodeId(2))
-                    == "replacement value"
+        #expect(readyContext !== context, "an emptied context is replaced by a fresh one")
+        #expect(readyContext.outbox.clientInstanceId != context.outbox.clientInstanceId,
+                "a fresh identity, as for a cold relaunch")
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "replacement snapshot mounted") {
+            readyContext.renderer.textEditingSession.lastKnownAuthoritative(for: NodeId(2)) == "replacement value"
         }
-        #expect(context.applier.lastAppliedRevision == Revision(1))
+        #expect(manager.entries.first?.sessionID == "replacement-session")
         await manager.shutdown()
     }
 

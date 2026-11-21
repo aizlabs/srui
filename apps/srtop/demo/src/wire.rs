@@ -85,11 +85,16 @@ pub struct Replica {
 fn connect(socket: &Path) -> Result<UnixStream> {
     let stream = UnixStream::connect(socket)
         .map_err(|error| format!("connect {}: {error}", socket.display()))?;
+    // Short reads made again until READ_DEADLINE: a blocked macOS AF_UNIX
+    // reader can sleep through its peer's end of file (`relay::READ_POLL`).
     stream
-        .set_read_timeout(Some(Duration::from_secs(15)))
+        .set_read_timeout(Some(crate::relay::READ_POLL))
         .map_err(|error| error.to_string())?;
     Ok(stream)
 }
+
+/// The longest one read waits for the server.
+const READ_DEADLINE: Duration = Duration::from_secs(15);
 
 impl Replica {
     /// A fresh client: `CLIENT_HELLO`, then the welcome and its snapshot.
@@ -227,10 +232,20 @@ impl Replica {
                 return decode_framed(&frame).map_err(|error| error.to_string());
             }
             let mut chunk = [0_u8; 64 * 1024];
-            let read = self
-                .stream
-                .read(&mut chunk)
-                .map_err(|error| format!("read: {error}"))?;
+            let deadline = Instant::now() + READ_DEADLINE;
+            let read = loop {
+                match self.stream.read(&mut chunk) {
+                    Ok(read) => break read,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) && Instant::now() < deadline => {}
+                    Err(error) => return Err(format!("read: {error}")),
+                }
+            };
             if read == 0 {
                 return Err("the server closed the connection".into());
             }

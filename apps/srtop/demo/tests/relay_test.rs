@@ -3,7 +3,9 @@
 //! every connection while the relay keeps accepting, and the `srtop-demo relay`
 //! command that the native client's tests put in front of srtop.
 
-use srtop_demo::relay::{DelayRelay, Traffic, DEFAULT_IN_FLIGHT, MAX_IN_FLIGHT, MAX_RTT};
+use srtop_demo::relay::{
+    DelayRelay, Traffic, DEFAULT_IN_FLIGHT, MAX_IN_FLIGHT, MAX_RTT, READ_POLL,
+};
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
@@ -80,6 +82,63 @@ fn connect(socket: &std::path::Path) -> UnixStream {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     stream
+}
+
+/// Whether a read error only means "nothing yet": a timed-out read, or one
+/// interrupted by a signal.
+fn transient(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+    )
+}
+
+/// Reads to end of file within `deadline`, with short reads made again (as
+/// the relay's are, `READ_POLL`): on macOS a blocked AF_UNIX reader can sleep
+/// through its peer's `shutdown(SHUT_WR)` although a fresh read then returns
+/// 0 at once, so one long blocking read could miss an end of file that is
+/// there. A missing end of file is still a `TimedOut` error at the deadline.
+fn read_until_eof(stream: &mut UnixStream, deadline: Duration) -> std::io::Result<Vec<u8>> {
+    // macOS refuses any socket option (EINVAL) once a socket can neither send
+    // nor receive. Its end of file is then already set, so a read returns at
+    // once whatever timeout it keeps.
+    let _ = stream.set_read_timeout(Some(READ_POLL));
+    let until = Instant::now() + deadline;
+    let mut received = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => return Ok(received),
+            Ok(read) => received.extend_from_slice(&buffer[..read]),
+            Err(error) if transient(&error) => {
+                if Instant::now() >= until {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "no end of file within {deadline:?} after {} bytes",
+                            received.len()
+                        ),
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// A cut or shut connection ends for its reader: end of file or a reset,
+/// but not silence until the deadline.
+fn assert_ends(stream: &mut UnixStream, what: &str) {
+    match read_until_eof(stream, Duration::from_secs(5)) {
+        Ok(_) => {}
+        Err(error) => assert_ne!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut,
+            "{what}: {error}"
+        ),
+    }
 }
 
 /// Each direction adds RTT/2, at every RTT D1 §31.4 names.
@@ -190,7 +249,11 @@ fn traffic_is_counted_in_both_directions() {
     client.write_all(&[7; 5]).unwrap();
     let mut echo = [0_u8; 5];
     client.read_exact(&mut echo).unwrap();
-    assert_eq!(relay.traffic(), Traffic { up: 5, down: 5 });
+    // A writer counts a chunk once its write returns, which can be just after
+    // the reader has it.
+    wait_for("both directions counted", Duration::from_secs(2), || {
+        relay.traffic() == Traffic { up: 5, down: 5 }
+    });
     assert_eq!(relay.accepted(), 1);
 }
 
@@ -216,11 +279,7 @@ fn a_cut_ends_every_connection_and_the_relay_accepts_again() {
     }
     assert_eq!(relay.cut(), 2);
     for client in [&mut first, &mut second] {
-        let mut byte = [0_u8; 1];
-        assert!(
-            matches!(client.read(&mut byte), Ok(0) | Err(_)),
-            "a cut connection ends"
-        );
+        assert_ends(client, "a cut connection ends");
     }
     let mut again = connect(relay.listen_path());
     again.write_all(&[2]).unwrap();
@@ -300,11 +359,14 @@ impl Pusher {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
+            // Writes, too, are made again rather than left to one wakeup.
+            let _ = stream.set_write_timeout(Some(READ_POLL));
             let mut push = |mut left: usize| {
                 let chunk = [0x5a_u8; 16 * 1024];
                 while left > 0 {
                     let size = left.min(chunk.len());
                     match stream.write(&chunk[..size]) {
+                        Err(error) if transient(&error) => continue,
                         Ok(0) | Err(_) => return false,
                         Ok(sent) => {
                             written.fetch_add(sent, Ordering::SeqCst);
@@ -533,15 +595,17 @@ enum Closer {
 fn read_to_end_on_a_thread(mut stream: UnixStream) -> mpsc::Receiver<(usize, Instant)> {
     let (done, ended) = mpsc::channel();
     thread::spawn(move || {
-        let mut total = 0;
-        let mut buffer = [0_u8; 8192];
-        loop {
-            match stream.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => total += read,
+        match read_until_eof(&mut stream, Duration::from_secs(10)) {
+            Ok(received) => {
+                let _ = done.send((received.len(), Instant::now()));
+            }
+            // No end of file at all: nothing is reported, and the caller's wait fails.
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
+            // A reset ends the read too.
+            Err(_) => {
+                let _ = done.send((0, Instant::now()));
             }
         }
-        let _ = done.send((total, Instant::now()));
     });
     ended
 }
@@ -562,15 +626,11 @@ fn a_half_closed_connection_is_still_cut_and_stopped() {
                 Closer::Server => (server, client),
                 Closer::Client => (client, server),
             };
-            other
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
             closing.shutdown(Shutdown::Write).unwrap();
             // The FIN is forwarded: the other end reads end of file.
-            let mut byte = [0_u8; 1];
             assert_eq!(
-                other.read(&mut byte).unwrap(),
-                0,
+                read_until_eof(&mut other, Duration::from_secs(5)).unwrap(),
+                Vec::<u8>::new(),
                 "{closer:?}: EOF forwarded"
             );
             // That direction is done; the other one still runs.
@@ -625,11 +685,15 @@ fn half_close_is_forwarded_in_each_direction_without_ending_the_other() {
         closing.write_all(&first).unwrap();
         closing.shutdown(Shutdown::Write).unwrap();
         let mut other_reader = other.try_clone().unwrap();
-        other_reader
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut received = Vec::new();
-        other_reader.read_to_end(&mut received).unwrap();
+        let received = read_until_eof(&mut other_reader, Duration::from_secs(5)).unwrap_or_else(|error| {
+            panic!(
+                "{closer:?}: {error}; relay traffic {:?}, in flight {:?}, delay-line threads {}, live {}",
+                relay.traffic(),
+                relay.in_flight(),
+                relay.pump_threads(),
+                relay.live_connections()
+            )
+        });
         assert_eq!(received, first, "{closer:?}: every byte, then end of file");
         // The other direction still flows.
         let mut other_writer = other;
@@ -646,14 +710,99 @@ fn half_close_is_forwarded_in_each_direction_without_ending_the_other() {
         assert_eq!(relay.live_connections(), 1);
         // The other end closes too: both directions end, and so does the connection.
         other_writer.shutdown(Shutdown::Write).unwrap();
-        let mut byte = [0_u8; 1];
-        assert_eq!(closing.read(&mut byte).unwrap(), 0);
+        assert_eq!(
+            read_until_eof(&mut closing, Duration::from_secs(5)).unwrap(),
+            Vec::<u8>::new()
+        );
         wait_for(
             "the connection to end by itself",
             rtt + Duration::from_secs(1),
             || relay.pump_threads() == 0 && relay.live_connections() == 0,
         );
     }
+}
+
+/// Every read the relay makes times out after `READ_POLL` and is simply
+/// made again, so an end of file the kernel failed to wake it for is still
+/// seen: both sockets of a connection carry that timeout, and a timeout is
+/// not mistaken for the end of a direction.
+#[test]
+fn every_relay_read_times_out_and_is_made_again() {
+    let scratch = Scratch::new();
+    let upstream = scratch.path("echo.sock");
+    let _arrivals = echo_server(&upstream);
+    let relay = DelayRelay::start(&scratch.path("r.sock"), &upstream, Duration::ZERO).unwrap();
+    let mut client = connect(relay.listen_path());
+    let mut echo = [0_u8; 1];
+    client.write_all(&[1]).unwrap();
+    client.read_exact(&mut echo).unwrap();
+    assert_eq!(
+        relay.read_timeouts(),
+        vec![(Some(READ_POLL), Some(READ_POLL))]
+    );
+    // Many timeouts on both readers, and nothing ends.
+    thread::sleep(READ_POLL * 10);
+    assert_eq!(
+        relay.pump_threads(),
+        4,
+        "a timed-out read ended a direction"
+    );
+    client.write_all(&[2]).unwrap();
+    client.read_exact(&mut echo).unwrap();
+    assert_eq!(echo, [2]);
+}
+
+/// The race behind the read timeout, many times over: an upstream that
+/// writes 100 000 bytes and shuts its write half at once, through the relay,
+/// on 800 connections, eight at a time. Every client gets every byte and then
+/// end of file within 2 s.
+#[test]
+fn a_half_close_reaches_the_far_end_every_time() {
+    let scratch = Scratch::new();
+    let upstream = scratch.path("burst.sock");
+    let listener = UnixListener::bind(&upstream).unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            thread::spawn(move || {
+                let _ = stream.write_all(&[0x33; 100_000]);
+                let _ = stream.shutdown(Shutdown::Write);
+                // Held open (still readable) until the client is done.
+                let _ = read_until_eof(&mut stream, Duration::from_secs(10));
+            });
+        }
+    });
+    let relay = DelayRelay::start(&scratch.path("r.sock"), &upstream, Duration::ZERO).unwrap();
+    let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let workers: Vec<_> = (0..8)
+        .map(|worker| {
+            let listen = relay.listen_path().to_path_buf();
+            let failures = Arc::clone(&failures);
+            thread::spawn(move || {
+                for round in 0..100 {
+                    let mut client = connect(&listen);
+                    match read_until_eof(&mut client, Duration::from_secs(2)) {
+                        Ok(received) if received.len() == 100_000 => {}
+                        other => failures.lock().unwrap().push(format!(
+                            "worker {worker} round {round}: {:?}",
+                            other.map(|received| received.len())
+                        )),
+                    }
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let failures = failures.lock().unwrap();
+    assert!(
+        failures.is_empty(),
+        "{} of 800: {:?}",
+        failures.len(),
+        &failures[..failures.len().min(5)]
+    );
+    assert_eq!(relay.accepted(), 800);
 }
 
 /// A relay whose socket path was removed underneath it still stops, and its
@@ -706,15 +855,20 @@ fn the_relay_command_is_driven_through_its_standard_input() {
     client.write_all(&[9, 9]).unwrap();
     let mut echo = [0_u8; 2];
     client.read_exact(&mut echo).unwrap();
-    writeln!(control, "traffic").unwrap();
-    assert_eq!(
-        replies.next().unwrap().unwrap(),
-        "traffic up=2 down=2 accepted=1"
-    );
+    // The downstream writer counts its chunk just after the client can read it.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        writeln!(control, "traffic").unwrap();
+        let reply = replies.next().unwrap().unwrap();
+        if reply == "traffic up=2 down=2 accepted=1" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{reply}");
+        thread::sleep(Duration::from_millis(5));
+    }
     writeln!(control, "cut").unwrap();
     assert_eq!(replies.next().unwrap().unwrap(), "cut 1");
-    let mut byte = [0_u8; 1];
-    assert!(matches!(client.read(&mut byte), Ok(0) | Err(_)));
+    assert_ends(&mut client, "the cut connection ends");
     drop(control);
     let status = relay.wait().unwrap();
     assert!(status.success());

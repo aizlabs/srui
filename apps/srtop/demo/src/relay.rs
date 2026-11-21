@@ -57,6 +57,22 @@ pub const MAX_IN_FLIGHT: usize = 64 << 20;
 /// The largest single read: also the largest chunk a delay line holds.
 const READ_CHUNK: usize = 64 * 1024;
 
+/// How long a delay-line read waits before it looks again.
+///
+/// On macOS (seen on 26.4.1, Darwin 25.4.0) a reader blocked on an AF_UNIX
+/// stream socket is sometimes never woken by its peer's `shutdown(SHUT_WR)`
+/// when that races the reader draining the last data: the end-of-file state is
+/// set (a fresh `read` returns 0 at once) but the sleeping reader stays asleep.
+/// A plain `UnixStream::pair` reproduces it about once in 2000 half-closes
+/// after a 100 KB write; Linux never did in 12 000. A relay reader that slept
+/// through it would hold its direction, and its peer's view of the FIN, until
+/// `cut` or `stop`. So every read the relay makes times out after this long
+/// and is simply made again, which sees the end of file if it is there.
+// lc-debt: an idle direction wakes every 25 ms and a FIN lost by the kernel
+// is forwarded up to 25 ms late; upgrade path: kqueue/poll(2) with EV_EOF,
+// which needs FFI this std-only package avoids.
+pub const READ_POLL: Duration = Duration::from_millis(25);
+
 /// Byte counts of everything a relay carried, both directions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Traffic {
@@ -214,6 +230,23 @@ impl DelayRelay {
         self.inner.pumps.load(Ordering::SeqCst)
     }
 
+    /// The read timeouts of both sockets of every live connection, client
+    /// side first: each is [`READ_POLL`].
+    pub fn read_timeouts(&self) -> Vec<(Option<Duration>, Option<Duration>)> {
+        self.inner
+            .live
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, client, server)| {
+                (
+                    client.read_timeout().ok().flatten(),
+                    server.read_timeout().ok().flatten(),
+                )
+            })
+            .collect()
+    }
+
     /// How many connections were accepted.
     pub fn accepted(&self) -> u64 {
         self.inner.accepted.load(Ordering::SeqCst)
@@ -283,6 +316,14 @@ fn accept_loop(listener: UnixListener, inner: Arc<Inner>) {
             let _ = client.shutdown(Shutdown::Both);
             continue;
         };
+        // Every read times out and is made again: see READ_POLL.
+        if client.set_read_timeout(Some(READ_POLL)).is_err()
+            || server.set_read_timeout(Some(READ_POLL)).is_err()
+        {
+            let _ = client.shutdown(Shutdown::Both);
+            let _ = server.shutdown(Shutdown::Both);
+            continue;
+        }
         let id = inner.accepted.fetch_add(1, Ordering::SeqCst);
         let (Ok(client_copy), Ok(server_copy)) = (client.try_clone(), server.try_clone()) else {
             continue;
@@ -478,7 +519,19 @@ fn pump(
             };
             loop {
                 match from.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
+                    // Nothing yet, or a signal: read again (see READ_POLL).
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock
+                                | io::ErrorKind::TimedOut
+                                | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        continue
+                    }
+                    Err(_) => break,
                     Ok(read) => {
                         // Stop reading while the line is full: the sender's
                         // socket then fills and the sender blocks.

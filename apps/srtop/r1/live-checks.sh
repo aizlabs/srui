@@ -32,9 +32,10 @@ SUITE=ProcessExplorerR1DevboxTests
 # theServerRefusesAnIncompatibleClientWithItsReason, needs a server that sends SERVER
 # HANDSHAKE_REFUSED with its reason (PX-026-G02) and fails against one that does not.
 EXPECTED_TESTS=7
-# PX-027: the image also carries apps/srtop/demo's workers, so they are inputs too.
+# PX-027: the image also carries the binaries apps/srtop/demo builds, so their sources are inputs.
 IMAGE_INPUTS=(
-  apps/srtop/Cargo.toml apps/srtop/Cargo.lock apps/srtop/src apps/srtop/demo server-rust protocol
+  apps/srtop/Cargo.toml apps/srtop/Cargo.lock apps/srtop/src apps/srtop/demo/Cargo.toml apps/srtop/demo/Cargo.lock apps/srtop/demo/src
+  server-rust protocol
   apps/srtop/devbox/Dockerfile apps/srtop/devbox/entrypoint.sh apps/srtop/devbox/sshd_config
 )
 

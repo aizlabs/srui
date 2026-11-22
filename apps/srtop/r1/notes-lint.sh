@@ -9,8 +9,8 @@
 #
 # A line is a claim when it says R1 is at parity with, replaces, or is a replacement for htop, or
 # that SRUI is always, automatically or inherently smaller, lighter or cheaper on the wire than
-# htop or an ncurses program, unless the same line negates it (not, no, never, without, nor,
-# out of scope, does not, is not). The R1 notes must also call R1 a read-only showcase.
+# htop or an ncurses program, unless the same line negates it (not, no, none, nothing, never,
+# without, nor, out of scope, does not, is not). The R1 notes must also call R1 a read-only showcase.
 # Bash 3.2 compatible.
 set -euo pipefail
 
@@ -20,7 +20,7 @@ REPO_ROOT=$(cd "$R1_DIR/../../.." && pwd)
 NOTES=apps/srtop/srui-process-explorer-plan/docs/process-explorer/releases/R1.md
 
 CLAIM='(htop[- ]parity|parity with htop|at parity|feature[- ]parity|(replaces|replacement for|substitute for|drop-in for) htop|htop replacement|(always|automatically|inherently|by design) (uses? )?(less|fewer|smaller|lighter|cheaper|lower)[a-z ]*(than|bandwidth|bytes|traffic)|(beats|outperforms) htop)'
-NEGATION='(^|[^a-z])(not|no|never|without|nor|isn.t|doesn.t|does not|is not|out of scope|do not|cannot)([^a-z]|$)'
+NEGATION='(^|[^a-z])(not|no|none|nothing|never|without|nor|isn.t|doesn.t|does not|is not|out of scope|do not|cannot)([^a-z]|$)'
 
 lint() { # files...
   local file found=0 line number

@@ -58,6 +58,23 @@ account, and a manual VoiceOver checklist. Nothing is signed beyond the linker's
 nothing is notarized, and no step needs `sudo`. See [r1/README.md](r1/README.md) and the
 [R1 notes](srui-process-explorer-plan/docs/process-explorer/releases/R1.md).
 
+## The R1 showcase (PX-027)
+
+R1 is a read-only showcase, not htop parity. PX-027 bundles the monitor, navigation, the
+inspector, the Connect form and a reproducible demonstration: `devbox.sh up`, then
+`devbox.sh workers 60` for PX-025's bounded workers, then `devbox.sh client`.
+
+It also publishes measured traffic and latency in the
+[R1 notes](srui-process-explorer-plan/docs/process-explorer/releases/R1.md#the-showcase-px-027). The
+SRUI payload is kept apart from SSH's encrypted bytes. srtop is measured against htop on the same
+box, with the same processes, the same 1 s sampling and the same 120×40 terminal. The notes give
+the conditions under which each side is the larger, and the tested envelope of processes,
+interval, RTT and bandwidth.
+
+To reproduce it, run `caffeinate -u -d apps/srtop/r1/showcase-measure.sh`. Under high churn and
+RTT a delayed range request converges within a stated bound
+(`apps/srtop/demo/tests/churn_range_test.rs`).
+
 ## System summary
 
 Between the status line and the table the shell publishes a summary (PX-007), built from standard `Text` and `Progress` nodes in a `Column` with one `Row` per bar: no custom graph, no image and no drawing instruction, rendered by the unchanged generic client as native labels and `NSProgressIndicator` bars. Every figure becomes text once, on the server, in integer arithmetic; each bar is filled to exactly the truncated share its line prints, and the client derives nothing. Each figure is read through the scanned root — `<root>/stat`, `<root>/meminfo`, `<root>/uptime`, `<root>/loadavg` — so a fixture tree states its own and is deterministic on any host, and each file is read, and can fail, on its own.

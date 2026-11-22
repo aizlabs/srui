@@ -35,7 +35,8 @@ IMAGE=${SRTOP_DEVBOX_IMAGE:-srtop-devbox:latest}
 PORT=${SRTOP_DEVBOX_PORT:-2222}
 REV=${SRTOP_DEVBOX_REV:-HEAD}
 IMAGE_INPUTS=(
-  apps/srtop/Cargo.toml apps/srtop/Cargo.lock apps/srtop/src apps/srtop/demo server-rust protocol
+  apps/srtop/Cargo.toml apps/srtop/Cargo.lock apps/srtop/src apps/srtop/demo/Cargo.toml apps/srtop/demo/Cargo.lock apps/srtop/demo/src
+  server-rust protocol
   apps/srtop/devbox/Dockerfile apps/srtop/devbox/entrypoint.sh apps/srtop/devbox/sshd_config
 )
 

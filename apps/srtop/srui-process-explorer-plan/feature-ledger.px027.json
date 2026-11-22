@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-027",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "The R1 release gate (D1 §§31–32; D2 T33–T35; H1): the read-only showcase bundle and its reproducible demonstration, measured traffic with the SRUI payload kept apart from the encrypted SSH stream, a matched comparison with htop 3.2.2-2 over ssh -tt, the RTT and latency results, the tested process-count/refresh/RTT/bandwidth envelope, zero app mutations for an unchanged fake source, and bounded progress of high-churn delayed range requests. Measuring tools, tests, scripts, the devbox image (release builds, htop pinned, the PX-025 workers) and documentation only: no client, SDK, runtime, protocol, registry, srtop or generated-file change",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md",
+      "H1": "SOURCES.md#H1"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX027-001",
+      "feature": "The showcase bundle and its reproducible demonstration: the read-only monitor, navigation and keyboard, the inspector, the Connect form and saved endpoints, the user-owned install (PX-026-G01) and the devbox demonstration (devbox.sh up, devbox.sh workers 60 running PX-025's bounded workers in the box, devbox.sh client); the devbox image now builds srtop, srui-ssh-bridge, srtop-demo and srtop-demo-worker in release and pins htop 3.2.2-2; the R1 live checks (7 of 7) and the R0 scenario passed against the final image, whose srtop and bridge are byte-identical to the measured image's",
+      "scope": "PX-027/apps/srtop/devbox/Dockerfile; apps/srtop/devbox/devbox.sh workers; apps/srtop/r1/live-checks.sh and apps/srtop/devbox/r0-scenario.sh IMAGE_INPUTS",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-027",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-027.md",
+        "docs/process-explorer/releases/R1.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX027-002",
+      "feature": "Measuring instruments that keep the semantic payload apart from the encrypted transport: TcpCountRelay (a userspace TCP relay in front of the devbox's SSH port, counting each direction, optional RTT/2 each way, no root or pcap), SruiProbe (the srui subsystem channel over ssh -s, counted as raw bytes and as decoded frames, which must agree; equal to PX-025's DelayRelay count to the byte), TtyProbe (htop's pty stream over ssh -tt), Split (payload never above encrypted; overhead = difference) and nearest-rank distributions; mutants swapping the split or double counting the payload are killed",
+      "scope": "PX-027/apps/srtop/demo/src/traffic.rs; apps/srtop/demo/tests/showcase_test.rs",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-027",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-027.md",
+        "docs/process-explorer/releases/R1.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX027-003",
+      "feature": "Matched htop comparison: srtop --refresh-interval-ms 1000 against htop -d 10 on a 120x40 pty, alternating, the same idle/busy/churn workloads, 3 s warm-up and 15 s window, 7 runs each; check_matched reads srtop's interval from its published sampling status and htop's from its argument vector in the box and refuses mismatched intervals, windows, terminals or process counts (a -d mutant is killed). Measured: htop's steady encrypted stream was the larger in all three workloads (SRUI/htop medians 0.50, 0.41, 0.48), SRUI's attach was the larger (19-31 KB against 15-19 KB), and SRUI's steady stream grows with the rows that change (6.6 KB/s at 1,000 and 59 KB/s at 10,000 synthetic rows) while htop's is bounded by its screen; no automatic bandwidth superiority is claimed",
+      "scope": "PX-027/apps/srtop/demo/src/showcase.rs compare, check_matched; apps/srtop/r1/showcase-measure.sh",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-027",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-027.md",
+        "docs/process-explorer/releases/R1.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX027-004",
+      "feature": "Latency results: over real SSH at 0/100/300/600 ms RTT (TCP relay), attach medians 724/1677/3461/6195 ms (about nine to ten RTTs, nearly all SSH), steady traffic and commit rate independent of RTT; behind the bridge (PX-025 scenarios, release builds, 3 runs x 10 trials), filter and search results no sooner than the RTT and within RTT + 10.5 ms, and every resume RESUME_OK",
+      "scope": "PX-027/apps/srtop/demo/src/showcase.rs rtt; srtop-demo scenarios; docs/process-explorer/evidence/PX-027/",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-027",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-027.md",
+        "docs/process-explorer/releases/R1.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX027-005",
+      "feature": "The tested envelope and the release notes: R1.md publishes the workload, hardware, build and sampling settings, the measured tables, the process-count/refresh/RTT/bandwidth envelope and the remaining gaps, and says read-only showcase, not htop parity; notes-lint.sh refuses a parity or automatic-superiority claim (a planted parity claim is killed) and runs in selftest.sh",
+      "scope": "PX-027/docs/process-explorer/releases/R1.md; apps/srtop/r1/notes-lint.sh; apps/srtop/r1/selftest.sh",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-027",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-027.md",
+        "docs/process-explorer/releases/R1.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX027-006",
+      "feature": "Zero app mutations for an unchanged fake source: over real SSH against srtop --fake-source --smoke-fixture --refresh-interval-ms 100, 0 app transactions and 0 bytes in the 10.0 s after the snapshot, then srtop's SIGUSR1 canary (sent only to the PID ps confirmed) was the next transaction (1 -> 2, two operations); locally at 50 ms the same check passes the frozen source and refuses a changing one; a blind check is killed",
+      "scope": "PX-027/apps/srtop/demo/src/showcase.rs idle_check, check_idle; apps/srtop/demo/tests/showcase_test.rs",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-027",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-027.md",
+        "docs/process-explorer/releases/R1.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX027-007",
+      "feature": "High-churn delayed range requests make bounded progress: overlapping 16-row CLIENT_MODEL_RANGE_REQUESTs every 250 ms through PX-025's DelayRelay at 100/300/600 ms RTT, against 2,000 synthetic rows churning every 100 ms (all platforms) and live /proc churned by PX-025's short-lived workers (Linux), each converging (a revision committed after it reached srtop, every row held, equal to an undelayed replica's) within RTT + 2 x interval + 750 ms: 12 of 12 at every RTT in every run (max 206/403/702 ms macOS, 209/405/705 ms Linux); a mutant srtop that holds back changed samples is killed as starved or superseded",
+      "scope": "PX-027/apps/srtop/demo/tests/churn_range_test.rs",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-027",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-027.md",
+        "docs/process-explorer/releases/R1.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX027-008",
+      "feature": "BLOCKED: awaiting user evidence. The clean-account end-to-end demo with a configured server: PX-026-G01's walkthrough, run with --with-showcase, adds one automated step (px027-showcase: showcase-measure.sh --quick, the idle wire, bounded workers, htop and RTT matrices) to the same script and result file; reconnect, keyboard and accessibility come from its live checks and the VoiceOver checklist. Not run by the implementer; no result is claimed",
+      "scope": "PX-027/the user's run of apps/srtop/r1/clean-account-walkthrough.sh --with-showcase and apps/srtop/r1/voiceover-keyboard-checklist.md",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-027",
+      "status": "planned",
+      "blocked": "awaiting user evidence",
+      "evidence": [
+        "docs/process-explorer/completions/PX-027.md",
+        "docs/process-explorer/releases/R1.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX027-009",
+      "feature": "BLOCKED: awaiting user evidence. The R1 gate itself: PX-010-G01 passed; PX-026-G01 passes everything but its two user-evidence items, so PX-027 is not passed and is not claimed",
+      "scope": "PX-027/PX-027 gate status",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-027",
+      "status": "planned",
+      "blocked": "awaiting user evidence",
+      "evidence": [
+        "docs/process-explorer/completions/PX-027.md",
+        "docs/process-explorer/releases/R1.md"
+      ]
+    }
+  ]
+}

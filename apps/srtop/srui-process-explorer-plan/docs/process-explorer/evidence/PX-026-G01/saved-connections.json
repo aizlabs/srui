@@ -1,0 +1,14 @@
+{
+  "connections" : [
+    {
+      "host" : "127.0.0.1",
+      "id" : "E66A046C-F745-4160-862F-227662ED542E",
+      "label" : "devbox",
+      "lastKnownRevision" : 1,
+      "port" : 2222,
+      "sessionID" : "81fbc3cde4c9b5946510cda9c63c98be",
+      "user" : "srui"
+    }
+  ],
+  "version" : 1
+}

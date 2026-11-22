@@ -219,7 +219,7 @@ This priority order keeps R1 and safe termination first, then the later dashboar
 | [PX-025](tickets/PX-025-demo.md) | Add bounded demonstration workloads and latency scenarios | PX-024 | none |
 | [PX-026](tickets/PX-026-automation.md) | Demonstrate semantic inspection without external IPC | PX-025 | none |
 | [PX-026-G02](tickets/PX-026-G02-handshake-refusal.md) | Refuse incompatible clients with the existing handshake refusal | PX-026 | R1-prerequisite |
-| [PX-026-G01](tickets/PX-026-G01-r1-package.md) | Gate installable R1 with compatibility, privacy, and native verification | PX-026, PX-068, PX-010-G01 | R1-prerequisite |
+| [PX-026-G01](tickets/PX-026-G01-r1-package.md) | Gate installable R1 with compatibility, privacy, and native verification | PX-026, PX-068, PX-010-G01, PX-026-G02 | R1-prerequisite |
 | [PX-027](tickets/PX-027-showcasegate.md) | Release gate: the first polished SRUI showcase | PX-026, PX-026-G01, PX-068 | R1 |
 
 ### D. Add safe process controls

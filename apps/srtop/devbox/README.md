@@ -50,6 +50,19 @@ A spawned process should appear within two sampling intervals and disappear
 within two of its exit. Rows that did not change keep their item identity, so
 the table must not rebuild or jump.
 
+Two commands exist for the R1 checklist (PX-026-G01). Each signals only a PID
+whose name `ps -p PID -o comm=` has confirmed inside the box:
+
+```sh
+apps/srtop/devbox/devbox.sh drop-bridges    # kill each client's srui-ssh-bridge: a disconnect; the session lives on
+apps/srtop/devbox/devbox.sh restart-srtop   # SIGTERM srtop, start a new one on the same socket: a replacement
+```
+
+`apps/srtop/r1/live-checks.sh` is the R1 gate's scripted run against this box. It
+covers protocol profiles and core versions, host keys, authentication,
+reconnect, replacement, the package's controls and the privacy of command
+lines; see [../r1/README.md](../r1/README.md).
+
 ## Turn it off
 
 ```sh
@@ -77,6 +90,11 @@ rm -rf "${SRTOP_DEVBOX_STATE:-$HOME/.codex/srtop-devbox}"
 
 ## How it is wired
 
+- Both base images are pinned by digest in the Dockerfile (PX-026-G01): the build
+  stage is `rust:1-bookworm` with rustc 1.99.1, and the runtime is
+  `debian:bookworm-slim` with Debian 12.15. The apt packages installed on top of
+  them (openssh-server, procps) are not pinned. `live-checks.sh` records their
+  versions.
 - The build context is a `git archive` of `SRTOP_DEVBOX_REV`, never the working
   tree, so no `.git`, no `target/`, and no key material reaches the image. The
   image is labelled `org.srui.revision` with that commit; `r0-scenario.sh`

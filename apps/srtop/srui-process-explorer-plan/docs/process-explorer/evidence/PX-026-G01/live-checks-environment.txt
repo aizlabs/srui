@@ -1,0 +1,14 @@
+date_utc: 2026-11-21T20:55:32Z
+revision_under_test: 7d28360981811e74caa8afa5cda58dad3323f18c
+image: srtop-devbox:latest id sha256:0c62b6b3889bfd8952b9b040565aaeb063a68aa3d714601a66a5ae1cf57980c2 label org.srui.revision=7d28360981811e74caa8afa5cda58dad3323f18c
+image_bases: FROM rust:1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS build FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+box_kernel: Linux 6.10.14-linuxkit aarch64
+box_os: Debian GNU/Linux 12 (bookworm) debian_version 12.15
+box_packages: openssh-server=1:9.2p1-2+deb12u10 procps=2:4.0.2-3
+box_binaries: /usr/local/bin/srtop=004b8d6a16cd48a7f4667259c189254259a2671ec36431327bd72915ffed79ae /usr/local/bin/srui-ssh-bridge=de57e823ad3c266dc3de65fefd6063b6f79fd15ce7404ec4b61b1215fe74e97c
+box_srtop_args: --live-source --refresh-interval-ms 1000
+docker: client 29.0.2 server 28.3.2 6.10.14-linuxkit
+macos: 26.4.1 (25E253) arm64
+swift: swift-driver version: 1.127.14.1 Apple Swift version 6.2.3 (swiftlang-6.2.3.3.21 clang-1700.6.3.2)
+xcode: Xcode 26.2 Build version 17C52
+client_ssh: OpenSSH_10.2p1, LibreSSL 3.3.6

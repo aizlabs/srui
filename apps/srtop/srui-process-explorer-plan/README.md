@@ -12,6 +12,8 @@ PX-002 now has deterministic fake-source implementation evidence in [its complet
 
 PX-003 now has live Linux implementation evidence in [its completion record](docs/process-explorer/completions/PX-003.md): one real `/proc` snapshot on an Ubuntu-kernel host that locates a test-owned sleeping worker, `ProcessKey` instance identity including a boot-tick creation token, incomplete scans kept distinct from authoritative empty results, and sanitized hostile process names. Its individual ledger remains `in_progress` until independent verification; broader release gates and task-index statuses are unchanged.
 
+PX-026-G01, the installable-R1 package gate, has implementation evidence in [its completion record](docs/process-explorer/completions/PX-026-G01.md) and release notes in [R1.md](docs/process-explorer/releases/R1.md). It covers a build-from-source package, live compatibility, host-key, authentication, reconnect and replacement checks against the devbox, a repeatable privacy audit, and the PX-010-G01 support envelope. PX-026-G02, the server's reasoned handshake refusal, is merged in, and every live check passes. The gate stays open until the user returns two results: the clean-account walkthrough and the VoiceOver checklist (`apps/srtop/r1/`). Its ledger marks both `blocked: awaiting user evidence`.
+
 ## Delivery priorities
 
 1. PX-000–PX-008: real read-only monitor.

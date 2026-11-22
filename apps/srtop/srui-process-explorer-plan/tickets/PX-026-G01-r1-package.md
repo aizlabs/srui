@@ -5,7 +5,7 @@ Edition 1.2 · 12 September 2026. Use the authoritative SRUI v0.6 design and the
 ## PX-026-G01 — Gate installable R1 with compatibility, privacy, and native verification
 
 **Phase:** C · **Scope size:** M · **Status:** planned · **Gate:** R1-prerequisite
-**Dependencies:** PX-026, PX-068, PX-010-G01
+**Dependencies:** PX-026, PX-068, PX-010-G01, PX-026-G02
 **Read:** D1 §§18, 20, 25–27, 29, 32; D2 T23–T24, T32–T34
 
 ### Standing execution contract

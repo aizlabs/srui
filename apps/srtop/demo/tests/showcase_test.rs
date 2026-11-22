@@ -568,7 +568,8 @@ fn htop_is_started_at_the_interval_srtop_publishes() {
     let devbox = Devbox {
         docker: "docker".into(),
         container: "c".into(),
-        port: 2222,
+        // Not 2222, the old fixed alias: the alias must follow the box's port (round 3, F10).
+        port: 2242,
         key: PathBuf::from("/k"),
         known_hosts: PathBuf::from("/h"),
         logs: PathBuf::from("/l"),
@@ -583,7 +584,11 @@ fn htop_is_started_at_the_interval_srtop_publishes() {
     let remote = argv.last().unwrap();
     let delay = htop_delay_from_args(&remote[remote.find("htop ").unwrap()..]);
     assert!(argv.iter().any(|arg| arg == "-tt"));
-    assert!(remote.starts_with("stty cols 120 rows 40 && "), "{remote}");
+    // The session reports its own size before htop starts (round 3, F8r).
+    assert!(
+        remote.starts_with("stty cols 120 rows 40 && stty size && exec env "),
+        "{remote}"
+    );
     check_matched(
         &s,
         &[srui("busy", Some(1000), 15.0, 210)],
@@ -604,10 +609,10 @@ fn htop_is_started_at_the_interval_srtop_publishes() {
         assert!(argv
             .iter()
             .any(|arg| arg == "Ciphers=chacha20-poly1305@openssh.com"));
-        // The box's own known_hosts name, from its port: an isolated box is not 2222.
+        // The box's own known_hosts name, from its port.
         assert!(argv
             .iter()
-            .any(|arg| arg == "HostKeyAlias=[127.0.0.1]:2222"));
+            .any(|arg| arg == "HostKeyAlias=[127.0.0.1]:2242"));
     }
 }
 

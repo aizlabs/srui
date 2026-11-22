@@ -34,7 +34,7 @@ use srui_sessiond::{logical_class_for_server_envelope, LogicalChannelClass, CORE
 use std::{
     io::{self, Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
-    os::unix::net::UnixStream,
+    os::unix::{net::UnixStream, process::CommandExt},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
@@ -911,13 +911,17 @@ impl TtyProbe {
     ) -> Result<TtyRun> {
         let (program, args) = argv.split_first().ok_or("an empty command")?;
         let start = Instant::now();
+        // Its own process group (PX-027 round 3, F7r): whatever it starts can be stopped with it,
+        // so no grandchild keeps the terminal stream open after the probe is done.
         let mut child = Command::new(program)
             .args(args)
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
             .spawn()
             .map_err(|error| format!("start {program}: {error}"))?;
+        let group = child.id();
         let mut stdout = child.stdout.take().ok_or("no stdout")?;
         let mut stdin = child.stdin.take().ok_or("no stdin")?;
         let arrivals: Arc<Mutex<Vec<(Instant, u64)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -965,17 +969,45 @@ impl TtyProbe {
         let _ = stdin.write_all(quit);
         let _ = stdin.flush();
         drop(stdin);
+        // The group this probe created, and only it. While the leader is unreaped its ID is the
+        // group's for certain, so a child still running at the deadline is stopped with its whole
+        // group first. A leader that exited by itself is reaped; then the group is signalled only
+        // if the stream is still open, which means a member it left behind holds it, and a group
+        // with a member keeps its ID.
         let until = Instant::now() + CLOSE_DEADLINE;
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) if Instant::now() < until => thread::sleep(Duration::from_millis(10)),
                 _ => {
+                    kill_group(group);
                     let _ = child.kill();
                     let _ = child.wait();
                     break;
                 }
             }
+        }
+        let grace = Instant::now() + Duration::from_millis(200);
+        while !reader.is_finished() && Instant::now() < grace {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !reader.is_finished() {
+            // lc-debt: a group emptied in this instant and its ID reused at once by another new
+            // group leader would be signalled; upgrade path: killpg(2) before waitpid(2) through
+            // FFI this package avoids. macOS and Linux allocate PIDs sequentially, so the window
+            // needs a full PID wrap within 200 ms.
+            kill_group(group);
+        }
+        // A reader that cannot drain what is left within the deadline is a probe that cannot
+        // keep up: the run fails, and the thread is left to finish on its own.
+        let until = Instant::now() + CLOSE_DEADLINE;
+        while !reader.is_finished() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !reader.is_finished() {
+            return Err(format!(
+                "the terminal stream was still being read {CLOSE_DEADLINE:?} after the program ended: the probe cannot keep up"
+            ));
         }
         let _ = reader.join();
         let (first, steady_from, steady_to, encrypted_from, encrypted_to) = measured?;
@@ -1004,6 +1036,19 @@ impl TtyProbe {
             prefix: kept,
         })
     }
+}
+
+/// SIGKILL to every process of the group `group` leads, which this probe
+/// created with `process_group(0)` for its own child. std has no killpg, and
+/// this package uses no FFI, so it is `kill -KILL -- -GROUP`; a group that is
+/// already empty makes `kill` fail, which is the outcome wanted.
+fn kill_group(group: u32) {
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{group}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// min, median, p95 (nearest rank) and max of repeated runs.

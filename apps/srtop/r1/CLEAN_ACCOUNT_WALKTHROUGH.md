@@ -32,14 +32,18 @@ It is meant for throwaway accounts only, and this walkthrough does not need it.
 
 1. Quit Docker Desktop in your usual account, so the new account's Docker can start and use port
    2222. If the devbox is running, stop it first with `apps/srtop/devbox/devbox.sh down`.
-2. Only if the new account cannot clone from GitHub, make a git bundle of the right ref instead.
-   Run this in your checkout, after `git fetch origin`:
+2. Only if the new account cannot clone from GitHub, make a git bundle instead. A bundle must hold a
+   local branch, because a bundle of `origin/main` holds only `refs/remotes/origin/main`, which a
+   clone cannot check out. Run this in your checkout:
 
    ```sh
-   git bundle create /Users/Shared/srui-r1.bundle origin/main
+   git fetch origin
+   git branch -f srui-r1 origin/main
+   git bundle create /Users/Shared/srui-r1.bundle srui-r1
    ```
 
-   Before PX-027 merges, bundle `origin/codex/PX-027-showcase` instead.
+   Before PX-027 merges, use `git branch -f srui-r1 origin/codex/PX-027-showcase` instead. The
+   bundle always holds the branch `srui-r1`.
 
 ## 2. Create the account
 
@@ -80,8 +84,11 @@ cd ~/srui-r1-src
 apps/srtop/r1/clean-account-walkthrough.sh --with-showcase
 ```
 
-With the bundle instead of GitHub, clone `/Users/Shared/srui-r1.bundle` with the same `--branch`
-(`main`, or `codex/PX-027-showcase` before PX-027 merges).
+With the bundle instead of GitHub, clone the bundle's `srui-r1` branch:
+
+```sh
+git clone --branch srui-r1 /Users/Shared/srui-r1.bundle ~/srui-r1-src
+```
 
 During the run:
 

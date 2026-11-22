@@ -35,7 +35,10 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -264,7 +267,9 @@ impl Workload {
             "-c",
             &format!("for i in $(seq 1 {SLEEPERS}); do sleep {seconds} & done; wait"),
         ])?;
-        let millis = lifetime.as_millis().min(60_000).to_string();
+        // Never capped here: a lifetime past the workers' limit is refused before anything starts
+        // (`check_workload_fits`), and the worker refuses one itself.
+        let millis = lifetime.as_millis().to_string();
         let mut workers = vec![
             "/usr/local/bin/srtop-demo",
             "workers",
@@ -293,6 +298,58 @@ impl Workload {
         devbox.exec_detached(&workers)
     }
 
+    /// The modes of the workers this workload runs (PX-025's `--mode` names).
+    pub fn worker_modes(self) -> &'static [&'static str] {
+        match self {
+            Self::Idle => &[],
+            Self::Busy => &["cpu", "memory", "threads"],
+            Self::Churn => &["cpu", "memory", "threads", "short-lived"],
+        }
+    }
+
+    /// Refuses a process list (`comm args`) from which one of this workload's workers or any of
+    /// its sleepers is gone: the traffic of a window it did not last is not this workload's.
+    pub fn check_alive(self, processes: &[(String, String)]) -> Result<()> {
+        if self == Self::Idle {
+            return Ok(());
+        }
+        let mut missing = Vec::new();
+        for mode in self.worker_modes() {
+            let flag = format!("--mode {mode} ");
+            let alive = processes
+                .iter()
+                .filter(|(comm, args)| comm.starts_with("srtop-demo-wor") && args.contains(&flag))
+                .count();
+            if alive != 1 {
+                missing.push(format!("{mode} worker {alive}/1"));
+            }
+        }
+        let sleepers = processes
+            .iter()
+            .filter(|(comm, args)| comm == "sleep" && args.starts_with("sleep "))
+            .count();
+        if sleepers != SLEEPERS as usize {
+            missing.push(format!("sleepers {sleepers}/{SLEEPERS}"));
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the {} workload lost processes: {}",
+                self.name(),
+                missing.join(", ")
+            ))
+        }
+    }
+
+    /// [`Workload::check_alive`] against the box's own process list.
+    pub fn alive(self, devbox: &Devbox) -> Result<()> {
+        if self == Self::Idle {
+            return Ok(());
+        }
+        self.check_alive(&devbox.processes()?)
+    }
+
     /// Waits until nothing the workload started is left, and says how long that took.
     pub fn wait_ended(self, devbox: &Devbox) -> Result<Duration> {
         let start = Instant::now();
@@ -315,6 +372,79 @@ impl Workload {
             }
             thread::sleep(Duration::from_millis(250));
         }
+    }
+}
+
+/// The longest a workload's workers live: PX-025's hard limit, which the showcase does not raise.
+pub const WORKLOAD_LIMIT: Duration = crate::worker::MAX_DURATION;
+
+/// Refuses, before anything starts, a matrix whose workload would have to outlive the workers'
+/// limit: each run starts its own workload for `lifetime` (settle, attach margin, warm-up and the
+/// steady window), so every lifetime must fit (PX-027, Codex review).
+pub fn check_workload_fits(workloads: &[Workload], lifetimes: &[Duration]) -> Result<()> {
+    if workloads.iter().all(|workload| *workload == Workload::Idle) {
+        return Ok(());
+    }
+    match lifetimes.iter().max() {
+        Some(longest) if *longest > WORKLOAD_LIMIT => Err(format!(
+            "the workload would have to live {:.1} s (settle, attach margin, warm-up and steady window), which exceeds the workers' {:.0} s limit; shorten --warmup-ms or --duration-ms",
+            longest.as_secs_f64(),
+            WORKLOAD_LIMIT.as_secs_f64()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Watches a workload through a run: `check` every `every`, on its own thread; the first failure
+/// is kept, and [`WorkloadWatch::held`] reports it to the probe's `held` hook from then on.
+pub struct WorkloadWatch {
+    failed: Arc<Mutex<Option<String>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl WorkloadWatch {
+    pub fn start(every: Duration, check: impl Fn() -> Result<()> + Send + 'static) -> Self {
+        let failed = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (failed, stop) = (Arc::clone(&failed), Arc::clone(&stop));
+            thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    if let Err(error) = check() {
+                        *failed.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
+                        return;
+                    }
+                    thread::sleep(every);
+                }
+            })
+        };
+        Self {
+            failed,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Err once the workload has failed its check.
+    pub fn held(&self) -> Result<()> {
+        match &*self.failed.lock().unwrap_or_else(|p| p.into_inner()) {
+            Some(error) => Err(format!("the workload did not last the window ({error})")),
+            None => Ok(()),
+        }
+    }
+
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for WorkloadWatch {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -341,7 +471,9 @@ impl Settings {
         Ok(self.interval_ms / 100)
     }
 
-    fn lifetime(&self) -> Duration {
+    /// How long each run's workload must live: settle, warm-up, steady window and an 8 s margin
+    /// for attach and close.
+    pub fn lifetime(&self) -> Duration {
         WORKLOAD_SETTLE + self.warmup + self.duration + Duration::from_secs(8)
     }
 }
@@ -561,6 +693,12 @@ fn process_count(devbox: &Devbox) -> Result<u64> {
     Ok(devbox.processes()?.len() as u64)
 }
 
+/// A watch on the box's workload, every 250 ms; the idle workload has nothing to watch.
+fn watch_workload(devbox: &Devbox, workload: Workload) -> WorkloadWatch {
+    let devbox = devbox.clone();
+    WorkloadWatch::start(Duration::from_millis(250), move || workload.alive(&devbox))
+}
+
 fn srui_run(
     devbox: &Devbox,
     workload: Workload,
@@ -573,9 +711,10 @@ fn srui_run(
     workload.start(devbox, settings_lifetime)?;
     thread::sleep(WORKLOAD_SETTLE);
     let processes = process_count(devbox)?;
+    let watch = watch_workload(devbox, workload);
     let relay = TcpCountRelay::start(devbox.upstream(), rtt).map_err(|error| error.to_string())?;
     let sample = || relay.traffic();
-    let held = || relay.check_open();
+    let held = || relay.check_open().and_then(|()| watch.held());
     let run = SruiProbe::run(
         SruiPlan {
             transport: Transport::Command(devbox.srui_argv(relay.local_addr())),
@@ -592,6 +731,10 @@ fn srui_run(
         },
         format!("px027-{}-{run_no}", workload.name()).as_bytes(),
     )?;
+    // The window is over: the workload must still be whole now, not just at the last poll.
+    workload.alive(devbox).map_err(|error| {
+        format!("the workload did not last the window ({error}); the run is refused")
+    })?;
     let mut record = srui_record(
         workload.name(),
         run_no,
@@ -612,10 +755,11 @@ fn htop_run(
     workload.start(devbox, settings.lifetime())?;
     thread::sleep(WORKLOAD_SETTLE);
     let processes = process_count(devbox)?;
+    let watch = watch_workload(devbox, workload);
     let relay = TcpCountRelay::start(devbox.upstream(), Duration::ZERO)
         .map_err(|error| error.to_string())?;
     let sample = || relay.traffic();
-    let held = || relay.check_open();
+    let held = || relay.check_open().and_then(|()| watch.held());
     // htop's interval as the box sees it: its own argument vector, read while it runs.
     let observed: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
     let watcher = {
@@ -651,6 +795,9 @@ fn htop_run(
         devbox.stderr(&format!("ssh-htop-{}-{run_no}.log", workload.name())),
     )?;
     let _ = watcher.join();
+    workload.alive(devbox).map_err(|error| {
+        format!("the workload did not last the window ({error}); the run is refused")
+    })?;
     let delay = *observed.lock().unwrap_or_else(|p| p.into_inner());
     let mut record = htop_record(workload.name(), run_no, processes, delay, &run)?;
     record.workload_end_ms = ms(workload.wait_ended(devbox)?);
@@ -664,6 +811,7 @@ pub fn compare(
     workloads: &[Workload],
     settings: &Settings,
 ) -> Result<(Vec<SruiRecord>, Vec<HtopRecord>)> {
+    check_workload_fits(workloads, &[settings.lifetime()])?;
     let (mut srui, mut htop) = (Vec::new(), Vec::new());
     for workload in workloads {
         for run_no in 0..settings.runs {
@@ -700,6 +848,9 @@ pub fn rtt(
     rtts_ms: &[u64],
     settings: &Settings,
 ) -> Result<Vec<SruiRecord>> {
+    let lifetime = |rtt_ms: u64| settings.lifetime() + Duration::from_millis(rtt_ms * 10);
+    let lifetimes: Vec<Duration> = rtts_ms.iter().map(|rtt_ms| lifetime(*rtt_ms)).collect();
+    check_workload_fits(&[workload], &lifetimes)?;
     let mut records = Vec::new();
     for rtt_ms in rtts_ms {
         for run_no in 0..settings.runs {
@@ -710,7 +861,7 @@ pub fn rtt(
                 Duration::from_millis(*rtt_ms),
                 settings.warmup,
                 settings.duration,
-                settings.lifetime() + Duration::from_millis(*rtt_ms * 10),
+                lifetime(*rtt_ms),
             )?;
             if record.attach_ms < *rtt_ms as f64 {
                 return Err(format!(
@@ -1004,6 +1155,32 @@ pub fn scale_markdown(label: &str, records: &[SruiRecord]) -> String {
     )
 }
 
+/// A JSON string literal, quotes included (RFC 8259 §7): `"` and `\` escaped, every
+/// control character U+0000 to U+001F escaped (the short forms where JSON has one, `\uXXXX`
+/// otherwise), everything else, non-ASCII included, as itself. Every string this module writes into
+/// JSON goes through it, labels from the command line above all (PX-027, Codex review).
+pub fn json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            control if u32::from(control) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", u32::from(control));
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn json_split(split: Split) -> String {
     format!(
         "{{\"payload\": {}, \"encrypted\": {}, \"overhead\": {}}}",
@@ -1016,8 +1193,8 @@ fn json_split(split: Split) -> String {
 /// One JSON object per SRUI record.
 pub fn srui_json(record: &SruiRecord) -> String {
     format!(
-        "{{\"side\": \"srui\", \"workload\": \"{}\", \"run\": {}, \"rtt_ms\": {}, \"processes\": {}, \"rows\": {}, \"published_interval_ms\": {}, \"attach_ms\": {:.1}, \"startup_payload\": {}, \"startup_encrypted\": {}, \"steady_secs\": {:.3}, \"down\": {}, \"up\": {}, \"app_transactions_in_window\": {}, \"workload_end_ms\": {:.0}}}",
-        record.workload,
+        "{{\"side\": \"srui\", \"workload\": {}, \"run\": {}, \"rtt_ms\": {}, \"processes\": {}, \"rows\": {}, \"published_interval_ms\": {}, \"attach_ms\": {:.1}, \"startup_payload\": {}, \"startup_encrypted\": {}, \"steady_secs\": {:.3}, \"down\": {}, \"up\": {}, \"app_transactions_in_window\": {}, \"workload_end_ms\": {:.0}}}",
+        json_string(&record.workload),
         record.run,
         record.rtt_ms,
         record.processes,
@@ -1037,8 +1214,8 @@ pub fn srui_json(record: &SruiRecord) -> String {
 /// One JSON object per htop record.
 pub fn htop_json(record: &HtopRecord) -> String {
     format!(
-        "{{\"side\": \"htop\", \"workload\": \"{}\", \"run\": {}, \"processes\": {}, \"observed_delay_ds\": {}, \"terminal\": \"{}x{}\", \"attach_ms\": {:.1}, \"startup_payload\": {}, \"startup_encrypted\": {}, \"steady_secs\": {:.3}, \"down\": {}, \"up\": {}, \"workload_end_ms\": {:.0}}}",
-        record.workload,
+        "{{\"side\": \"htop\", \"workload\": {}, \"run\": {}, \"processes\": {}, \"observed_delay_ds\": {}, \"terminal\": \"{}x{}\", \"attach_ms\": {:.1}, \"startup_payload\": {}, \"startup_encrypted\": {}, \"steady_secs\": {:.3}, \"down\": {}, \"up\": {}, \"workload_end_ms\": {:.0}}}",
+        json_string(&record.workload),
         record.run,
         record.processes,
         record.delay_ds.map_or("null".into(), |d| d.to_string()),
@@ -1059,7 +1236,7 @@ pub fn idle_json(report: &IdleReport) -> String {
     let after: Vec<String> = report
         .after_sync
         .iter()
-        .map(|(kind, bytes)| format!("\"{kind} ({bytes} B)\""))
+        .map(|(kind, bytes)| json_string(&format!("{kind} ({bytes} B)")))
         .collect();
     format!(
         "{{\"window_secs\": {:.3}, \"sync_revision\": {}, \"app_transactions_after_sync\": {}, \"messages_after_sync\": [{}], \"payload_down_window\": {}, \"encrypted_window\": {{\"up\": {}, \"down\": {}}}, \"canary\": {{\"after_ms\": {:.1}, \"revisions\": [{}, {}], \"operations\": {}}}}}",

@@ -17,8 +17,9 @@
 use srtop_demo::{
     relay::{DelayRelay, Traffic},
     showcase::{
-        check_idle, check_matched, htop_delay_from_args, htop_record, srui_record, Devbox,
-        HtopRecord, IdleReport, Settings, SruiRecord,
+        check_idle, check_matched, check_workload_fits, compare, htop_delay_from_args, htop_json,
+        htop_record, idle_json, json_string, rtt, srui_json, srui_record, Devbox, HtopRecord,
+        IdleReport, Settings, SruiRecord, Workload, WorkloadWatch,
     },
     traffic::{
         check_payload_counts, published_interval_ms, tty_size_from_prefix, Distribution, Split,
@@ -972,4 +973,227 @@ fn the_steady_window_reported_is_the_one_observed() {
         "{:?}",
         run.steady_duration
     );
+}
+
+// PX-027, Codex review (second pass): a workload must outlive its window, and
+// every string written into JSON is escaped.
+
+#[test]
+fn a_workload_that_would_outlive_its_workers_is_refused_before_anything_starts() {
+    let mut long = settings();
+    long.duration = Duration::from_millis(60_000);
+    let error = check_workload_fits(&[Workload::Busy], &[long.lifetime()]).unwrap_err();
+    assert!(
+        error.contains("72.5 s") && error.contains("exceeds the workers' 60 s limit"),
+        "{error}"
+    );
+    check_workload_fits(&[Workload::Idle], &[long.lifetime()]).unwrap();
+    check_workload_fits(&[Workload::Churn], &[settings().lifetime()]).unwrap();
+    // Refused before any process starts: a docker that does not exist is never reached.
+    let devbox = Devbox {
+        docker: "/nonexistent/px027-docker".into(),
+        container: "c".into(),
+        port: 2242,
+        key: PathBuf::from("/k"),
+        known_hosts: PathBuf::from("/h"),
+        logs: PathBuf::from("/l"),
+    };
+    for error in [
+        compare(&devbox, &[Workload::Idle, Workload::Churn], &long).unwrap_err(),
+        rtt(&devbox, Workload::Busy, &[0, 600], &long).unwrap_err(),
+    ] {
+        assert!(
+            error.contains("exceeds the workers'") && !error.contains("docker"),
+            "{error}"
+        );
+    }
+}
+
+fn box_processes(workers: &[&str], sleepers: usize) -> Vec<(String, String)> {
+    let mut processes: Vec<(String, String)> = workers
+        .iter()
+        .map(|mode| {
+            (
+                "srtop-demo-work".to_string(),
+                format!("/usr/local/bin/srtop-demo-worker --srtop-test-owner srtop-demo-1 --mode {mode} --duration-ms 27500"),
+            )
+        })
+        .collect();
+    processes.extend((0..sleepers).map(|_| ("sleep".to_string(), "sleep 27".to_string())));
+    processes.push(("sshd".into(), "sshd: srui [priv]".into()));
+    processes
+}
+
+#[test]
+fn a_workload_is_whole_only_while_every_worker_and_sleeper_lives() {
+    Workload::Busy
+        .check_alive(&box_processes(&["cpu", "memory", "threads"], 200))
+        .unwrap();
+    Workload::Churn
+        .check_alive(&box_processes(
+            &["cpu", "memory", "threads", "short-lived", "child", "child"],
+            200,
+        ))
+        .unwrap();
+    Workload::Idle.check_alive(&[]).unwrap();
+    for (workload, processes, missing) in [
+        (
+            Workload::Busy,
+            box_processes(&["cpu", "threads"], 200),
+            "memory worker 0/1",
+        ),
+        (
+            Workload::Churn,
+            box_processes(&["cpu", "memory", "threads"], 200),
+            "short-lived worker 0/1",
+        ),
+        (
+            Workload::Busy,
+            box_processes(&["cpu", "memory", "threads"], 199),
+            "sleepers 199/200",
+        ),
+    ] {
+        let error = workload.check_alive(&processes).unwrap_err();
+        assert!(error.contains(missing), "{error}");
+    }
+}
+
+/// A real PX-025 worker killed in the middle of the steady window fails the run
+/// through the probe's `held` hook, naming the phase.
+#[test]
+fn a_workload_worker_killed_mid_window_fails_the_run() {
+    use srtop_demo::{
+        harness::{fresh_owner, live_processes_with_owner, wait_until_none_live, DemoWorker},
+        worker::{Mode, WorkerSpec},
+    };
+    let owner = fresh_owner();
+    let spec = WorkerSpec {
+        owner: owner.clone(),
+        mode: Mode::Cpu { threads: 1 },
+        duration: Duration::from_secs(20),
+        fail_after: None,
+    };
+    let worker = std::sync::Arc::new(std::sync::Mutex::new(
+        DemoWorker::spawn(
+            std::path::Path::new(env!("CARGO_BIN_EXE_srtop-demo-worker")),
+            &spec,
+        )
+        .unwrap(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while live_processes_with_owner(&owner).unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "the worker started");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let watching = owner.clone();
+    let mut watch =
+        WorkloadWatch::start(
+            Duration::from_millis(50),
+            move || match live_processes_with_owner(&watching)
+                .map_err(|error| error.to_string())?
+                .len()
+            {
+                1 => Ok(()),
+                alive => Err(format!("cpu worker {alive}/1")),
+            },
+        );
+    let killer = {
+        let worker = std::sync::Arc::clone(&worker);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1000));
+            worker.lock().unwrap().kill().unwrap();
+        })
+    };
+    let held = || watch.held();
+    let argv: Vec<String> = ["sh", "-c", "printf go; exec cat"]
+        .map(String::from)
+        .to_vec();
+    let started = Instant::now();
+    let error = TtyProbe::run(
+        &argv,
+        Duration::from_millis(300),
+        Duration::from_millis(2000),
+        b"q",
+        None,
+        Some(&held),
+        Stdio::null(),
+    )
+    .unwrap_err();
+    killer.join().unwrap();
+    watch.stop();
+    assert!(
+        error.contains("the workload did not last the window")
+            && error.contains("during the steady window"),
+        "{error}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(wait_until_none_live(&owner, Duration::from_secs(5))
+        .unwrap()
+        .is_empty());
+}
+
+/// Labels round-trip through a real JSON parser unchanged, whatever they hold.
+#[test]
+fn every_string_written_into_json_is_escaped() {
+    assert_eq!(json_string("a\"b\\c"), r#""a\"b\\c""#);
+    assert_eq!(
+        json_string("\n\t\r\u{8}\u{c}\u{1}\u{1f}"),
+        r#""\n\t\r\b\f\u0001\u001f""#
+    );
+    assert_eq!(json_string("é ✓"), "\"é ✓\"");
+    let label = "x\"y\\z\nnew\tline\u{1}é ✓";
+    let mut record = srui("busy", Some(1000), 15.0, 210);
+    record.workload = label.to_string();
+    let srui_text = srui_json(&record);
+    let mut theirs = htop("busy", Some(10), 15.0, 210, (120, 40));
+    theirs.workload = label.to_string();
+    let htop_text = htop_json(&theirs);
+    let idle_text = idle_json(&IdleReport {
+        window: Duration::from_secs(10),
+        sync_revision: 1,
+        ui_after_sync: 0,
+        after_sync: vec![("Transaction", 12)],
+        canary_after: Duration::from_millis(5),
+        canary_revisions: (1, 2),
+        canary_operations: 2,
+        payload_down_window: 0,
+        encrypted_window: Traffic::default(),
+    });
+    for (text, field) in [(&srui_text, "workload"), (&htop_text, "workload")] {
+        assert_eq!(python_json_field(text, field), label.as_bytes(), "{text}");
+    }
+    assert_eq!(
+        python_json_field(&idle_text, "messages_after_sync"),
+        b"[\"Transaction (12 B)\"]"
+    );
+}
+
+/// Parses `text` with Python's `json` and prints `field` (a string as itself, anything else
+/// as compact JSON), as UTF-8 bytes.
+fn python_json_field(text: &str, field: &str) -> Vec<u8> {
+    let mut child = Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            "import json,sys\nvalue=json.loads(sys.stdin.buffer.read().decode('utf-8'))[sys.argv[1]]\nsys.stdout.buffer.write((value if isinstance(value,str) else json.dumps(value,separators=(',',':'))).encode('utf-8'))",
+            field,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("python3 parses the JSON");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "python3 refused {text}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
 }

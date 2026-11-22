@@ -372,7 +372,13 @@ fn showcase(args: &[String]) -> Result<()> {
                     .map(|rtt| number(&flag, rtt))
                     .collect::<Result<_>>()?
             }
-            "--label" => label = value,
+            "--label" => {
+                // Bounded: it names a row of the report and a JSON string, nothing more.
+                if value.is_empty() || value.len() > 64 {
+                    return Err("--label takes 1 to 64 bytes".into());
+                }
+                label = value
+            }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }

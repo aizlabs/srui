@@ -13,6 +13,13 @@
 #   clean-account-walkthrough.sh --verify FILE   re-check a result file's checksum and summary
 #   --output FILE        the result file (default ~/srui-r1-walkthrough-<UTC time>.txt)
 #   --previous-rev REV   the release updated from and rolled back to (default the PX-026 merge)
+#   --with-showcase      PX-027: after the live checks, one more step runs
+#                        apps/srtop/r1/showcase-measure.sh --quick against the same box (an
+#                        unchanged fake source's idle wire and canary, bounded workers gone after
+#                        every run, srtop against htop and the RTT matrix, two runs each), then
+#                        brings the box back as the later steps expect it. Needs Rust (cargo) in
+#                        the account, for the release build of the measuring tool; about 10 more
+#                        minutes. The step is SKIP in a dry run.
 #   --allow-existing-srui-data
 #                        DANGEROUS. Without it the script refuses, before writing anything, an
 #                        account that already has an R1 install (~/.local/share/srui-r1), saved
@@ -50,9 +57,11 @@ OUTPUT=""
 PREVIOUS_REV=$DEFAULT_PREVIOUS_REV
 VERIFY=""
 ALLOW_EXISTING=""
+SHOWCASE=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run) MODE=dry-run; shift ;;
+    --with-showcase) SHOWCASE=1; shift ;;
     --output) OUTPUT=${2:?--output needs a file}; shift 2 ;;
     --previous-rev) PREVIOUS_REV=${2:?--previous-rev needs a revision}; shift 2 ;;
     --verify) VERIFY=${2:?--verify needs a file}; shift 2 ;;
@@ -266,6 +275,9 @@ step_prerequisites() {
     fact "FAIL: docker is not installed"; ok=1
   fi
   fact "rust (optional; the Linux server is built inside the devbox image): $(rustc --version 2>/dev/null || echo absent) / $(cargo --version 2>/dev/null || echo absent)"
+  if [ -n "$SHOWCASE" ] && [ "$MODE" = real ] && ! command -v cargo >/dev/null 2>&1; then
+    fact "FAIL: --with-showcase builds the measuring tool with cargo; install Rust (rustup) in this account or run without it"; ok=1
+  fi
   if [ "$MODE" = real ] && command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     fact "FAIL: port $PORT is already in use (stop the devbox in your other account first)"; ok=1
   fi
@@ -426,6 +438,18 @@ step_use_r0_scenario() {
 step_live_checks() {
   SRTOP_R1_KEEP_BOX=1 PX026G01_EVIDENCE_DIR=$EVIDENCE bash "$SCRIPT_DIR/live-checks.sh" || return 1
   grep -o 'PX-026-G01 R1 live evidence: [a-z ]*:' "$EVIDENCE/live-checks-swift-test.log" | sed 's/^/FACT passed /'
+}
+
+# PX-027 (--with-showcase): the showcase's own checks against this account's box, then the box as
+# the later steps expect it (srtop's default live source).
+step_showcase() {
+  local dir=$EVIDENCE/showcase
+  SRTOP_SHOWCASE_KEEP_BOX=1 SRUI_SHOWCASE_EVIDENCE_DIR=$dir bash "$SCRIPT_DIR/showcase-measure.sh" --quick || return 1
+  fact "idle wire: $(head -1 "$dir/idle.md")"
+  grep -E '^(workers_left_after_all_runs|settings):' "$dir/environment.txt" | sed 's/^/FACT /'
+  grep -E '^\| (idle|busy|churn) \| [0-9]' "$dir/compare.md" | sed 's/^/FACT encrypted B\/s, SRUI against htop: /'
+  "$DEVBOX" up >/dev/null || return 1
+  fact "the box is back on srtop's default live source"
 }
 
 step_rollback() {
@@ -600,11 +624,13 @@ if [ "$MODE" = real ]; then
   run_step connect step_connect
   run_step use-r0-scenario step_use_r0_scenario
   run_step r1-live-checks step_live_checks
+  [ -n "$SHOWCASE" ] && run_step px027-showcase step_showcase
 else
   skip_step devbox-up "dry run" "$DEVBOX" up
   skip_step connect "dry run" "$PREFIX/bin/srui-client --ssh 127.0.0.1 --port $PORT ..."
   skip_step use-r0-scenario "dry run" apps/srtop/devbox/r0-scenario.sh
   skip_step r1-live-checks "dry run" apps/srtop/r1/live-checks.sh
+  [ -n "$SHOWCASE" ] && skip_step px027-showcase "dry run" apps/srtop/r1/showcase-measure.sh --quick
 fi
 run_step rollback step_rollback
 run_step roll-forward step_roll_forward

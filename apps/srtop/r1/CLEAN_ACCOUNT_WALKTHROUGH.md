@@ -76,6 +76,16 @@ CHECKSUM sha256=...
 The walkthrough passed. Send back: ~/srui-r1-walkthrough-<UTC time>.txt
 ```
 
+**PX-027 (the R1 showcase gate) needs one flag more.** Run it as
+`apps/srtop/r1/clean-account-walkthrough.sh --with-showcase`, from a revision that includes PX-027
+(the `codex/PX-027-showcase` branch until it merges). The flag adds one step after the live
+checks, `px027-showcase`, which runs `apps/srtop/r1/showcase-measure.sh --quick` against the same
+box: an unchanged fake source must send no app transaction, the demonstration workers must be gone
+after every run, and srtop is measured against htop and at four RTTs. It needs Rust (`cargo`) in
+the new account, installed with rustup, and about 10 more minutes. A passing run then ends
+`SUMMARY PASS mode=real steps=18 pass=18 fail=0 skip=0`. It is still one script and one result
+file, and the same file serves PX-026-G01.
+
 If the preflight or the prerequisites step fails, the run stops there, before anything is
 planted, built or installed. It ends with `STOPPED after …` and `SUMMARY FAIL`; fix what that step
 names and run it again.

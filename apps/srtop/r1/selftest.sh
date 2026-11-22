@@ -180,6 +180,15 @@ check "walkthrough --dry-run: no install prefix, settings or sentinel left" [ "$
 echo "  files the dry run left in its HOME (all inside it by construction):"
 (cd "$W" && find . -type f | LC_ALL=C sort | sed 's/^/    /')
 
+# PX-027: --with-showcase adds exactly one step, skipped in a dry run, and the verdict still follows.
+sandboxed_walk "$STUBS/pass" "$W/result-showcase.txt" --with-showcase >"$ROOT/walk-showcase.log" 2>&1
+status=$?
+ok=1; [ "$status" -eq 0 ] && grep -qE '^STEP [0-9]+ px027-showcase SKIP ' "$W/result-showcase.txt" \
+  && [ "$(grep -c '^STEP ' "$W/result-showcase.txt")" -eq $(( $(grep -c '^STEP ' "$W/result-pass.txt") + 1 )) ] \
+  && grep -q '^SUMMARY DRY-RUN-OK mode=dry-run ' "$W/result-showcase.txt" \
+  && walk "$STUBS/pass" --verify "$W/result-showcase.txt" >/dev/null 2>&1 && ok=0
+check "walkthrough --with-showcase --dry-run: one more step, skipped, DRY-RUN-OK and verified (exit $status)" [ "$ok" -eq 0 ]
+
 sandboxed_walk "$STUBS/fail" "$W/result-fail.txt" >"$ROOT/walk-fail.log" 2>&1
 check "walkthrough: a failed prerequisite fails the run (non-zero exit)" [ "$?" -ne 0 ]
 check "walkthrough: the prerequisites step reports FAIL" grep -q '^STEP 2 prerequisites FAIL exit=1 ' "$W/result-fail.txt"

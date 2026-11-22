@@ -5,6 +5,8 @@
 #   apps/srtop/devbox/devbox.sh up        build the image if needed and start it
 #   apps/srtop/devbox/devbox.sh client    build and launch the macOS client at it
 #   apps/srtop/devbox/devbox.sh spawn 30  run `sleep 30` inside the box
+#   apps/srtop/devbox/devbox.sh workers 60  PX-027's demonstration: PX-025's bounded workers (CPU,
+#                                          memory, threads, short-lived processes) for 60 s
 #   apps/srtop/devbox/devbox.sh drop-bridges   cut every client connection; srtop keeps its session
 #   apps/srtop/devbox/devbox.sh restart-srtop  stop srtop and start a new one: a new session
 #   apps/srtop/devbox/devbox.sh down      stop and remove the container
@@ -102,6 +104,19 @@ cmd_spawn() {
   echo "devbox: spawned $count sleeper(s) of ${seconds}s"
 }
 
+# PX-027: the showcase's demonstration workload, the one showcase-measure.sh calls churn. Every
+# worker is PX-025's bounded, test-owned srtop-demo-worker and ends by itself at the deadline
+# (at most 60 s); nothing here can signal a process it did not start.
+cmd_workers() {
+  local seconds=${1:-60}
+  case "$seconds" in ''|*[!0-9]*) die "workers takes whole seconds, 1 to 60" ;; esac
+  [ "$seconds" -ge 1 ] && [ "$seconds" -le 60 ] || die "workers takes whole seconds, 1 to 60"
+  docker exec -d -u srui "$NAME" /usr/local/bin/srtop-demo workers --duration-ms "$((seconds * 1000))" \
+    --cpu-threads 1 --memory-mib 64 --threads 16 --short-lived 64 \
+    --short-lived-interval-ms "$((seconds * 1000 / 64))" --short-lived-lifetime-ms 500
+  echo "devbox: bounded demonstration workers started for ${seconds}s (CPU, memory, threads, short-lived)"
+}
+
 cmd_ssh() {
   exec ssh -p "$PORT" -i "$KEY" -o IdentitiesOnly=yes \
     -o UserKnownHostsFile="$KNOWN_HOSTS" -o BatchMode=yes srui@127.0.0.1 "$@"
@@ -165,6 +180,7 @@ case "${1:-}" in
   up) cmd_up ;;
   client) cmd_client ;;
   spawn) shift; cmd_spawn "$@" ;;
+  workers) shift; cmd_workers "$@" ;;
   ssh) shift; cmd_ssh "$@" ;;
   drop-bridges) cmd_drop_bridges ;;
   restart-srtop) cmd_restart_srtop ;;
@@ -175,7 +191,7 @@ case "${1:-}" in
     ;;
   down) cmd_down ;;
   *)
-    sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

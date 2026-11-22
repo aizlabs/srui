@@ -257,7 +257,10 @@ fn the_intervals_each_side_reports_are_read_from_their_own_words() {
 /// probe's raw count equals its sum of frames.
 #[test]
 fn the_probes_payload_count_equals_the_delay_relays_count_of_the_same_stream() {
-    let srtop = Srtop::start(&["--fake-sequence", "--refresh-interval-ms", "100"]);
+    // The synthetic source churns on every tick for as long as it runs (the
+    // scripted sequence ends after a few steps), so the window always holds
+    // commits whenever the probe attaches.
+    let srtop = Srtop::start(&["--scale-source", "50", "--scale-interval-ms", "100"]);
     let mut relay =
         DelayRelay::start(&srtop.path("r.sock"), &srtop.socket(), Duration::ZERO).unwrap();
     let run = SruiProbe::run(
@@ -275,7 +278,7 @@ fn the_probes_payload_count_equals_the_delay_relays_count_of_the_same_stream() {
     check_payload_counts(&run).unwrap();
     assert!(
         run.steady.ui_transactions >= 3,
-        "the sequence commits every tick: {:?}",
+        "the synthetic source commits every tick: {:?}",
         run.steady
     );
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -290,7 +293,7 @@ fn the_probes_payload_count_equals_the_delay_relays_count_of_the_same_stream() {
     assert_eq!(traffic.up, run.startup.payload_up + run.steady.payload_up);
     assert!(run.startup.payload_down + run.steady.payload_down <= run.framed_down);
     assert_eq!(run.published_interval_ms, Some(100));
-    assert_eq!(run.rows, 3);
+    assert_eq!(run.rows, 50);
     relay.stop();
     println!(
         "PX-027 payload differential: relay down {} B = probe raw {} B = probe framed {} B; up {} B",

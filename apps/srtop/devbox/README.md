@@ -58,6 +58,17 @@ apps/srtop/devbox/devbox.sh drop-bridges    # kill each client's srui-ssh-bridge
 apps/srtop/devbox/devbox.sh restart-srtop   # SIGTERM srtop, start a new one on the same socket: a replacement
 ```
 
+PX-027's demonstration workload is one command. It runs PX-025's bounded, test-owned workers inside
+the box: one CPU thread, 64 MiB resident, 16 parked threads, and a short-lived process every
+few hundred milliseconds. Each ends by itself at the deadline, which is at most 60 s:
+
+```sh
+apps/srtop/devbox/devbox.sh workers 60
+```
+
+`apps/srtop/r1/showcase-measure.sh` measures srtop against htop on this box, with the same
+workloads; see [../r1/README.md](../r1/README.md).
+
 `apps/srtop/r1/live-checks.sh` is the R1 gate's scripted run against this box. It
 covers protocol profiles and core versions, host keys, authentication,
 reconnect, replacement, the package's controls and the privacy of command
@@ -94,7 +105,11 @@ rm -rf "${SRTOP_DEVBOX_STATE:-$HOME/.codex/srtop-devbox}"
   stage is `rust:1-bookworm` with rustc 1.99.1, and the runtime is
   `debian:bookworm-slim` with Debian 12.15. The apt packages installed on top of
   them (openssh-server, procps) are not pinned. `live-checks.sh` records their
-  versions.
+  versions. PX-027:
+  - every binary is a release build;
+  - the image also carries `srtop-demo` and `srtop-demo-worker` (PX-025's bounded
+    workers);
+  - it carries htop for the matched comparison, pinned to bookworm's `3.2.2-2`.
 - The build context is a `git archive` of `SRTOP_DEVBOX_REV`, never the working
   tree, so no `.git`, no `target/`, and no key material reaches the image. The
   image is labelled `org.srui.revision` with that commit; `r0-scenario.sh`

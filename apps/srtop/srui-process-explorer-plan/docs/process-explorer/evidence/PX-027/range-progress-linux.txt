@@ -1,0 +1,26 @@
+PX-027 range progress evidence: live rtt=300ms interval=100ms requests=12 window=16 converged=12 bound=1.25s min=302.860751ms median=399.40025ms max=404.883584ms rows=13..20 revisions 38->76
+PX-027 range progress evidence: live rtt=600ms interval=100ms requests=12 window=16 converged=12 bound=1.55s min=600.889875ms median=697.329625ms max=705.01175ms rows=13..20 revisions 81->120
+PX-027 live churn workers: 18 bounded short-lived workers started; left running afterwards: 0
+PX-027 range progress evidence: synthetic rtt=300ms interval=100ms requests=12 window=16 converged=12 bound=1.25s min=384.687208ms median=395.996166ms max=407.454292ms rows=2000..2000 revisions 40->77
+PX-027 range progress evidence: synthetic rtt=600ms interval=100ms requests=12 window=16 converged=12 bound=1.55s min=633.824251ms median=699.974625ms max=716.665751ms rows=2000..2000 revisions 82->123
+PX-027 range progress evidence: synthetic rtt=100ms interval=100ms requests=12 window=16 converged=12 bound=1.05s min=166.41675ms median=198.704459ms max=204.111875ms rows=2000..2000 revisions 1->36
+PX-027 range progress evidence: live rtt=100ms interval=100ms requests=12 window=16 converged=12 bound=1.05s min=101.118084ms median=199.556333ms max=209.125584ms rows=14..21 revisions 1->35
+PX-027 range progress evidence: synthetic rtt=300ms interval=100ms requests=12 window=16 converged=12 bound=1.25s min=372.858167ms median=399.791042ms max=433.843542ms rows=2000..2000 revisions 39->76
+PX-027 range progress evidence: live rtt=300ms interval=100ms requests=12 window=16 converged=12 bound=1.25s min=301.156042ms median=398.861084ms max=401.456083ms rows=15..21 revisions 37->74
+PX-027 range progress evidence: synthetic rtt=600ms interval=100ms requests=12 window=16 converged=12 bound=1.55s min=618.224792ms median=698.029626ms max=702.405ms rows=2000..2000 revisions 81->122
+PX-027 range progress evidence: live rtt=600ms interval=100ms requests=12 window=16 converged=12 bound=1.55s min=601.203084ms median=698.68525ms max=700.919959ms rows=14..21 revisions 79->118
+PX-027 live churn workers: 18 bounded short-lived workers started; left running afterwards: 0
+PX-027 range progress evidence: synthetic rtt=100ms interval=100ms requests=12 window=16 converged=12 bound=1.05s min=163.1535ms median=199.070709ms max=201.7355ms rows=2000..2000 revisions 1->36
+PX-027 range progress evidence: live rtt=100ms interval=100ms requests=12 window=16 converged=12 bound=1.05s min=100.979333ms median=199.618917ms max=201.197625ms rows=14..21 revisions 1->37
+PX-027 range progress evidence: synthetic rtt=300ms interval=100ms requests=12 window=16 converged=12 bound=1.25s min=382.994917ms median=397.631375ms max=405.436292ms rows=2000..2000 revisions 39->76
+PX-027 range progress evidence: live rtt=300ms interval=100ms requests=12 window=16 converged=12 bound=1.25s min=301.047542ms median=399.323083ms max=401.029667ms rows=14..21 revisions 39->77
+PX-027 range progress evidence: synthetic rtt=600ms interval=100ms requests=12 window=16 converged=12 bound=1.55s min=627.39825ms median=699.548ms max=703.697042ms rows=2000..2000 revisions 81->122
+PX-027 range progress evidence: live rtt=600ms interval=100ms requests=12 window=16 converged=12 bound=1.55s min=600.925917ms median=698.708292ms max=701.581001ms rows=12..21 revisions 82->122
+PX-027 live churn workers: 18 bounded short-lived workers started; left running afterwards: 0
+PX-027 range progress evidence: synthetic rtt=100ms interval=100ms requests=12 window=16 converged=12 bound=1.05s min=160.972417ms median=197.582959ms max=213.979375ms rows=2000..2000 revisions 1->36
+PX-027 range progress evidence: live rtt=100ms interval=100ms requests=12 window=16 converged=12 bound=1.05s min=101.255167ms median=200.073292ms max=201.852917ms rows=14..21 revisions 1->36
+PX-027 range progress evidence: synthetic rtt=300ms interval=100ms requests=12 window=16 converged=12 bound=1.25s min=379.62275ms median=399.145751ms max=404.464625ms rows=2000..2000 revisions 39->76
+PX-027 range progress evidence: live rtt=300ms interval=100ms requests=12 window=16 converged=12 bound=1.25s min=300.867917ms median=399.937125ms max=404.022459ms rows=14..21 revisions 38->76
+PX-027 range progress evidence: synthetic rtt=600ms interval=100ms requests=12 window=16 converged=12 bound=1.55s min=633.681167ms median=698.173501ms max=709.620792ms rows=2000..2000 revisions 81->122
+PX-027 range progress evidence: live rtt=600ms interval=100ms requests=12 window=16 converged=12 bound=1.55s min=600.622792ms median=699.989084ms max=703.436083ms rows=14..21 revisions 81->121
+PX-027 live churn workers: 18 bounded short-lived workers started; left running afterwards: 0

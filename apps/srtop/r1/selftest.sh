@@ -19,6 +19,7 @@
 #    absent, empty, unterminated, ordinary or 0600 config is byte for byte, mode and existence what
 #    it was; a symbolic link, an existing block and an existing srtop-devbox host are refused; a
 #    config edited during the session loses only the block.
+# 5. notes-lint.sh (PX-027): planted htop-parity claims are caught; the shipped notes have none.
 # Bash 3.2 compatible. Exit 0 only if every case passes.
 set -uo pipefail
 
@@ -179,6 +180,23 @@ check "walkthrough --dry-run: no install prefix, settings or sentinel left" [ "$
 echo "  files the dry run left in its HOME (all inside it by construction):"
 (cd "$W" && find . -type f | LC_ALL=C sort | sed 's/^/    /')
 
+# PX-027 round 2 (F3): --help prints the whole header, through its last line, whatever its length.
+header_lines=$(awk 'NR == 1 { next } !/^#/ { exit } { n++ } END { print n }' "$R1_DIR/clean-account-walkthrough.sh")
+walk "$STUBS/pass" --help >"$ROOT/walk-help.txt" 2>&1
+ok=1; [ "$(grep -c '' "$ROOT/walk-help.txt")" -eq "$header_lines" ] \
+  && [ "$(tail -1 "$ROOT/walk-help.txt")" = "verdict is PASS only if every step passed; a dry run's best verdict is DRY-RUN-OK." ] \
+  && grep -q -- '--with-showcase' "$ROOT/walk-help.txt" && grep -q 'apps/srtop/demo/target' "$ROOT/walk-help.txt" && ok=0
+check "walkthrough --help: the whole $header_lines-line header, --with-showcase and cargo's writes included" [ "$ok" -eq 0 ]
+
+# PX-027: --with-showcase adds exactly one step, skipped in a dry run, and the verdict still follows.
+sandboxed_walk "$STUBS/pass" "$W/result-showcase.txt" --with-showcase >"$ROOT/walk-showcase.log" 2>&1
+status=$?
+ok=1; [ "$status" -eq 0 ] && grep -qE '^STEP [0-9]+ px027-showcase SKIP ' "$W/result-showcase.txt" \
+  && [ "$(grep -c '^STEP ' "$W/result-showcase.txt")" -eq $(( $(grep -c '^STEP ' "$W/result-pass.txt") + 1 )) ] \
+  && grep -q '^SUMMARY DRY-RUN-OK mode=dry-run ' "$W/result-showcase.txt" \
+  && walk "$STUBS/pass" --verify "$W/result-showcase.txt" >/dev/null 2>&1 && ok=0
+check "walkthrough --with-showcase --dry-run: one more step, skipped, DRY-RUN-OK and verified (exit $status)" [ "$ok" -eq 0 ]
+
 sandboxed_walk "$STUBS/fail" "$W/result-fail.txt" >"$ROOT/walk-fail.log" 2>&1
 check "walkthrough: a failed prerequisite fails the run (non-zero exit)" [ "$?" -ne 0 ]
 check "walkthrough: the prerequisites step reports FAIL" grep -q '^STEP 2 prerequisites FAIL exit=1 ' "$W/result-fail.txt"
@@ -304,6 +322,12 @@ printf 'Host added-later\n  Port 2201\n' >> "$E/.ssh/config"
 HOME=$E bash "$ALIAS" remove "$state" >/dev/null 2>&1
 expected=$(printf 'Host a\n  User x\nHost added-later\n  Port 2201\n' | shasum -a 256 | awk '{print $1}')
 check "ssh-config-alias: a config edited during the session loses only the block" [ "$(sha "$E/.ssh/config")" = "$expected" ]
+
+# 5. PX-027: notes-lint.sh --self-test catches every planted htop-parity or automatic-superiority
+#    claim and passes its negations; the shipped R1 notes and READMEs carry no such claim.
+echo "== notes-lint.sh (PX-027)"
+check "notes-lint: its self-test catches every planted claim" bash "$R1_DIR/notes-lint.sh" --self-test
+check "notes-lint: the R1 notes and READMEs claim no htop parity" bash "$R1_DIR/notes-lint.sh"
 
 echo "selftest: $((CASES - FAILURES)) of $CASES cases passed"
 [ "$FAILURES" -eq 0 ]

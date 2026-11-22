@@ -1,0 +1,3 @@
+PX-027 range progress evidence: synthetic rtt=100ms interval=100ms requests=12 window=16 converged=12 bound=1.05s min=158.792417ms median=199.938125ms max=205.789666ms rows=2000..2000 revisions 1->36
+PX-027 range progress evidence: synthetic rtt=300ms interval=100ms requests=12 window=16 converged=12 bound=1.25s min=393.57225ms median=398.2095ms max=403.075375ms rows=2000..2000 revisions 39->76
+PX-027 range progress evidence: synthetic rtt=600ms interval=100ms requests=12 window=16 converged=12 bound=1.55s min=648.9115ms median=697.61125ms max=702.205209ms rows=2000..2000 revisions 81->121

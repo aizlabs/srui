@@ -546,7 +546,12 @@ fn read_session(mut reader: Box<dyn Read + Send>, log: Arc<Mutex<ProbeLog>>) {
             }
             if let Some((0, revision)) = revisions {
                 if welcomed && log.synced.is_none() {
-                    log.synced = Some((at, revision));
+                    // Attach ends once the replica holds the snapshot, so take the time after
+                    // conversion and `replace_from_snapshot` above, not at arrival (`at`). The
+                    // event below keeps the arrival time for traffic accounting (Codex review,
+                    // PR #118). The snapshot's own event stays outside `after_sync`, which counts
+                    // only events that arrive after this time.
+                    log.synced = Some((Instant::now(), revision));
                 }
             }
             if revisions.is_some() {
@@ -595,7 +600,8 @@ pub struct Window {
 /// What one SRUI session probe measured.
 #[derive(Debug, Clone)]
 pub struct SruiRun {
-    /// Start to the first snapshot applied (welcome, snapshot).
+    /// Start to the first snapshot applied (welcome, snapshot): timed after the replica has
+    /// converted and applied it, not when its frame arrived.
     pub attach: Duration,
     pub sync_revision: u64,
     /// Every byte before the steady window: handshake, snapshot, warm-up.

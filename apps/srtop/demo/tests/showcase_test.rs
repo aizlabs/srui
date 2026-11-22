@@ -17,12 +17,12 @@
 use srtop_demo::{
     relay::{DelayRelay, Traffic},
     showcase::{
-        check_idle, check_matched, htop_delay_from_args, srui_record, Devbox, HtopRecord,
-        IdleReport, Settings, SruiRecord,
+        check_idle, check_matched, htop_delay_from_args, htop_record, srui_record, Devbox,
+        HtopRecord, IdleReport, Settings, SruiRecord,
     },
     traffic::{
-        check_payload_counts, published_interval_ms, Distribution, Split, SruiPlan, SruiProbe,
-        SruiRun, TcpCountRelay, Transport, TtyProbe, Window,
+        check_payload_counts, published_interval_ms, tty_size_from_prefix, Distribution, Split,
+        SruiPlan, SruiProbe, SruiRun, TcpCountRelay, Transport, TtyProbe, TtyRun, Window,
     },
 };
 use std::{
@@ -604,6 +604,10 @@ fn htop_is_started_at_the_interval_srtop_publishes() {
         assert!(argv
             .iter()
             .any(|arg| arg == "Ciphers=chacha20-poly1305@openssh.com"));
+        // The box's own known_hosts name, from its port: an isolated box is not 2222.
+        assert!(argv
+            .iter()
+            .any(|arg| arg == "HostKeyAlias=[127.0.0.1]:2222"));
     }
 }
 
@@ -628,4 +632,143 @@ fn the_tty_probe_counts_the_terminal_stream_by_window() {
     assert_eq!(run.startup_down + run.steady_down, 7);
     assert_eq!(run.steady_down, 4, "{run:?}");
     assert!(run.steady_duration >= Duration::from_millis(1500));
+    assert_eq!(run.prefix, b"abcdefg", "the stream's start is kept");
+}
+
+/// PX-027 round 2 (F5): at an injected RTT the relay counts a byte when it is
+/// delivered to the far side, not when it is read, so the encrypted window
+/// moves with what the far side has received instead of leading it by RTT/2.
+#[test]
+fn the_tcp_relay_counts_a_byte_when_it_is_delivered_not_when_it_is_read() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let upstream = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut got = vec![0_u8; 1000];
+        stream.read_exact(&mut got).unwrap();
+        let at = Instant::now();
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).unwrap();
+        at
+    });
+    let rtt = Duration::from_millis(800);
+    let mut relay = TcpCountRelay::start(upstream, rtt).unwrap();
+    let mut client = std::net::TcpStream::connect(relay.local_addr()).unwrap();
+    let sent = Instant::now();
+    client.write_all(&[3_u8; 1000]).unwrap();
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        relay.traffic().up,
+        0,
+        "150 ms after the write, 400 ms before its delivery, nothing has reached the far side"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while relay.traffic().up < 1000 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    let counted = Instant::now();
+    assert_eq!(relay.traffic().up, 1000);
+    assert!(
+        counted >= sent + rtt / 2,
+        "counted after {:?}, before its RTT/2 delivery",
+        counted - sent
+    );
+    client.shutdown(Shutdown::Write).unwrap();
+    let delivered = server.join().unwrap();
+    assert!(delivered >= sent + rtt / 2);
+    relay.stop();
+}
+
+/// PX-027 round 2 (F6): the canary must be the very next transaction after the
+/// synchronized revision, with its two operations; anything else is refused.
+#[test]
+fn the_idle_check_refuses_a_canary_that_is_not_the_next_transaction() {
+    let report = |revisions: (u64, u64), operations: usize| IdleReport {
+        window: Duration::from_secs(10),
+        sync_revision: 7,
+        ui_after_sync: 0,
+        after_sync: Vec::new(),
+        canary_after: Duration::from_millis(20),
+        canary_revisions: revisions,
+        canary_operations: operations,
+        payload_down_window: 0,
+        encrypted_window: Traffic::default(),
+    };
+    check_idle(&report((7, 8), 2)).unwrap();
+    for (revisions, operations) in [
+        ((8, 9), 2),
+        ((6, 7), 2),
+        ((7, 9), 2),
+        ((7, 8), 3),
+        ((7, 8), 1),
+    ] {
+        let error = check_idle(&report(revisions, operations)).unwrap_err();
+        assert!(
+            error.contains("not the next transaction"),
+            "{revisions:?} {operations}: {error}"
+        );
+    }
+}
+
+/// PX-027 round 2 (F7): the terminal probe drains as fast as the program
+/// writes. 600 KB written in one burst inside the window all arrive inside it,
+/// so the probe never trails htop or holds back what it already sent.
+#[test]
+fn the_tty_probe_keeps_up_with_a_fast_writer() {
+    let argv: Vec<String> = [
+        "sh",
+        "-c",
+        "printf go; sleep 0.3; head -c 600000 /dev/zero; exec cat >/dev/null",
+    ]
+    .map(String::from)
+    .to_vec();
+    let run = TtyProbe::run(
+        &argv,
+        Duration::ZERO,
+        Duration::from_millis(1500),
+        b"q",
+        None,
+        Stdio::null(),
+    )
+    .unwrap();
+    assert_eq!(run.startup_down, 2, "{run:?}");
+    assert_eq!(
+        run.steady_down, 600_000,
+        "every byte written in the window was drained in it"
+    );
+}
+
+/// PX-027 round 2 (F8): the terminal size in a record is the one the remote
+/// session reported with `stty size`, never the size that was asked for.
+#[test]
+fn an_htop_record_carries_the_terminal_size_the_session_reported() {
+    assert_eq!(
+        tty_size_from_prefix(b"40 120\r\n\x1b[?1049h"),
+        Some((120, 40))
+    );
+    assert_eq!(tty_size_from_prefix(b"\x1b[?1049h"), None);
+    assert_eq!(tty_size_from_prefix(b"40 120 7\r\n"), None);
+    let run = |prefix: &[u8]| TtyRun {
+        attach: Duration::from_millis(50),
+        startup_down: 9000,
+        steady_down: 300,
+        steady_up: 0,
+        encrypted_startup: Some(Traffic {
+            up: 4000,
+            down: 11000,
+        }),
+        encrypted_steady: Some(Traffic { up: 0, down: 500 }),
+        steady_duration: Duration::from_secs(15),
+        prefix: prefix.to_vec(),
+    };
+    let s = settings();
+    let ours = [srui("busy", Some(1000), 15.0, 210)];
+    let reported = htop_record("busy", 0, 210, Some(10), &run(b"40 120\r\n")).unwrap();
+    assert_eq!((reported.columns, reported.lines), (120, 40));
+    check_matched(&s, &ours, &[reported]).unwrap();
+    for prefix in [&b"24 80\r\n"[..], b"\x1b[H"] {
+        let record = htop_record("busy", 0, 210, Some(10), &run(prefix)).unwrap();
+        let error = check_matched(&s, &ours, &[record]).unwrap_err();
+        assert!(error.contains("terminal"), "{error}");
+    }
 }

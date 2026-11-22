@@ -180,6 +180,14 @@ check "walkthrough --dry-run: no install prefix, settings or sentinel left" [ "$
 echo "  files the dry run left in its HOME (all inside it by construction):"
 (cd "$W" && find . -type f | LC_ALL=C sort | sed 's/^/    /')
 
+# PX-027 round 2 (F3): --help prints the whole header, through its last line, whatever its length.
+header_lines=$(awk 'NR == 1 { next } !/^#/ { exit } { n++ } END { print n }' "$R1_DIR/clean-account-walkthrough.sh")
+walk "$STUBS/pass" --help >"$ROOT/walk-help.txt" 2>&1
+ok=1; [ "$(grep -c '' "$ROOT/walk-help.txt")" -eq "$header_lines" ] \
+  && [ "$(tail -1 "$ROOT/walk-help.txt")" = "verdict is PASS only if every step passed; a dry run's best verdict is DRY-RUN-OK." ] \
+  && grep -q -- '--with-showcase' "$ROOT/walk-help.txt" && grep -q 'apps/srtop/demo/target' "$ROOT/walk-help.txt" && ok=0
+check "walkthrough --help: the whole $header_lines-line header, --with-showcase and cargo's writes included" [ "$ok" -eq 0 ]
+
 # PX-027: --with-showcase adds exactly one step, skipped in a dry run, and the verdict still follows.
 sandboxed_walk "$STUBS/pass" "$W/result-showcase.txt" --with-showcase >"$ROOT/walk-showcase.log" 2>&1
 status=$?

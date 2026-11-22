@@ -36,7 +36,9 @@
 # the account's Docker; ~/Library/Application Support/SRUI/ (only a sentinel file this script plants
 # and removes); four sentinel files listed in the result; the checkout's own .build directories;
 # SwiftPM's and Docker's caches under ~/Library; and the /tmp/srui-* fixture directories the
-# native tests create and remove. Never sudo, never ~/.ssh, never a system setting. A failed
+# native tests create and remove. With --with-showcase also: the checkout's apps/srtop/demo/target
+# (cargo's release build of the measuring tool), cargo's registry and git caches under ~/.cargo,
+# and the step's evidence under ~/srui-r1-walkthrough/evidence/showcase. Never sudo, never ~/.ssh, never a system setting. A failed
 # preflight or prerequisites step ends the run there, before anything is planted, built or
 # installed.
 #
@@ -66,7 +68,8 @@ while [ "$#" -gt 0 ]; do
     --previous-rev) PREVIOUS_REV=${2:?--previous-rev needs a revision}; shift 2 ;;
     --verify) VERIFY=${2:?--verify needs a file}; shift 2 ;;
     --allow-existing-srui-data) ALLOW_EXISTING=1; shift ;;
-    -h|--help) sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # The whole header: every comment line after the first, up to the first line that is not one.
+    -h|--help) awk 'NR == 1 { next } !/^#/ { exit } { print }' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "clean-account-walkthrough: unknown option: $1" >&2; exit 2 ;;
   esac
 done

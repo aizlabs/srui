@@ -219,17 +219,29 @@ fn tcp_join(client: TcpStream, inner: &Arc<TcpInner>) -> io::Result<()> {
         pumps.push(
             thread::Builder::new()
                 .name("tcp-count-pump".into())
-                .spawn(move || tcp_pump(from, to, delay, upward, &inner))?,
+                .spawn(move || tcp_pump(from, to, delay, upward, inner))?,
         );
     }
     Ok(())
 }
 
-/// One direction: reads, counts at read time, and writes on at once or, with a
-/// delay, from a bounded delay line. An end of file is passed on as a half
-/// close, so `ssh` and sshd see each other's FIN.
-fn tcp_pump(mut from: TcpStream, to: TcpStream, delay: Duration, upward: bool, inner: &TcpInner) {
-    let counter = if upward { &inner.up } else { &inner.down };
+/// One direction: reads, and writes on at once or, with a delay, from a bounded
+/// delay line. A byte is counted when it is written on to the far side, not
+/// when it is read: at an injected RTT the count then moves with what the far
+/// side has received, in step with the probe's payload window, instead of
+/// leading it by RTT/2 (PX-027 round 2, F5). An end of file is passed on as a
+/// half close, so `ssh` and sshd see each other's FIN.
+fn tcp_pump(
+    mut from: TcpStream,
+    to: TcpStream,
+    delay: Duration,
+    upward: bool,
+    inner: Arc<TcpInner>,
+) {
+    let count = move |inner: &TcpInner, bytes: usize| {
+        let counter = if upward { &inner.up } else { &inner.down };
+        counter.fetch_add(bytes as u64, Ordering::SeqCst);
+    };
     let (line, writer) = if delay.is_zero() {
         (None, None)
     } else {
@@ -238,6 +250,7 @@ fn tcp_pump(mut from: TcpStream, to: TcpStream, delay: Duration, upward: bool, i
             Ok(out) => out,
             Err(_) => return,
         };
+        let counting = Arc::clone(&inner);
         let writer = thread::spawn(move || {
             for (due, chunk) in receive {
                 let now = Instant::now();
@@ -247,6 +260,7 @@ fn tcp_pump(mut from: TcpStream, to: TcpStream, delay: Duration, upward: bool, i
                 if out.write_all(&chunk).is_err() {
                     break;
                 }
+                count(&counting, chunk.len());
             }
             let _ = out.shutdown(Shutdown::Write);
         });
@@ -258,12 +272,17 @@ fn tcp_pump(mut from: TcpStream, to: TcpStream, delay: Duration, upward: bool, i
         match from.read(&mut chunk) {
             Ok(0) => break,
             Ok(read) => {
-                counter.fetch_add(read as u64, Ordering::SeqCst);
                 let sent = match &line {
                     Some(line) => line
                         .send((Instant::now() + delay, chunk[..read].to_vec()))
                         .is_ok(),
-                    None => direct.write_all(&chunk[..read]).is_ok(),
+                    None => {
+                        let written = direct.write_all(&chunk[..read]).is_ok();
+                        if written {
+                            count(&inner, read);
+                        }
+                        written
+                    }
                 };
                 if !sent {
                     break;
@@ -856,6 +875,23 @@ pub struct TtyRun {
     pub encrypted_startup: Option<Traffic>,
     pub encrypted_steady: Option<Traffic>,
     pub steady_duration: Duration,
+    /// The first [`TTY_PREFIX`] bytes of the terminal stream: the session's own
+    /// `stty size` answer comes first (PX-027 round 2, F8).
+    pub prefix: Vec<u8>,
+}
+
+/// How much of the start of the terminal stream a [`TtyRun`] keeps.
+pub const TTY_PREFIX: usize = 256;
+
+/// The pseudo-terminal's size as the remote session itself reported it with
+/// `stty size` ("ROWS COLUMNS" on the stream's first line): `(columns, lines)`.
+pub fn tty_size_from_prefix(prefix: &[u8]) -> Option<(u16, u16)> {
+    let text = std::str::from_utf8(&prefix[..prefix.len().min(TTY_PREFIX)]).ok()?;
+    let first = text.split(['\r', '\n']).next()?;
+    let mut words = first.split(' ');
+    let lines = words.next()?.parse().ok()?;
+    let columns = words.next()?.parse().ok()?;
+    words.next().is_none().then_some((columns, lines))
 }
 
 /// htop (or any full-screen program) over `ssh -tt`: its terminal stream is
@@ -885,12 +921,19 @@ impl TtyProbe {
         let mut stdout = child.stdout.take().ok_or("no stdout")?;
         let mut stdin = child.stdin.take().ok_or("no stdin")?;
         let arrivals: Arc<Mutex<Vec<(Instant, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let prefix: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let reading = Arc::clone(&arrivals);
+        let keeping = Arc::clone(&prefix);
         let reader = thread::spawn(move || {
             let mut chunk = vec![0_u8; 64 * 1024];
             while let Ok(read) = stdout.read(&mut chunk) {
                 if read == 0 {
                     break;
+                }
+                {
+                    let mut prefix = lock(&keeping);
+                    let room = TTY_PREFIX.saturating_sub(prefix.len()).min(read);
+                    prefix.extend_from_slice(&chunk[..room]);
                 }
                 let mut arrivals = lock(&reading);
                 if arrivals.len() < MAX_PROBE_EVENTS {
@@ -936,6 +979,7 @@ impl TtyProbe {
         }
         let _ = reader.join();
         let (first, steady_from, steady_to, encrypted_from, encrypted_to) = measured?;
+        let kept = lock(&prefix).clone();
         let arrivals = lock(&arrivals);
         if arrivals.len() >= MAX_PROBE_EVENTS {
             return Err(format!("more than {MAX_PROBE_EVENTS} terminal reads"));
@@ -957,6 +1001,7 @@ impl TtyProbe {
                 .zip(encrypted_to)
                 .map(|(from, to)| difference(to, from)),
             steady_duration: steady_to - steady_from,
+            prefix: kept,
         })
     }
 }

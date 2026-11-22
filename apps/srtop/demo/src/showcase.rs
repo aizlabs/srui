@@ -25,8 +25,8 @@
 use crate::{
     relay::Traffic,
     traffic::{
-        check_payload_counts, Distribution, Split, SruiPlan, SruiProbe, SruiRun, TcpCountRelay,
-        Transport, TtyProbe, TtyRun,
+        check_payload_counts, tty_size_from_prefix, Distribution, Split, SruiPlan, SruiProbe,
+        SruiRun, TcpCountRelay, Transport, TtyProbe, TtyRun,
     },
 };
 use std::{
@@ -45,8 +45,6 @@ pub type Result<T> = std::result::Result<T, String>;
 /// SSH's cipher for every run, pinned so the overhead is one cipher's:
 /// chacha20-poly1305 (a 4-byte encrypted length, padding, a 16-byte tag).
 pub const CIPHER: &str = "chacha20-poly1305@openssh.com";
-/// The box's own name for its host key, whatever port the relay listens on.
-const HOST_KEY_ALIAS: &str = "[127.0.0.1]:2222";
 /// The command that ends htop.
 const HTOP_QUIT: &[u8] = b"q";
 /// The most a run waits for its workload to end.
@@ -184,7 +182,9 @@ impl Devbox {
             "StrictHostKeyChecking=yes".into(),
             "UpdateHostKeys=no".into(),
             "BatchMode=yes".into(),
-            format!("HostKeyAlias={HOST_KEY_ALIAS}"),
+            // The box's own name for its host key in known_hosts, whatever port the relay
+            // listens on: the box's published port, not a fixed 2222 (an isolated box differs).
+            format!("HostKeyAlias=[127.0.0.1]:{}", self.port),
             format!("Ciphers={CIPHER}"),
             "Compression=no".into(),
             "LogLevel=ERROR".into(),
@@ -213,7 +213,7 @@ impl Devbox {
         argv.push("srui@127.0.0.1".into());
         // Constants only: numbers this program formats, never input.
         argv.push(format!(
-            "stty cols {columns} rows {lines} && exec env TERM=xterm-256color COLUMNS={columns} LINES={lines} htop -d {delay_ds}"
+            "stty cols {columns} rows {lines} && stty size && exec env TERM=xterm-256color COLUMNS={columns} LINES={lines} htop -d {delay_ds}"
         ));
         argv
     }
@@ -428,15 +428,15 @@ pub fn srui_record(
     })
 }
 
-/// Turns a terminal probe's run into a record.
-#[allow(clippy::too_many_arguments)]
+/// Turns a terminal probe's run into a record. The terminal size is the one
+/// the remote session itself reported (`stty size`, the stream's first line),
+/// never the size that was asked for: 0 × 0 when it reported none, which
+/// [`check_matched`] refuses (PX-027 round 2, F8).
 pub fn htop_record(
     workload: &str,
     run_no: usize,
     processes: u64,
     delay_ds: Option<u64>,
-    columns: u16,
-    lines: u16,
     run: &TtyRun,
 ) -> Result<HtopRecord> {
     let steady = run
@@ -444,6 +444,7 @@ pub fn htop_record(
         .ok_or("no encrypted count for the steady window")?;
     let startup = total(run.encrypted_startup);
     Split::new(run.startup_down, startup)?;
+    let (columns, lines) = tty_size_from_prefix(&run.prefix).unwrap_or((0, 0));
     Ok(HtopRecord {
         workload: workload.to_string(),
         run: run_no,
@@ -647,15 +648,7 @@ fn htop_run(
     )?;
     let _ = watcher.join();
     let delay = *observed.lock().unwrap_or_else(|p| p.into_inner());
-    let mut record = htop_record(
-        workload.name(),
-        run_no,
-        processes,
-        delay,
-        settings.columns,
-        settings.lines,
-        &run,
-    )?;
+    let mut record = htop_record(workload.name(), run_no, processes, delay, &run)?;
     record.workload_end_ms = ms(workload.wait_ended(devbox)?);
     Ok(record)
 }

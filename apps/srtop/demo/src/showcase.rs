@@ -466,7 +466,10 @@ pub fn htop_record(
 /// steady window (within 5%), the same terminal size on every htop run, and
 /// process counts within 10% of each other.
 pub fn check_matched(settings: &Settings, srui: &[SruiRecord], htop: &[HtopRecord]) -> Result<()> {
-    let delay = settings.htop_delay_ds()?;
+    // Not `htop_delay_ds`, which chose the argument htop was started with: the
+    // check stands apart from the choice it checks.
+    settings.htop_delay_ds()?;
+    let delay = settings.interval_ms / 100;
     let mut problems = Vec::new();
     let workloads: Vec<&str> = {
         let mut names: Vec<&str> = srui.iter().map(|record| record.workload.as_str()).collect();
@@ -497,10 +500,11 @@ pub fn check_matched(settings: &Settings, srui: &[SruiRecord], htop: &[HtopRecor
                     srui.run, srui.interval_ms, settings.interval_ms
                 ));
             }
-            if htop.delay_ds != Some(delay) {
+            if htop.delay_ds != Some(delay) || htop.delay_ds.map(|ds| ds * 100) != srui.interval_ms
+            {
                 problems.push(format!(
-                    "{workload} run {}: htop ran with -d {:?}, not -d {delay} ({} ms): mismatched intervals",
-                    htop.run, htop.delay_ds, settings.interval_ms
+                    "{workload} run {}: htop ran with -d {:?} against srtop's {:?} ms, not -d {delay} ({} ms): mismatched intervals",
+                    htop.run, htop.delay_ds, srui.interval_ms, settings.interval_ms
                 ));
             }
             if (htop.columns, htop.lines) != (settings.columns, settings.lines) {

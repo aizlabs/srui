@@ -17,12 +17,12 @@
 use srtop_demo::{
     relay::{DelayRelay, Traffic},
     showcase::{
-        check_idle, check_matched, htop_delay_from_args, HtopRecord, IdleReport, Settings,
-        SruiRecord,
+        check_idle, check_matched, htop_delay_from_args, srui_record, Devbox, HtopRecord,
+        IdleReport, Settings, SruiRecord,
     },
     traffic::{
         check_payload_counts, published_interval_ms, Distribution, Split, SruiPlan, SruiProbe,
-        TcpCountRelay, Transport, TtyProbe,
+        SruiRun, TcpCountRelay, Transport, TtyProbe, Window,
     },
 };
 use std::{
@@ -498,6 +498,110 @@ fn a_comparison_is_refused_unless_both_sides_ran_matched() {
     assert!(check_matched(&odd, &[], &[])
         .unwrap_err()
         .contains("no exact match"));
+}
+
+fn probe_run(payload_down: u64, encrypted_down: u64) -> SruiRun {
+    let window = |payload_down, payload_up| Window {
+        payload_up,
+        payload_down,
+        messages: 1,
+        ui_transactions: 1,
+        control_messages: 0,
+        other_messages: 0,
+    };
+    SruiRun {
+        attach: Duration::from_millis(40),
+        sync_revision: 3,
+        startup: window(4000, 60),
+        steady: window(payload_down, 0),
+        ui_after_sync: 1,
+        after_sync: vec![("Transaction", payload_down)],
+        encrypted_startup: Some(Traffic {
+            up: 3000,
+            down: 6000,
+        }),
+        encrypted_steady: Some(Traffic {
+            up: 90,
+            down: encrypted_down,
+        }),
+        rows: 9,
+        published_interval_ms: Some(1000),
+        steady_duration: Duration::from_secs(15),
+        canary: None,
+        raw_down: 4000 + payload_down,
+        framed_down: 4000 + payload_down,
+    }
+}
+
+/// The record keeps the probe's payload as payload and the relay's count as
+/// encrypted: the overhead is their difference, in each window.
+#[test]
+fn a_record_keeps_payload_and_encrypted_bytes_apart() {
+    let record = srui_record("busy", 0, 0, 9, &probe_run(1000, 1600)).unwrap();
+    assert_eq!(
+        (
+            record.down.payload,
+            record.down.encrypted,
+            record.down.overhead()
+        ),
+        (1000, 1600, 600)
+    );
+    assert_eq!((record.up.payload, record.up.encrypted), (0, 90));
+    assert_eq!(
+        (record.startup_payload, record.startup_encrypted),
+        (4060, 9000)
+    );
+    // A run whose encrypted stream carried less than its payload is refused.
+    assert!(srui_record("busy", 0, 0, 9, &probe_run(1700, 1600)).is_err());
+    let mut lost = probe_run(1000, 1600);
+    lost.framed_down -= 1;
+    assert!(srui_record("busy", 0, 0, 9, &lost).is_err());
+}
+
+/// htop is started with the `-d` the configured interval implies, and the
+/// comparison holds the argument it was started with against srtop's own.
+#[test]
+fn htop_is_started_at_the_interval_srtop_publishes() {
+    let devbox = Devbox {
+        docker: "docker".into(),
+        container: "c".into(),
+        port: 2222,
+        key: PathBuf::from("/k"),
+        known_hosts: PathBuf::from("/h"),
+        logs: PathBuf::from("/l"),
+    };
+    let s = settings();
+    let argv = devbox.htop_argv(
+        "127.0.0.1:4000".parse().unwrap(),
+        s.htop_delay_ds().unwrap(),
+        120,
+        40,
+    );
+    let remote = argv.last().unwrap();
+    let delay = htop_delay_from_args(&remote[remote.find("htop ").unwrap()..]);
+    assert!(argv.iter().any(|arg| arg == "-tt"));
+    assert!(remote.starts_with("stty cols 120 rows 40 && "), "{remote}");
+    check_matched(
+        &s,
+        &[srui("busy", Some(1000), 15.0, 210)],
+        &[htop("busy", delay, 15.0, 210, (120, 40))],
+    )
+    .unwrap();
+    let srui_argv = devbox.srui_argv("127.0.0.1:4000".parse().unwrap());
+    assert_eq!(
+        &srui_argv[srui_argv.len() - 3..],
+        ["-s", "srui@127.0.0.1", "srui"]
+    );
+    for argv in [&argv, &srui_argv] {
+        assert!(
+            argv.windows(2).any(|pair| pair == ["-F", "/dev/null"]),
+            "never the user's ssh config"
+        );
+        assert!(argv.iter().any(|arg| arg == "StrictHostKeyChecking=yes"));
+        assert!(argv
+            .iter()
+            .any(|arg| arg == "Ciphers=chacha20-poly1305@openssh.com"));
+    }
 }
 
 #[test]

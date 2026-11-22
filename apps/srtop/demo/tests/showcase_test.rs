@@ -270,6 +270,7 @@ fn the_probes_payload_count_equals_the_delay_relays_count_of_the_same_stream() {
             duration: Duration::from_millis(1200),
             encrypted: None,
             canary: None,
+            held: None,
             stderr: Stdio::null(),
         },
         b"px027-differential",
@@ -312,6 +313,7 @@ fn a_probe_whose_two_payload_counts_disagree_is_refused() {
             duration: Duration::from_millis(100),
             encrypted: None,
             canary: None,
+            held: None,
             stderr: Stdio::null(),
         },
         b"px027-counts",
@@ -332,6 +334,7 @@ fn idle_report(srtop: &Srtop, window: Duration) -> IdleReport {
             duration: window,
             encrypted: None,
             canary: Some(&canary),
+            held: None,
             stderr: Stdio::null(),
         },
         b"px027-idle",
@@ -618,18 +621,15 @@ fn htop_is_started_at_the_interval_srtop_publishes() {
 
 #[test]
 fn the_tty_probe_counts_the_terminal_stream_by_window() {
-    let argv: Vec<String> = [
-        "sh",
-        "-c",
-        "printf abc; sleep 0.6; printf defg; exec cat >/dev/null",
-    ]
-    .map(String::from)
-    .to_vec();
+    let argv: Vec<String> = ["sh", "-c", "printf abc; sleep 0.6; printf defg; exec cat"]
+        .map(String::from)
+        .to_vec();
     let run = TtyProbe::run(
         &argv,
         Duration::ZERO,
         Duration::from_millis(1500),
         b"q",
+        None,
         None,
         Stdio::null(),
     )
@@ -637,7 +637,8 @@ fn the_tty_probe_counts_the_terminal_stream_by_window() {
     assert_eq!(run.startup_down + run.steady_down, 7);
     assert_eq!(run.steady_down, 4, "{run:?}");
     assert!(run.steady_duration >= Duration::from_millis(1500));
-    assert_eq!(run.prefix, b"abcdefg", "the stream's start is kept");
+    // `cat` echoes the quit key after the window; the stream's start is kept.
+    assert!(run.prefix.starts_with(b"abcdefg"), "{:?}", run.prefix);
 }
 
 /// PX-027 round 2 (F5): at an injected RTT the relay counts a byte when it is
@@ -723,7 +724,7 @@ fn the_tty_probe_keeps_up_with_a_fast_writer() {
     let argv: Vec<String> = [
         "sh",
         "-c",
-        "printf go; sleep 0.3; head -c 600000 /dev/zero; exec cat >/dev/null",
+        "printf go; sleep 0.3; head -c 600000 /dev/zero; exec cat",
     ]
     .map(String::from)
     .to_vec();
@@ -732,6 +733,7 @@ fn the_tty_probe_keeps_up_with_a_fast_writer() {
         Duration::ZERO,
         Duration::from_millis(1500),
         b"q",
+        None,
         None,
         Stdio::null(),
     )
@@ -776,4 +778,198 @@ fn an_htop_record_carries_the_terminal_size_the_session_reported() {
         let error = check_matched(&s, &ours, &[record]).unwrap_err();
         assert!(error.contains("terminal"), "{error}");
     }
+}
+
+// PX-027, Codex review: a session, program or connection that does not last the
+// whole warm-up and steady window is refused, naming the phase and how far into
+// it; the steady window reported is the one observed, never the one requested.
+
+fn srui_plan(transport: Transport, held: Option<&dyn Fn() -> Result<(), String>>) -> SruiPlan<'_> {
+    SruiPlan {
+        transport,
+        warmup: Duration::from_millis(1000),
+        duration: Duration::from_millis(1000),
+        encrypted: None,
+        canary: None,
+        held,
+        stderr: Stdio::null(),
+    }
+}
+
+#[test]
+fn a_session_that_ends_in_its_warmup_or_steady_window_is_refused() {
+    let srtop = Srtop::start(&["--fake-source"]);
+    for (cut_after, phase) in [
+        (400, "during the warm-up"),
+        (1500, "during the steady window"),
+    ] {
+        let socket = srtop.path(&format!("cut-{cut_after}.sock"));
+        let relay = std::sync::Arc::new(std::sync::Mutex::new(
+            DelayRelay::start(&socket, &srtop.socket(), Duration::ZERO).unwrap(),
+        ));
+        let cutter = {
+            let relay = std::sync::Arc::clone(&relay);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(cut_after));
+                relay.lock().unwrap().cut()
+            })
+        };
+        let started = Instant::now();
+        let error =
+            SruiProbe::run(srui_plan(Transport::Unix(socket), None), b"px027-cut").unwrap_err();
+        assert_eq!(cutter.join().unwrap(), 1, "the one connection was cut");
+        assert!(
+            error.contains("the session ended") && error.contains(phase),
+            "{error}"
+        );
+        assert!(
+            error.contains("the window was not observed whole"),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "refused promptly"
+        );
+        relay.lock().unwrap().stop();
+    }
+    // Held open, the same plan passes, with a window at least as long as requested.
+    let run = SruiProbe::run(
+        srui_plan(Transport::Unix(srtop.socket()), None),
+        b"px027-held",
+    )
+    .unwrap();
+    assert!(run.steady_duration >= Duration::from_millis(1000));
+}
+
+#[test]
+fn a_terminal_program_that_exits_in_its_warmup_or_steady_window_is_refused() {
+    for (script, phase) in [
+        ("printf go; sleep 0.4", "during the warm-up"),
+        ("printf go; sleep 1.5", "during the steady window"),
+    ] {
+        let argv: Vec<String> = ["sh", "-c", script].map(String::from).to_vec();
+        let started = Instant::now();
+        let error = TtyProbe::run(
+            &argv,
+            Duration::from_millis(1000),
+            Duration::from_millis(1000),
+            b"q",
+            None,
+            None,
+            Stdio::null(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("exited") || error.contains("stream ended"),
+            "{error}"
+        );
+        assert!(error.contains(phase), "{script}: {error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "refused promptly"
+        );
+    }
+}
+
+/// An upstream that closes its end of the TCP relay's connection after
+/// `close_after`, with the relay in front of it and a client connected.
+fn closing_upstream(close_after: Duration) -> (TcpCountRelay, std::net::TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let upstream = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        thread::sleep(close_after);
+        drop(stream);
+    });
+    let relay = TcpCountRelay::start(upstream, Duration::ZERO).unwrap();
+    let client = std::net::TcpStream::connect(relay.local_addr()).unwrap();
+    (relay, client)
+}
+
+#[test]
+fn a_relay_connection_that_closes_in_the_window_fails_the_run() {
+    let argv: Vec<String> = ["sh", "-c", "printf go; exec cat"]
+        .map(String::from)
+        .to_vec();
+    for (close_after, phase) in [
+        (400, "during the warm-up"),
+        (1500, "during the steady window"),
+    ] {
+        let (mut relay, _client) = closing_upstream(Duration::from_millis(close_after));
+        relay.check_open().unwrap();
+        let held = || relay.check_open();
+        let started = Instant::now();
+        let error = TtyProbe::run(
+            &argv,
+            Duration::from_millis(1000),
+            Duration::from_millis(1000),
+            b"q",
+            None,
+            Some(&held),
+            Stdio::null(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("counting relay closed") && error.contains(phase),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "refused promptly"
+        );
+        relay.stop();
+    }
+    // A relay whose connection stays open holds the same run.
+    let (mut relay, _client) = closing_upstream(Duration::from_secs(30));
+    let held = || relay.check_open();
+    TtyProbe::run(
+        &argv,
+        Duration::from_millis(300),
+        Duration::from_millis(300),
+        b"q",
+        None,
+        Some(&held),
+        Stdio::null(),
+    )
+    .unwrap();
+    relay.stop();
+}
+
+/// The window reported is the one observed: here a slow encrypted sample at
+/// the start of the window makes it longer than requested, and the record says so.
+#[test]
+fn the_steady_window_reported_is_the_one_observed() {
+    let slow = || {
+        thread::sleep(Duration::from_millis(300));
+        Traffic::default()
+    };
+    let srtop = Srtop::start(&["--fake-source"]);
+    let mut plan = srui_plan(Transport::Unix(srtop.socket()), None);
+    plan.warmup = Duration::ZERO;
+    plan.duration = Duration::from_millis(500);
+    plan.encrypted = Some(&slow);
+    let run = SruiProbe::run(plan, b"px027-observed").unwrap();
+    assert!(
+        run.steady_duration >= Duration::from_millis(800),
+        "{:?}",
+        run.steady_duration
+    );
+    let argv: Vec<String> = ["sh", "-c", "printf go; exec cat"]
+        .map(String::from)
+        .to_vec();
+    let run = TtyProbe::run(
+        &argv,
+        Duration::ZERO,
+        Duration::from_millis(500),
+        b"q",
+        Some(&slow),
+        None,
+        Stdio::null(),
+    )
+    .unwrap();
+    assert!(
+        run.steady_duration >= Duration::from_millis(800),
+        "{:?}",
+        run.steady_duration
+    );
 }

@@ -575,6 +575,7 @@ fn srui_run(
     let processes = process_count(devbox)?;
     let relay = TcpCountRelay::start(devbox.upstream(), rtt).map_err(|error| error.to_string())?;
     let sample = || relay.traffic();
+    let held = || relay.check_open();
     let run = SruiProbe::run(
         SruiPlan {
             transport: Transport::Command(devbox.srui_argv(relay.local_addr())),
@@ -582,6 +583,7 @@ fn srui_run(
             duration,
             encrypted: Some(&sample),
             canary: None,
+            held: Some(&held),
             stderr: devbox.stderr(&format!(
                 "ssh-srui-{}-{run_no}-{}ms.log",
                 workload.name(),
@@ -613,6 +615,7 @@ fn htop_run(
     let relay = TcpCountRelay::start(devbox.upstream(), Duration::ZERO)
         .map_err(|error| error.to_string())?;
     let sample = || relay.traffic();
+    let held = || relay.check_open();
     // htop's interval as the box sees it: its own argument vector, read while it runs.
     let observed: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
     let watcher = {
@@ -644,6 +647,7 @@ fn htop_run(
         settings.duration,
         HTOP_QUIT,
         Some(&sample),
+        Some(&held),
         devbox.stderr(&format!("ssh-htop-{}-{run_no}.log", workload.name())),
     )?;
     let _ = watcher.join();
@@ -763,6 +767,7 @@ pub fn idle_check(devbox: &Devbox, window: Duration) -> Result<IdleReport> {
     let relay = TcpCountRelay::start(devbox.upstream(), Duration::ZERO)
         .map_err(|error| error.to_string())?;
     let sample = || relay.traffic();
+    let held = || relay.check_open();
     let canary = || devbox.signal(pid, "srtop", "USR1");
     let run = SruiProbe::run(
         SruiPlan {
@@ -771,6 +776,7 @@ pub fn idle_check(devbox: &Devbox, window: Duration) -> Result<IdleReport> {
             duration: window,
             encrypted: Some(&sample),
             canary: Some(&canary),
+            held: Some(&held),
             stderr: devbox.stderr("ssh-idle.log"),
         },
         b"px027-idle",
@@ -799,6 +805,7 @@ pub fn scale(devbox: &Devbox, label: &str, settings: &Settings) -> Result<Vec<Sr
         let relay = TcpCountRelay::start(devbox.upstream(), Duration::ZERO)
             .map_err(|error| error.to_string())?;
         let sample = || relay.traffic();
+        let held = || relay.check_open();
         let run = SruiProbe::run(
             SruiPlan {
                 transport: Transport::Command(devbox.srui_argv(relay.local_addr())),
@@ -806,6 +813,7 @@ pub fn scale(devbox: &Devbox, label: &str, settings: &Settings) -> Result<Vec<Sr
                 duration: settings.duration,
                 encrypted: Some(&sample),
                 canary: None,
+                held: Some(&held),
                 stderr: devbox.stderr(&format!("ssh-scale-{label}-{run_no}.log")),
             },
             format!("px027-scale-{label}-{run_no}").as_bytes(),

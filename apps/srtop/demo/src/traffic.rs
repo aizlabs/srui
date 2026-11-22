@@ -69,6 +69,8 @@ struct TcpInner {
     up: AtomicU64,
     down: AtomicU64,
     accepted: AtomicU64,
+    /// Directions that ended (end of file or an error) while the relay was not stopping.
+    ended: AtomicU64,
     stopping: AtomicBool,
     sockets: Mutex<Vec<TcpStream>>,
     pumps: Mutex<Vec<JoinHandle<()>>>,
@@ -103,6 +105,7 @@ impl TcpCountRelay {
             up: AtomicU64::new(0),
             down: AtomicU64::new(0),
             accepted: AtomicU64::new(0),
+            ended: AtomicU64::new(0),
             stopping: AtomicBool::new(false),
             sockets: Mutex::new(Vec::new()),
             pumps: Mutex::new(Vec::new()),
@@ -132,6 +135,18 @@ impl TcpCountRelay {
 
     pub fn accepted(&self) -> u64 {
         self.inner.accepted.load(Ordering::SeqCst)
+    }
+
+    /// Refuses a relay one of whose connections has ended, in either direction
+    /// (PX-027, Codex review): polled through a measurement window, it fails a
+    /// run whose SSH connection closed before the window was over.
+    pub fn check_open(&self) -> Result<()> {
+        match self.inner.ended.load(Ordering::SeqCst) {
+            0 => Ok(()),
+            ended => Err(format!(
+                "the SSH connection through the counting relay closed ({ended} direction(s) ended)"
+            )),
+        }
     }
 
     pub fn one_way(&self) -> (Duration, Duration) {
@@ -303,6 +318,9 @@ fn tcp_pump(
             Err(_) => break,
         }
     }
+    if !inner.stopping.load(Ordering::SeqCst) {
+        inner.ended.fetch_add(1, Ordering::SeqCst);
+    }
     match (line, writer) {
         (Some(line), Some(writer)) => {
             drop(line);
@@ -374,6 +392,41 @@ struct ProbeLog {
     sampling_status: Option<String>,
     error: Option<String>,
     closed: bool,
+}
+
+/// Holds for `length`, polling `alive` every 10 ms, and returns when the phase
+/// ended. A failure is named by the phase and how far into it the session was:
+/// a run whose session or connection did not last the whole warm-up and
+/// steady window is never accepted (PX-027, Codex review).
+fn hold(phase: &str, length: Duration, alive: &dyn Fn() -> Result<()>) -> Result<Instant> {
+    let from = Instant::now();
+    let until = from + length;
+    loop {
+        let now = Instant::now();
+        if let Err(error) = alive() {
+            return Err(format!(
+                "{error}: during the {phase}, {:.3}s into its {:.3}s; the window was not observed whole, so the run is refused",
+                (now - from).as_secs_f64(),
+                length.as_secs_f64()
+            ));
+        }
+        if now >= until {
+            return Ok(now);
+        }
+        thread::sleep((until - now).min(Duration::from_millis(10)));
+    }
+}
+
+/// Refuses a steady window shorter than the one requested.
+fn check_window(observed: Duration, requested: Duration) -> Result<()> {
+    if observed < requested {
+        return Err(format!(
+            "the steady window lasted {:.3}s, less than the {:.3}s requested",
+            observed.as_secs_f64(),
+            requested.as_secs_f64()
+        ));
+    }
+    Ok(())
 }
 
 fn kind(message: &SruiMessage) -> &'static str {
@@ -584,6 +637,9 @@ pub struct SruiPlan<'a> {
     /// Fired once after the steady window; the probe then waits for the first
     /// transaction it causes.
     pub canary: Option<&'a dyn Fn() -> Result<()>>,
+    /// Polled through the warm-up and the steady window beside the session's
+    /// own state: the counting relay's [`TcpCountRelay::check_open`], say.
+    pub held: Option<&'a dyn Fn() -> Result<()>>,
     pub stderr: Stdio,
 }
 
@@ -782,13 +838,26 @@ impl SruiProbe {
         })?;
         session.wait_for("the snapshot", ATTACH_DEADLINE, |log| log.synced.is_some())?;
         let (synced_at, sync_revision) = lock(&session.log).synced.expect("synchronized");
-        thread::sleep(plan.warmup);
+        let alive = || -> Result<()> {
+            {
+                let log = lock(&session.log);
+                if let Some(error) = &log.error {
+                    return Err(format!("the session failed ({error})"));
+                }
+                if log.closed {
+                    return Err("the session ended".to_string());
+                }
+            }
+            plan.held.map_or(Ok(()), |held| held())
+        };
+        hold("warm-up", plan.warmup, &alive)?;
         let steady_from = Instant::now();
         let encrypted_from = encrypted(plan.encrypted);
         let up_from = session.up;
-        thread::sleep(plan.duration);
+        hold("steady window", plan.duration, &alive)?;
         let steady_to = Instant::now();
         let encrypted_to = encrypted(plan.encrypted);
+        check_window(steady_to - steady_from, plan.duration)?;
         let mut canary = None;
         if let Some(fire) = plan.canary {
             let fired = Instant::now();
@@ -907,6 +976,7 @@ impl TtyProbe {
         duration: Duration,
         quit: &[u8],
         encrypted: Option<&dyn Fn() -> Traffic>,
+        held: Option<&dyn Fn() -> Result<()>>,
         stderr: Stdio,
     ) -> Result<TtyRun> {
         let (program, args) = argv.split_first().ok_or("an empty command")?;
@@ -957,15 +1027,36 @@ impl TtyProbe {
                 thread::sleep(Duration::from_millis(5));
             }
         };
-        let measured = first.map(|first| {
-            thread::sleep(warmup);
-            let steady_from = Instant::now();
-            let encrypted_from = encrypted.map(|sample| sample());
-            thread::sleep(duration);
-            let steady_to = Instant::now();
-            let encrypted_to = encrypted.map(|sample| sample());
-            (first, steady_from, steady_to, encrypted_from, encrypted_to)
-        });
+        // The program (htop, or ssh) and its stream must last the whole window.
+        let measured = {
+            let exited: std::cell::Cell<Option<std::process::ExitStatus>> =
+                std::cell::Cell::new(None);
+            let watched = std::cell::RefCell::new(&mut child);
+            let alive = || -> Result<()> {
+                if exited.get().is_none() {
+                    if let Ok(Some(status)) = watched.borrow_mut().try_wait() {
+                        exited.set(Some(status));
+                    }
+                }
+                if let Some(status) = exited.get() {
+                    return Err(format!("{program} exited ({status})"));
+                }
+                if reader.is_finished() {
+                    return Err("the terminal stream ended".to_string());
+                }
+                held.map_or(Ok(()), |held| held())
+            };
+            first.and_then(|first| {
+                hold("warm-up", warmup, &alive)?;
+                let steady_from = Instant::now();
+                let encrypted_from = encrypted.map(|sample| sample());
+                hold("steady window", duration, &alive)?;
+                let steady_to = Instant::now();
+                let encrypted_to = encrypted.map(|sample| sample());
+                check_window(steady_to - steady_from, duration)?;
+                Ok((first, steady_from, steady_to, encrypted_from, encrypted_to))
+            })
+        };
         let _ = stdin.write_all(quit);
         let _ = stdin.flush();
         drop(stdin);

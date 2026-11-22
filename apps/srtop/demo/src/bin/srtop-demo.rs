@@ -8,7 +8,8 @@
 //!     on standard input stops it and removes its socket.
 //!
 //! srtop-demo workers --duration-ms MS [--cpu-threads N] [--memory-mib N]
-//!     [--threads N] [--short-lived COUNT]
+//!     [--threads N] [--short-lived COUNT [--short-lived-interval-ms MS]
+//!     [--short-lived-lifetime-ms MS]]
 //!     Starts one worker per requested mode under one fresh owner token (each
 //!     flag at most once, so at most four workers), prints `owner TOKEN` and
 //!     `worker MODE PID`, and waits for them all to
@@ -19,12 +20,23 @@
 //!     Runs the remote-result matrix at 0/100/300/600 ms RTT, a transport
 //!     interruption and a collector failure against srtop's own fixtures,
 //!     and prints one JSON report.
+//!
+//! srtop-demo showcase compare|rtt|idle|scale --key PATH --known-hosts PATH
+//!     --logs DIR --out FILE [--docker PATH] [--container NAME] [--port N]
+//!     [--runs N] [--warmup-ms MS] [--duration-ms MS] [--interval-ms MS]
+//!     [--columns N] [--lines N] [--workloads idle,busy,churn]
+//!     [--rtts 0,100,300,600] [--label TEXT]
+//!     PX-027's measurements against the devbox (`showcase` module): writes
+//!     Markdown to FILE and one JSON object per run to FILE.json, and exits
+//!     non-zero if a run's counts do not add up or the comparison is not
+//!     matched.
 //! ```
 
 use srtop_demo::{
     harness::{fresh_owner, DemoWorker},
     relay::DelayRelay,
     scenario::{self, RTTS_MS},
+    showcase::{self, Devbox, Settings, Workload},
     worker::{Mode, WorkerSpec},
 };
 use std::{
@@ -117,6 +129,9 @@ fn workers(args: &[String]) -> Result<()> {
     let mut duration = None;
     let mut modes = Vec::new();
     let mut seen: Vec<String> = Vec::new();
+    // PX-027: the short-lived worker's pace, so a run can spread its 64
+    // children over its own duration. Validated with the rest of the spec.
+    let (mut lifetime, mut interval) = (Duration::from_millis(500), Duration::from_millis(100));
     for (flag, value) in flag_values(args)? {
         // One worker per named workload: a repeated flag would multiply the
         // per-worker limits, so a run is at most one worker of each mode.
@@ -133,10 +148,22 @@ fn workers(args: &[String]) -> Result<()> {
             "--threads" => modes.push(Mode::Threads { count: small }),
             "--short-lived" => modes.push(Mode::ShortLived {
                 count: small,
-                lifetime: Duration::from_millis(500),
-                interval: Duration::from_millis(100),
+                lifetime,
+                interval,
             }),
+            "--short-lived-interval-ms" => interval = Duration::from_millis(value),
+            "--short-lived-lifetime-ms" => lifetime = Duration::from_millis(value),
             other => return Err(format!("unknown argument {other:?}")),
+        }
+    }
+    for mode in &mut modes {
+        if let Mode::ShortLived {
+            lifetime: l,
+            interval: i,
+            ..
+        } = mode
+        {
+            (*l, *i) = (lifetime, interval);
         }
     }
     let duration = duration.ok_or("workers needs --duration-ms MS")?;
@@ -282,13 +309,153 @@ fn scenarios(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn showcase(args: &[String]) -> Result<()> {
+    let (matrix, rest) = args
+        .split_first()
+        .ok_or("showcase needs compare|rtt|idle|scale")?;
+    let mut devbox = Devbox {
+        docker: "docker".into(),
+        container: "srtop-devbox".into(),
+        port: 2222,
+        key: PathBuf::new(),
+        known_hosts: PathBuf::new(),
+        logs: PathBuf::new(),
+    };
+    let mut settings = Settings {
+        interval_ms: 1000,
+        warmup: Duration::from_secs(3),
+        duration: Duration::from_secs(15),
+        columns: 120,
+        lines: 40,
+        runs: 7,
+    };
+    let (mut out, mut workloads, mut rtts, mut label) = (
+        None,
+        vec![Workload::Idle, Workload::Busy, Workload::Churn],
+        RTTS_MS.to_vec(),
+        "scale".to_string(),
+    );
+    for (flag, value) in flag_values(rest)? {
+        match flag.as_str() {
+            "--docker" => devbox.docker = value,
+            "--container" => devbox.container = value,
+            "--port" => {
+                devbox.port = u16::try_from(number(&flag, &value)?).map_err(|e| e.to_string())?
+            }
+            "--key" => devbox.key = PathBuf::from(value),
+            "--known-hosts" => devbox.known_hosts = PathBuf::from(value),
+            "--logs" => devbox.logs = PathBuf::from(value),
+            "--out" => out = Some(PathBuf::from(value)),
+            "--runs" => {
+                settings.runs =
+                    usize::try_from(number(&flag, &value)?).map_err(|e| e.to_string())?
+            }
+            "--warmup-ms" => settings.warmup = Duration::from_millis(number(&flag, &value)?),
+            "--duration-ms" => settings.duration = Duration::from_millis(number(&flag, &value)?),
+            "--interval-ms" => settings.interval_ms = number(&flag, &value)?,
+            "--columns" => {
+                settings.columns =
+                    u16::try_from(number(&flag, &value)?).map_err(|e| e.to_string())?
+            }
+            "--lines" => {
+                settings.lines = u16::try_from(number(&flag, &value)?).map_err(|e| e.to_string())?
+            }
+            "--workloads" => {
+                workloads = value
+                    .split(',')
+                    .map(Workload::parse)
+                    .collect::<Result<_>>()?
+            }
+            "--rtts" => {
+                rtts = value
+                    .split(',')
+                    .map(|rtt| number(&flag, rtt))
+                    .collect::<Result<_>>()?
+            }
+            "--label" => label = value,
+            other => return Err(format!("unknown argument {other:?}")),
+        }
+    }
+    let out = out.ok_or("showcase needs --out FILE")?;
+    for (what, path) in [
+        ("--key", &devbox.key),
+        ("--known-hosts", &devbox.known_hosts),
+    ] {
+        if !path.is_file() {
+            return Err(format!("{what} {} is not a file", path.display()));
+        }
+    }
+    if !devbox.logs.is_dir() {
+        return Err(format!(
+            "--logs {} is not a directory",
+            devbox.logs.display()
+        ));
+    }
+    if settings.runs == 0 {
+        return Err("--runs must be at least 1".into());
+    }
+    let (markdown, json): (String, Vec<String>) = match matrix.as_str() {
+        "compare" => {
+            let (srui, htop) = showcase::compare(&devbox, &workloads, &settings)?;
+            (
+                showcase::compare_markdown(&settings, &srui, &htop),
+                srui.iter()
+                    .map(showcase::srui_json)
+                    .chain(htop.iter().map(showcase::htop_json))
+                    .collect(),
+            )
+        }
+        "rtt" => {
+            let workload = *workloads.first().ok_or("rtt needs one workload")?;
+            let records = showcase::rtt(&devbox, workload, &rtts, &settings)?;
+            (
+                showcase::rtt_markdown(&settings, &records),
+                records.iter().map(showcase::srui_json).collect(),
+            )
+        }
+        "idle" => {
+            let report = showcase::idle_check(&devbox, settings.duration)?;
+            (
+                format!(
+                    "Unchanged fake source: {:.1} s after the snapshot at revision {}, {} app transactions; canary {} -> {} ({} operations) {:.1} ms after SIGUSR1.\n",
+                    report.window.as_secs_f64(),
+                    report.sync_revision,
+                    report.ui_after_sync,
+                    report.canary_revisions.0,
+                    report.canary_revisions.1,
+                    report.canary_operations,
+                    report.canary_after.as_secs_f64() * 1000.0
+                ),
+                vec![showcase::idle_json(&report)],
+            )
+        }
+        "scale" => {
+            let records = showcase::scale(&devbox, &label, &settings)?;
+            (
+                showcase::scale_markdown(&label, &records),
+                records.iter().map(showcase::srui_json).collect(),
+            )
+        }
+        other => return Err(format!("unknown showcase matrix {other:?}")),
+    };
+    std::fs::write(&out, &markdown).map_err(|error| format!("write {}: {error}", out.display()))?;
+    let json_path = out.with_extension("json");
+    std::fs::write(&json_path, format!("[\n{}\n]\n", json.join(",\n")))
+        .map_err(|error| format!("write {}: {error}", json_path.display()))?;
+    print!("{markdown}");
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("relay") => relay(&args[1..]),
         Some("workers") => workers(&args[1..]),
         Some("scenarios") => scenarios(&args[1..]),
-        _ => Err("usage: srtop-demo relay|workers|scenarios … (see the source header)".into()),
+        Some("showcase") => showcase(&args[1..]),
+        _ => Err(
+            "usage: srtop-demo relay|workers|scenarios|showcase … (see the source header)".into(),
+        ),
     };
     if let Err(error) = result {
         eprintln!("srtop-demo: {error}");

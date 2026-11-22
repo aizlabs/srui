@@ -19,6 +19,7 @@
 #    absent, empty, unterminated, ordinary or 0600 config is byte for byte, mode and existence what
 #    it was; a symbolic link, an existing block and an existing srtop-devbox host are refused; a
 #    config edited during the session loses only the block.
+# 5. notes-lint.sh (PX-027): planted htop-parity claims are caught; the shipped notes have none.
 # Bash 3.2 compatible. Exit 0 only if every case passes.
 set -uo pipefail
 
@@ -304,6 +305,12 @@ printf 'Host added-later\n  Port 2201\n' >> "$E/.ssh/config"
 HOME=$E bash "$ALIAS" remove "$state" >/dev/null 2>&1
 expected=$(printf 'Host a\n  User x\nHost added-later\n  Port 2201\n' | shasum -a 256 | awk '{print $1}')
 check "ssh-config-alias: a config edited during the session loses only the block" [ "$(sha "$E/.ssh/config")" = "$expected" ]
+
+# 5. PX-027: notes-lint.sh --self-test catches every planted htop-parity or automatic-superiority
+#    claim and passes its negations; the shipped R1 notes and READMEs carry no such claim.
+echo "== notes-lint.sh (PX-027)"
+check "notes-lint: its self-test catches every planted claim" bash "$R1_DIR/notes-lint.sh" --self-test
+check "notes-lint: the R1 notes and READMEs claim no htop parity" bash "$R1_DIR/notes-lint.sh"
 
 echo "selftest: $((CASES - FAILURES)) of $CASES cases passed"
 [ "$FAILURES" -eq 0 ]

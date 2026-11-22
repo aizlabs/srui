@@ -21,6 +21,12 @@
 //! property of the native client and is measured there, through this relay,
 //! by `client-macos/Tests/SRUITests/ProcessExplorerLatencyTests.swift`.
 //!
+//! * [`traffic`] and [`showcase`] (PX-027): a counting TCP relay in front of
+//!   the devbox's SSH port, probes that keep the semantic payload apart from
+//!   the encrypted SSH stream, and the showcase matrices — srtop against htop
+//!   under matched workloads and sampling, the RTT envelope over real SSH, an
+//!   unchanged fake source's idle wire, and the synthetic scale source.
+//!
 //! This is a separate package from srtop: srtop's package must stay free of
 //! process creation, signals and outbound sockets (PX-008), and nothing here is
 //! linked into it.
@@ -28,5 +34,7 @@
 pub mod harness;
 pub mod relay;
 pub mod scenario;
+pub mod showcase;
+pub mod traffic;
 pub mod wire;
 pub mod worker;

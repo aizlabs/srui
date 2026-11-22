@@ -25,8 +25,9 @@ PORT=${SRTOP_DEVBOX_PORT:-2222}
 REV=${SRTOP_DEVBOX_REV:-HEAD}
 # What `devbox.sh build` puts into the image: srtop and the runtime from the exported revision,
 # and the image files from this directory.
+# PX-027: the image also carries apps/srtop/demo's workers, so they are inputs too.
 IMAGE_INPUTS=(
-  apps/srtop/Cargo.toml apps/srtop/Cargo.lock apps/srtop/src server-rust protocol
+  apps/srtop/Cargo.toml apps/srtop/Cargo.lock apps/srtop/src apps/srtop/demo server-rust protocol
   apps/srtop/devbox/Dockerfile apps/srtop/devbox/entrypoint.sh apps/srtop/devbox/sshd_config
 )
 

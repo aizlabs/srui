@@ -17,6 +17,7 @@
 //! `shortcut` property) sends the same event its control's click sends, or
 //! only moves local focus; it adds no handler.
 
+pub mod actions;
 pub mod catalogue;
 pub mod command;
 pub mod filter;
@@ -206,6 +207,16 @@ pub const TAG_DESCENDANTS: NodeId = NodeId::new(80);
 pub const TAGS_CLEAR: NodeId = NodeId::new(81);
 pub const TAGS_STATUS: NodeId = NodeId::new(82);
 pub const TAGS_NODE_COUNT: usize = 5;
+/// The action controls (PX-028): a Row under the inspector holding the
+/// "Prepare dry run: terminate selected", Confirm and Cancel buttons and the
+/// actions status. Created only when an instance is started with `--actions`
+/// ([`install_actions`]), so they are not part of the shell; the row ceiling
+/// charges their reserve whether they exist or not.
+pub const ACTIONS_ROW: NodeId = NodeId::new(83);
+pub const ACTION_PREPARE: NodeId = NodeId::new(84);
+pub const ACTION_CONFIRM: NodeId = NodeId::new(85);
+pub const ACTION_CANCEL: NodeId = NodeId::new(86);
+pub const ACTIONS_STATUS: NodeId = NodeId::new(87);
 pub const VIEW_LABEL: &str = "Show process tree";
 pub const VIEW_DESCRIPTION: &str =
     "When on, the same processes are shown as a tree under their parents instead of the table. The server resolves each parent from the latest scan and never guesses one: a process whose parent is not in the scan, unreadable, a newer process reusing its PID, hidden by the filters, or caught in a cycle is shown at the top, and its Parent column says why. Expanding and collapsing are local; sorting orders each parent's children. The selection and follow carry over.";
@@ -642,6 +653,36 @@ pub fn install_follow_handlers(session: &Session, view: &refresh::SharedView) {
     session.on(FOLLOW_TOGGLE, VALUE_CHANGED, move |session, event| {
         refresh::follow_toggled(&follow, session, event);
     });
+}
+
+/// Creates the action controls (PX-028) under the shell's column, as
+/// `gate`'s mode calls for, and installs their three `ACTIVATE` handlers.
+///
+/// Prepare builds an immutable intent for the process the server resolved as
+/// selected; Confirm hands it, re-checked in full, to the gate's executor;
+/// Cancel discards it. Each click names only its button: no handler reads an
+/// event argument, and the gate refuses every action in read-only mode
+/// whatever the store says about the buttons. The only executor this build
+/// constructs is [`actions::DryRunExecutor`], which sends nothing.
+pub fn install_actions(
+    session: &Session,
+    view: &refresh::SharedView,
+    gate: &actions::SharedActions,
+) -> Result<(), SessionError> {
+    actions::lock_actions(gate).create_controls(session, COLUMN)?;
+    let (prepare_gate, prepare_view) = (std::sync::Arc::clone(gate), std::sync::Arc::clone(view));
+    session.on(ACTION_PREPARE, ACTIVATE, move |session, event| {
+        actions::prepare_requested(&prepare_gate, &prepare_view, session, event);
+    });
+    let (confirm_gate, confirm_view) = (std::sync::Arc::clone(gate), std::sync::Arc::clone(view));
+    session.on(ACTION_CONFIRM, ACTIVATE, move |session, event| {
+        actions::confirm_requested(&confirm_gate, &confirm_view, session, event);
+    });
+    let cancel_gate = std::sync::Arc::clone(gate);
+    session.on(ACTION_CANCEL, ACTIVATE, move |session, _| {
+        actions::cancel_requested(&cancel_gate, session);
+    });
+    Ok(())
 }
 
 /// One click on `field`'s sort button.

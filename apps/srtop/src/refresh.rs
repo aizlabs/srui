@@ -370,6 +370,13 @@ pub const THREADS_RESERVE_BYTES: usize = 4096;
 /// cut mark. Charged at this fixed reserve, never at the status's current
 /// length.
 pub const TAGS_RESERVE_BYTES: usize = 4096;
+/// The action controls' allowance in the catch-up snapshot (PX-028): the
+/// row, the three buttons with their fixed labels and descriptions, the
+/// Confirm label at [`crate::actions::MAX_CONFIRM_LABEL_BYTES`] and the
+/// actions status at [`crate::actions::MAX_ACTIONS_STATUS_BYTES`], each with
+/// the cut mark. Charged whether or not the instance was started with
+/// `--actions`, so the controls never change which rows fit.
+pub const ACTIONS_RESERVE_BYTES: usize = 4096;
 
 /// What every row's tag cell is charged in the row ceiling (PX-020): an
 /// untagged, empty cell, whether the row is tagged or not, so tagging or
@@ -3499,6 +3506,11 @@ impl ProcessView {
     /// The published process row a tag request acts on (PX-020): the row
     /// the inspector describes, the user's own resolved selection, while this
     /// view still publishes it; otherwise why nothing can be tagged.
+    /// Whether `row`, a row of this view, is one the latest scan confirmed.
+    fn confirmed(&self, row: &Row) -> bool {
+        !self.unconfirmed.contains(&row.item_id)
+    }
+
     fn tag_target(&self) -> Result<Row, String> {
         let Some(selected) = self.inspector.selected_row() else {
             return Err("Nothing tagged: select a process row first".to_string());
@@ -4002,6 +4014,60 @@ pub enum TagRequest {
     Descendants,
     /// "Clear tags".
     Clear,
+}
+
+/// What the action gate asks of the view (PX-028): the account the source
+/// states, whether the view is paused, the inspector's resolved selection and
+/// what the latest scan says about one process instance. Answered from the
+/// server's own rows and records; nothing here is anything a client sent.
+impl crate::actions::ActionTargets for ProcessView {
+    fn account(&self) -> crate::source::Observed<u32> {
+        self.owner.current().clone()
+    }
+
+    fn paused(&self) -> bool {
+        self.sampling.frozen().is_some()
+    }
+
+    fn selected(&self) -> Option<ProcessKey> {
+        self.inspector.selected_row().map(|row| row.key.clone())
+    }
+
+    fn state_of(&self, key: &ProcessKey) -> crate::actions::TargetState {
+        use crate::actions::TargetState;
+        use crate::source::Observed;
+        if let Some(row) = self.unfiltered_rows.iter().find(|row| &row.key == key) {
+            if !self.confirmed(row) {
+                return TargetState::Unconfirmed;
+            }
+            return TargetState::Current {
+                pid: row.key.pid.clone(),
+                owner: row.owner.clone(),
+                thread: row.key.is_thread(),
+                who: crate::tags::who(row),
+            };
+        }
+        // Another instance under the same PID, in the same source, host, boot
+        // and PID namespace, confirmed by the latest scan.
+        let replaced = matches!(key.pid, Observed::Known(_))
+            && key.thread.is_none()
+            && self.unfiltered_rows.iter().any(|row| {
+                self.confirmed(row)
+                    && row.key.thread.is_none()
+                    && row.key.source == key.source
+                    && row.key.host == key.host
+                    && row.key.boot == key.boot
+                    && row.key.pid_namespace == key.pid_namespace
+                    && row.key.pid == key.pid
+            });
+        if replaced {
+            TargetState::Replaced
+        } else if self.last_seen.get(key).is_some() {
+            TargetState::Historical
+        } else {
+            TargetState::Unknown
+        }
+    }
 }
 
 /// Dispatches one tag button's `ACTIVATE` to the shared view (PX-020).
@@ -4960,7 +5026,8 @@ fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
             + VIEW_RESERVE_BYTES
             + THREADS_RESERVE_BYTES
             + TAGS_RESERVE_BYTES
-            + TAG_CELLS_RESERVE_BYTES,
+            + TAG_CELLS_RESERVE_BYTES
+            + ACTIONS_RESERVE_BYTES,
     );
     let mut spent = 0usize;
     let mut kept = 0usize;
@@ -7000,7 +7067,8 @@ mod tests {
                 + VIEW_RESERVE_BYTES
                 + THREADS_RESERVE_BYTES
                 + TAGS_RESERVE_BYTES
-                + TAG_CELLS_RESERVE_BYTES);
+                + TAG_CELLS_RESERVE_BYTES
+                + ACTIONS_RESERVE_BYTES);
         let mut published = Vec::new();
         for system in [
             SystemSample::not_provided(),

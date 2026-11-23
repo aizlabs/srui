@@ -3503,14 +3503,14 @@ impl ProcessView {
         }
     }
 
-    /// The published process row a tag request acts on (PX-020): the row
-    /// the inspector describes, the user's own resolved selection, while this
-    /// view still publishes it; otherwise why nothing can be tagged.
     /// Whether `row`, a row of this view, is one the latest scan confirmed.
     fn confirmed(&self, row: &Row) -> bool {
         !self.unconfirmed.contains(&row.item_id)
     }
 
+    /// The published process row a tag request acts on (PX-020): the row
+    /// the inspector describes, the user's own resolved selection, while this
+    /// view still publishes it; otherwise why nothing can be tagged.
     fn tag_target(&self) -> Result<Row, String> {
         let Some(selected) = self.inspector.selected_row() else {
             return Err("Nothing tagged: select a process row first".to_string());

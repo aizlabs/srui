@@ -5663,6 +5663,15 @@ struct ProcessExplorerTerminateDevboxTests {
         #expect(terms.status == 0 && terms.output.split(whereSeparator: \.isNewline).count == 1,
                 "exactly one SIGTERM, nothing escalated: \(terms.output)")
         #expect(rows().contains { $0.count > 1 && $0[0] == stubbornPID }, "its row stays")
+        // The test ends its own stubborn worker, after its name is confirmed, and waits for it to
+        // go, so no worker outlives the run (the deferred kill covers a failure before here).
+        let named = try await runToCompletion(box.docker, ["exec", box.container, "ps", "-p", stubbornPID, "-o", "comm="])
+        if named.status == 0 && named.output == Self.stubbornName {
+            _ = try await runToCompletion(box.docker, ["exec", box.container, "kill", "-KILL", stubbornPID])
+        }
+        try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(15), description: "the stubborn worker ended") {
+            ((try? await Self.boxPIDs(box, comm: Self.stubbornName)) ?? [stubbornPID]).isEmpty
+        }
         print("PX-030 devbox evidence: window \(window.windowNumber); worker \(Self.workerName) PID \(workerPID); "
             + "confirmation \"\(question)\"; \(requested); worker gone from the box's ps; support chain: \(refusals); "
             + "revision \(applier.lastAppliedRevision.value)")

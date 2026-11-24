@@ -14,6 +14,8 @@ PX-003 now has live Linux implementation evidence in [its completion record](doc
 
 PX-026-G01, the installable-R1 package gate, has implementation evidence in [its completion record](docs/process-explorer/completions/PX-026-G01.md) and release notes in [R1.md](docs/process-explorer/releases/R1.md). It covers a build-from-source package, live compatibility, host-key, authentication, reconnect and replacement checks against the devbox, a repeatable privacy audit, and the PX-010-G01 support envelope. PX-026-G02, the server's reasoned handshake refusal, is merged in, and every live check passes. The gate stays open until the user returns two results: the clean-account walkthrough and the VoiceOver checklist (`apps/srtop/r1/`). Its ledger marks both `blocked: awaiting user evidence`.
 
+PX-031 completes the implementation of the safe single-target slice (`delivery_milestones.safe_termination`; the release map's "Confirmed SIGTERM and observed outcome", gate: none): PX-028's authorization, PX-029's process handles, PX-030's confirmed SIGTERM and PX-031's observed outcome, which reports a sent request separately from what srtop's own scans then show (exited after the request, still running, or outcome unknown, never escalated), settles every result through the runtime's event result cache, and abandons every intent on a restart. Its [completion record](docs/process-explorer/completions/PX-031.md) has the evidence; HTOP-R1-001 is `in_progress` until independent verification. The plan defines no separate release record for this slice, and the R1 user evidence above is still outstanding.
+
 ## Delivery priorities
 
 1. PX-000–PX-008: real read-only monitor.

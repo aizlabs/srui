@@ -1029,7 +1029,9 @@ impl ActionGate {
         client: &[u8],
         operation: ActionOperation,
     ) -> Result<IntentId, ActionOutcome> {
-        // A new Prepare replaces the old intent whatever its result.
+        // A new Prepare replaces the old intent whatever its result: a
+        // refused one leaves nothing pending, and the old panel goes with the
+        // next publication.
         self.pending = None;
         let prepared = self.prepare_intent(targets, client, operation);
         match prepared {
@@ -2408,6 +2410,42 @@ mod tests {
             }
         ));
         assert_eq!(recording.reached.lock().unwrap().len(), 1);
+    }
+
+    /// PX-030 verification round 1 (F4): a new Prepare replaces the pending
+    /// intent whatever its result. A refused one leaves nothing pending, and
+    /// no panel, even where the old intent would otherwise be kept (a paused
+    /// view holds a pending intent; the selection has not moved).
+    #[test]
+    fn a_refused_prepare_leaves_no_earlier_intent_pending() {
+        let recording = Arc::new(Recording::default());
+        let clock = Arc::new(ManualClock::default());
+        let mut gate = gate(&recording, &clock);
+        let (mut fake, _) = mine(4101);
+        let first = prepared(&mut gate, &fake);
+        fake.paused = true;
+        gate.hold_for(&fake);
+        gate.revalidate(&fake);
+        assert_eq!(gate.pending().map(ActionIntent::id), Some(first), "held");
+        assert!(matches!(
+            gate.prepare(&fake, CLIENT, ActionOperation::Terminate),
+            Err(ActionOutcome::Refused {
+                reason: Refusal::Paused,
+                ..
+            })
+        ));
+        assert!(gate.pending().is_none(), "the refused Prepare replaced it");
+        assert!(gate.view().panel.is_none());
+        // The old panel's slot confirms nothing.
+        fake.paused = false;
+        assert!(matches!(
+            gate.confirm_panel(&fake, CLIENT, 10, 0),
+            ActionOutcome::Refused {
+                reason: Refusal::Withdrawn,
+                ..
+            }
+        ));
+        assert!(recording.reached.lock().unwrap().is_empty());
     }
 
     #[test]

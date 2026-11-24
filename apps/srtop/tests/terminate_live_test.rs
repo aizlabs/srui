@@ -33,23 +33,56 @@ use std::time::{Duration, Instant};
 
 const CLIENT: &[u8] = b"px030-live-client";
 
-/// A worker that exits with status 0 when it receives SIGTERM.
-const EXITS_ON_TERM: &str = "trap 'exit 0' TERM; while :; do sleep 0.1; done";
-/// A worker that records each SIGTERM in `$1` and keeps running.
-const COUNTS_TERM: &str = "trap 'echo term >> \"$0\"' TERM; while :; do sleep 0.1; done";
+/// A worker that exits with status 0 when it receives SIGTERM. Each worker
+/// ends by itself with status 3 after about 60 s (600 sleeps of 0.1 s), a
+/// backstop should this test die without reaping it.
+const EXITS_ON_TERM: &str =
+    "trap 'exit 0' TERM; i=0; while [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done; exit 3";
+/// A worker that records each SIGTERM in `$0` and keeps running.
+const COUNTS_TERM: &str = "trap 'echo term >> \"$0\"' TERM; i=0; while [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done; exit 3";
 
-fn worker(script: &str, argument: Option<&Path>) -> Child {
+/// One worker this test started: killed and reaped on drop if it is still
+/// running (PX-030 verification round 1, F2), so a failed assertion leaves
+/// no `sh` behind. It is this test's own unreaped child, so its PID cannot
+/// name any other process.
+struct Worker(Child);
+
+impl std::ops::Deref for Worker {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Worker {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
+fn worker(script: &str, argument: Option<&Path>) -> Worker {
     let mut command = Command::new("sh");
     command.arg("-c").arg(script);
     if let Some(argument) = argument {
         command.arg(argument);
     }
-    let child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("sh starts");
+    let child = Worker(
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sh starts"),
+    );
     // Let the trap be installed before anything is sent.
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(
@@ -414,8 +447,7 @@ fn live_terminate_reaches_exactly_the_confirmed_owned_worker() {
 
     // B is the test's own: end it here.
     assert_eq!(comm(b.id()), "sh");
-    b.kill().unwrap();
-    b.wait().unwrap();
+    drop(b);
     println!(
         "PX-030 live: kernel {}; A (sh, exits on TERM) terminated through the gate with exit 0; B (sh, counts TERM) received exactly one SIGTERM across a duplicate delivery; this process (PID {me}) and its parent (PID {parent}) refused as the support chain; PID 1: {pid1}; descriptors {before} before and after",
         std::fs::read_to_string("/proc/sys/kernel/osrelease")

@@ -631,6 +631,28 @@ fn selecting_another_process_withdraws_the_intent_and_its_panel() {
     assert_eq!(reached[0].1, vec![key(4103, "spare")]);
 }
 
+/// PX-030 verification round 1 (F4): a new Prepare replaces the pending
+/// intent whatever its result. Paused, a pending intent is held; a Prepare
+/// that gets through and is refused leaves nothing pending, and the held
+/// intent's panel goes with it.
+#[test]
+fn a_refused_prepare_replaces_the_pending_intent_and_its_panel() {
+    let mut source = Steps::new(vec![host(10)]);
+    let mut h = harness(ActionMode::DryRun, &mut source);
+    h.select(4101);
+    h.processed(ACTION_PREPARE);
+    let panel = h.panel().unwrap();
+    h.processed(SAMPLING_PAUSE);
+    assert_eq!(h.panel(), Some(panel), "held while paused");
+    h.enable_all();
+    h.processed(ACTION_PREPARE);
+    assert_eq!(h.refused(), Refusal::Paused);
+    assert!(lock_actions(&h.gate).pending().is_none());
+    assert!(!h.exists(panel.row), "the held intent's panel is deleted");
+    assert!(rejected_as_gone(&h.click(panel.confirm)));
+    assert!(h.executor.reached().is_empty());
+}
+
 #[test]
 fn disabled_controls_are_refused_by_event_validation() {
     // Read-only: every control is disabled, and a click is rejected before

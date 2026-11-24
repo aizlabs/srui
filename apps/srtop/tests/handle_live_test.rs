@@ -235,11 +235,16 @@ fn descriptor_exhaustion_body() {
     // SAFETY: `lowered` is a valid `rlimit`; only this process's soft limit
     // changes.
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+    // Every descriptor the kernel hands out is below the soft limit, so no
+    // more than `rlim_cur` opens can succeed. The count is not `8`: an
+    // inherited descriptor table can have holes below `highest` (a CI runner
+    // passes one high descriptor down), and each hole is filled first.
+    let bound = usize::try_from(lowered.rlim_cur).unwrap_or(usize::MAX);
     let mut filler = Vec::new();
     let exhausted = loop {
         match std::fs::File::open("/dev/null") {
-            Ok(file) if filler.len() < 64 => filler.push(file),
-            Ok(_) => panic!("64 descriptors under a lowered limit still opened"),
+            Ok(file) if filler.len() < bound => filler.push(file),
+            Ok(_) => panic!("{bound} descriptors under a lowered limit of {bound} still opened"),
             Err(error) => break error,
         }
     };

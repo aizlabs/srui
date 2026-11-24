@@ -2322,15 +2322,18 @@ struct ProcessExplorerShellTests {
     // range rather than by a fixed ID.
     fileprivate static let panelRangeStart: UInt64 = 1 << 32
     fileprivate static let panelRunSpan: UInt64 = 3 * 4096
+    @MainActor
     fileprivate static func panelHandle(_ registry: RenderRegistry, slot: UInt64, offset: UInt64) -> RenderHandle? {
         registry.allHandles.first { handle in
             let id = handle.nodeID.value
             return id >= panelRangeStart && (id - panelRangeStart) % panelRunSpan == 3 * slot + offset
         }
     }
+    @MainActor
     fileprivate static func panelConfirm(_ registry: RenderRegistry, _ slot: UInt64) -> NSButton? {
         panelHandle(registry, slot: slot, offset: 2)?.view as? NSButton
     }
+    @MainActor
     fileprivate static func panelQuestion(_ registry: RenderRegistry, _ slot: UInt64) -> String {
         (panelHandle(registry, slot: slot, offset: 1)?.view as? NSTextField)?.stringValue ?? ""
     }

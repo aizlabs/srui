@@ -1907,7 +1907,13 @@ fn reason_for(error: &io::Error) -> MissingReason {
     }
 }
 
-fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
+/// The source identity [`ProcFsSource::live`] stamps its keys with: the only
+/// keys a process handle may be opened for (PX-029, [`crate::handle`]).
+pub(crate) fn live_source_id() -> SourceId {
+    source_id_for(Path::new(DEFAULT_PROC_ROOT))
+}
+
+pub(crate) fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
     // `/proc` files report size 0, so read through a hard byte bound instead.
     // Reading one byte past the bound is what separates "exactly this long" from
     // "cut here": a stat line cut mid-field still parses — first `(`, last `)`,
@@ -1935,7 +1941,7 @@ fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
 /// see [`RecordAccess`]). Either access can meet either error, and both are an
 /// exit during the scan, never an unreadable record — for a record's `statm`,
 /// once [`RecordDir::confirms_exit`] agrees.
-fn ended(error: &io::Error) -> bool {
+pub(crate) fn ended(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(ESRCH)
 }
 
@@ -1984,7 +1990,7 @@ pub fn parse_pid(name: &[u8]) -> Option<u32> {
     }
 }
 
-fn parse_namespace(link: &str) -> Option<u64> {
+pub(crate) fn parse_namespace(link: &str) -> Option<u64> {
     parse_namespace_of_kind(link, "pid")
 }
 

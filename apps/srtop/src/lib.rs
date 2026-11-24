@@ -22,6 +22,7 @@ pub mod catalogue;
 pub mod command;
 pub mod filter;
 pub mod follow;
+pub mod handle;
 pub mod inspector;
 pub mod lastseen;
 pub mod metric;

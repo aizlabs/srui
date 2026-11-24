@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-029",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Identity-checked, bounded-lifetime Linux process handles for signaling (D1 §§6.2, 27; D2 T32; K1-K3): pidfd_open, then the sampled ProcessKey re-checked against /proc/<pid>/stat after the open; at most 16 handles for at most 30 s, closed on cancellation, expiry, settlement and drop; one closed signal (SIGTERM) sent only through the descriptor; unsupported (not Linux, ENOSYS, a filter's EPERM, ENODEV) and descriptor exhaustion reported, never retried and never answered by a PID-addressed kill. No action path reaches it: the dry-run executor is still the only production executor, and PX-008's audit allows exactly the module's two system calls and refuses any other production reference to it. No protocol, registry, SDK, runtime, renderer or client change. Contributes to HTOP-R1-001 (owner PX-028/PX-031), which stays planned until PX-030 and PX-031 deliver a real, observed action",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md",
+      "K1": "https://docs.kernel.org/filesystems/proc.html",
+      "K2": "https://man7.org/linux/man-pages/man2/pidfd_send_signal.2.html",
+      "K3": "https://man7.org/linux/man-pages/man2/pidfd_open.2.html"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX029-001",
+      "feature": "A handle on the sampled process instance, not on a PID: ProcessHandles::acquire takes only a key from the live /proc source that names a process with a known PID, boot, PID namespace and LinuxBootTicks start time, in this boot and in the reader's own active PID namespace; it opens pidfd_open(pid, 0) and then re-reads /proc/<pid>/stat, whose start time must equal the key's, or the descriptor is closed and the acquisition refused (Replaced, Ended, Unverified); exit or PID reuse before acquisition and between the open and the re-check never yields a handle",
+      "scope": "PX-029/apps/srtop/src/handle.rs ProcessHandles::acquire, identifiable, same_boot_and_namespace, LivePidfds; tests/handle_test.rs a_pid_reused_before_acquisition_is_refused_and_the_replacement_receives_nothing, an_exit_or_reuse_between_the_open_and_the_identity_check_is_refused, a_key_that_cannot_name_a_live_process_here_opens_nothing, a_record_that_cannot_confirm_the_identity_after_the_open_fails_closed; tests/handle_live_test.rs live_pidfd_handles_on_owned_workers",
+      "source_refs": ["D1", "D2", "K1", "K3"],
+      "owner": "PX-029",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-029.md"]
+    },
+    {
+      "feature_id": "SRUI-PX029-002",
+      "feature": "A signal reaches only the handle's own process: ProcessHandles::settle sends one HandleSignal (Terminate, SIGTERM) through pidfd_send_signal on the held descriptor and closes it whatever the result; a process that exited after preparation answers Ended (ESRCH) and a replacement under its PID receives nothing; nothing is ever reopened or sent by PID; EPERM is Denied",
+      "scope": "PX-029/apps/srtop/src/handle.rs ProcessHandles::settle, HandleSignal, SignalOutcome, linux::LinuxPidfd; tests/handle_test.rs an_exit_or_pid_reuse_after_preparation_never_reaches_the_replacement, permission_denial_at_the_signal_is_reported_and_closes_the_handle; tests/handle_live_test.rs live_pidfd_handles_on_owned_workers",
+      "source_refs": ["D1", "D2", "K2"],
+      "owner": "PX-029",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-029.md"]
+    },
+    {
+      "feature_id": "SRUI-PX029-003",
+      "feature": "Bounded handles: at most DEFAULT_MAX_LIVE_HANDLES (16) per table and DEFAULT_HANDLE_LIFETIME (30 s) each on a suspend-aware monotonic clock; closed on cancel, on expiry (expire, and before every acquisition and signal), on settlement and when the table is dropped; owned descriptors, counted closed by the fake and by /proc/self/fd on Linux",
+      "scope": "PX-029/apps/srtop/src/handle.rs ProcessHandles::cancel, expire, settle, with_limit, with_lifetime; tests/handle_test.rs handles_close_on_cancel_expiry_settlement_and_drop_and_are_bounded; tests/handle_live_test.rs live_pidfd_handles_on_owned_workers",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-029",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-029.md"]
+    },
+    {
+      "feature_id": "SRUI-PX029-004",
+      "feature": "Unsupported and exhausted paths are explicit: not Linux, ENOSYS, EPERM/EACCES from pidfd_open (a filter or security module) and ENODEV are Unsupported, and ProcessHandles::probe reports it so the actions that need a handle stay disabled; EMFILE and ENFILE are DescriptorsExhausted, reported once and never retried; no PID-addressed fallback exists; minimum path Linux 5.3 (pidfd_send_signal 5.1) through syscall(2) with libc 0.2.189's call numbers, no glibc wrapper",
+      "scope": "PX-029/apps/srtop/src/handle.rs open_error, Unsupported, ProcessHandles::probe; tests/handle_test.rs an_unsupported_api_is_refused_and_nothing_is_signalled, descriptor_exhaustion_is_reported_once_and_never_retried, the_live_handles_are_unsupported_off_linux, enosys_is_read_as_unsupported; tests/handle_live_test.rs descriptor_exhaustion_body",
+      "source_refs": ["D1", "D2", "K2", "K3"],
+      "owner": "PX-029",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-029.md"]
+    },
+    {
+      "feature_id": "SRUI-PX029-005",
+      "feature": "PX-008's audit allows exactly the handle module's two system calls: only src/handle.rs may name unsafe, libc and syscall; libc:: only with one of six items, libc::syscall only with SYS_pidfd_open or SYS_pidfd_send_signal first, and unsafe only as one of three blocks pinned token for token; kill, extern and every other rule hold there; no other production file may name the module or its items; libc is an allowed normal dependency (already locked via srui-unix-security); DryRunExecutor stays the only production ProcessActions",
+      "scope": "PX-029/apps/srtop/tests/no_process_control_test.rs HANDLE_MODULE, HANDLE_LIBC_ITEMS, HANDLE_SYSCALLS, HANDLE_UNSAFE_BLOCKS, HANDLE_ITEMS, handle_module_allows, handle_unsafe_violations, the_pidfd_allowance_is_exactly_the_handle_modules_two_system_calls; apps/srtop/Cargo.toml libc",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-029",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-029.md"]
+    }
+  ]
+}

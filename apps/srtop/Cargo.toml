@@ -12,6 +12,10 @@ srui-sdk = { path = "../../server-rust/sdk" }
 srui-semantic-tree = { path = "../../server-rust/semantic-tree" }
 srui-sessiond = { path = "../../server-rust/sessiond" }
 srui-unix-security = { path = "../../server-rust/unix-security" }
+# PX-029: `syscall(2)` and the `SYS_pidfd_open`/`SYS_pidfd_send_signal` numbers for the process
+# handle module (`src/handle.rs`), the only file PX-008's audit lets name it. Already locked at
+# 0.2.189 through srui-unix-security: no new package.
+libc = "0.2"
 
 # PX-008's process-control audit reads the sources as Rust tokens, with the proc-macro2
 # version the runtime's macros already lock: no new package, and nothing in the binary.

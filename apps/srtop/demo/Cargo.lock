@@ -860,6 +860,7 @@ dependencies = [
 name = "srui-process-explorer"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "srui-protocol",
  "srui-sdk",
  "srui-semantic-tree",

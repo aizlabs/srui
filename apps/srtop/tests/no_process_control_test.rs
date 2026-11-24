@@ -61,6 +61,19 @@
 //!   (`std::io::Write::write_all(&mut f, ..)`).
 //!   The only signal API is receiving SIGINT, SIGTERM and the
 //!   `--smoke-fixture` SIGUSR1.
+//! * **The one raw system-call allowance (PX-029).** `src/handle.rs`, and no
+//!   other file, may name `unsafe`, `libc` and `syscall`, and only as
+//!   `pidfd_open` and `pidfd_send_signal` need them: `libc::` followed by
+//!   one of [`HANDLE_LIBC_ITEMS`], `libc::syscall(` only with
+//!   `libc::SYS_pidfd_open` or `libc::SYS_pidfd_send_signal` as its first
+//!   argument, and `unsafe` only as a block whose tokens are exactly one of
+//!   [`HANDLE_UNSAFE_BLOCKS`]; the signal number is pinned too
+//!   ([`HANDLE_SIGNAL_PINS`]: `Terminate` is `libc::SIGTERM`, the only
+//!   `libc::SIG..` named). `kill`, `extern`, every other `libc` item and
+//!   every other rule hold there as everywhere. No other production file may
+//!   name the module or its public items ([`HANDLE_ITEMS`]): nothing reaches
+//!   the signal it can send until PX-030 wires termination, under review, and
+//!   the dry-run executor is still the only production executor.
 //! * **Binary imports.** `nm` lists the symbols the built `srtop` imports. None
 //!   may create a process, deliver a targeted signal other than `kill`, trace a
 //!   process, or change one's priority, affinity, limits, group or session. The
@@ -259,6 +272,9 @@ const NORMAL_DEPENDENCIES: &[&str] = &[
     "srui-unix-security",
     "tokio",
     "tokio-util",
+    // PX-029: the two pidfd system calls of `src/handle.rs`, the only file
+    // the token rules let name it; already locked through srui-unix-security.
+    "libc",
 ];
 const DEV_DEPENDENCIES: &[&str] = &["proc-macro2"];
 
@@ -318,7 +334,10 @@ const FORBIDDEN_IMPORTS: &[&str] = &[
 ];
 
 /// Process-related imports the binary has today. They are reported, not
-/// attributed: this test does not establish which code reaches them.
+/// attributed: this test does not establish which code reaches them. Since
+/// PX-029 srtop's own `src/handle.rs` calls `syscall` on Linux (for
+/// `pidfd_open` and `pidfd_send_signal` only, as the token rules pin); the
+/// binary reaches none of that module yet.
 const UNATTRIBUTED_IMPORTS: &[&str] = &["kill", "waitpid", "waitid", "syscall"];
 
 // ---------------------------------------------------------------------------
@@ -608,7 +627,210 @@ fn check_attribute(
     }
 }
 
-fn scan(level: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
+// ---------------------------------------------------------------------------
+// PX-029: the process handle module's two system calls
+// ---------------------------------------------------------------------------
+
+/// The one production file that may make a raw system call (PX-029).
+const HANDLE_MODULE: &str = "src/handle.rs";
+
+/// The `libc` items the handle module may name: the call, the two call
+/// numbers, the one signal and two argument types. Every other one —
+/// `kill`, `SYS_kill`, `setpriority` — is refused there as everywhere.
+const HANDLE_LIBC_ITEMS: &[&str] = &[
+    "syscall",
+    "SYS_pidfd_open",
+    "SYS_pidfd_send_signal",
+    "SIGTERM",
+    "pid_t",
+    "c_uint",
+];
+
+/// The calls `libc::syscall` may make in the handle module, named as its
+/// first argument. A number (`libc::syscall(62, ..)`) or another name is
+/// refused.
+const HANDLE_SYSCALLS: &[&str] = &["SYS_pidfd_open", "SYS_pidfd_send_signal"];
+
+/// The handle module's `unsafe` blocks, token for token
+/// ([`canonical`]): `pidfd_open`, taking ownership of the descriptor it
+/// returns, and `pidfd_send_signal` with a NULL `siginfo_t`. Any other
+/// `unsafe` — another block, a changed argument, an `unsafe fn` or
+/// `impl` — is refused until it is reviewed and pinned here.
+const HANDLE_UNSAFE_BLOCKS: &[&str] = &[
+    "libc : : syscall ( libc : : SYS_pidfd_open , pid , 0 as libc : : c_uint )",
+    "OwnedFd : : from_raw_fd ( fd )",
+    "libc : : syscall ( libc : : SYS_pidfd_send_signal , fd , number , std : : ptr : : null : : < u8 > (  ) , 0 as libc : : c_uint , )",
+];
+
+/// The handle module's one signal mapping and its one use, token for token
+/// ([`canonical`]): `Terminate` is `libc::SIGTERM`, and the number the pinned
+/// `pidfd_send_signal` block sends is exactly that. With
+/// [`handle_signal_violations`], no other number (`=> 9`), no other signal
+/// (`libc::SIGKILL`) and no shadowing `let number` can reach the call.
+const HANDLE_SIGNAL_PINS: &[&str] = &[
+    "fn number ( self ) - > i32 { match self { Self : : Terminate = > libc : : SIGTERM , } }",
+    "let number = signal . number (  ) ;",
+];
+
+/// The handle module's public items. No other production file may name
+/// them, or the module itself as a path: no action path reaches a handle
+/// until PX-030 wires termination through it, under review.
+const HANDLE_ITEMS: &[&str] = &[
+    "ProcessHandles",
+    "PidfdSystem",
+    "Pidfd",
+    "LivePidfds",
+    "HandleSignal",
+    "SignalOutcome",
+    "AcquireError",
+    "HandleId",
+];
+
+/// Whether a parenthesized argument list starts with one of
+/// [`HANDLE_SYSCALLS`], as `libc::SYS_pidfd_open,`.
+fn is_allowed_syscall_call(arguments: Option<&Tok>) -> bool {
+    match arguments {
+        Some(Tok::Group(Delimiter::Parenthesis, tokens, _)) => matches!(
+            tokens.as_slice(),
+            [Tok::Ident(crate_name, false, _), Tok::PathSep(_), Tok::Ident(call, false, _), Tok::Punct(',', _), ..]
+                if crate_name == "libc" && HANDLE_SYSCALLS.contains(&call.as_str())
+        ),
+        _ => false,
+    }
+}
+
+/// Whether the forbidden identifier at `level[i]` is one the handle module
+/// may use there: `unsafe` opening a block (its tokens are checked by
+/// [`handle_unsafe_violations`]), `libc::` an allowed item, and `syscall`
+/// only as `libc::syscall(libc::SYS_pidfd_.., ..)`.
+fn handle_module_allows(level: &[Tok], i: usize) -> bool {
+    let prev = i.checked_sub(1).and_then(|p| level.get(p));
+    match ident(level.get(i)) {
+        Some("unsafe") => matches!(level.get(i + 1), Some(Tok::Group(Delimiter::Brace, ..))),
+        Some("libc") => {
+            !is_path_sep(prev)
+                && is_path_sep(level.get(i + 1))
+                && match ident(level.get(i + 2)) {
+                    Some("syscall") => is_allowed_syscall_call(level.get(i + 3)),
+                    Some(item) => HANDLE_LIBC_ITEMS.contains(&item),
+                    None => false,
+                }
+        }
+        Some("syscall") => {
+            is_path_sep(prev)
+                && ident(i.checked_sub(2).and_then(|p| level.get(p))) == Some("libc")
+                && is_allowed_syscall_call(level.get(i + 1))
+        }
+        _ => false,
+    }
+}
+
+/// A token stream as one canonical line: every token's text, single spaces
+/// between them, groups in their delimiters. Literals keep their text, so
+/// `0` and `9` differ.
+fn canonical(stream: TokenStream) -> String {
+    stream
+        .into_iter()
+        .map(|tree| match tree {
+            TokenTree::Group(group) => {
+                let inner = canonical(group.stream());
+                match group.delimiter() {
+                    Delimiter::Parenthesis => format!("( {inner} )"),
+                    Delimiter::Brace => format!("{{ {inner} }}"),
+                    Delimiter::Bracket => format!("[ {inner} ]"),
+                    Delimiter::None => inner,
+                }
+            }
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Every way the handle module's `unsafe` departs from
+/// [`HANDLE_UNSAFE_BLOCKS`], over all of its tokens (test code included): an
+/// `unsafe` that does not open a block, a block not pinned there, and a
+/// pinned block that is gone (so the list stays exact).
+fn handle_unsafe_violations(source: &str) -> Vec<String> {
+    fn walk(stream: TokenStream, unsafes: &mut usize, blocks: &mut Vec<String>) {
+        let trees: Vec<TokenTree> = stream.into_iter().collect();
+        for (i, tree) in trees.iter().enumerate() {
+            match tree {
+                TokenTree::Ident(name) if name == "unsafe" => {
+                    *unsafes += 1;
+                    if let Some(TokenTree::Group(group)) = trees.get(i + 1) {
+                        if group.delimiter() == Delimiter::Brace {
+                            blocks.push(canonical(group.stream()));
+                        }
+                    }
+                }
+                TokenTree::Group(group) => walk(group.stream(), unsafes, blocks),
+                _ => {}
+            }
+        }
+    }
+    let stream = match TokenStream::from_str(source) {
+        Ok(stream) => stream,
+        Err(error) => return vec![format!("does not tokenize: {error}")],
+    };
+    let (mut unsafes, mut blocks) = (0, Vec::new());
+    walk(stream, &mut unsafes, &mut blocks);
+    let mut found = Vec::new();
+    if unsafes != blocks.len() {
+        found.push(format!(
+            "{} `unsafe` that open no block (an unsafe fn, impl, trait or extern)",
+            unsafes - blocks.len()
+        ));
+    }
+    let mut pinned: Vec<&str> = HANDLE_UNSAFE_BLOCKS.to_vec();
+    for block in &blocks {
+        match pinned.iter().position(|allowed| allowed == block) {
+            Some(at) => {
+                pinned.remove(at);
+            }
+            None => found.push(format!("an `unsafe` block that is not pinned: {block}")),
+        }
+    }
+    for missing in pinned {
+        found.push(format!("a pinned `unsafe` block is gone: {missing}"));
+    }
+    found
+}
+
+/// Every way the handle module's signal mapping departs from
+/// [`HANDLE_SIGNAL_PINS`]: each pin must occur exactly once, `let number`
+/// exactly once (no shadowing), and `libc::SIG..` exactly once (the pinned
+/// `SIGTERM`), over all of the module's tokens.
+fn handle_signal_violations(source: &str) -> Vec<String> {
+    let stream = match TokenStream::from_str(source) {
+        Ok(stream) => stream,
+        Err(error) => return vec![format!("does not tokenize: {error}")],
+    };
+    let text = format!(" {} ", canonical(stream));
+    let count = |needle: &str| text.matches(&format!(" {needle} ")).count();
+    let mut found = Vec::new();
+    for pin in HANDLE_SIGNAL_PINS {
+        let seen = count(pin);
+        if seen != 1 {
+            found.push(format!(
+                "the pinned signal mapping occurs {seen} times: {pin}"
+            ));
+        }
+    }
+    let lets = count("let number");
+    if lets != 1 {
+        found.push(format!("`let number` occurs {lets} times"));
+    }
+    let signals = text.matches(" libc : : SIG").count();
+    if signals != 1 {
+        found.push(format!(
+            "{signals} `libc::SIG..` names, not the one pinned `SIGTERM`"
+        ));
+    }
+    found
+}
+
+fn scan(level: &[Tok], handle_module: bool, report: &mut dyn FnMut(usize, &str, String)) {
     for (i, tok) in level.iter().enumerate() {
         let prev = i.checked_sub(1).and_then(|p| level.get(p));
         let next = level.get(i + 1);
@@ -617,7 +839,28 @@ fn scan(level: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
             Tok::Ident(name, raw, line) => {
                 let line = *line;
                 if let Some((_, why)) = FORBIDDEN_IDENTS.iter().find(|(word, _)| word == name) {
-                    report(line, "ident", format!("`{name}`: {why}"));
+                    if !(handle_module && handle_module_allows(level, i)) {
+                        report(line, "ident", format!("`{name}`: {why}"));
+                    }
+                }
+                // PX-029: the handle module is reached by no other file yet.
+                if !handle_module {
+                    if HANDLE_ITEMS.contains(&name.as_str()) {
+                        report(
+                            line,
+                            "handle",
+                            format!("`{name}`: the process handle module is not wired"),
+                        );
+                    }
+                    if name == "handle"
+                        && (is_path_sep(prev) || is_path_sep(next) || ident(next) == Some("as"))
+                    {
+                        report(
+                            line,
+                            "handle",
+                            "a path to the process handle module, which is not wired".into(),
+                        );
+                    }
                 }
                 // `.name(` or `.name::<T>(`, and the path form in any position
                 // (`std::io::Write::write_all(&mut file, ..)`, or taken as a
@@ -751,7 +994,7 @@ fn scan(level: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
                     check_attribute(inner, *line, false, report);
                 }
             }
-            Tok::Group(_, inner, _) => scan(inner, report),
+            Tok::Group(_, inner, _) => scan(inner, handle_module, report),
             _ => {}
         }
     }
@@ -1003,7 +1246,7 @@ fn token_violations(file: &str, source: &str) -> Vec<String> {
     };
     let tokens = production(&lower(stream));
     let mut found = Vec::new();
-    scan(&tokens, &mut |line, rule, what| {
+    scan(&tokens, file == HANDLE_MODULE, &mut |line, rule, what| {
         found.push(format!("{file}:{line}: [{rule}] {what}"))
     });
     found
@@ -2077,11 +2320,11 @@ fn the_package_checks_report_every_known_bypass() {
             "normal dependency nix",
         ),
         (
-            "N2 libc",
-            with(&dependency("libc", "null", "null", "null")),
+            "N2 rustix (libc is allowed since PX-029, for src/handle.rs only)",
+            with(&dependency("rustix", "null", "null", "null")),
             good_targets.clone(),
             manifest.to_string(),
-            "normal dependency libc",
+            "normal dependency rustix",
         ),
         (
             "a target-specific dependency",
@@ -2215,6 +2458,10 @@ fn no_production_source_can_signal_or_reconfigure_a_process() {
         files.iter().any(|path| path.ends_with("src/main.rs")),
         "the audit must cover the binary's entry point"
     );
+    assert!(
+        files.iter().any(|path| path.ends_with(HANDLE_MODULE)),
+        "the pinned unsafe blocks are checked against the handle module that holds them"
+    );
     let mut found = Vec::new();
     let mut receivers = 0;
     let mut attributes = BTreeSet::new();
@@ -2226,6 +2473,18 @@ fn no_production_source_can_signal_or_reconfigure_a_process() {
             .display()
             .to_string();
         found.extend(token_violations(&name, &text));
+        if name == HANDLE_MODULE {
+            found.extend(
+                handle_unsafe_violations(&text)
+                    .into_iter()
+                    .map(|violation| format!("{name}: [unsafe] {violation}")),
+            );
+            found.extend(
+                handle_signal_violations(&text)
+                    .into_iter()
+                    .map(|violation| format!("{name}: [signal] {violation}")),
+            );
+        }
         receivers += signal_receivers(&text);
         production_attributes(&text, &mut attributes);
     }
@@ -2332,11 +2591,238 @@ fn process_actions_implementations(source: &str) -> Vec<String> {
     found
 }
 
+/// PX-029: the handle module's allowance is exactly its two system calls.
+/// Each construct below is refused in `src/handle.rs` itself, and what the
+/// module really writes passes there and is refused in any other file.
+#[test]
+fn the_pidfd_allowance_is_exactly_the_handle_modules_two_system_calls() {
+    let in_handle = |snippet: &str| token_violations(HANDLE_MODULE, snippet);
+    for (name, snippet) in [
+        ("libc::kill", "let _ = libc::kill(pid, 15);"),
+        (
+            "libc::kill in an unsafe block",
+            "let _ = unsafe { libc::kill(pid, libc::SIGTERM) };",
+        ),
+        (
+            "a leading-path libc::kill",
+            "let _ = ::libc::kill(pid, 15);",
+        ),
+        ("kill imported", "use libc::kill;"),
+        ("libc renamed", "use libc as c;"),
+        ("libc imported bare", "use libc;"),
+        ("libc glob", "use libc::*;"),
+        ("libc grouped", "use libc::{syscall, SIGTERM};"),
+        ("syscall renamed", "use libc::syscall as raw;"),
+        ("syscall as a value", "let call = libc::syscall;"),
+        ("syscall by number", "let _ = libc::syscall(62, pid, 9);"),
+        (
+            "syscall SYS_kill",
+            "let _ = libc::syscall(libc::SYS_kill, pid, 9);",
+        ),
+        (
+            "syscall SYS_tgkill",
+            "let _ = libc::syscall(libc::SYS_tgkill, pid, pid, 9);",
+        ),
+        (
+            "syscall with a computed number",
+            "let _ = libc::syscall(number, pid, 9);",
+        ),
+        (
+            "syscall unqualified",
+            "let _ = syscall(libc::SYS_pidfd_open, pid, 0);",
+        ),
+        ("another libc item", "let _ = libc::SIGKILL;"),
+        (
+            "libc::setpriority",
+            "libc::setpriority(libc::PRIO_PROCESS, 0, 19);",
+        ),
+        (
+            "an extern block",
+            "extern \"C\" { fn kill(pid: i32, sig: i32) -> i32; }",
+        ),
+        (
+            "nix kill",
+            "let _ = nix::sys::signal::kill(Pid::from_raw(pid), None);",
+        ),
+        (
+            "a kill command",
+            "std::process::Command::new(\"kill\").arg(pid).status();",
+        ),
+        ("an unsafe fn", "unsafe fn f() {}"),
+    ] {
+        assert!(
+            in_handle(snippet).iter().any(|v| v.contains("[ident]")),
+            "{name} is refused in the handle module: {:?}",
+            in_handle(snippet)
+        );
+    }
+
+    // Each layer refuses `libc::kill` on its own: the `libc` item rule and
+    // the `kill` rule, so widening either one alone is still caught here.
+    for snippet in [
+        "let _ = libc::kill(pid, 15);",
+        "let _ = unsafe { libc::kill(pid, libc::SIGTERM) };",
+    ] {
+        let found = in_handle(snippet);
+        for word in ["`libc`", "`kill`"] {
+            assert!(
+                found.iter().any(|v| v.contains(word)),
+                "{word} is refused in {snippet}: {found:?}"
+            );
+        }
+    }
+
+    // What the module writes passes there, and nowhere else.
+    let real = "let pid = libc::pid_t::try_from(pid);\n\
+                let result = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_uint) };\n\
+                let fd = unsafe { OwnedFd::from_raw_fd(fd) };\n\
+                let number = libc::SIGTERM;\n\
+                let result = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, fd, number, std::ptr::null::<u8>(), 0 as libc::c_uint) };";
+    assert_eq!(in_handle(real), Vec::<String>::new());
+    for elsewhere in [
+        "src/actions.rs",
+        "src/handle/inner.rs",
+        "handle.rs",
+        "snippet.rs",
+    ] {
+        let found = token_violations(elsewhere, real);
+        for word in ["unsafe", "libc", "syscall"] {
+            assert!(
+                found.iter().any(|v| v.contains(&format!("`{word}`"))),
+                "{word} is refused in {elsewhere}: {found:?}"
+            );
+        }
+    }
+
+    // Every `unsafe` is pinned token for token.
+    let module = std::fs::read_to_string(crate_root().join(HANDLE_MODULE)).unwrap();
+    assert_eq!(handle_unsafe_violations(&module), Vec::<String>::new());
+    for (name, extra) in [
+        (
+            "another block",
+            "fn f() { unsafe { std::ptr::write(p, 1) } }",
+        ),
+        (
+            "a changed argument",
+            "fn f() { unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 1 as libc::c_uint) } }",
+        ),
+        ("an unsafe fn", "unsafe fn f() {}"),
+        ("an unsafe impl", "unsafe impl Send for Handle {}"),
+        (
+            "an unsafe extern",
+            "unsafe extern \"C\" { fn kill(pid: i32, sig: i32) -> i32; }",
+        ),
+        (
+            "a pinned block twice",
+            "fn f() { unsafe { OwnedFd::from_raw_fd(fd) } }",
+        ),
+        (
+            "a pinned block in test code",
+            "#[cfg(test)] mod t { fn f() { unsafe { OwnedFd::from_raw_fd(fd) } } }",
+        ),
+    ] {
+        assert!(
+            !handle_unsafe_violations(&format!("{module}\n{extra}")).is_empty(),
+            "{name} is refused"
+        );
+    }
+    assert!(
+        handle_unsafe_violations("fn f() {}")
+            .iter()
+            .any(|v| v.contains("is gone")),
+        "a pinned block that is gone is reported, so the pins stay exact"
+    );
+
+    // The signal sent is pinned: `Terminate` is `SIGTERM`, and nothing else
+    // reaches the call.
+    assert_eq!(handle_signal_violations(&module), Vec::<String>::new());
+    for (name, from, to) in [
+        (
+            "a number",
+            "Self::Terminate => libc::SIGTERM,",
+            "Self::Terminate => 9,",
+        ),
+        (
+            "SIGKILL",
+            "Self::Terminate => libc::SIGTERM,",
+            "Self::Terminate => libc::SIGKILL,",
+        ),
+        (
+            "a number at the call",
+            "let number = signal.number();",
+            "let number = 9;",
+        ),
+        (
+            "an offset at the call",
+            "let number = signal.number();",
+            "let number = signal.number() + 0;",
+        ),
+        (
+            "a shadowing number",
+            "let number = signal.number();",
+            "let number = signal.number();\nlet number = 9;",
+        ),
+        (
+            "a second mapping",
+            "Self::Terminate => libc::SIGTERM,",
+            "Self::Terminate => libc::SIGTERM,\n}\n}\nfn kill_number() -> i32 { libc::SIGKILL",
+        ),
+    ] {
+        assert_eq!(
+            module.matches(from).count(),
+            1,
+            "{name}: the anchor is in the module"
+        );
+        assert!(
+            !handle_signal_violations(&module.replacen(from, to, 1)).is_empty(),
+            "{name} is refused"
+        );
+    }
+    assert!(
+        in_handle("pub fn number(self) -> i32 { match self { Self::Terminate => libc::SIGKILL } }")
+            .iter()
+            .any(|v| v.contains("`libc`")),
+        "SIGKILL is not a libc item the handle module may name"
+    );
+
+    // No other production file reaches the module.
+    for snippet in [
+        "use crate::handle::ProcessHandles;",
+        "let table = crate::handle::ProcessHandles::live();",
+        "use crate::handle;\nfn f() { handle::LivePidfds; }",
+        "use super::handle as h;",
+        "pub use handle::*;",
+        "fn f(table: &mut ProcessHandles) {}",
+        "let _ = HandleSignal::Terminate;",
+        "impl PidfdSystem for Mine {}",
+    ] {
+        assert!(
+            token_violations("src/actions.rs", snippet)
+                .iter()
+                .any(|v| v.contains("[handle]")),
+            "{snippet} is refused outside the handle module"
+        );
+    }
+    for innocent in [
+        "pub mod handle;",
+        "fn fd_link(handle: &File) -> PathBuf { todo!() }",
+        "let fd = handle.as_raw_fd();",
+        "Execution::Unsupported",
+    ] {
+        assert_eq!(
+            token_violations("src/lib.rs", innocent),
+            Vec::<String>::new(),
+            "{innocent}"
+        );
+    }
+}
+
 /// PX-028: the action gate reaches a process only through a
 /// `ProcessActions` executor, and production code has exactly one, the
 /// dry-run executor. A second implementation — one that could send a
-/// signal — is PX-029/PX-030's to add, under review, and fails here until
-/// this rule names it.
+/// signal — is PX-030's to add, under review, and fails here until this
+/// rule names it. PX-029's process handles are not an executor and implement
+/// no `ProcessActions`.
 #[test]
 fn the_only_production_action_executor_is_the_dry_run_executor() {
     assert_eq!(

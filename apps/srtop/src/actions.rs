@@ -16,7 +16,9 @@
 //!   construct, after it re-checked every target against the latest scan. The
 //!   only implementation is [`DryRunExecutor`], which sends nothing: it has no
 //!   way to reach a process (PX-008's audit holds for this module like any
-//!   other). Handles, signals and termination are PX-029 and PX-030.
+//!   other). PX-029 adds identity-checked process handles
+//!   ([`crate::handle`]), which no action path reaches yet; termination
+//!   through them is PX-030.
 //! * [`ActionOutcome`] keeps the six results apart: refused, unsupported,
 //!   requested, observed complete, failed and outcome unknown. An executor
 //!   reports only what it did ([`Execution`]); it cannot report an observed

@@ -80,6 +80,7 @@ struct State {
     open_errors: VecDeque<io::Error>,
     send_errors: VecDeque<io::Error>,
     stat_errors: VecDeque<io::Error>,
+    boot_errors: VecDeque<io::Error>,
     garbled_stat: bool,
     after_open: Option<AfterOpen>,
 }
@@ -239,7 +240,11 @@ impl PidfdSystem for FakeSystem {
     }
 
     fn boot_id(&self) -> io::Result<String> {
-        Ok(self.0.state().boot.clone())
+        let mut state = self.0.state();
+        if let Some(error) = state.boot_errors.pop_front() {
+            return Err(error);
+        }
+        Ok(state.boot.clone())
     }
 
     fn pid_namespace(&self) -> io::Result<u64> {
@@ -626,6 +631,71 @@ fn descriptor_exhaustion_is_reported_once_and_never_retried() {
         assert!(h.handles.cancel(id));
         assert_eq!(h.kernel.open_descriptors(), 0);
     }
+}
+
+/// The identity reads need descriptors too: when the pidfd took the last
+/// free one, the `stat` re-read after it fails with `EMFILE`; under
+/// exhaustion a first acquisition already fails reading the boot ID. Both are
+/// exhaustion, not an unconfirmed identity: reported once, never retried,
+/// the pidfd closed, nothing sent.
+#[test]
+fn exhaustion_during_an_identity_read_is_reported_as_exhaustion() {
+    for (errno, system_wide) in [(EMFILE, false), (ENFILE, true)] {
+        // The re-read after the open.
+        let mut h = harness();
+        h.kernel.start(4101, 500);
+        h.kernel
+            .state()
+            .stat_errors
+            .push_back(io::Error::from_raw_os_error(errno));
+        assert_eq!(
+            h.handles.acquire(&key(4101, 500)),
+            Err(AcquireError::DescriptorsExhausted { system_wide })
+        );
+        assert_eq!(h.kernel.open_attempts(), 1, "not retried");
+        assert_eq!(h.kernel.open_descriptors(), 0, "the pidfd is closed");
+        assert_eq!(h.handles.live_count(), 0);
+        assert_eq!(h.kernel.deliveries(), 0);
+        let id = h.handles.acquire(&key(4101, 500)).unwrap();
+        assert!(h.handles.cancel(id));
+
+        // The boot ID, read on a table's first acquisition, before any open.
+        let mut h = harness();
+        h.kernel.start(4101, 500);
+        h.kernel
+            .state()
+            .boot_errors
+            .push_back(io::Error::from_raw_os_error(errno));
+        assert_eq!(
+            h.handles.acquire(&key(4101, 500)),
+            Err(AcquireError::DescriptorsExhausted { system_wide })
+        );
+        assert_eq!(h.kernel.open_attempts(), 0, "nothing is opened");
+        assert_eq!(h.kernel.deliveries(), 0);
+        // Nothing was cached from the failed read: the next acquisition
+        // reads the boot again and succeeds.
+        let id = h.handles.acquire(&key(4101, 500)).unwrap();
+        assert!(h.handles.cancel(id));
+        assert_eq!(h.kernel.open_descriptors(), 0);
+    }
+    // Another read failure is still an unconfirmed identity.
+    let mut h = harness();
+    h.kernel.start(4101, 500);
+    h.kernel
+        .state()
+        .boot_errors
+        .push_back(io::Error::from_raw_os_error(EPERM));
+    assert!(matches!(
+        h.handles.acquire(&key(4101, 500)),
+        Err(AcquireError::Unverified(_))
+    ));
+}
+
+/// The one signal mapping, on every platform: `Terminate` is `SIGTERM`, 15
+/// on Linux and macOS alike.
+#[test]
+fn terminate_is_sigterm() {
+    assert_eq!(HandleSignal::Terminate.number(), 15);
 }
 
 #[test]

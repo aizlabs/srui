@@ -67,7 +67,9 @@
 //!   one of [`HANDLE_LIBC_ITEMS`], `libc::syscall(` only with
 //!   `libc::SYS_pidfd_open` or `libc::SYS_pidfd_send_signal` as its first
 //!   argument, and `unsafe` only as a block whose tokens are exactly one of
-//!   [`HANDLE_UNSAFE_BLOCKS`]. `kill`, `extern`, every other `libc` item and
+//!   [`HANDLE_UNSAFE_BLOCKS`]; the signal number is pinned too
+//!   ([`HANDLE_SIGNAL_PINS`]: `Terminate` is `libc::SIGTERM`, the only
+//!   `libc::SIG..` named). `kill`, `extern`, every other `libc` item and
 //!   every other rule hold there as everywhere. No other production file may
 //!   name the module or its public items ([`HANDLE_ITEMS`]): nothing reaches
 //!   the signal it can send until PX-030 wires termination, under review, and
@@ -660,6 +662,16 @@ const HANDLE_UNSAFE_BLOCKS: &[&str] = &[
     "libc : : syscall ( libc : : SYS_pidfd_send_signal , fd , number , std : : ptr : : null : : < u8 > (  ) , 0 as libc : : c_uint , )",
 ];
 
+/// The handle module's one signal mapping and its one use, token for token
+/// ([`canonical`]): `Terminate` is `libc::SIGTERM`, and the number the pinned
+/// `pidfd_send_signal` block sends is exactly that. With
+/// [`handle_signal_violations`], no other number (`=> 9`), no other signal
+/// (`libc::SIGKILL`) and no shadowing `let number` can reach the call.
+const HANDLE_SIGNAL_PINS: &[&str] = &[
+    "fn number ( self ) - > i32 { match self { Self : : Terminate = > libc : : SIGTERM , } }",
+    "let number = signal . number (  ) ;",
+];
+
 /// The handle module's public items. No other production file may name
 /// them, or the module itself as a path: no action path reaches a handle
 /// until PX-030 wires termination through it, under review.
@@ -781,6 +793,39 @@ fn handle_unsafe_violations(source: &str) -> Vec<String> {
     }
     for missing in pinned {
         found.push(format!("a pinned `unsafe` block is gone: {missing}"));
+    }
+    found
+}
+
+/// Every way the handle module's signal mapping departs from
+/// [`HANDLE_SIGNAL_PINS`]: each pin must occur exactly once, `let number`
+/// exactly once (no shadowing), and `libc::SIG..` exactly once (the pinned
+/// `SIGTERM`), over all of the module's tokens.
+fn handle_signal_violations(source: &str) -> Vec<String> {
+    let stream = match TokenStream::from_str(source) {
+        Ok(stream) => stream,
+        Err(error) => return vec![format!("does not tokenize: {error}")],
+    };
+    let text = format!(" {} ", canonical(stream));
+    let count = |needle: &str| text.matches(&format!(" {needle} ")).count();
+    let mut found = Vec::new();
+    for pin in HANDLE_SIGNAL_PINS {
+        let seen = count(pin);
+        if seen != 1 {
+            found.push(format!(
+                "the pinned signal mapping occurs {seen} times: {pin}"
+            ));
+        }
+    }
+    let lets = count("let number");
+    if lets != 1 {
+        found.push(format!("`let number` occurs {lets} times"));
+    }
+    let signals = text.matches(" libc : : SIG").count();
+    if signals != 1 {
+        found.push(format!(
+            "{signals} `libc::SIG..` names, not the one pinned `SIGTERM`"
+        ));
     }
     found
 }
@@ -2434,6 +2479,11 @@ fn no_production_source_can_signal_or_reconfigure_a_process() {
                     .into_iter()
                     .map(|violation| format!("{name}: [unsafe] {violation}")),
             );
+            found.extend(
+                handle_signal_violations(&text)
+                    .into_iter()
+                    .map(|violation| format!("{name}: [signal] {violation}")),
+            );
         }
         receivers += signal_receivers(&text);
         production_attributes(&text, &mut attributes);
@@ -2681,6 +2731,58 @@ fn the_pidfd_allowance_is_exactly_the_handle_modules_two_system_calls() {
             .iter()
             .any(|v| v.contains("is gone")),
         "a pinned block that is gone is reported, so the pins stay exact"
+    );
+
+    // The signal sent is pinned: `Terminate` is `SIGTERM`, and nothing else
+    // reaches the call.
+    assert_eq!(handle_signal_violations(&module), Vec::<String>::new());
+    for (name, from, to) in [
+        (
+            "a number",
+            "Self::Terminate => libc::SIGTERM,",
+            "Self::Terminate => 9,",
+        ),
+        (
+            "SIGKILL",
+            "Self::Terminate => libc::SIGTERM,",
+            "Self::Terminate => libc::SIGKILL,",
+        ),
+        (
+            "a number at the call",
+            "let number = signal.number();",
+            "let number = 9;",
+        ),
+        (
+            "an offset at the call",
+            "let number = signal.number();",
+            "let number = signal.number() + 0;",
+        ),
+        (
+            "a shadowing number",
+            "let number = signal.number();",
+            "let number = signal.number();\nlet number = 9;",
+        ),
+        (
+            "a second mapping",
+            "Self::Terminate => libc::SIGTERM,",
+            "Self::Terminate => libc::SIGTERM,\n}\n}\nfn kill_number() -> i32 { libc::SIGKILL",
+        ),
+    ] {
+        assert_eq!(
+            module.matches(from).count(),
+            1,
+            "{name}: the anchor is in the module"
+        );
+        assert!(
+            !handle_signal_violations(&module.replacen(from, to, 1)).is_empty(),
+            "{name} is refused"
+        );
+    }
+    assert!(
+        in_handle("pub fn number(self) -> i32 { match self { Self::Terminate => libc::SIGKILL } }")
+            .iter()
+            .any(|v| v.contains("`libc`")),
+        "SIGKILL is not a libc item the handle module may name"
     );
 
     // No other production file reaches the module.

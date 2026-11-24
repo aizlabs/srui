@@ -59,7 +59,11 @@
 //! **Not wired.** No production action path reaches this module yet: the only
 //! executor is still [`crate::actions::DryRunExecutor`], and PX-008's audit
 //! refuses any production reference to this module outside it. PX-030 wires
-//! graceful termination through it.
+//! graceful termination through it, and must use **exactly one** table:
+//! a [`HandleId`] is minted per table and [`ProcessHandles::settle`] takes no
+//! key, so an ID from one table could settle another table's handle, and
+//! PX-030 must also check [`ProcessHandles::key_of`] against the intent's
+//! target key before settling.
 //!
 //! **Minimum supported path.** Linux 5.3 or later on the architectures the
 //! `libc` crate (0.2.189, the version already locked by the runtime's
@@ -105,6 +109,17 @@ const EMFILE: i32 = 24;
 pub enum HandleSignal {
     /// `SIGTERM`: a request to terminate, which the process may handle.
     Terminate,
+}
+
+impl HandleSignal {
+    /// The signal number sent for this signal: `SIGTERM` (15) for
+    /// [`HandleSignal::Terminate`]. The one mapping; PX-008's audit pins it
+    /// token for token, and it is the only `libc::SIG*` this module names.
+    pub fn number(self) -> i32 {
+        match self {
+            Self::Terminate => libc::SIGTERM,
+        }
+    }
 }
 
 /// Why no PID file descriptor path exists here.
@@ -307,9 +322,7 @@ mod linux {
 
     impl Pidfd for LinuxPidfd {
         fn send(&self, signal: HandleSignal) -> io::Result<()> {
-            let number = match signal {
-                HandleSignal::Terminate => libc::SIGTERM,
-            };
+            let number = signal.number();
             let fd = self.0.as_raw_fd();
             // SAFETY: the descriptor is open for as long as `self` is; the
             // `siginfo_t` argument is NULL, which the kernel accepts (K2), so
@@ -478,7 +491,7 @@ impl ProcessHandles {
         let bytes = match self.system.read_stat(pid) {
             Ok(bytes) => bytes,
             Err(error) if ended(&error) => return Err(AcquireError::Ended),
-            Err(error) => return Err(AcquireError::Unverified(format!("stat: {error}"))),
+            Err(error) => return Err(read_error("stat", error)),
         };
         let Some(stat) = parse_stat(pid, &bytes) else {
             return Err(AcquireError::Unverified("stat does not parse".into()));
@@ -538,11 +551,11 @@ impl ProcessHandles {
                 let current = self
                     .system
                     .boot_id()
-                    .map_err(|error| AcquireError::Unverified(format!("boot_id: {error}")))?;
+                    .map_err(|error| read_error("boot_id", error))?;
                 let own = self
                     .system
                     .pid_namespace()
-                    .map_err(|error| AcquireError::Unverified(format!("self/ns/pid: {error}")))?;
+                    .map_err(|error| read_error("self/ns/pid", error))?;
                 self.host.insert((current, own)).clone()
             }
         };
@@ -587,6 +600,18 @@ impl ProcessHandles {
             }
             Err(error) => SignalOutcome::Failed(error.to_string()),
         }
+    }
+}
+
+/// What a failed identity read means: descriptor exhaustion (`EMFILE`,
+/// `ENFILE` — the read itself needed a descriptor, perhaps the last one the
+/// open just took) is reported as exhaustion, never retried; anything else
+/// means the identity could not be confirmed.
+fn read_error(what: &str, error: io::Error) -> AcquireError {
+    match error.raw_os_error() {
+        Some(EMFILE) => AcquireError::DescriptorsExhausted { system_wide: false },
+        Some(ENFILE) => AcquireError::DescriptorsExhausted { system_wide: true },
+        _ => AcquireError::Unverified(format!("{what}: {error}")),
     }
 }
 

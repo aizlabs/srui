@@ -1660,6 +1660,50 @@ mod tests {
     /// The action controls, at their widest, fit the reserve the row ceiling
     /// charges for them in every catch-up snapshot.
     #[test]
+    fn a_failed_publication_of_the_controls_is_retried_by_the_next_call() {
+        // PX-028 round 2 verification (V6). No transient store failure can
+        // be made in one session: a deleted node's ID is never reused
+        // (§6.2) and store limits are fixed per session. So the failing
+        // commit goes to a session without the controls, through the real
+        // `publish_if_changed` and its error branch, and the next call, with
+        // the gate's state unchanged, goes to the session that has them.
+        let session = Session::mint();
+        crate::initialize(&session).unwrap();
+        let recording = Arc::new(Recording::default());
+        let clock = Arc::new(ManualClock::default());
+        let mut gate = gate(&recording, &clock);
+        gate.create_controls(&session, crate::COLUMN).unwrap();
+        let enabled = |session: &Session, node: NodeId| {
+            session.with_store(|store| {
+                store
+                    .get_node(node)
+                    .and_then(|node| node.get_property(ENABLED))
+                    .cloned()
+            }) != Some(srui_sdk::Value::Bool(false))
+        };
+        assert!(enabled(&session, ACTION_PREPARE));
+        let (mut fake, _) = mine(4101);
+        fake.resuming = true;
+        gate.hold_for(&fake);
+        let elsewhere = Session::mint();
+        assert!(
+            gate.publish_if_changed(&elsewhere).is_err(),
+            "the controls do not exist there"
+        );
+        assert!(enabled(&session, ACTION_PREPARE), "nothing reached it yet");
+        let before = session.current_revision();
+        gate.hold_for(&fake);
+        gate.publish_if_changed(&session).unwrap();
+        assert!(session.current_revision() > before, "retried");
+        assert!(!enabled(&session, ACTION_PREPARE));
+        assert!(!enabled(&session, ACTION_CONFIRM));
+        // Published now: an unchanged gate commits nothing more.
+        let after = session.current_revision();
+        gate.publish_if_changed(&session).unwrap();
+        assert_eq!(session.current_revision(), after);
+    }
+
+    #[test]
     fn the_widest_action_controls_fit_their_snapshot_reserve() {
         use srui_sdk::Operation;
         let session = Session::mint();

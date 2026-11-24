@@ -323,6 +323,23 @@ impl Harness {
         self.sync();
     }
 
+    /// The view's sampling epoch now: a sample taken now is published only
+    /// while this is still the epoch.
+    fn epoch(&self) -> u64 {
+        lock_view(&self.view).sampling().epoch()
+    }
+
+    /// One sample from `source` handed to the view as the refresh loop hands
+    /// it, as taken under `epoch` (`ProcessView::apply_sampled`).
+    fn sample_under(&mut self, source: &mut Steps, epoch: u64) {
+        let status = source.status_text().to_string();
+        let snapshot = source.snapshot();
+        lock_view(&self.view)
+            .apply_sampled(&self.session, epoch, &status, &snapshot)
+            .unwrap();
+        self.sync();
+    }
+
     fn sample(&mut self, source: &mut Steps) {
         lock_view(&self.view)
             .refresh(&self.session, source)
@@ -729,6 +746,110 @@ fn a_resumed_view_refuses_actions_until_its_first_sample_is_published() {
     h.processed(ACTION_CONFIRM);
     assert_eq!(h.refused(), Refusal::Historical);
     assert!(h.executor.reached().is_empty());
+}
+
+/// PX-028 round 2 verification (V3b): a scan the refresh loop began before
+/// the pause returns after Resume view. It is discarded, so it neither ends
+/// the resume nor makes the frozen rows actionable: only a sample taken
+/// under the current epoch does.
+#[test]
+fn a_sample_discarded_for_its_epoch_does_not_end_the_resume_hold() {
+    let mut exited = host(20);
+    exited.remove(1);
+    let mut source = Steps::new(vec![host(10), exited]);
+    let mut h = harness(ActionMode::DryRun, &mut source);
+    h.select(4101);
+    h.processed(ACTION_PREPARE);
+    let before_pause = h.epoch();
+    h.processed(SAMPLING_PAUSE);
+    h.processed(SAMPLING_PAUSE);
+    assert_ne!(h.epoch(), before_pause);
+    // The scan taken under the pre-pause epoch returns: discarded.
+    h.sample_under(&mut source, before_pause);
+    assert!(lock_view(&h.view).sampling().resuming(), "still resuming");
+    assert!(!h.enabled(ACTION_PREPARE) && !h.enabled(ACTION_CONFIRM));
+    assert!(
+        h.status()
+            .contains("on hold: the view is resuming: waiting for a fresh sample"),
+        "{}",
+        h.status()
+    );
+    // The frozen row still says 4101 is current; a click that gets through
+    // is refused all the same.
+    h.enable_all();
+    h.processed(ACTION_CONFIRM);
+    assert_eq!(h.refused(), Refusal::Resuming);
+    h.enable_all();
+    h.processed(ACTION_PREPARE);
+    assert_eq!(h.refused(), Refusal::Resuming);
+    assert!(!h.enabled(ACTION_PREPARE) && !h.enabled(ACTION_CONFIRM));
+    assert!(h.executor.reached().is_empty());
+
+    // The sample taken under the current epoch ends the resume: the
+    // controls are republished, and the checks run on its rows.
+    let current = h.epoch();
+    h.sample_under(&mut source, current);
+    assert!(!lock_view(&h.view).sampling().resuming());
+    assert!(h.enabled(ACTION_PREPARE), "republished enabled");
+    h.processed(ACTION_PREPARE);
+    assert_eq!(h.refused(), Refusal::Historical, "4101 exited");
+    h.select(4103);
+    h.processed(ACTION_PREPARE);
+    h.processed(ACTION_CONFIRM);
+    assert!(matches!(h.outcome(), Some(ActionOutcome::Requested { .. })));
+    let reached = h.executor.reached();
+    assert_eq!(reached.len(), 1);
+    assert_eq!(reached[0].1, vec![key(4103, "spare")]);
+}
+
+/// PX-028 round 2 verification (V5): the first scan after Resume view may
+/// confirm nothing — a snapshot the app rejects, or a process list that
+/// could not be read. It still ends the resume, because it is the latest
+/// scan: the hold lifts, and what it says about every row is that it did not
+/// confirm it, so a target is refused as unconfirmed. The next good scan
+/// confirms the rows again.
+#[test]
+fn a_first_scan_that_confirms_nothing_ends_the_resume_and_leaves_every_row_unconfirmed() {
+    // Two records with one process-instance identity: rejected whole.
+    let duplicate = vec![
+        record(4101, "worker", ME, 10),
+        record(4101, "worker", ME, 11),
+    ];
+    let cases: Vec<(&str, Vec<ProcessRecord>, bool)> = vec![
+        ("rejected snapshot", duplicate, false),
+        ("unlistable process list", Vec::new(), true),
+    ];
+    for (name, step, unenumerable) in cases {
+        let mut source = Steps::new(vec![host(10), step, host(30)]);
+        if unenumerable {
+            source.unenumerable.insert(1);
+        }
+        let mut h = harness(ActionMode::DryRun, &mut source);
+        h.select(4101);
+        h.processed(SAMPLING_PAUSE);
+        h.processed(SAMPLING_PAUSE);
+        assert!(!h.enabled(ACTION_PREPARE), "{name}: on hold while resuming");
+        h.sample(&mut source);
+        assert!(
+            !lock_view(&h.view).sampling().resuming(),
+            "{name}: the scan ends the resume"
+        );
+        assert!(h.enabled(ACTION_PREPARE), "{name}: the hold lifts");
+        assert!(!h.status().contains("on hold"), "{name}: {}", h.status());
+        h.processed(ACTION_PREPARE);
+        assert_eq!(h.refused(), Refusal::Unconfirmed, "{name}");
+        assert!(lock_actions(&h.gate).pending().is_none(), "{name}");
+        h.sample(&mut source);
+        h.processed(ACTION_PREPARE);
+        assert!(lock_actions(&h.gate).pending().is_some(), "{name}");
+        h.processed(ACTION_CONFIRM);
+        assert!(
+            matches!(h.outcome(), Some(ActionOutcome::Requested { .. })),
+            "{name}: {:?}",
+            h.outcome()
+        );
+        assert_eq!(h.executor.reached()[0].1, vec![key(4101, "worker")]);
+    }
 }
 
 #[test]

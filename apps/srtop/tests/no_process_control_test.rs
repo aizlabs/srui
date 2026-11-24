@@ -41,7 +41,9 @@
 //!   `SELECTION_CHANGED` or `TREE` with `EXPANSION_CHANGED` (PX-018), or
 //!   exactly `USER_THREADS_TOGGLE` or `KERNEL_THREADS_TOGGLE` with
 //!   `VALUE_CHANGED` (PX-019), or a tag button (`TAG_TOGGLE`,
-//!   `TAG_DESCENDANTS`, `TAGS_CLEAR`) with `ACTIVATE` (PX-020);
+//!   `TAG_DESCENDANTS`, `TAGS_CLEAR`) with `ACTIVATE` (PX-020), or an
+//!   action button (`ACTION_PREPARE`, `ACTION_CONFIRM`, `ACTION_CANCEL`)
+//!   with `ACTIVATE` (PX-028), whose gate reaches only the dry-run executor;
 //!   `on_result`, `on_text_edit`, `on_expansion_changed`
 //!   and a model range provider unconditionally; `include`, called or
 //!   renamed; or a macro definition (`macro_rules!`), whose expansion can
@@ -799,6 +801,14 @@ const TAG_BUTTON_CONSTANTS: &[&str] = &["TAG_TOGGLE", "TAG_DESCENDANTS", "TAGS_C
 const SAMPLING_BUTTON_CONSTANTS: &[&str] =
     &["SAMPLING_PAUSE", "SAMPLING_REFRESH", "INTERVAL_APPLY"];
 
+/// The action buttons (PX-028), whose `ACTIVATE` handlers prepare an
+/// intent for the process the server resolved as selected, confirm it
+/// through the action gate, or cancel it. The only executor srtop
+/// constructs is the dry-run executor, which sends nothing; this audit's
+/// identifier, method and import rules hold for it as for every other module,
+/// so it cannot signal, open for control or reconfigure a process.
+const ACTION_BUTTON_CONSTANTS: &[&str] = &["ACTION_PREPARE", "ACTION_CONFIRM", "ACTION_CANCEL"];
+
 /// The text inputs whose `TEXT_EDIT` handlers are allowed: the filter input
 /// (PX-010), the search and PID fields (PX-011), and the user and PID-set
 /// fields (PX-012), and the sampling interval field (PX-015).
@@ -848,6 +858,7 @@ fn is_sort_button_activation(tokens: &[Tok]) -> bool {
             || OWNER_BUTTON_CONSTANTS.contains(&name)
             || SAMPLING_BUTTON_CONSTANTS.contains(&name)
             || TAG_BUTTON_CONSTANTS.contains(&name)
+            || ACTION_BUTTON_CONSTANTS.contains(&name)
     ) && event.as_deref() == Some("ACTIVATE")
 }
 
@@ -1728,6 +1739,33 @@ fn the_source_audit_reports_every_known_bypass() {
             "session.on(crate::SAMPLING_PAUSE, ACTIVATE, |_, _| {});",
             "handler",
         ),
+        // PX-028: the action buttons' ACTIVATE is allowed only in its exact
+        // shape; their status, another event type or a computed target is not.
+        (
+            "an action button under a value change",
+            "session.on(ACTION_CONFIRM, VALUE_CHANGED, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the actions status as a button",
+            "session.on(ACTIONS_STATUS, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "the actions row as a button",
+            "session.on(ACTIONS_ROW, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "a computed action target",
+            "session.on(action_buttons[i], ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+        (
+            "an action button by path",
+            "session.on(crate::ACTION_PREPARE, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
         // PX-013: the table's SELECTION_CHANGED is allowed only in its exact
         // shape: the bare `TABLE` and the bare `SELECTION_CHANGED`.
         (
@@ -2264,6 +2302,62 @@ fn the_binary_imports_no_process_creation_targeted_signal_or_reconfiguration_fun
         std::env::consts::OS,
         imports.len()
     );
+}
+
+/// Every `impl <trait> for <type>` in the production tokens of `source`
+/// whose trait path ends in `ProcessActions`: the implementing type's first
+/// identifier, or `?` when it is not a plain one.
+fn process_actions_implementations(source: &str) -> Vec<String> {
+    fn walk(level: &[Tok], found: &mut Vec<String>) {
+        for (i, tok) in level.iter().enumerate() {
+            match tok {
+                Tok::Ident(name, _, _) if name == "ProcessActions" => {
+                    let implemented = level[..i]
+                        .iter()
+                        .rev()
+                        .take_while(|tok| !matches!(tok, Tok::Group(..) | Tok::Punct(';', _)))
+                        .any(|tok| matches!(tok, Tok::Ident(name, _, _) if name == "impl"));
+                    if implemented && ident(level.get(i + 1)) == Some("for") {
+                        found.push(ident(level.get(i + 2)).unwrap_or("?").to_string());
+                    }
+                }
+                Tok::Group(_, inner, _) => walk(inner, found),
+                _ => {}
+            }
+        }
+    }
+    let stream = TokenStream::from_str(source).expect("a source file tokenizes");
+    let mut found = Vec::new();
+    walk(&production(&lower(stream)), &mut found);
+    found
+}
+
+/// PX-028: the action gate reaches a process only through a
+/// `ProcessActions` executor, and production code has exactly one, the
+/// dry-run executor. A second implementation — one that could send a
+/// signal — is PX-029/PX-030's to add, under review, and fails here until
+/// this rule names it.
+#[test]
+fn the_only_production_action_executor_is_the_dry_run_executor() {
+    assert_eq!(
+        process_actions_implementations(
+            "impl ProcessActions for DryRunExecutor {}\n\
+             impl crate::actions::ProcessActions for Other {}\n\
+             #[cfg(test)] impl ProcessActions for Recording {}\n\
+             fn f(x: &dyn ProcessActions) {}"
+        ),
+        vec!["DryRunExecutor".to_string(), "Other".to_string()],
+        "the rule sees plain and path-qualified implementations and skips test code"
+    );
+    let root = crate_root();
+    let (mut files, mut links) = (Vec::new(), Vec::new());
+    rust_files(&root.join("src"), &mut files, &mut links);
+    let mut implementations = Vec::new();
+    for path in &files {
+        let text = std::fs::read_to_string(path).expect("a readable source file");
+        implementations.extend(process_actions_implementations(&text));
+    }
+    assert_eq!(implementations, vec!["DryRunExecutor".to_string()]);
 }
 
 #[test]

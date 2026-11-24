@@ -2194,6 +2194,93 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
+    /// PX-028 over real SSH and the generic client: `srtop --actions dry-run` adds standard
+    /// Prepare, Confirm and Cancel buttons and a status line under the inspector. Confirm and Cancel
+    /// are disabled natively until Prepare has prepared a request for the selected process on the
+    /// server; selecting another row afterwards does not retarget it; Confirm reports the dry run as
+    /// requested, never as complete, and disables itself; another account's process is refused at
+    /// Prepare. `--actions read-only` shows the same controls, all disabled.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func dryRunActionControlsPrepareAndConfirmOnTheServerAndReadOnlyDisablesThem() async throws {
+        for mode in ["dry-run", "read-only"] {
+            let harness = try await Self.launch(arguments: ["--fake-source", "--actions", mode, "--refresh-interval-ms", "300000"])
+            defer { Self.shutDown(harness) }
+            _ = NSApplication.shared
+            let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+            try await controller.start()
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer over SSH with its action controls (\(mode))") {
+                applier.lastAppliedRevision.value >= 1
+                    && controller.isEventDispatchEnabled
+                    && renderer.registry.handle(for: NodeId(5)) != nil
+                    && renderer.registry.handle(for: NodeId(Self.actionsStatusID)) != nil
+            }
+            let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+            defer { window.orderOut(nil); window.close() }
+            func view<T>(_ id: UInt64, as _: T.Type = T.self) throws -> T {
+                try #require(renderer.registry.handle(for: NodeId(id))?.view as? T, "node \(id)")
+            }
+            let table = try #require((renderer.registry.handle(for: NodeId(5))?.view as? NSScrollView)?.documentView as? NSTableView)
+            let prepare: NSButton = try view(Self.actionPrepareID)
+            let confirm: NSButton = try view(Self.actionConfirmID)
+            let cancel: NSButton = try view(Self.actionCancelID)
+            let status: NSTextField = try view(Self.actionsStatusID)
+            let inspectorStatus: NSTextField = try view(Self.inspectorLineIDs[0])
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the fixture rows (\(mode))") {
+                Self.nativeRows(table) == Self.fakeRows
+            }
+            #expect([prepare.title, confirm.title, cancel.title] == ["Prepare dry run: terminate selected", "Confirm", "Cancel"])
+            #expect(!confirm.isEnabled && !cancel.isEnabled, "nothing is prepared")
+            if mode == "read-only" {
+                #expect(!prepare.isEnabled)
+                #expect(status.stringValue == "Read-only: this server refuses every process action; nothing can be prepared or sent")
+                print("PX-028 native SSH evidence (read-only): window \(window.windowNumber); status=\(status.stringValue); enabled=\([prepare.isEnabled, confirm.isEnabled, cancel.isEnabled])")
+                await controller.stop()
+                continue
+            }
+            #expect(prepare.isEnabled)
+            #expect(status.stringValue.hasPrefix("Dry run: Prepare checks the selected process"))
+
+            // Select PID 4101, the fixture account's own process, natively; prepare.
+            table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on 4101") {
+                inspectorStatus.stringValue == "Selected process: PID 4101 · worker"
+            }
+            NativeActivation.click(prepare)
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "prepared for 4101") {
+                status.stringValue.hasPrefix("Prepared #1: terminate PID 4101 · worker (dry run)")
+                    && confirm.isEnabled && cancel.isEnabled
+                    && confirm.title == "Confirm dry run: terminate PID 4101 · worker"
+            }
+            // Another row is selected: the prepared request still names 4101.
+            table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on 4102") {
+                inspectorStatus.stringValue == "Selected process: PID 4102 · worker"
+            }
+            #expect(confirm.title == "Confirm dry run: terminate PID 4101 · worker")
+            NativeActivation.click(confirm)
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the dry run requested for 4101") {
+                status.stringValue.hasPrefix("Dry run #1 requested (terminate PID 4101 · worker): nothing was sent")
+                    && !confirm.isEnabled && !cancel.isEnabled && confirm.title == "Confirm"
+            }
+            #expect(!status.stringValue.contains("complete"), "a request is never reported complete")
+            // 4102 belongs to another account: refused at Prepare, nothing to confirm.
+            NativeActivation.click(prepare)
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "4102 refused") {
+                status.stringValue.hasPrefix("Refused: the process is owned by UID 1001, not this account (UID 1000)")
+            }
+            #expect(!confirm.isEnabled)
+            print("PX-028 native SSH evidence (dry-run): window \(window.windowNumber); status=\(status.stringValue); revision=\(applier.lastAppliedRevision.value)")
+            await controller.stop()
+        }
+    }
+
+    // PX-028: the action controls, present only with `--actions`.
+    fileprivate static let actionPrepareID: UInt64 = 84
+    fileprivate static let actionConfirmID: UInt64 = 85
+    fileprivate static let actionCancelID: UInt64 = 86
+    fileprivate static let actionsStatusID: UInt64 = 87
+
     // PX-020: the tag controls.
     fileprivate static let tagToggleID: UInt64 = 79
     fileprivate static let tagDescendantsID: UInt64 = 80

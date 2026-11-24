@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-028",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Action authorization and a dry-run action contract (D1 §§7.7, 18.2, 27; D2 T24, T32): a server-only ProcessActions interface reached only through an Authorized intent, an immutable ActionIntent, server-enforced read-only mode, six typed outcomes, intent-specific freshness, target eligibility checked at Prepare and again at Confirm, and only a dry-run executor; opt-in action controls (--actions read-only|dry-run) built from standard Buttons and a status Text. No signal, handle, termination, protocol, registry, SDK, runtime, renderer or client source change. Contributes to HTOP-R1-001 (owner PX-028/PX-031), which stays planned until PX-029..PX-031 deliver a real, observed action",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX028-001",
+      "feature": "A server-only ProcessActions interface and an immutable ActionIntent: intent ID minted by the server, the exact ProcessKeys, the operation (graceful termination request), its server-fixed parameters (scope: the selected process), the account the daemon acts as and the preparing client instance, creation time and expiry on a suspend-aware monotonic clock; fields private, no setter; an executor receives only an Authorized, which only ActionGate::confirm constructs after re-checking every target; the only production executor is DryRunExecutor, which sends nothing (a new PX-008 audit rule fails on any other production ProcessActions implementation)",
+      "scope": "PX-028/apps/srtop/src/actions.rs ActionIntent, ActionTarget, ActionContext, ActionParameters, Authorized, ProcessActions, DryRunExecutor, ActionGate; tests/no_process_control_test.rs the_only_production_action_executor_is_the_dry_run_executor; src/actions.rs tests an_intent_records_exactly_what_was_prepared",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-028",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-028.md"]
+    },
+    {
+      "feature_id": "SRUI-PX028-002",
+      "feature": "Read-only mode enforced on the server, not only by disabled buttons: in read-only every action control is published disabled and event validation rejects a click; a click that reaches a handler anyway (the button enabled in the store) is refused by the gate at Prepare and at Confirm, and the server republishes the controls disabled, diffed against what the store holds",
+      "scope": "PX-028/apps/srtop/src/actions.rs ActionGate::writable, publish; tests/actions_test.rs disabled_controls_are_refused_by_event_validation, read_only_mode_is_enforced_by_the_server_even_with_the_buttons_enabled; tests/actions_wire_test.rs a_read_only_instance_disables_and_rejects_every_action_control; ProcessExplorerShellTests dryRunActionControlsPrepareAndConfirmOnTheServerAndReadOnlyDisablesThem",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-028",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-028.md"]
+    },
+    {
+      "feature_id": "SRUI-PX028-003",
+      "feature": "Six typed outcomes kept apart: refused (with a typed Refusal), unsupported, requested (dry_run marked), observed complete, failed and outcome unknown; an executor reports only an Execution (requested, unsupported, failed, outcome unknown) and cannot report an observed completion, which only a later observation can establish (PX-031); a dry run is published as requested with nothing sent and the outcome not observed, never as complete",
+      "scope": "PX-028/apps/srtop/src/actions.rs ActionOutcome, Execution, Refusal; src/actions.rs tests the_six_outcomes_stay_distinct_and_read_only_refuses_everything; tests/actions_test.rs a_confirmed_dry_run_reaches_the_executor_with_exactly_the_prepared_instance",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-028",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-028.md"]
+    },
+    {
+      "feature_id": "SRUI-PX028-004",
+      "feature": "Intent-specific freshness: a Confirm is accepted when its observed_revision is at or after the revision that published this intent's confirmation, by the preparing client instance, before expiry, with the account unchanged and the view neither paused nor resumed and still awaiting its first sample; telemetry commits between Prepare and Confirm leave it valid; a click observed before the confirmation was published, another client's click, an expired intent, a paused view and a resumed view before its first sample is published (Refusal::Resuming; Codex review round 1) are refused at Prepare and at Confirm, and in both states Prepare and Confirm are published disabled and republished enabled once that sample is applied; a confirm is single-use, and redelivery of the same event is answered from the runtime's dedupe cache without reaching the executor",
+      "scope": "PX-028/apps/srtop/src/actions.rs ActionGate::authorize, publish (confirmable_from), hold_of, hold_for, publish_if_changed; src/refresh.rs ProcessView::sync_actions (pause_view, resume_view, apply); src/sampling.rs Sampling::resuming; tests/actions_test.rs stale_intents_are_refused_through_dispatch, a_resumed_view_refuses_actions_until_its_first_sample_is_published, a_confirmed_dry_run_reaches_the_executor_with_exactly_the_prepared_instance; tests/actions_wire_test.rs a_dry_run_instance_settles_prepare_and_confirm_and_refuses_what_it_must",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-028",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-028.md"]
+    },
+    {
+      "feature_id": "SRUI-PX028-005",
+      "feature": "Target eligibility, at Prepare and again at Confirm, from the server's own view: the latest scan's own instance by whole ProcessKey (unknown, historical last-observed, unconfirmed kept rows and a newer instance under the same PID are refused), a process not a thread, a known PID, owned by the account the source states (another or an unread owner refused), not a protected PID (1); no event argument is read, so a forged ItemId, PID text or list neither widens nor changes the target set, and a new selection after Prepare does not retarget the intent; a recording executor observes that no ineligible target reaches it",
+      "scope": "PX-028/apps/srtop/src/actions.rs ActionGate::admit, prepare_requested, confirm_requested; src/refresh.rs impl ActionTargets for ProcessView; tests/actions_test.rs ineligible_targets_never_reach_the_executor; src/actions.rs tests every_ineligible_target_is_refused_and_never_reaches_the_executor",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-028",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-028.md"]
+    },
+    {
+      "feature_id": "SRUI-PX028-006",
+      "feature": "Opt-in action controls: srtop --actions read-only|dry-run adds a Row under the inspector with Prepare dry run: terminate selected, Confirm and Cancel Buttons and a status Text, standard SDK widgets only; without --actions no action node or handler exists and the shell is unchanged; an unknown mode, a repeated option and --actions without a source are refused before a socket is published; the row ceiling charges ACTIONS_RESERVE_BYTES (4 KiB) whether or not the controls exist, measured against the widest controls on the encoder; the PX-008 audit allows exactly the three ACTIVATE registrations",
+      "scope": "PX-028/apps/srtop/src/lib.rs install_actions, ACTIONS_ROW..ACTIONS_STATUS (83..87); src/main.rs --actions; src/refresh.rs ACTIONS_RESERVE_BYTES; tests/actions_wire_test.rs without_the_option_no_action_control_exists_and_bad_options_are_refused; src/actions.rs tests the_widest_action_controls_fit_their_snapshot_reserve; tests/no_process_control_test.rs ACTION_BUTTON_CONSTANTS",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-028",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-028.md"]
+    }
+  ]
+}

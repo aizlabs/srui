@@ -210,11 +210,18 @@ impl Sampling {
         self.interval
     }
 
-    /// Where the view is frozen, if it is paused. Process-changing actions
-    /// (none exist yet) must refuse a target while this is `Some`: the rows
-    /// shown are historical data, not the host's current processes.
+    /// Where the view is frozen, if it is paused. Process actions refuse a
+    /// target while this is `Some` (PX-028): the rows shown are historical
+    /// data, not the host's current processes.
     pub fn frozen(&self) -> Option<Frozen> {
         self.frozen
+    }
+
+    /// Whether Resume view was applied and no sample has been published
+    /// since. The rows shown are still the frozen ones, so process actions
+    /// refuse a target while this is true too (PX-028, Codex review round 1).
+    pub fn resuming(&self) -> bool {
+        self.resuming
     }
 
     pub fn epoch(&self) -> u64 {

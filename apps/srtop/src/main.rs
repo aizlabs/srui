@@ -7,10 +7,18 @@
 //! runtime's (`srui_sessiond`); srtop only configures the window. Every start
 //! mints a new incarnation and restores nothing, so a client resuming an
 //! earlier instance is answered `REPLACED` (§§17–18).
+//!
+//! `--actions read-only|dry-run` adds the action controls under the inspector
+//! (PX-028, §§7.7, 27). In `read-only` the server refuses every action and the
+//! controls are disabled; in `dry-run` Prepare and Confirm are authorized in
+//! full and handed to the dry-run executor, which sends nothing. Without the
+//! option no action control or handler exists.
 use srui_process_explorer::{
-    initialize, install_column_handlers, install_filter_handlers, install_follow_handlers,
-    install_inspector, install_owner_handlers, install_sampling_handlers, install_search_handlers,
-    install_sort_handlers, install_tag_handlers, install_thread_handlers, install_view_handlers,
+    actions::{ActionGate, ActionMode, DryRunExecutor},
+    initialize, install_actions, install_column_handlers, install_filter_handlers,
+    install_follow_handlers, install_inspector, install_owner_handlers, install_sampling_handlers,
+    install_search_handlers, install_sort_handlers, install_tag_handlers, install_thread_handlers,
+    install_view_handlers,
     procfs::ProcFsSource,
     refresh::{poll, ProcessView, DEFAULT_REFRESH_INTERVAL},
     sampling::parse_interval,
@@ -60,6 +68,7 @@ fn collect<S>(
     session: &Arc<Session>,
     mut source: S,
     interval: Duration,
+    actions: Option<ActionMode>,
     shutdown: &CancellationToken,
     connections: &mut JoinSet<()>,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -96,6 +105,15 @@ where
     // The inspector reads details through its own reader of the source's
     // records, on its own bounded worker (PX-013).
     install_inspector(session, &view, source.details());
+    // The action controls act on the inspector's resolved selection, through
+    // the dry-run executor only (PX-028).
+    if let Some(mode) = actions {
+        let gate = Arc::new(Mutex::new(ActionGate::new(
+            mode,
+            Arc::new(DryRunExecutor::default()),
+        )));
+        install_actions(session, &view, &gate)?;
+    }
     let session = Arc::clone(session);
     let shutdown = shutdown.child_token();
     connections.spawn(poll(view, source, session, interval, shutdown));
@@ -110,7 +128,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              [--fake-source | --fake-repeated-names | --fake-follow | --fake-tree | --fake-threads \
              | --fake-sequence \
              | --live-source | --procfs | --scale-source COUNT] \
-             [--refresh-interval-ms MS | --scale-interval-ms MS] [--journal-capacity N]"
+             [--refresh-interval-ms MS | --scale-interval-ms MS] [--journal-capacity N] \
+             [--actions read-only|dry-run]"
             .into());
     }
     let socket_path = PathBuf::from(args.next().ok_or("missing --socket PATH")?);
@@ -118,6 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut collection = Collection::None;
     let mut interval = None;
     let mut journal_capacity = None;
+    let mut actions = None;
     let mut args = args.peekable();
     while let Some(value) = args.next() {
         let select = |current: &mut Collection, chosen| {
@@ -170,10 +190,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("--journal-capacity N must be a positive integer")?;
                 journal_capacity = Some(capacity);
             }
+            Some("--actions") if actions.is_none() => {
+                let mode = args
+                    .next()
+                    .ok_or("missing --actions read-only|dry-run")?
+                    .to_str()
+                    .and_then(ActionMode::parse)
+                    .ok_or("--actions must be read-only or dry-run")?;
+                actions = Some(mode);
+            }
             _ => return Err("unknown or repeated option".into()),
         }
     }
     let interval = interval.unwrap_or(DEFAULT_REFRESH_INTERVAL);
+    if actions.is_some() && collection == Collection::None {
+        return Err("--actions needs a process source".into());
+    }
     let uid = effective_uid();
     require_unprivileged_uid(uid, "srtop")?;
     // Install both handlers before publishing the socket so a ready instance
@@ -200,6 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &session,
             FakeProcessSource,
             interval,
+            actions,
             &shutdown,
             &mut connections,
         ),
@@ -207,6 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &session,
             RepeatedNamesSource,
             interval,
+            actions,
             &shutdown,
             &mut connections,
         ),
@@ -214,6 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &session,
             FollowSource::default(),
             interval,
+            actions,
             &shutdown,
             &mut connections,
         ),
@@ -221,6 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &session,
             TreeSource::default(),
             interval,
+            actions,
             &shutdown,
             &mut connections,
         ),
@@ -228,6 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &session,
             ThreadsSource::default(),
             interval,
+            actions,
             &shutdown,
             &mut connections,
         ),
@@ -235,6 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &session,
             ScriptedFakeSource::default(),
             interval,
+            actions,
             &shutdown,
             &mut connections,
         ),
@@ -244,6 +282,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &session,
             ProcFsSource::live(),
             interval,
+            actions,
             &shutdown,
             &mut connections,
         ),
@@ -251,6 +290,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &session,
             SyntheticProcessSource::new(count),
             interval,
+            actions,
             &shutdown,
             &mut connections,
         ),

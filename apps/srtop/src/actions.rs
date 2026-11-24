@@ -275,6 +275,9 @@ pub trait ActionTargets {
     fn account(&self) -> Observed<u32>;
     /// Whether the view is paused, so its rows are not the latest scan.
     fn paused(&self) -> bool;
+    /// Whether the view was resumed and has not yet published a sample, so
+    /// its rows are still the frozen ones, not the latest scan.
+    fn resuming(&self) -> bool;
     /// The process instance the server resolved as selected.
     fn selected(&self) -> Option<ProcessKey>;
     /// What the latest scan says about `key`.
@@ -290,6 +293,9 @@ pub enum Refusal {
     AccountUnknown,
     /// The view is paused, so its rows are not the latest scan.
     Paused,
+    /// The view was resumed and waits for its first sample: its rows, and
+    /// what they confirm, are still those of before the pause.
+    Resuming,
     /// No process row is selected.
     NothingSelected,
     /// A thread row is selected; actions target processes.
@@ -334,6 +340,10 @@ impl Refusal {
             Self::Paused => {
                 "the view is paused, so its rows are not the latest scan; resume it first".into()
             }
+            Self::Resuming => {
+                "the view is resuming: waiting for a fresh sample; its rows are still those of before the pause"
+                    .into()
+            }
             Self::NothingSelected => "select a process row first".into(),
             Self::NotAProcess => "a thread is selected; actions target processes".into(),
             Self::PidUnknown => "the scan could not read the process's PID".into(),
@@ -364,6 +374,21 @@ impl Refusal {
             Self::Expired => "the prepared request expired".into(),
             Self::AccountChanged => "the account changed since the request was prepared".into(),
         }
+    }
+}
+
+/// Why no action can be prepared or confirmed on `targets` now, whatever the
+/// target (PX-028): the view is paused, or resumed and still showing the
+/// frozen rows until its first sample is applied. `None` when its rows are
+/// the latest scan. The one rule the gate checks at Prepare and Confirm and
+/// publishes its controls' enabled state by.
+pub fn hold_of(targets: &dyn ActionTargets) -> Option<Refusal> {
+    if targets.paused() {
+        Some(Refusal::Paused)
+    } else if targets.resuming() {
+        Some(Refusal::Resuming)
+    } else {
+        None
     }
 }
 
@@ -579,6 +604,10 @@ pub struct ActionGate {
     next_intent: u64,
     pending: Option<Pending>,
     report: Report,
+    /// Why the view's rows are not the latest scan, as the view last said
+    /// ([`Self::hold_for`]): Prepare and Confirm are published disabled while
+    /// this is `Some`. The checks themselves always ask the view again.
+    hold: Option<Refusal>,
     published: Option<ActionsView>,
 }
 
@@ -616,8 +645,21 @@ impl ActionGate {
             next_intent: 1,
             pending: None,
             report: Report::Idle,
+            hold: None,
             published: None,
         }
+    }
+
+    /// Records whether `targets`' rows are the latest scan, so the controls
+    /// are published for it. Changes no intent: Prepare and Confirm check
+    /// `targets` again themselves.
+    pub fn hold_for(&mut self, targets: &dyn ActionTargets) {
+        self.hold = hold_of(targets);
+    }
+
+    /// Why the controls are on hold, as last recorded.
+    pub fn hold(&self) -> Option<&Refusal> {
+        self.hold.as_ref()
     }
 
     /// This gate on `clock`, which intents are created and expire by.
@@ -770,8 +812,8 @@ impl ActionGate {
             });
         }
         let account = Self::account(targets).map_err(refused)?;
-        if targets.paused() {
-            return Err(refused(Refusal::Paused));
+        if let Some(hold) = hold_of(targets) {
+            return Err(refused(hold));
         }
         let key = targets
             .selected()
@@ -862,8 +904,8 @@ impl ActionGate {
         if Self::account(targets)? != intent.context.account {
             return Err(Refusal::AccountChanged);
         }
-        if targets.paused() {
-            return Err(Refusal::Paused);
+        if let Some(hold) = hold_of(targets) {
+            return Err(hold);
         }
         for target in &intent.targets {
             self.admit(targets, &target.key, intent.context.account)?;
@@ -892,6 +934,12 @@ impl ActionGate {
         let writable = self.writable().is_ok();
         let pending = self.pending.as_ref().map(|pending| &pending.intent);
         let status = match (&self.report, pending) {
+            (Report::Prepared, Some(intent)) if self.hold.is_some() => format!(
+                "Prepared #{}: {} (dry run), on hold: {}; Confirm is unavailable until it is current, and Cancel discards it",
+                intent.id.get(),
+                intent.subject(),
+                self.hold.as_ref().map(Refusal::describe).unwrap_or_default()
+            ),
             (Report::Prepared, Some(intent)) => format!(
                 "Prepared #{}: {} (dry run). Confirm within {} s or Cancel; only this process can be acted on",
                 intent.id.get(),
@@ -902,12 +950,18 @@ impl ActionGate {
                 format!("Cancelled #{}: nothing was requested", id.get())
             }
             (Report::Outcome { outcome, subject }, _) => outcome.describe(subject.as_deref()),
-            _ if writable => DRY_RUN_STATUS.to_string(),
+            _ if writable => match &self.hold {
+                Some(hold) => format!("Actions on hold: {}", hold.describe()),
+                None => DRY_RUN_STATUS.to_string(),
+            },
             _ => READ_ONLY_STATUS.to_string(),
         };
+        // Paused or resuming, nothing can be prepared or confirmed: the rows
+        // are not the latest scan. Cancel only discards, so it stays.
+        let actionable = writable && self.hold.is_none();
         ActionsView {
-            prepare_enabled: writable,
-            confirm_enabled: writable && pending.is_some(),
+            prepare_enabled: actionable,
+            confirm_enabled: actionable && pending.is_some(),
             cancel_enabled: writable && pending.is_some(),
             confirm_label: match pending {
                 Some(intent) => bounded(
@@ -977,6 +1031,21 @@ impl ActionGate {
     /// client can confirm only a confirmation it can have seen.
     pub fn publish(&mut self, session: &Session) -> Result<(), SessionError> {
         let target = self.view();
+        self.publish_view(session, target)
+    }
+
+    /// [`Self::publish`], only when the controls this gate's state calls for
+    /// differ from the ones it last published, or that publication failed:
+    /// what a sample's commit asks for, so an unchanged gate reads nothing.
+    pub fn publish_if_changed(&mut self, session: &Session) -> Result<(), SessionError> {
+        let target = self.view();
+        if self.published.as_ref() == Some(&target) {
+            return Ok(());
+        }
+        self.publish_view(session, target)
+    }
+
+    fn publish_view(&mut self, session: &Session, target: ActionsView) -> Result<(), SessionError> {
         if self.published.is_none() {
             // The controls were never created: nothing can be shown, so
             // nothing may stay confirmable.
@@ -1078,16 +1147,16 @@ pub fn prepare_requested(
     session: &Session,
     event: &srui_protocol::Event,
 ) {
+    // The view, then the gate: the order every holder of both takes them.
+    let view = lock_view(view);
     let mut gate = lock_actions(gate);
-    {
-        let view = lock_view(view);
-        // A refusal is reported on the status line, not as an error.
-        let _ = gate.prepare(
-            &*view,
-            &event.client_instance_id,
-            ActionOperation::Terminate,
-        );
-    }
+    // A refusal is reported on the status line, not as an error.
+    let _ = gate.prepare(
+        &*view,
+        &event.client_instance_id,
+        ActionOperation::Terminate,
+    );
+    gate.hold_for(&*view);
     if let Err(error) = gate.publish(session) {
         eprintln!("srtop: action controls not published: {error}");
     }
@@ -1101,11 +1170,11 @@ pub fn confirm_requested(
     session: &Session,
     event: &srui_protocol::Event,
 ) {
+    // The view, then the gate: the order every holder of both takes them.
+    let view = lock_view(view);
     let mut gate = lock_actions(gate);
-    {
-        let view = lock_view(view);
-        gate.confirm(&*view, &event.client_instance_id, event.observed_revision);
-    }
+    gate.confirm(&*view, &event.client_instance_id, event.observed_revision);
+    gate.hold_for(&*view);
     if let Err(error) = gate.publish(session) {
         eprintln!("srtop: action controls not published: {error}");
     }
@@ -1183,6 +1252,7 @@ mod tests {
     struct Fake {
         account: Option<u32>,
         paused: bool,
+        resuming: bool,
         selected: Option<ProcessKey>,
         states: HashMap<ProcessKey, TargetState>,
     }
@@ -1211,6 +1281,9 @@ mod tests {
         }
         fn paused(&self) -> bool {
             self.paused
+        }
+        fn resuming(&self) -> bool {
+            self.resuming
         }
         fn selected(&self) -> Option<ProcessKey> {
             self.selected.clone()
@@ -1339,6 +1412,11 @@ mod tests {
                 "paused",
                 Box::new(|fake, _| fake.paused = true),
                 Refusal::Paused,
+            ),
+            (
+                "resuming",
+                Box::new(|fake, _| fake.resuming = true),
+                Refusal::Resuming,
             ),
             (
                 "account unknown",

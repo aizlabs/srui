@@ -662,13 +662,18 @@ pub fn install_follow_handlers(session: &Session, view: &refresh::SharedView) {
 /// selected; Confirm hands it, re-checked in full, to the gate's executor;
 /// Cancel discards it. Each click names only its button: no handler reads an
 /// event argument, and the gate refuses every action in read-only mode
-/// whatever the store says about the buttons. The only executor this build
+/// whatever the store says about the buttons. While the view is paused, or
+/// resumed and not yet sampled, Prepare and Confirm are refused and published
+/// disabled: its rows are not the latest scan. The only executor this build
 /// constructs is [`actions::DryRunExecutor`], which sends nothing.
 pub fn install_actions(
     session: &Session,
     view: &refresh::SharedView,
     gate: &actions::SharedActions,
 ) -> Result<(), SessionError> {
+    // The view tells the gate when its rows stop or start being the latest
+    // scan (paused, resuming, current), so the controls follow it.
+    refresh::ProcessView::attach_actions(view, session, gate);
     actions::lock_actions(gate).create_controls(session, COLUMN)?;
     let (prepare_gate, prepare_view) = (std::sync::Arc::clone(gate), std::sync::Arc::clone(view));
     session.on(ACTION_PREPARE, ACTIVATE, move |session, event| {

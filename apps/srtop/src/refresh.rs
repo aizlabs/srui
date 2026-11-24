@@ -668,6 +668,10 @@ pub struct ProcessView {
     /// For each row in `unconfirmed`, the sample time of the last scan that
     /// listed it (PX-021). Bounded by `unconfirmed`; replaced with it.
     unconfirmed_since: HashMap<ItemId, SystemTime>,
+    /// The action gate whose controls follow this view's sampling state
+    /// (PX-028): set by [`crate::install_actions`]. Lock order is always this
+    /// view, then the gate.
+    actions: Option<crate::actions::SharedActions>,
 }
 
 /// The rows every active filter keeps, and what the filters' controls say
@@ -940,6 +944,7 @@ impl ProcessView {
                 clock: Arc::new(SystemMonotonicClock::default()),
                 confirmed_at: snapshot.sampled_at.0,
                 unconfirmed_since: HashMap::new(),
+                actions: None,
             },
             snapshot,
         ))
@@ -1152,7 +1157,38 @@ impl ProcessView {
     ) -> Result<Refreshed, SessionError> {
         let applied = self.apply_sample(session, source_status, snapshot);
         self.debug_check_tag_accounting();
+        // The first sample after Resume view ends the resume: the action
+        // controls are republished for the rows it confirmed (PX-028).
+        self.sync_actions(session);
         applied
+    }
+
+    /// Has `gate`'s controls follow this view's sampling state (PX-028) and
+    /// publishes them for the state it is in now. The caller holds neither
+    /// lock: this takes the view's, then the gate's.
+    pub fn attach_actions(
+        view: &std::sync::Mutex<ProcessView>,
+        session: &Session,
+        gate: &crate::actions::SharedActions,
+    ) {
+        let mut view = lock_view(view);
+        view.actions = Some(Arc::clone(gate));
+        view.sync_actions(session);
+    }
+
+    /// Tells the action gate whether this view's rows are the latest scan
+    /// (PX-028): paused, resuming before its first sample, or current. The
+    /// gate republishes its controls when that changes what they show, or
+    /// when an earlier publication of them failed.
+    fn sync_actions(&self, session: &Session) {
+        let Some(gate) = &self.actions else {
+            return;
+        };
+        let mut gate = crate::actions::lock_actions(gate);
+        gate.hold_for(self);
+        if let Err(error) = gate.publish_if_changed(session) {
+            eprintln!("srtop: action controls not published: {error}");
+        }
     }
 
     /// [`Self::apply`], before the tag accounting is checked.
@@ -3731,9 +3767,10 @@ impl ProcessView {
     }
 
     /// Where this view is frozen, if it is paused (PX-015). The rows it then
-    /// shows are historical data, not the host's current processes: a future
-    /// process-changing action must refuse every target while this is `Some`
-    /// and be disabled on the client. None exists yet.
+    /// shows are historical data, not the host's current processes: the
+    /// action gate refuses every target while this is `Some`, and until the
+    /// first sample after Resume view is applied, and its controls are
+    /// published disabled (PX-028).
     pub fn frozen(&self) -> Option<Frozen> {
         self.sampling.frozen()
     }
@@ -3804,7 +3841,11 @@ impl ProcessView {
             paused_at: SystemTime::now(),
         });
         self.inspector.pause();
-        self.publish_sampling(session)
+        let published = self.publish_sampling(session);
+        // Frozen rows are not the latest scan: no action may be prepared or
+        // confirmed on them (PX-028).
+        self.sync_actions(session);
+        published
     }
 
     /// Resumes a paused view (PX-015): the sampling status says the view is
@@ -3819,7 +3860,11 @@ impl ProcessView {
         }
         self.sampling.resume();
         self.inspector.resume();
-        self.publish_sampling(session)
+        let published = self.publish_sampling(session);
+        // Until the resume's sample is applied the rows are still the frozen
+        // ones, so actions stay on hold (PX-028, Codex review round 1).
+        self.sync_actions(session);
+        published
     }
 
     /// Commits the sampling controls, the freshness label and the inspector
@@ -4017,9 +4062,10 @@ pub enum TagRequest {
 }
 
 /// What the action gate asks of the view (PX-028): the account the source
-/// states, whether the view is paused, the inspector's resolved selection and
-/// what the latest scan says about one process instance. Answered from the
-/// server's own rows and records; nothing here is anything a client sent.
+/// states, whether the view is paused or resuming, the inspector's resolved
+/// selection and what the latest scan says about one process instance.
+/// Answered from the server's own rows and records; nothing here is anything
+/// a client sent.
 impl crate::actions::ActionTargets for ProcessView {
     fn account(&self) -> crate::source::Observed<u32> {
         self.owner.current().clone()
@@ -4027,6 +4073,10 @@ impl crate::actions::ActionTargets for ProcessView {
 
     fn paused(&self) -> bool {
         self.sampling.frozen().is_some()
+    }
+
+    fn resuming(&self) -> bool {
+        self.sampling.resuming()
     }
 
     fn selected(&self) -> Option<ProcessKey> {

@@ -15,6 +15,9 @@
 //! * telemetry commits between Prepare and Confirm leave a valid intent
 //!   valid; an expired intent, a click made before the confirmation was
 //!   published, another client's click and a paused view are refused;
+//! * a resumed view refuses Prepare and Confirm, and publishes them disabled,
+//!   until its first sample is published; then every check is made on that
+//!   sample's rows (Codex review round 1);
 //! * a dry-run request is reported as requested, never as observed complete,
 //!   and redelivery of the same Confirm is answered from the dedupe cache
 //!   without reaching the executor again.
@@ -306,6 +309,20 @@ impl Harness {
         ));
     }
 
+    /// As if a client, or a bug, had every action button enabled: the store
+    /// says so, so event validation lets a click through to its handler.
+    fn enable_all(&mut self) {
+        self.session
+            .transaction(|ui| {
+                for button in [ACTION_PREPARE, ACTION_CONFIRM, ACTION_CANCEL] {
+                    ui.set(button, ENABLED, true)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        self.sync();
+    }
+
     fn sample(&mut self, source: &mut Steps) {
         lock_view(&self.view)
             .refresh(&self.session, source)
@@ -592,14 +609,29 @@ fn stale_intents_are_refused_through_dispatch() {
     ));
     assert_eq!(h.refused(), Refusal::OtherClient);
 
-    // A paused view: its rows are not the latest scan.
+    // A paused view: its rows are not the latest scan. Prepare and Confirm
+    // are published disabled, and refused by the server when a click gets
+    // through all the same.
     h.processed(ACTION_PREPARE);
     h.processed(SAMPLING_PAUSE);
+    assert!(!h.enabled(ACTION_PREPARE) && !h.enabled(ACTION_CONFIRM));
+    assert!(
+        h.enabled(ACTION_CANCEL),
+        "a pending intent can still be discarded"
+    );
+    assert!(rejected_as_disabled(&h.click(ACTION_CONFIRM)));
+    h.enable_all();
     h.processed(ACTION_CONFIRM);
     assert_eq!(h.refused(), Refusal::Paused);
+    h.enable_all();
     h.processed(ACTION_PREPARE);
     assert_eq!(h.refused(), Refusal::Paused);
+    assert!(!h.enabled(ACTION_PREPARE), "republished disabled");
     h.processed(SAMPLING_PAUSE);
+    // Resumed: on hold until the resume's sample is applied.
+    assert!(!h.enabled(ACTION_PREPARE));
+    h.sample(&mut source);
+    assert!(h.enabled(ACTION_PREPARE));
 
     // And a valid one still goes through, exactly at the publishing revision.
     h.processed(ACTION_PREPARE);
@@ -612,6 +644,91 @@ fn stale_intents_are_refused_through_dispatch() {
         1,
         "only the last intent reached it"
     );
+}
+
+/// Codex review round 1 (PR #119): Resume view makes the view live at once,
+/// but its rows and their confirmations stay the frozen ones until the
+/// resume's sample is applied. In that window nothing may be prepared or
+/// confirmed against them, and once the sample is published every check is
+/// made on its rows.
+#[test]
+fn a_resumed_view_refuses_actions_until_its_first_sample_is_published() {
+    let mut exited = host(20);
+    exited.remove(1);
+    let mut source = Steps::new(vec![host(10), exited.clone()]);
+    let mut h = harness(ActionMode::DryRun, &mut source);
+    h.select(4101);
+    // Prepared before the pause, while 4101 was the latest scan's own.
+    h.processed(ACTION_PREPARE);
+    assert!(h.enabled(ACTION_CONFIRM));
+    h.processed(SAMPLING_PAUSE);
+    // 4101 exits while the view is paused; Resume view is applied, and the
+    // sample it asked for has not been taken yet.
+    h.processed(SAMPLING_PAUSE);
+    assert!(lock_actions(&h.gate).pending().is_some());
+    assert!(!h.enabled(ACTION_PREPARE), "Prepare on hold while resuming");
+    assert!(!h.enabled(ACTION_CONFIRM), "Confirm on hold while resuming");
+    assert!(h.enabled(ACTION_CANCEL));
+    let status = h.status();
+    assert!(
+        status.contains("on hold: the view is resuming: waiting for a fresh sample"),
+        "{status}"
+    );
+    assert!(rejected_as_disabled(&h.click(ACTION_CONFIRM)));
+    assert!(rejected_as_disabled(&h.click(ACTION_PREPARE)));
+    // A click that gets through anyway is refused by the server: the frozen
+    // row still says 4101 is current, but that is not the latest scan.
+    h.enable_all();
+    h.processed(ACTION_CONFIRM);
+    assert_eq!(h.refused(), Refusal::Resuming);
+    assert!(h
+        .status()
+        .starts_with("Refused #1 (terminate PID 4101 · worker): the view is resuming: waiting for a fresh sample"));
+    assert!(lock_actions(&h.gate).pending().is_none(), "consumed");
+    h.enable_all();
+    h.processed(ACTION_PREPARE);
+    assert_eq!(h.refused(), Refusal::Resuming);
+    assert!(lock_actions(&h.gate).pending().is_none());
+    assert!(!h.enabled(ACTION_PREPARE) && !h.enabled(ACTION_CONFIRM));
+    assert!(
+        h.executor.reached().is_empty(),
+        "nothing reached the executor"
+    );
+
+    // The resume's sample is published: the controls follow it, and every
+    // check is made on its rows. 4101 exited during the pause.
+    h.sample(&mut source);
+    assert!(h.enabled(ACTION_PREPARE), "republished enabled");
+    assert!(!h.enabled(ACTION_CONFIRM), "nothing is prepared");
+    h.processed(ACTION_PREPARE);
+    assert_eq!(h.refused(), Refusal::Historical);
+    // A process the fresh sample confirmed can be prepared and confirmed.
+    h.select(4103);
+    h.processed(ACTION_PREPARE);
+    h.processed(ACTION_CONFIRM);
+    assert!(matches!(h.outcome(), Some(ActionOutcome::Requested { .. })));
+    let reached = h.executor.reached();
+    assert_eq!(reached.len(), 1);
+    assert_eq!(reached[0].1, vec![key(4103, "spare")]);
+
+    // An intent prepared before the pause and left pending is not
+    // confirmable during the resume, and once the sample is published it is
+    // re-checked on the fresh rows: its target exited, so it is refused.
+    let mut source = Steps::new(vec![host(10), exited]);
+    let mut h = harness(ActionMode::DryRun, &mut source);
+    h.select(4101);
+    h.processed(ACTION_PREPARE);
+    h.processed(SAMPLING_PAUSE);
+    h.processed(SAMPLING_PAUSE);
+    assert!(rejected_as_disabled(&h.click(ACTION_CONFIRM)));
+    h.sample(&mut source);
+    assert!(
+        h.enabled(ACTION_CONFIRM),
+        "the pending intent is shown again"
+    );
+    h.processed(ACTION_CONFIRM);
+    assert_eq!(h.refused(), Refusal::Historical);
+    assert!(h.executor.reached().is_empty());
 }
 
 #[test]

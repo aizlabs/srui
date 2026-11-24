@@ -36,14 +36,19 @@
 //! widgets: a `Row` holding a `Text` that names the exact process and its
 //! owner, and a `Button` that confirms exactly that intent. The three nodes
 //! are fresh for every intent and never reused (§6.2): the `n`-th intent of a
-//! run (from 0) takes [`PanelIds::of`]`(n)`, IDs `PANEL_ID_BASE + 3n` to
-//! `PANEL_ID_BASE + 3n + 2`, and a run shows at most
-//! [`DEFAULT_CONFIRMATION_PANELS`] of them; past that Prepare is refused until
-//! srtop restarts. The runtime has no way to remove an event handler, so the
-//! panel handlers are all registered once, before the socket is served
-//! ([`crate::install_actions`]), each bound to its slot: a click on slot `n`
-//! can confirm only the intent shown in slot `n`, never a later one. A
-//! withdrawn panel is deleted in the commit that withdraws it, so a click
+//! run (from 0) takes [`PanelIds::at`]`(base, n)`, IDs `base + 3n` to
+//! `base + 3n + 2`, and a run shows at most [`DEFAULT_CONFIRMATION_PANELS`]
+//! of them; past that Prepare is refused until srtop restarts. `base` is
+//! drawn afresh for every run ([`random_panel_base`], PX-031 verification
+//! round 1): a Confirm click from an earlier run of srtop names a node of
+//! that run's range, which a restarted instance does not hold, so event
+//! validation rejects it even after the new run has shown a panel in the
+//! same slot. Revisions restart with the session, so the intent's freshness
+//! check alone could not tell the two runs' clicks apart. The runtime has no
+//! way to remove an event handler, so the panel handlers are all registered
+//! once, before the socket is served ([`crate::install_actions`]), each
+//! bound to its slot: a click on slot `n` can confirm only the intent shown
+//! in slot `n`, never a later one. A withdrawn panel is deleted in the commit that withdraws it, so a click
 //! still in flight names a node that no longer exists and event validation
 //! rejects it (§7.4). Repeated prepare/cancel cycles leave the live node
 //! count, the handler table and the handle table as they were.
@@ -102,9 +107,12 @@
 //!   absence, never an unreadable, capped or evicted row). It is never
 //!   called terminated by srtop: a process that was exiting anyway, or a
 //!   zombie (which accepts the signal), is reported the same way, and the
-//!   line says the cause is not known. An exit seen before the settlement
-//!   is never attributed: the request then fails or is refused ("nothing was
-//!   sent"), and no watch starts;
+//!   line says the cause is not known. An exit *and reap* seen before the
+//!   settlement is never attributed: the request then fails or is refused
+//!   ("nothing was sent"), and no watch starts. A process already exited
+//!   but not yet reaped when Confirm arrives still accepts the signal, so it
+//!   is watched and, once reaped, reported exited after the request: true
+//!   of the instance, though its exit came first;
 //! * **still running** when, at the deadline, the latest such scan still
 //!   lists the instance. A zombie stays listed until it is reaped and the
 //!   scan does not read its state, so the line says that too rather than
@@ -165,9 +173,6 @@ pub const DEFAULT_PROTECTED_PIDS: [u32; 1] = [1];
 /// The most PIDs `--protect-pid` may name (PX-030).
 pub const MAX_CONFIGURED_PROTECTED_PIDS: usize = 64;
 
-/// The first node ID of the confirmation panels (PX-030), far above every
-/// fixed node of the shell.
-pub const PANEL_ID_BASE: u64 = 1_000_000;
 /// The nodes one confirmation panel takes: its row, question and Confirm.
 pub const PANEL_IDS: u64 = 3;
 /// How many confirmation panels one run of srtop shows at most (PX-030):
@@ -175,6 +180,38 @@ pub const PANEL_IDS: u64 = 3;
 /// and every panel's Confirm handler is registered at start. Past this many
 /// prepared intents, Prepare is refused until srtop restarts.
 pub const DEFAULT_CONFIRMATION_PANELS: u32 = 4096;
+/// The first node ID any confirmation panel can take (PX-030, PX-031):
+/// 2^32, far above every fixed node of the shell (at most 88).
+pub const PANEL_RANGE_START: u64 = 1 << 32;
+/// The node IDs one run's panels span: [`DEFAULT_CONFIRMATION_PANELS`]
+/// panels of [`PANEL_IDS`] nodes (PX-031).
+pub const PANEL_RUN_SPAN: u64 = PANEL_IDS * DEFAULT_CONFIRMATION_PANELS as u64;
+/// How many disjoint run ranges a run's base is drawn from (PX-031): 2^39.
+/// Two runs collide only if they draw the same range, with probability
+/// 2^-39 (about 1.8 × 10^-12) per pair of runs. The highest panel node ID,
+/// `PANEL_RANGE_START + PANEL_RUN_BASES × PANEL_RUN_SPAN - 1`, is about
+/// 6.8 × 10^15, below 2^53, so no client that holds node IDs as doubles
+/// loses one.
+pub const PANEL_RUN_BASES: u64 = 1 << 39;
+
+/// A fresh base for this run's confirmation panels (PX-031):
+/// `PANEL_RANGE_START + k · PANEL_RUN_SPAN` for `k` drawn uniformly from
+/// `[0, PANEL_RUN_BASES)`. The draw hashes this process's ID and the wall
+/// clock with the standard library's randomly keyed SipHash
+/// (`RandomState`, seeded from the operating system's random source), so it
+/// needs no new dependency; `2^64` is a multiple of `PANEL_RUN_BASES`, so the
+/// reduction is unbiased.
+pub fn random_panel_base() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos()),
+    );
+    PANEL_RANGE_START + (hasher.finish() % PANEL_RUN_BASES) * PANEL_RUN_SPAN
+}
 
 pub const PREPARE_LABEL: &str = "Prepare dry run: terminate selected";
 pub const PREPARE_DESCRIPTION: &str =
@@ -237,8 +274,9 @@ impl ActionMode {
     }
 }
 
-/// The three nodes of one confirmation panel (PX-030): slot `n` is
-/// `PANEL_ID_BASE + 3n` (the row), `+ 1` (the question) and `+ 2` (Confirm).
+/// The three nodes of one confirmation panel (PX-030): slot `n` of a run
+/// whose base is `base` is `base + 3n` (the row), `+ 1` (the question) and
+/// `+ 2` (Confirm).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PanelIds {
     pub row: NodeId,
@@ -247,13 +285,25 @@ pub struct PanelIds {
 }
 
 impl PanelIds {
-    pub fn of(slot: u32) -> Self {
-        let row = PANEL_ID_BASE + PANEL_IDS * u64::from(slot);
+    pub fn at(base: u64, slot: u32) -> Self {
+        let row = base + PANEL_IDS * u64::from(slot);
         Self {
             row: NodeId::new(row),
             question: NodeId::new(row + 1),
             confirm: NodeId::new(row + 2),
         }
+    }
+
+    /// The panel `node` belongs to, and its slot, when `node` is in the
+    /// panels' range: what a client replica can tell from a node ID alone.
+    pub fn containing(node: NodeId) -> Option<(Self, u32)> {
+        let offset = node.get().checked_sub(PANEL_RANGE_START)?;
+        if offset >= PANEL_RUN_BASES * PANEL_RUN_SPAN {
+            return None;
+        }
+        let within = offset % PANEL_RUN_SPAN;
+        let slot = u32::try_from(within / PANEL_IDS).ok()?;
+        Some((Self::at(node.get() - within, slot), slot))
     }
 }
 
@@ -1008,6 +1058,9 @@ pub struct ActionGate {
     /// one (PX-030). A slot is never used twice.
     panel_slots: u32,
     next_slot: u32,
+    /// The first node ID of this run's panels (PX-031): drawn per run, so
+    /// no node ID of one run's panels names a panel of another.
+    panel_base: u64,
     pending: Option<Pending>,
     report: Report,
     /// Why the view's rows are not the latest scan, as the view last said
@@ -1064,6 +1117,7 @@ impl ActionGate {
             next_intent: 1,
             panel_slots: DEFAULT_CONFIRMATION_PANELS,
             next_slot: 0,
+            panel_base: random_panel_base(),
             pending: None,
             report: Report::Idle,
             hold: None,
@@ -1277,8 +1331,20 @@ impl ActionGate {
 
     /// This gate showing at most `slots` confirmation panels (PX-030).
     pub fn with_panel_slots(mut self, slots: u32) -> Self {
-        self.panel_slots = slots;
+        // A run's range holds DEFAULT_CONFIRMATION_PANELS panels (PX-031).
+        self.panel_slots = slots.min(DEFAULT_CONFIRMATION_PANELS);
         self
+    }
+
+    /// The first node ID of this run's panels (PX-031).
+    pub fn panel_base(&self) -> u64 {
+        self.panel_base
+    }
+
+    /// The nodes of this run's panel `slot`: what its Confirm handler is
+    /// registered for ([`crate::install_actions`]).
+    pub fn panel_ids(&self, slot: u32) -> PanelIds {
+        PanelIds::at(self.panel_base, slot)
     }
 
     pub fn mode(&self) -> ActionMode {
@@ -1305,7 +1371,7 @@ impl ActionGate {
     pub fn pending_panel(&self) -> Option<PanelIds> {
         self.pending
             .as_ref()
-            .map(|pending| PanelIds::of(pending.slot))
+            .map(|pending| PanelIds::at(self.panel_base, pending.slot))
     }
 
     /// The revision that published the pending intent's confirmation.
@@ -1799,6 +1865,7 @@ impl ActionGate {
         parent: NodeId,
     ) -> Result<(), SessionError> {
         let view = self.view();
+        let base = self.panel_base;
         let (prepare_label, prepare_description) =
             (self.prepare_label(), self.prepare_description());
         session.transaction(|ui| {
@@ -1838,7 +1905,7 @@ impl ActionGate {
                 .role(TextRole::Status)
                 .create(ui)?;
             if let Some(panel) = &view.panel {
-                create_panel(ui, parent, panel)?;
+                create_panel(ui, parent, base, panel)?;
             }
             Ok(())
         })?;
@@ -1877,6 +1944,7 @@ impl ActionGate {
             return Ok(());
         };
         let shown = self.shown;
+        let base = self.panel_base;
         // Diffed against what the store holds, not what this gate last
         // wrote, so a control enabled by anything else is put back.
         let published = session.with_store(|store| {
@@ -1897,7 +1965,7 @@ impl ActionGate {
                 status: text(ACTIONS_STATUS, TEXT),
                 observed: text(ACTIONS_OBSERVED, TEXT),
                 panel: shown.and_then(|slot| {
-                    let ids = PanelIds::of(slot);
+                    let ids = PanelIds::at(base, slot);
                     store.get_node(ids.row)?;
                     Some(PanelView {
                         slot,
@@ -1943,7 +2011,7 @@ impl ActionGate {
             }
             match (&published.panel, &target.panel) {
                 (Some(was), Some(now)) if was.slot == now.slot => {
-                    let ids = PanelIds::of(now.slot);
+                    let ids = PanelIds::at(base, now.slot);
                     if was.confirm_enabled != now.confirm_enabled {
                         ui.set(ids.confirm, ENABLED, now.confirm_enabled)?;
                     }
@@ -1958,10 +2026,10 @@ impl ActionGate {
                     // Another intent, or none: the old panel goes, with its
                     // button, and a new one gets fresh node IDs.
                     if let Some(was) = was {
-                        ui.delete(PanelIds::of(was.slot).row)?;
+                        ui.delete(PanelIds::at(base, was.slot).row)?;
                     }
                     if let Some(now) = now {
-                        create_panel(ui, parent, now)?;
+                        create_panel(ui, parent, base, now)?;
                     }
                 }
             }
@@ -1997,9 +2065,10 @@ impl ActionGate {
 fn create_panel(
     ui: &mut srui_sdk::UiTransaction,
     parent: NodeId,
+    base: u64,
     panel: &PanelView,
 ) -> Result<(), srui_semantic_tree::StoreError> {
-    let ids = PanelIds::of(panel.slot);
+    let ids = PanelIds::at(base, panel.slot);
     Row::builder(ids.row)
         .parent(parent)
         .spacing_role(SpacingRole::Normal)
@@ -2884,7 +2953,7 @@ mod tests {
             prepared(&mut gate, &fake);
             let ids = gate.pending_panel().unwrap();
             for id in [ids.row, ids.question, ids.confirm] {
-                assert!(id.0 >= PANEL_ID_BASE, "{id:?} is clear of the shell");
+                assert!(id.0 >= PANEL_RANGE_START, "{id:?} is clear of the shell");
                 assert!(seen.insert(id.0), "{id:?} is never reused");
             }
             assert!(gate.cancel().is_some());
@@ -2898,13 +2967,16 @@ mod tests {
         ));
         assert!(gate.view().status.contains("restart srtop"));
         // The default bound's last panel ends where the scheme says.
-        let last = PanelIds::of(DEFAULT_CONFIRMATION_PANELS - 1);
-        assert_eq!(
-            last.confirm.0,
-            PANEL_ID_BASE + PANEL_IDS * u64::from(DEFAULT_CONFIRMATION_PANELS) - 1
-        );
-        for fixed in [ACTIONS_ROW, ACTION_PREPARE, ACTION_CANCEL, ACTIONS_STATUS] {
-            assert!(fixed.0 < PANEL_ID_BASE);
+        let last = gate.panel_ids(DEFAULT_CONFIRMATION_PANELS - 1);
+        assert_eq!(last.confirm.0, gate.panel_base() + PANEL_RUN_SPAN - 1);
+        for fixed in [
+            ACTIONS_ROW,
+            ACTION_PREPARE,
+            ACTION_CANCEL,
+            ACTIONS_STATUS,
+            ACTIONS_OBSERVED,
+        ] {
+            assert!(fixed.0 < PANEL_RANGE_START);
         }
     }
 

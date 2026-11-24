@@ -2233,7 +2233,7 @@ struct ProcessExplorerShellTests {
             func inspector() -> String { text(Self.inspectorLineIDs[0]) }
             func prepare() throws -> NSButton { try #require(button(Self.actionPrepareID)) }
             func cancelEnabled() -> Bool { button(Self.actionCancelID)?.isEnabled == true }
-            func panelConfirm(_ slot: UInt64) -> NSButton? { button(Self.panelConfirmID(slot)) }
+            func panelConfirm(_ slot: UInt64) -> NSButton? { Self.panelConfirm(renderer.registry, slot) }
             func select(_ row: Int, _ pid: Int) async throws {
                 try table().selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
                 try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on \(pid)") {
@@ -2277,7 +2277,7 @@ struct ProcessExplorerShellTests {
                     && panelConfirm(0)?.isEnabled == true
                     && panelConfirm(0)?.title == "Confirm dry run: terminate PID 4101 · worker"
             }
-            #expect(text(Self.panelQuestionID(0)) == "Dry run: terminate PID 4101 · worker (UID 1000)? Confirm records the request; nothing is sent to the process.")
+            #expect(Self.panelQuestion(renderer.registry, 0) == "Dry run: terminate PID 4101 · worker (UID 1000)? Confirm records the request; nothing is sent to the process.")
             #expect(inspector() == "Selected process: PID 4101 · worker", "the remount keeps the selection")
             // Another row is selected: the request for 4101 is withdrawn and its panel goes.
             try table().selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
@@ -2316,10 +2316,24 @@ struct ProcessExplorerShellTests {
     fileprivate static let actionsStatusID: UInt64 = 87
     // PX-031: what was observed of the process after a sent request, apart from the request.
     fileprivate static let actionsObservedID: UInt64 = 88
-    // PX-030: confirmation panel `slot`'s nodes, fresh for every intent: 1_000_000 + 3·slot is its
-    // row, + 1 its question and + 2 its Confirm (`actions::PanelIds`).
-    fileprivate static func panelQuestionID(_ slot: UInt64) -> UInt64 { 1_000_000 + 3 * slot + 1 }
-    fileprivate static func panelConfirmID(_ slot: UInt64) -> UInt64 { 1_000_000 + 3 * slot + 2 }
+    // PX-030: confirmation panel `slot`'s nodes, fresh for every intent: base + 3·slot is its row,
+    // + 1 its question and + 2 its Confirm (`actions::PanelIds`). PX-031: every run of srtop draws
+    // its own base, 2^32 + k·12288, so the native handle is found by its offset within the run's
+    // range rather than by a fixed ID.
+    fileprivate static let panelRangeStart: UInt64 = 1 << 32
+    fileprivate static let panelRunSpan: UInt64 = 3 * 4096
+    fileprivate static func panelHandle(_ registry: RenderRegistry, slot: UInt64, offset: UInt64) -> RenderHandle? {
+        registry.allHandles.first { handle in
+            let id = handle.nodeID.value
+            return id >= panelRangeStart && (id - panelRangeStart) % panelRunSpan == 3 * slot + offset
+        }
+    }
+    fileprivate static func panelConfirm(_ registry: RenderRegistry, _ slot: UInt64) -> NSButton? {
+        panelHandle(registry, slot: slot, offset: 2)?.view as? NSButton
+    }
+    fileprivate static func panelQuestion(_ registry: RenderRegistry, _ slot: UInt64) -> String {
+        (panelHandle(registry, slot: slot, offset: 1)?.view as? NSTextField)?.stringValue ?? ""
+    }
 
     // PX-020: the tag controls.
     fileprivate static let tagToggleID: UInt64 = 79
@@ -5542,7 +5556,7 @@ struct ProcessExplorerTerminateDevboxTests {
         }
         func prepare() throws -> NSButton { try #require(button(ProcessExplorerShellTests.actionPrepareID)) }
         func status() -> String { text(ProcessExplorerShellTests.actionsStatusID) }
-        func panelConfirm(_ slot: UInt64) -> NSButton? { button(ProcessExplorerShellTests.panelConfirmID(slot)) }
+        func panelConfirm(_ slot: UInt64) -> NSButton? { ProcessExplorerShellTests.panelConfirm(renderer.registry, slot) }
         #expect(try prepare().title == "Terminate…")
         #expect(try prepare().isEnabled, "the box has PID file descriptors: \(status())")
         #expect(status().hasPrefix("Terminate… checks the selected process"), "\(status())")
@@ -5584,7 +5598,7 @@ struct ProcessExplorerTerminateDevboxTests {
             panelConfirm(0)?.isEnabled == true
                 && panelConfirm(0)?.title == "Confirm: terminate PID \(workerPID) · \(Self.workerName)"
         }
-        let question = text(ProcessExplorerShellTests.panelQuestionID(0))
+        let question = ProcessExplorerShellTests.panelQuestion(renderer.registry, 0)
         #expect(question.hasPrefix("Terminate PID \(workerPID) · \(Self.workerName) (UID "), "\(question)")
         #expect(question.hasSuffix("? Confirm sends it SIGTERM, which asks it to exit; it may handle or ignore it."), "\(question)")
         #expect(try await Self.boxPIDs(box, comm: Self.workerName) == [workerPID], "nothing was sent at Prepare")

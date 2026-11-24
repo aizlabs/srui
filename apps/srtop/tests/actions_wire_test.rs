@@ -21,7 +21,9 @@
 //! * an unknown mode, `--actions` without a process source, and a bad or
 //!   orphaned `--protect-pid` are refused at start.
 
-use srui_process_explorer::actions::{PanelIds, DRY_RUN_STATUS, READ_ONLY_STATUS, TERMINATE_LABEL};
+use srui_process_explorer::actions::{
+    PanelIds, DRY_RUN_STATUS, PANEL_RANGE_START, READ_ONLY_STATUS, TERMINATE_LABEL,
+};
 use srui_process_explorer::{
     ACTIONS_ROW, ACTIONS_STATUS, ACTION_CANCEL, ACTION_PREPARE, MODEL, TABLE,
 };
@@ -292,6 +294,14 @@ impl Client {
             })
     }
 
+    /// This instance's panel `slot`, as the replica holds it (PX-031: a
+    /// run's panel base is drawn per run, so it is read off the node IDs).
+    fn panel(&self, slot: u32) -> Option<PanelIds> {
+        self.replica.iter_nodes().find_map(|node| {
+            PanelIds::containing(node.id).and_then(|(panel, at)| (at == slot).then_some(panel))
+        })
+    }
+
     fn status(&self) -> String {
         match self.property(ACTIONS_STATUS, TEXT) {
             Some(Value::String(text)) => text,
@@ -353,11 +363,10 @@ fn a_dry_run_instance_settles_prepare_and_confirm_and_refuses_what_it_must() {
     assert_eq!(client.status(), DRY_RUN_STATUS);
     assert!(client.enabled(ACTION_PREPARE));
     assert!(!client.enabled(ACTION_CANCEL));
-    let panel = PanelIds::of(0);
-    assert!(client.replica.get_node(panel.row).is_none(), "no panel yet");
+    assert!(client.panel(0).is_none(), "no panel yet");
     // A Confirm that does not exist is rejected at validation, before any
     // handler.
-    let ack = client.click(panel.confirm);
+    let ack = client.click(PanelIds::at(PANEL_RANGE_START, 0).confirm);
     assert_eq!(ack.status, rejected(), "{ack:?}");
 
     // PID 4101 is the fixture account's own process.
@@ -370,6 +379,7 @@ fn a_dry_run_instance_settles_prepare_and_confirm_and_refuses_what_it_must() {
         "{}",
         client.status()
     );
+    let panel = client.panel(0).expect("panel 0 is shown");
     assert!(client.enabled(panel.confirm) && client.enabled(ACTION_CANCEL));
     assert_eq!(
         client.property(panel.confirm, srui_sdk::LABEL),
@@ -411,7 +421,7 @@ fn a_dry_run_instance_settles_prepare_and_confirm_and_refuses_what_it_must() {
         "{}",
         client.status()
     );
-    assert!(client.replica.get_node(PanelIds::of(1).row).is_none());
+    assert!(client.panel(1).is_none());
 }
 
 /// PX-030: `--actions terminate` over the wire. Off Linux there is no PID
@@ -447,12 +457,12 @@ fn a_terminate_instance_is_truthful_about_what_it_can_send() {
         );
         assert!(!client.enabled(ACTION_PREPARE));
         assert_eq!(client.click(ACTION_PREPARE).status, rejected());
-        assert!(client.replica.get_node(PanelIds::of(0).row).is_none());
+        assert!(client.panel(0).is_none());
         return;
     }
     assert!(client.enabled(ACTION_PREPARE), "{}", client.status());
     assert_eq!(client.click(ACTION_PREPARE).status, processed());
-    let panel = PanelIds::of(0);
+    let panel = client.panel(0).expect("panel 0 is shown");
     assert_eq!(
         client.property(panel.question, TEXT),
         Some(Value::String(
@@ -501,7 +511,7 @@ fn a_configured_protected_pid_is_refused() {
         "{}",
         client.status()
     );
-    assert!(client.replica.get_node(PanelIds::of(0).row).is_none());
+    assert!(client.panel(0).is_none());
 }
 
 #[test]
@@ -512,7 +522,11 @@ fn a_read_only_instance_disables_and_rejects_every_action_control() {
     let mut client = Client::hello(&socket);
     assert_eq!(client.status(), READ_ONLY_STATUS);
     client.select(4101);
-    for button in [ACTION_PREPARE, ACTION_CANCEL, PanelIds::of(0).confirm] {
+    for button in [
+        ACTION_PREPARE,
+        ACTION_CANCEL,
+        PanelIds::at(PANEL_RANGE_START, 0).confirm,
+    ] {
         assert!(
             !client.enabled(button) || client.replica.get_node(button).is_none(),
             "{button:?}"
@@ -529,16 +543,10 @@ fn without_the_option_no_action_control_exists_and_bad_options_are_refused() {
     let socket = directory.socket();
     let server = Server::start(&socket, &["--fake-source"]);
     let mut client = Client::hello(&socket);
-    for node in [
-        ACTIONS_ROW,
-        ACTION_PREPARE,
-        ACTION_CANCEL,
-        ACTIONS_STATUS,
-        PanelIds::of(0).row,
-        PanelIds::of(0).confirm,
-    ] {
+    for node in [ACTIONS_ROW, ACTION_PREPARE, ACTION_CANCEL, ACTIONS_STATUS] {
         assert!(client.replica.get_node(node).is_none(), "{node:?}");
     }
+    assert!(client.panel(0).is_none());
     let ack = client.click(ACTION_PREPARE);
     assert_eq!(ack.status, rejected(), "{ack:?}");
     drop(client);
@@ -732,7 +740,7 @@ fn a_connected_transport_is_refused_only_while_it_is_connected() {
         )),
         "a connected transport is refused: {status}"
     );
-    assert!(client.replica.get_node(PanelIds::of(0).row).is_none());
+    assert!(client.panel(0).is_none());
     // The helper drops its connection and keeps running: it leaves the chain.
     fs::write(signals.join("release"), b"").unwrap();
     waits_for(

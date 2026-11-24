@@ -102,6 +102,9 @@ fn host(ticks: u64) -> Vec<ProcessRecord> {
 struct Steps {
     steps: Vec<Vec<ProcessRecord>>,
     next: usize,
+    /// The PIDs step `n` listed but did not read (PX-031): their absence is
+    /// not an exit.
+    capped: HashMap<usize, Vec<u32>>,
 }
 
 impl ProcessSource for Steps {
@@ -124,7 +127,13 @@ impl ProcessSource for Steps {
             records: self.steps[index].clone(),
             vanished: 0,
             threads: ThreadScan::NotProvided,
-            capped: CappedRecords::none(),
+            capped: {
+                let mut capped = CappedRecords::with_limit(16);
+                for pid in self.capped.get(&index).into_iter().flatten() {
+                    capped.record(*pid);
+                }
+                capped
+            },
             completeness: Completeness::Complete,
             system: SystemSample::not_provided(),
         }
@@ -291,8 +300,22 @@ fn harness_with(
     kernel: Kernel,
     configure: impl FnOnce(ActionGate) -> ActionGate,
 ) -> Harness {
+    harness_limited(source, kernel, None, configure)
+}
+
+/// [`harness_with`], the view's published-row ceiling lowered to `limit`.
+fn harness_limited(
+    source: &mut Steps,
+    kernel: Kernel,
+    limit: Option<usize>,
+    configure: impl FnOnce(ActionGate) -> ActionGate,
+) -> Harness {
     let session = Arc::new(Session::mint());
     let (view, _) = start_from_source(&session, source).unwrap();
+    let view = match limit {
+        Some(limit) => view.with_published_limit(limit),
+        None => view,
+    };
     let view: SharedView = Arc::new(Mutex::new(view));
     install_inspector(&session, &view, None);
     install_sampling_handlers(&session, &view);
@@ -328,7 +351,11 @@ fn harness(source: &mut Steps) -> Harness {
 }
 
 fn steps(steps: Vec<Vec<ProcessRecord>>) -> Steps {
-    Steps { steps, next: 0 }
+    Steps {
+        steps,
+        next: 0,
+        capped: HashMap::new(),
+    }
 }
 
 impl Harness {
@@ -414,6 +441,11 @@ impl Harness {
         lock_actions(&self.gate).pending_panel()
     }
 
+    /// This run's panel `slot` (PX-031: the base is drawn per run).
+    fn slot(&self, slot: u32) -> PanelIds {
+        lock_actions(&self.gate).panel_ids(slot)
+    }
+
     fn property(&self, node: NodeId, property: PropertyRef) -> Option<Value> {
         self.replica
             .get_node(node)
@@ -476,6 +508,12 @@ impl Harness {
     }
 
     fn item_of(&self, pid: u64) -> ItemId {
+        self.item_of_checked(pid)
+            .unwrap_or_else(|| panic!("PID {pid} is shown"))
+    }
+
+    /// The row showing PID `pid`, if the table shows one.
+    fn item_of_checked(&self, pid: u64) -> Option<ItemId> {
         let Some(Value::List(headings)) = self.property(TABLE, COLUMNS) else {
             panic!("headings")
         };
@@ -494,8 +532,7 @@ impl Harness {
                 },
                 _ => false,
             })
-            .unwrap_or_else(|| panic!("PID {pid} is shown"))
-            .item_id
+            .map(|item| item.item_id)
     }
 
     /// Every handler the session holds for the action controls: Prepare,
@@ -506,7 +543,7 @@ impl Harness {
         for slot in 0..self.slots {
             count += self
                 .session
-                .handler_count(PanelIds::of(slot).confirm, ACTIVATE);
+                .handler_count(self.slot(slot).confirm, ACTIVATE);
         }
         count
     }
@@ -1188,7 +1225,7 @@ fn every_handler_result_settles_processed_and_only_event_validation_rejects() {
             ..
         }
     ));
-    assert!(gone(&h.click(PanelIds::of(0).confirm)));
+    assert!(gone(&h.click(h.slot(0).confirm)));
     let mut future = h.wire(ACTION_PREPARE, ACTIVATE, Vec::new());
     future.observed_revision = h.revision() + 1000;
     assert!(matches!(
@@ -1329,4 +1366,182 @@ async fn the_refresh_loop_settles_a_watch_at_its_deadline_without_sampling() {
         .await
         .expect("the loop stops")
         .expect("the loop does not panic");
+}
+
+// --------------------------------------------------------------------------
+// PX-031 verification round 1
+// --------------------------------------------------------------------------
+
+/// `init` (1), `worker` (4101) and `spare` (4103): three rows.
+fn three(ticks: u64) -> Vec<ProcessRecord> {
+    without(ticks, &[4102])
+}
+
+/// W1: an absence that establishes nothing is never an exit. A scan that
+/// listed the target but could not read it keeps its row unconfirmed; and
+/// one that also fills the row ceiling evicts it, leaving a last-observed
+/// record whose verdict is "no longer observed". Either way the target is
+/// still watched, and at the deadline the outcome is unknown, not exited.
+#[test]
+fn an_absence_that_establishes_no_exit_is_never_attributed() {
+    // Unconfirmed: listed, not read.
+    let mut source = steps(vec![three(10), three(20), three(30)]);
+    for step in [1, 2] {
+        source.steps[step].retain(|record| record.key.pid != Observed::Known(4101));
+        source.capped.insert(step, vec![4101]);
+    }
+    let mut h = harness(&mut source);
+    h.confirm_pid(4101);
+    h.sample(&mut source);
+    h.sample(&mut source);
+    assert_eq!(h.observed(), Some(ObservedOutcome::Watching));
+    h.clock.advance(WINDOW);
+    h.deadline_timer();
+    assert_eq!(
+        h.observed(),
+        Some(ObservedOutcome::Unknown(Unobserved::Unaccounted))
+    );
+
+    // Evicted: listed, not read, and a newcomer fills the three-row ceiling.
+    let mut evicting = three(20);
+    evicting.retain(|record| record.key.pid != Observed::Known(4101));
+    evicting.push(record(4104, 800, "newcomer", ME, 1));
+    let mut source = steps(vec![three(10), evicting.clone(), evicting]);
+    for step in [1, 2] {
+        source.capped.insert(step, vec![4101]);
+    }
+    let mut h = harness_limited(&mut source, Kernel::new(true), Some(3), |gate| gate);
+    h.confirm_pid(4101);
+    // Only the watch keeps the record: the inspector moves on.
+    h.select(4103);
+    h.sample(&mut source);
+    h.sample(&mut source);
+    assert!(
+        h.item_of_checked(4101).is_none(),
+        "the row was evicted from the collection"
+    );
+    assert_eq!(h.observed(), Some(ObservedOutcome::Watching));
+    h.clock.advance(WINDOW);
+    h.deadline_timer();
+    assert_eq!(
+        h.observed(),
+        Some(ObservedOutcome::Unknown(Unobserved::Unaccounted))
+    );
+    assert_eq!(h.kernel.delivered().len(), 1);
+}
+
+/// W1: another instance confirmed under the target's PID establishes that
+/// the target exited: a PID is reused only once its holder was reaped.
+#[test]
+fn a_pid_taken_by_another_instance_establishes_the_exit() {
+    let mut reused = host(20);
+    reused[1] = record(4101, 900, "worker", ME, 1);
+    let mut source = steps(vec![host(10), reused.clone(), reused]);
+    let mut h = harness(&mut source);
+    h.confirm_pid(4101);
+    h.kernel.state().processes.insert(4101, 900);
+    h.sample(&mut source);
+    h.clock.advance(Duration::from_millis(1200));
+    h.sample(&mut source);
+    assert_eq!(
+        h.observed(),
+        Some(ObservedOutcome::ExitedAfterRequest {
+            within: Duration::from_millis(1200)
+        })
+    );
+    assert_eq!(h.kernel.delivered(), vec![(4101, 500, SIGTERM)]);
+}
+
+/// W1: the production refresh loop settles a watch at its deadline while
+/// the view is paused, when it polls no ticker at all; the outcome is
+/// unknown because a paused view's rows are not the latest scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_refresh_loop_settles_a_watch_while_the_view_is_paused() {
+    use srui_process_explorer::on_demand::SuspendAwareClock;
+    let mut source = steps(vec![host(10), host(20)]);
+    let mut h = harness_with(&mut source, Kernel::new(true), |gate| {
+        gate.with_clock(Arc::new(SuspendAwareClock::new()) as Arc<dyn MonotonicClock>)
+            .with_observation_window(Duration::from_millis(1500))
+    });
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let polling = tokio::spawn(srui_process_explorer::refresh::poll(
+        Arc::clone(&h.view),
+        source,
+        Arc::clone(&h.session),
+        Duration::from_secs(300),
+        shutdown.child_token(),
+    ));
+    let (_, outcome) = h.confirm_pid(4101);
+    assert!(matches!(outcome, EventOutcome::Processed { .. }));
+    h.processed(SAMPLING_PAUSE);
+    let settled = tokio::time::timeout(Duration::from_secs(20), async {
+        while h.observed() == Some(ObservedOutcome::Watching) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(settled.is_ok(), "the paused loop's timer settled the watch");
+    h.sync();
+    assert_eq!(
+        h.observed(),
+        Some(ObservedOutcome::Unknown(Unobserved::NotCurrent))
+    );
+    assert_eq!(h.kernel.delivered(), vec![(4101, 500, SIGTERM)]);
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(20), polling)
+        .await
+        .expect("the loop stops")
+        .expect("the loop does not panic");
+}
+
+/// W1: the action controls add exactly `ACTIONS_NODE_COUNT` fixed nodes to
+/// the shell, and a pending intent its panel's `PANEL_IDS` more.
+#[test]
+fn the_action_controls_add_exactly_their_fixed_nodes() {
+    use srui_process_explorer::actions::{ACTIONS_NODE_COUNT, PANEL_IDS};
+    let bare = Session::mint();
+    start_from_source(&bare, &mut steps(vec![host(10)])).unwrap();
+    let mut source = steps(vec![host(10)]);
+    let mut h = harness(&mut source);
+    assert_eq!(
+        h.session.node_count(),
+        bare.node_count() + ACTIONS_NODE_COUNT
+    );
+    h.select(4101);
+    h.processed(ACTION_PREPARE);
+    assert_eq!(
+        h.session.node_count(),
+        bare.node_count() + ACTIONS_NODE_COUNT + PANEL_IDS as usize
+    );
+}
+
+/// F1: this run's panels are in a range of their own, drawn per run: two
+/// gates (two runs) never share a panel node, and every panel node maps back
+/// to its own run's base and slot.
+#[test]
+fn each_run_draws_its_own_panel_range() {
+    use srui_process_explorer::actions::{PANEL_RANGE_START, PANEL_RUN_BASES, PANEL_RUN_SPAN};
+    let mut source = steps(vec![host(10)]);
+    let first = harness(&mut source);
+    let mut source = steps(vec![host(10)]);
+    let second = harness(&mut source);
+    let (a, b) = (
+        lock_actions(&first.gate).panel_base(),
+        lock_actions(&second.gate).panel_base(),
+    );
+    assert_ne!(a, b, "two runs, two ranges (a collision has odds 2^-39)");
+    for base in [a, b] {
+        assert!(base >= PANEL_RANGE_START);
+        assert_eq!((base - PANEL_RANGE_START) % PANEL_RUN_SPAN, 0);
+        assert!(base + PANEL_RUN_SPAN <= PANEL_RANGE_START + PANEL_RUN_BASES * PANEL_RUN_SPAN);
+        assert!(base + PANEL_RUN_SPAN < 1 << 53);
+    }
+    for slot in [0, 1, 4095] {
+        let ids = first.slot(slot);
+        for node in [ids.row, ids.question, ids.confirm] {
+            assert_eq!(PanelIds::containing(node), Some((ids, slot)));
+        }
+        assert!(second.session.handler_count(ids.confirm, ACTIVATE) == 0);
+        assert_eq!(first.session.handler_count(ids.confirm, ACTIVATE), 1);
+    }
 }

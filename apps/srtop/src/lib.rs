@@ -692,17 +692,19 @@ pub fn install_actions(
     // The view tells the gate when its rows stop or start being the latest
     // scan (paused, resuming, current), so the controls follow it.
     refresh::ProcessView::attach_actions(view, session, gate);
-    let slots = {
+    // This run's panel range (PX-031): every slot's Confirm is registered at
+    // its node in that range, which no other run of srtop uses.
+    let (slots, base) = {
         let mut gate = actions::lock_actions(gate);
         gate.create_controls(session, COLUMN)?;
-        gate.panel_slots()
+        (gate.panel_slots(), gate.panel_base())
     };
     let (prepare_gate, prepare_view) = (std::sync::Arc::clone(gate), std::sync::Arc::clone(view));
     session.on(ACTION_PREPARE, ACTIVATE, move |session, event| {
         actions::prepare_requested(&prepare_gate, &prepare_view, session, event);
     });
     for slot in 0..slots {
-        let panel_confirm = actions::PanelIds::of(slot).confirm;
+        let panel_confirm = actions::PanelIds::at(base, slot).confirm;
         let (confirm_gate, confirm_view) =
             (std::sync::Arc::clone(gate), std::sync::Arc::clone(view));
         session.on(panel_confirm, ACTIVATE, move |session, event| {

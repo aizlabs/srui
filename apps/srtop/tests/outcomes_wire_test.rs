@@ -407,6 +407,15 @@ impl Client {
         self.text(ACTIONS_STATUS)
     }
 
+    /// The confirmation panel the replica holds, if any (PX-031: a run's
+    /// panel base is drawn per run, so it is read off the node IDs).
+    fn any_panel(&self) -> Option<PanelIds> {
+        self.replica
+            .iter_nodes()
+            .find_map(|node| PanelIds::containing(node.id))
+            .map(|(panel, _)| panel)
+    }
+
     fn observed(&self) -> String {
         self.text(ACTIONS_OBSERVED)
     }
@@ -459,10 +468,7 @@ fn prepare(client: &mut Client, pid: u64) -> PanelIds {
         "{}",
         client.status()
     );
-    let slot = (0..64)
-        .map(PanelIds::of)
-        .find(|panel| client.replica.get_node(panel.row).is_some())
-        .expect("a confirmation panel");
+    let slot = client.any_panel().expect("a confirmation panel");
     assert!(client.enabled(slot.confirm));
     slot
 }
@@ -569,22 +575,28 @@ fn a_restarted_daemon_abandons_the_old_intent_and_confirms_nothing_from_before()
     server.stop();
     let _restarted = Server::start(&socket, &options);
     assert_eq!(client.resume(&socket), Decision::Replaced);
-    assert!(client.replica.get_node(panel.row).is_none(), "no old panel");
+    assert!(client.any_panel().is_none(), "no old panel");
     assert_eq!(client.status(), DRY_RUN_STATUS);
     assert_eq!(client.observed(), OBSERVED_IDLE);
     assert!(!client.enabled(ACTION_CANCEL), "nothing is prepared");
-    // Past the old revision, so the old Confirm is refused for naming no
-    // node, not for a revision this instance has not reached. Another
-    // client's selections advance it, outside this client's sequence space.
+    // Verification round 1 (F1): the new instance shows its own first
+    // confirmation, in the same slot as the old one, and is then taken past
+    // the old click's observed revision (by another client's pause and
+    // resume, which keep the selection), so neither the slot nor the
+    // revision tells the old click from a new one. Only the node does: this
+    // run's panels are in another range.
+    let new_panel = prepare(&mut client, 4101);
+    assert_ne!(new_panel.confirm, panel.confirm, "a new run, a new range");
     let mut observer = Client::hello(&socket, OBSERVER);
-    let mut toggle = [4102, 4101].into_iter().cycle();
     while observer.revision() <= old_confirm.observed_revision.get() {
-        observer.select(toggle.next().unwrap());
+        pause_resume(&mut observer);
     }
     let target = observer.revision();
-    client.until("the observer's commits", |client| {
-        client.revision() >= target
+    client.until("the observer's commits, Confirm enabled", |client| {
+        client.revision() >= target && client.enabled(new_panel.confirm)
     });
+    let prepared = client.status();
+    assert!(prepared.starts_with("Prepared #1"), "{prepared}");
     let ack = client.deliver(&old_confirm);
     assert_eq!(ack.status, rejected(), "{ack:?}");
     assert_eq!(
@@ -594,7 +606,20 @@ fn a_restarted_daemon_abandons_the_old_intent_and_confirms_nothing_from_before()
             panel.confirm
         ),
     );
-    assert_eq!(client.status(), DRY_RUN_STATUS);
+    assert_eq!(
+        client.status(),
+        prepared,
+        "the new intent was not confirmed"
+    );
+    assert!(client.enabled(new_panel.confirm), "it is still pending");
+}
+
+/// Pauses and resumes the view through `observer`: two commits that keep
+/// the selection, so a pending intent is held, not withdrawn.
+fn pause_resume(observer: &mut Client) {
+    let pause = srui_process_explorer::SAMPLING_PAUSE;
+    assert_eq!(observer.click(pause).status, processed());
+    assert_eq!(observer.click(pause).status, processed());
 }
 
 /// Waits until `client`'s instance has passed `event`'s observed revision,
@@ -672,10 +697,23 @@ fn live_replay_sends_one_sigterm_and_a_restart_retries_nothing() {
     server.stop();
     let _restarted = Server::start(&socket, &options);
     assert_eq!(client.resume(&socket), Decision::Replaced);
-    assert!(client.replica.get_node(panel.row).is_none(), "no old panel");
+    assert!(client.any_panel().is_none(), "no old panel");
     assert_eq!(client.status(), TERMINATE_STATUS);
     assert_eq!(client.observed(), OBSERVED_IDLE, "no watch survives");
+    // Verification round 1 (F1): the new instance prepares twice, so its
+    // pending intent shows its panel in the old Confirm's slot (1), and it is
+    // past the old click's revision: only the node range tells them apart.
+    client.until("the worker's row again", |client| {
+        client.item_of(pid).is_some()
+    });
+    let at = client.revision();
+    client.until("two more commits", |client| client.revision() >= at + 2);
+    prepare(&mut client, pid);
+    let new_panel = prepare(&mut client, pid);
+    assert_ne!(new_panel.confirm, panel.confirm, "a new run, a new range");
     past(&mut client, &old_confirm);
+    let prepared = client.status();
+    assert!(prepared.starts_with("Prepared #2"), "{prepared}");
     let ack = client.deliver(&old_confirm);
     assert_eq!(ack.status, rejected(), "{ack:?}");
     assert_eq!(
@@ -684,6 +722,11 @@ fn live_replay_sends_one_sigterm_and_a_restart_retries_nothing() {
             "event target node {} does not exist in store",
             panel.confirm
         ),
+    );
+    assert!(
+        client.status().starts_with("Prepared #2"),
+        "the new intent was not confirmed: {}",
+        client.status()
     );
     // Several samples of the new instance later: nothing more was sent.
     let at = client.revision();

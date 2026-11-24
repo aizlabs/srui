@@ -6511,6 +6511,11 @@ pub fn lock_view(view: &Mutex<ProcessView>) -> std::sync::MutexGuard<'_, Process
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// The longest the refresh loop waits before re-checking a watched action
+/// request's deadline (PX-031): its timer runs on a clock that stops while
+/// the host sleeps, the deadline on one that does not.
+pub const OBSERVATION_RECHECK: Duration = Duration::from_secs(1);
+
 /// The loop's one ticker: its first tick one `interval` from now, never at
 /// once, so a new interval neither fires a burst nor keeps the old phase.
 fn ticker_every(interval: Duration) -> tokio::time::Interval {
@@ -6569,11 +6574,15 @@ pub async fn poll<S>(
         // decides nothing, because the request read below does: a tick of a
         // ticker the request retires is ignored either way (PR #95 review, F2).
         // A watched action request's deadline (PX-031) is the one other
-        // timer: it samples nothing, and also fires while paused.
+        // timer: it samples nothing, and also fires while paused. The
+        // deadline is on the gate's suspend-aware clock and this timer's is
+        // not, so it re-checks at least every OBSERVATION_RECHECK: after the
+        // host sleeps past a deadline, it settles within that much of waking
+        // (verification round 1, W3).
         let due = lock_view(&view).action_observation_due();
         let deadline = async move {
             match due {
-                Some(due) => tokio::time::sleep(due).await,
+                Some(due) => tokio::time::sleep(due.min(OBSERVATION_RECHECK)).await,
                 None => std::future::pending().await,
             }
         };

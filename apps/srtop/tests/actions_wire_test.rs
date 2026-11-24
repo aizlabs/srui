@@ -6,19 +6,24 @@
 //! validates and dispatches, and every answer is the `SERVER_EVENT_ACK` it
 //! settles with:
 //!
-//! * `--actions dry-run`: Confirm is disabled, and a click on it rejected,
-//!   until Prepare has prepared an intent for the selected process; Confirm
-//!   then settles as processed with the dry run requested, a redelivery of
-//!   the same event is a duplicate that changes nothing, and another
-//!   account's process is refused at Prepare;
+//! * `--actions dry-run`: there is no Confirm, and a click on its node names
+//!   nothing, until Prepare has prepared an intent for the selected process
+//!   and shown its confirmation panel (PX-030); that panel's Confirm then
+//!   settles as processed with the dry run requested and the panel is
+//!   deleted, a redelivery of the same event is a duplicate that changes
+//!   nothing, and another account's process is refused at Prepare;
+//! * `--actions terminate` (PX-030): "Terminate…", disabled with the reason
+//!   where this host has no PID file descriptors (macOS); on Linux a fixture
+//!   process is prepared and confirmed by name, and the terminator refuses to
+//!   hold a key no live scan of this host produced, so nothing is sent;
 //! * `--actions read-only`: every control is disabled and a click rejected;
 //! * without `--actions` no action control exists, so a click names no node;
-//! * an unknown mode, and `--actions` without a process source, are refused at
-//!   start.
+//! * an unknown mode, `--actions` without a process source, and a bad or
+//!   orphaned `--protect-pid` are refused at start.
 
-use srui_process_explorer::actions::{DRY_RUN_STATUS, READ_ONLY_STATUS};
+use srui_process_explorer::actions::{PanelIds, DRY_RUN_STATUS, READ_ONLY_STATUS, TERMINATE_LABEL};
 use srui_process_explorer::{
-    ACTIONS_ROW, ACTIONS_STATUS, ACTION_CANCEL, ACTION_CONFIRM, ACTION_PREPARE, MODEL, TABLE,
+    ACTIONS_ROW, ACTIONS_STATUS, ACTION_CANCEL, ACTION_PREPARE, MODEL, TABLE,
 };
 use srui_protocol::{
     decode_framed, encode_framed, srui_message::Msg, ClientHello, EventAckStatus, ServerEventAck,
@@ -320,11 +325,13 @@ fn a_dry_run_instance_settles_prepare_and_confirm_and_refuses_what_it_must() {
     let mut client = Client::hello(&socket);
     assert_eq!(client.status(), DRY_RUN_STATUS);
     assert!(client.enabled(ACTION_PREPARE));
-    assert!(!client.enabled(ACTION_CONFIRM) && !client.enabled(ACTION_CANCEL));
-    // A disabled Confirm is rejected at validation, before any handler.
-    let ack = client.click(ACTION_CONFIRM);
+    assert!(!client.enabled(ACTION_CANCEL));
+    let panel = PanelIds::of(0);
+    assert!(client.replica.get_node(panel.row).is_none(), "no panel yet");
+    // A Confirm that does not exist is rejected at validation, before any
+    // handler.
+    let ack = client.click(panel.confirm);
     assert_eq!(ack.status, rejected(), "{ack:?}");
-    assert!(ack.reject_reason.contains("disabled"), "{ack:?}");
 
     // PID 4101 is the fixture account's own process.
     client.select(4101);
@@ -336,8 +343,14 @@ fn a_dry_run_instance_settles_prepare_and_confirm_and_refuses_what_it_must() {
         "{}",
         client.status()
     );
-    assert!(client.enabled(ACTION_CONFIRM) && client.enabled(ACTION_CANCEL));
-    let confirm = client.click_event(ACTION_CONFIRM);
+    assert!(client.enabled(panel.confirm) && client.enabled(ACTION_CANCEL));
+    assert_eq!(
+        client.property(panel.confirm, srui_sdk::LABEL),
+        Some(Value::String(
+            "Confirm dry run: terminate PID 4101 · worker".into()
+        ))
+    );
+    let confirm = client.click_event(panel.confirm);
     let ack = client.deliver(&confirm);
     assert_eq!(ack.status, processed(), "{ack:?}");
     let status = client.status();
@@ -345,7 +358,10 @@ fn a_dry_run_instance_settles_prepare_and_confirm_and_refuses_what_it_must() {
         status.starts_with("Dry run #1 requested (terminate PID 4101 · worker): nothing was sent"),
         "{status}"
     );
-    assert!(!client.enabled(ACTION_CONFIRM), "a confirm is single-use");
+    assert!(
+        client.replica.get_node(panel.row).is_none(),
+        "a confirm is single-use: its panel is deleted"
+    );
     // The same event again: the settled result, nothing re-run (§18.2).
     let revision = client.revision();
     let replay = client.deliver(&confirm);
@@ -368,7 +384,97 @@ fn a_dry_run_instance_settles_prepare_and_confirm_and_refuses_what_it_must() {
         "{}",
         client.status()
     );
-    assert!(!client.enabled(ACTION_CONFIRM));
+    assert!(client.replica.get_node(PanelIds::of(1).row).is_none());
+}
+
+/// PX-030: `--actions terminate` over the wire. Off Linux there is no PID
+/// file descriptor, so Terminate… is published disabled with the reason and a
+/// click is rejected. On Linux the fixture's own process is prepared and its
+/// panel names it; the Confirm reaches the terminator, which refuses to hold
+/// a key this host's live scan did not produce, so nothing is sent; and a
+/// redelivery of the same Confirm is a duplicate.
+#[test]
+fn a_terminate_instance_is_truthful_about_what_it_can_send() {
+    let directory = SocketDirectory::new();
+    let socket = directory.socket();
+    let _server = Server::start(
+        &socket,
+        &[
+            "--fake-source",
+            "--actions",
+            "terminate",
+            "--refresh-interval-ms",
+            "300000",
+        ],
+    );
+    let mut client = Client::hello(&socket);
+    assert_eq!(
+        client.property(ACTION_PREPARE, srui_sdk::LABEL),
+        Some(Value::String(TERMINATE_LABEL.into()))
+    );
+    client.select(4101);
+    if !cfg!(target_os = "linux") {
+        assert_eq!(
+            client.status(),
+            "Terminate unavailable: this system has no PID file descriptors (Linux 5.3 or later is needed); nothing can be sent to any process"
+        );
+        assert!(!client.enabled(ACTION_PREPARE));
+        assert_eq!(client.click(ACTION_PREPARE).status, rejected());
+        assert!(client.replica.get_node(PanelIds::of(0).row).is_none());
+        return;
+    }
+    assert!(client.enabled(ACTION_PREPARE), "{}", client.status());
+    assert_eq!(client.click(ACTION_PREPARE).status, processed());
+    let panel = PanelIds::of(0);
+    assert_eq!(
+        client.property(panel.question, TEXT),
+        Some(Value::String(
+            "Terminate PID 4101 · worker (UID 1000)? Confirm sends it SIGTERM, which asks it to exit; it may handle or ignore it.".into()
+        ))
+    );
+    let confirm = client.click_event(panel.confirm);
+    let ack = client.deliver(&confirm);
+    assert_eq!(ack.status, processed(), "{ack:?}");
+    let status = client.status();
+    assert!(
+        status.starts_with("Refused #1 (terminate PID 4101 · worker): the process could not be held for signalling: the process cannot be identified here: it was not sampled from this host's /proc"),
+        "{status}"
+    );
+    let replay = client.deliver(&confirm);
+    assert_eq!(
+        replay.status,
+        EventAckStatus::Duplicate as i32,
+        "{replay:?}"
+    );
+    assert_eq!(replay.revision_after_effect, ack.revision_after_effect);
+}
+
+/// PX-030: a PID configured with `--protect-pid` is refused at Prepare.
+#[test]
+fn a_configured_protected_pid_is_refused() {
+    let directory = SocketDirectory::new();
+    let socket = directory.socket();
+    let _server = Server::start(
+        &socket,
+        &[
+            "--fake-source",
+            "--actions",
+            "dry-run",
+            "--protect-pid",
+            "4101",
+        ],
+    );
+    let mut client = Client::hello(&socket);
+    client.select(4101);
+    assert_eq!(client.click(ACTION_PREPARE).status, processed());
+    assert!(
+        client
+            .status()
+            .starts_with("Refused: PID 4101 is protected; nothing was requested"),
+        "{}",
+        client.status()
+    );
+    assert!(client.replica.get_node(PanelIds::of(0).row).is_none());
 }
 
 #[test]
@@ -379,8 +485,11 @@ fn a_read_only_instance_disables_and_rejects_every_action_control() {
     let mut client = Client::hello(&socket);
     assert_eq!(client.status(), READ_ONLY_STATUS);
     client.select(4101);
-    for button in [ACTION_PREPARE, ACTION_CONFIRM, ACTION_CANCEL] {
-        assert!(!client.enabled(button), "{button:?}");
+    for button in [ACTION_PREPARE, ACTION_CANCEL, PanelIds::of(0).confirm] {
+        assert!(
+            !client.enabled(button) || client.replica.get_node(button).is_none(),
+            "{button:?}"
+        );
         let ack = client.click(button);
         assert_eq!(ack.status, rejected(), "{button:?}: {ack:?}");
     }
@@ -396,9 +505,10 @@ fn without_the_option_no_action_control_exists_and_bad_options_are_refused() {
     for node in [
         ACTIONS_ROW,
         ACTION_PREPARE,
-        ACTION_CONFIRM,
         ACTION_CANCEL,
         ACTIONS_STATUS,
+        PanelIds::of(0).row,
+        PanelIds::of(0).confirm,
     ] {
         assert!(client.replica.get_node(node).is_none(), "{node:?}");
     }
@@ -417,6 +527,23 @@ fn without_the_option_no_action_control_exists_and_bad_options_are_refused() {
             "--actions",
             "dry-run",
         ][..],
+        // PX-030: `--protect-pid` needs `--actions` and a positive PID.
+        &["--fake-source", "--protect-pid", "4101"][..],
+        &[
+            "--fake-source",
+            "--actions",
+            "terminate",
+            "--protect-pid",
+            "0",
+        ][..],
+        &[
+            "--fake-source",
+            "--actions",
+            "terminate",
+            "--protect-pid",
+            "x",
+        ][..],
+        &["--fake-source", "--actions", "terminate", "--protect-pid"][..],
     ] {
         let refused = SocketDirectory::new();
         let output = Command::new(env!("CARGO_BIN_EXE_srtop"))

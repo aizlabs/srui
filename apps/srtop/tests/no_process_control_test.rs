@@ -42,8 +42,10 @@
 //!   exactly `USER_THREADS_TOGGLE` or `KERNEL_THREADS_TOGGLE` with
 //!   `VALUE_CHANGED` (PX-019), or a tag button (`TAG_TOGGLE`,
 //!   `TAG_DESCENDANTS`, `TAGS_CLEAR`) with `ACTIVATE` (PX-020), or an
-//!   action button (`ACTION_PREPARE`, `ACTION_CONFIRM`, `ACTION_CANCEL`)
-//!   with `ACTIVATE` (PX-028), whose gate reaches only the dry-run executor;
+//!   action button (`ACTION_PREPARE`, `ACTION_CANCEL`) with `ACTIVATE`
+//!   (PX-028), or, in `src/lib.rs` only, exactly `panel_confirm` with
+//!   `ACTIVATE`, the confirmation panels' Confirm handlers (PX-030), whose
+//!   gate reaches one of the two production executors pinned below;
 //!   `on_result`, `on_text_edit`, `on_expansion_changed`
 //!   and a model range provider unconditionally; `include`, called or
 //!   renamed; or a macro definition (`macro_rules!`), whose expansion can
@@ -71,9 +73,19 @@
 //!   ([`HANDLE_SIGNAL_PINS`]: `Terminate` is `libc::SIGTERM`, the only
 //!   `libc::SIG..` named). `kill`, `extern`, every other `libc` item and
 //!   every other rule hold there as everywhere. No other production file may
-//!   name the module or its public items ([`HANDLE_ITEMS`]): nothing reaches
-//!   the signal it can send until PX-030 wires termination, under review, and
-//!   the dry-run executor is still the only production executor.
+//!   name the module or its public items ([`HANDLE_ITEMS`]) but the one
+//!   termination executor (PX-030).
+//! * **The one executor that can reach a process (PX-030).**
+//!   `src/terminate.rs` alone may name the handle module, and only the
+//!   items [`EXECUTOR_HANDLE_ITEMS`] (not its system-call seam); all of
+//!   production holds exactly one handle table construction
+//!   ([`EXECUTOR_TABLE`]) and exactly one settlement ([`EXECUTOR_SETTLE`],
+//!   SIGTERM through the handle it acquired), both in that file; `main`
+//!   builds that executor exactly once; and the production `ProcessActions`
+//!   are exactly [`PRODUCTION_EXECUTORS`]. Every other rule — `kill`,
+//!   `libc`, `unsafe`, `syscall` — holds in that file as everywhere: the
+//!   handle module stays the only system-call site, and nothing falls back to
+//!   a PID-addressed signal.
 //! * **Binary imports.** `nm` lists the symbols the built `srtop` imports. None
 //!   may create a process, deliver a targeted signal other than `kill`, trace a
 //!   process, or change one's priority, affinity, limits, group or session. The
@@ -336,8 +348,9 @@ const FORBIDDEN_IMPORTS: &[&str] = &[
 /// Process-related imports the binary has today. They are reported, not
 /// attributed: this test does not establish which code reaches them. Since
 /// PX-029 srtop's own `src/handle.rs` calls `syscall` on Linux (for
-/// `pidfd_open` and `pidfd_send_signal` only, as the token rules pin); the
-/// binary reaches none of that module yet.
+/// `pidfd_open` and `pidfd_send_signal` only, as the token rules pin); since
+/// PX-030 the binary reaches it through the termination executor of
+/// `--actions terminate`.
 const UNATTRIBUTED_IMPORTS: &[&str] = &["kill", "waitpid", "waitid", "syscall"];
 
 // ---------------------------------------------------------------------------
@@ -673,8 +686,8 @@ const HANDLE_SIGNAL_PINS: &[&str] = &[
 ];
 
 /// The handle module's public items. No other production file may name
-/// them, or the module itself as a path: no action path reaches a handle
-/// until PX-030 wires termination through it, under review.
+/// them, or the module itself as a path, but [`EXECUTOR_MODULE`], and that
+/// one only [`EXECUTOR_HANDLE_ITEMS`] (PX-030).
 const HANDLE_ITEMS: &[&str] = &[
     "ProcessHandles",
     "PidfdSystem",
@@ -685,6 +698,188 @@ const HANDLE_ITEMS: &[&str] = &[
     "AcquireError",
     "HandleId",
 ];
+
+// ---------------------------------------------------------------------------
+// PX-030: the one executor that reaches a process handle
+// ---------------------------------------------------------------------------
+
+/// The one production file besides the handle module that may name it: the
+/// termination executor.
+const EXECUTOR_MODULE: &str = "src/terminate.rs";
+
+/// What the executor module may name of the handle module: the table, its
+/// handle IDs, the one signal and the two result types. Not the system-call
+/// seam (`PidfdSystem`, `Pidfd`, `LivePidfds`): production code uses only the
+/// host's, through `ProcessHandles::live`.
+const EXECUTOR_HANDLE_ITEMS: &[&str] = &[
+    "ProcessHandles",
+    "HandleSignal",
+    "SignalOutcome",
+    "AcquireError",
+    "HandleId",
+];
+
+/// The one handle settlement in production code, token for token
+/// ([`render`]): the handle just acquired, with SIGTERM. In
+/// [`EXECUTOR_MODULE`], and nowhere else.
+const EXECUTOR_SETTLE: &str = ". settle ( id , HandleSignal : : Terminate )";
+
+/// The one handle table production code builds: PX-029 requires exactly one
+/// table, since a `HandleId` is minted per table and `settle` takes no key.
+/// In [`EXECUTOR_MODULE`], and nowhere else.
+const EXECUTOR_TABLE: &str = "ProcessHandles : : live (  )";
+
+/// The one construction of the termination executor in production code, in
+/// `src/main.rs`.
+const EXECUTOR_CONSTRUCTION: (&str, &str) = ("src/main.rs", "PidfdTerminator : : live (  )");
+
+/// The production action executors (PX-028, PX-030) and the file each one is
+/// implemented in.
+const PRODUCTION_EXECUTORS: &[(&str, &str)] = &[
+    ("DryRunExecutor", "src/actions.rs"),
+    ("PidfdTerminator", EXECUTOR_MODULE),
+];
+
+/// The confirmation panels' Confirm handlers (PX-030): one registration per
+/// panel slot, made in a loop in `install_actions`, whose node argument is
+/// exactly the identifier `panel_confirm` with `ACTIVATE`, in this file only.
+const PANEL_CONFIRM: (&str, &str) = ("src/lib.rs", "panel_confirm");
+
+/// The production tokens of `level` as one line: identifiers and
+/// punctuation by their text, `::` as `: :` (as [`canonical`] prints it),
+/// groups in their delimiters, every literal as `<literal>`.
+fn render(level: &[Tok]) -> String {
+    level
+        .iter()
+        .map(|tok| match tok {
+            Tok::Ident(name, _, _) => name.clone(),
+            Tok::Punct(ch, _) => ch.to_string(),
+            Tok::PathSep(_) => ": :".to_string(),
+            Tok::Literal(_) => "<literal>".to_string(),
+            Tok::Group(delimiter, inner, _) => {
+                let inner = render(inner);
+                match delimiter {
+                    Delimiter::Parenthesis => format!("( {inner} )"),
+                    Delimiter::Brace => format!("{{ {inner} }}"),
+                    Delimiter::Bracket => format!("[ {inner} ]"),
+                    Delimiter::None => inner,
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// How the production tokens of one file reach the handle table: every
+/// `settle` called as a method or a path, and every associated function of
+/// `ProcessHandles` or `PidfdTerminator` (`::live`, `::new`, ...) named,
+/// each as the rendered text around it, so a pinned one can be told from any
+/// other.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HandleReach {
+    settles: Vec<String>,
+    tables: Vec<String>,
+    executors: Vec<String>,
+}
+
+fn handle_reach(source: &str) -> HandleReach {
+    fn walk(level: &[Tok], reach: &mut HandleReach) {
+        for (i, tok) in level.iter().enumerate() {
+            let prev = i.checked_sub(1).and_then(|p| level.get(p));
+            match tok {
+                Tok::Ident(name, _, _)
+                    if name == "settle" && (is_punct(prev, '.') || is_path_sep(prev)) =>
+                {
+                    let start = i - 1;
+                    reach
+                        .settles
+                        .push(render(&level[start..(i + 2).min(level.len())]));
+                }
+                Tok::Ident(name, _, _)
+                    if (name == "ProcessHandles" || name == "PidfdTerminator")
+                        && is_path_sep(level.get(i + 1)) =>
+                {
+                    let end = (i + 4).min(level.len());
+                    let text = render(&level[i..end]);
+                    // Any associated function, called or taken as a value,
+                    // is a way to build one.
+                    if ident(level.get(i + 2))
+                        .is_some_and(|member| member.starts_with(|c: char| c.is_ascii_lowercase()))
+                    {
+                        if name == "ProcessHandles" {
+                            reach.tables.push(text);
+                        } else {
+                            reach.executors.push(text);
+                        }
+                    }
+                }
+                Tok::Group(_, inner, _) => walk(inner, reach),
+                _ => {}
+            }
+        }
+    }
+    let stream = TokenStream::from_str(source).expect("a source file tokenizes");
+    let mut reach = HandleReach::default();
+    walk(&production(&lower(stream)), &mut reach);
+    reach
+}
+
+/// Every way `files` (path, source) depart from the one table, the one
+/// settlement and the one executor construction PX-030 allows.
+fn handle_reach_violations(files: &[(String, String)]) -> Vec<String> {
+    let mut found = Vec::new();
+    let (mut settles, mut tables, mut executors) = (0, 0, 0);
+    for (file, source) in files {
+        let reach = handle_reach(source);
+        for settle in &reach.settles {
+            settles += 1;
+            if file != EXECUTOR_MODULE || settle != EXECUTOR_SETTLE {
+                found.push(format!(
+                    "{file}: [settle] `{settle}` is not the one settlement"
+                ));
+            }
+        }
+        for table in &reach.tables {
+            tables += 1;
+            if file != EXECUTOR_MODULE || table != EXECUTOR_TABLE {
+                found.push(format!(
+                    "{file}: [table] `{table}` builds another handle table"
+                ));
+            }
+        }
+        for executor in &reach.executors {
+            executors += 1;
+            if (file.as_str(), executor.as_str()) != EXECUTOR_CONSTRUCTION {
+                found.push(format!(
+                    "{file}: [executor] `{executor}` builds another terminator"
+                ));
+            }
+        }
+    }
+    for (what, count) in [
+        ("settlement", settles),
+        ("handle table", tables),
+        ("terminator construction", executors),
+    ] {
+        if count != 1 {
+            found.push(format!(
+                "[count] {count} {what}s in production code, not exactly one"
+            ));
+        }
+    }
+    found
+}
+
+/// Whether an `on(..)` argument list is a confirmation panel's Confirm
+/// registration (PX-030): exactly the identifier `panel_confirm`, then
+/// exactly `ACTIVATE`. The file is checked by the caller.
+fn is_panel_confirm_activation(tokens: &[Tok]) -> bool {
+    matches!(
+        tokens,
+        [Tok::Ident(node, false, _), Tok::Punct(',', _), Tok::Ident(event, false, _), Tok::Punct(',', _), ..]
+            if node == PANEL_CONFIRM.1 && event == "ACTIVATE"
+    )
+}
 
 /// Whether a parenthesized argument list starts with one of
 /// [`HANDLE_SYSCALLS`], as `libc::SYS_pidfd_open,`.
@@ -830,7 +1025,9 @@ fn handle_signal_violations(source: &str) -> Vec<String> {
     found
 }
 
-fn scan(level: &[Tok], handle_module: bool, report: &mut dyn FnMut(usize, &str, String)) {
+fn scan(level: &[Tok], file: &str, report: &mut dyn FnMut(usize, &str, String)) {
+    let handle_module = file == HANDLE_MODULE;
+    let executor_module = file == EXECUTOR_MODULE;
     for (i, tok) in level.iter().enumerate() {
         let prev = i.checked_sub(1).and_then(|p| level.get(p));
         let next = level.get(i + 1);
@@ -843,16 +1040,21 @@ fn scan(level: &[Tok], handle_module: bool, report: &mut dyn FnMut(usize, &str, 
                         report(line, "ident", format!("`{name}`: {why}"));
                     }
                 }
-                // PX-029: the handle module is reached by no other file yet.
+                // PX-029: the handle module is reached by no other file but
+                // the termination executor, and that one names only its
+                // table, IDs, signal and results (PX-030).
                 if !handle_module {
-                    if HANDLE_ITEMS.contains(&name.as_str()) {
+                    if HANDLE_ITEMS.contains(&name.as_str())
+                        && !(executor_module && EXECUTOR_HANDLE_ITEMS.contains(&name.as_str()))
+                    {
                         report(
                             line,
                             "handle",
-                            format!("`{name}`: the process handle module is not wired"),
+                            format!("`{name}`: the process handle module is not wired here"),
                         );
                     }
                     if name == "handle"
+                        && !executor_module
                         && (is_path_sep(prev) || is_path_sep(next) || ident(next) == Some("as"))
                     {
                         report(
@@ -910,6 +1112,8 @@ fn scan(level: &[Tok], handle_module: bool, report: &mut dyn FnMut(usize, &str, 
                                     || is_table_selection(tokens)
                                     || is_follow_toggle(tokens)
                                     || is_view_or_tree_input(tokens)
+                                    || (file == PANEL_CONFIRM.0
+                                        && is_panel_confirm_activation(tokens))
                             }
                             _ => false,
                         };
@@ -994,7 +1198,7 @@ fn scan(level: &[Tok], handle_module: bool, report: &mut dyn FnMut(usize, &str, 
                     check_attribute(inner, *line, false, report);
                 }
             }
-            Tok::Group(_, inner, _) => scan(inner, handle_module, report),
+            Tok::Group(_, inner, _) => scan(inner, file, report),
             _ => {}
         }
     }
@@ -1044,13 +1248,11 @@ const TAG_BUTTON_CONSTANTS: &[&str] = &["TAG_TOGGLE", "TAG_DESCENDANTS", "TAGS_C
 const SAMPLING_BUTTON_CONSTANTS: &[&str] =
     &["SAMPLING_PAUSE", "SAMPLING_REFRESH", "INTERVAL_APPLY"];
 
-/// The action buttons (PX-028), whose `ACTIVATE` handlers prepare an
-/// intent for the process the server resolved as selected, confirm it
-/// through the action gate, or cancel it. The only executor srtop
-/// constructs is the dry-run executor, which sends nothing; this audit's
-/// identifier, method and import rules hold for it as for every other module,
-/// so it cannot signal, open for control or reconfigure a process.
-const ACTION_BUTTON_CONSTANTS: &[&str] = &["ACTION_PREPARE", "ACTION_CONFIRM", "ACTION_CANCEL"];
+/// The fixed action buttons (PX-028), whose `ACTIVATE` handlers prepare an
+/// intent for the process the server resolved as selected or cancel it. A
+/// prepared intent is confirmed through its own panel's Confirm (PX-030,
+/// [`PANEL_CONFIRM`]); the generic Confirm `ACTION_CONFIRM` is gone.
+const ACTION_BUTTON_CONSTANTS: &[&str] = &["ACTION_PREPARE", "ACTION_CANCEL"];
 
 /// The text inputs whose `TEXT_EDIT` handlers are allowed: the filter input
 /// (PX-010), the search and PID fields (PX-011), and the user and PID-set
@@ -1246,7 +1448,7 @@ fn token_violations(file: &str, source: &str) -> Vec<String> {
     };
     let tokens = production(&lower(stream));
     let mut found = Vec::new();
-    scan(&tokens, file == HANDLE_MODULE, &mut |line, rule, what| {
+    scan(&tokens, file, &mut |line, rule, what| {
         found.push(format!("{file}:{line}: [{rule}] {what}"))
     });
     found
@@ -2681,6 +2883,9 @@ fn the_pidfd_allowance_is_exactly_the_handle_modules_two_system_calls() {
     assert_eq!(in_handle(real), Vec::<String>::new());
     for elsewhere in [
         "src/actions.rs",
+        // PX-030: the termination executor names the handle module, and
+        // still makes no system call of its own.
+        EXECUTOR_MODULE,
         "src/handle/inner.rs",
         "handle.rs",
         "snippet.rs",
@@ -2817,14 +3022,48 @@ fn the_pidfd_allowance_is_exactly_the_handle_modules_two_system_calls() {
     }
 }
 
-/// PX-028: the action gate reaches a process only through a
-/// `ProcessActions` executor, and production code has exactly one, the
-/// dry-run executor. A second implementation — one that could send a
-/// signal — is PX-030's to add, under review, and fails here until this
-/// rule names it. PX-029's process handles are not an executor and implement
-/// no `ProcessActions`.
+/// Every production source file, by its path under the crate root.
+fn production_files() -> Vec<(String, String)> {
+    let root = crate_root();
+    let (mut files, mut links) = (Vec::new(), Vec::new());
+    rust_files(&root.join("src"), &mut files, &mut links);
+    assert!(links.is_empty(), "{links:?}");
+    files
+        .iter()
+        .map(|path| {
+            (
+                path.strip_prefix(&root)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string(),
+                std::fs::read_to_string(path).expect("a readable source file"),
+            )
+        })
+        .collect()
+}
+
+/// Every production `ProcessActions` implementation as (type, file).
+fn production_executors(files: &[(String, String)]) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = files
+        .iter()
+        .flat_map(|(file, text)| {
+            process_actions_implementations(text)
+                .into_iter()
+                .map(move |name| (name, file.clone()))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// PX-028, PX-030: the action gate reaches a process only through a
+/// `ProcessActions` executor, and production code has exactly two: the
+/// dry-run executor, which sends nothing, and the PID file descriptor
+/// terminator, the one that can, each in its own file. A third fails here
+/// until this rule names it, under review. PX-029's process handles are not
+/// an executor and implement no `ProcessActions`.
 #[test]
-fn the_only_production_action_executor_is_the_dry_run_executor() {
+fn the_production_action_executors_are_the_dry_run_executor_and_the_pidfd_terminator() {
     assert_eq!(
         process_actions_implementations(
             "impl ProcessActions for DryRunExecutor {}\n\
@@ -2835,16 +3074,206 @@ fn the_only_production_action_executor_is_the_dry_run_executor() {
         vec!["DryRunExecutor".to_string(), "Other".to_string()],
         "the rule sees plain and path-qualified implementations and skips test code"
     );
-    let root = crate_root();
-    let (mut files, mut links) = (Vec::new(), Vec::new());
-    rust_files(&root.join("src"), &mut files, &mut links);
-    let mut implementations = Vec::new();
-    for path in &files {
-        let text = std::fs::read_to_string(path).expect("a readable source file");
-        implementations.extend(process_actions_implementations(&text));
-    }
-    assert_eq!(implementations, vec!["DryRunExecutor".to_string()]);
+    let mut expected: Vec<(String, String)> = PRODUCTION_EXECUTORS
+        .iter()
+        .map(|(name, file)| (name.to_string(), file.to_string()))
+        .collect();
+    expected.sort();
+    assert_eq!(production_executors(&production_files()), expected);
+    // The terminator implemented anywhere else is another executor.
+    let moved = vec![(
+        "src/actions.rs".to_string(),
+        "impl ProcessActions for PidfdTerminator {}".to_string(),
+    )];
+    assert_ne!(production_executors(&moved), expected[1..].to_vec());
 }
+
+/// PX-030: the termination executor is the one production file that reaches
+/// the handle module besides the module itself, and it reaches it in exactly
+/// one way: one table, one settlement with SIGTERM, built once by `main`.
+/// Each departure below is refused, and the module's system-call rules still
+/// hold there.
+#[test]
+fn the_termination_executor_is_the_one_reach_into_the_handle_module() {
+    let files = production_files();
+    assert_eq!(handle_reach_violations(&files), Vec::<String>::new());
+    let executor = files
+        .iter()
+        .find(|(file, _)| file == EXECUTOR_MODULE)
+        .expect("the termination executor exists")
+        .1
+        .clone();
+    let with = |file: &str, extra: &str| -> Vec<(String, String)> {
+        let mut changed = files.clone();
+        match changed.iter_mut().find(|(name, _)| name == file) {
+            Some((_, text)) => text.push_str(extra),
+            None => changed.push((file.to_string(), extra.to_string())),
+        }
+        changed
+    };
+    for (name, file, extra, rule) in [
+        (
+            "a second settlement, identical",
+            EXECUTOR_MODULE,
+            "\nfn again(t: &mut ProcessHandles, id: HandleId) { t.settle(id, HandleSignal::Terminate); }",
+            "[count]",
+        ),
+        (
+            "a settlement elsewhere",
+            "src/actions.rs",
+            "\nfn f() { table.settle(id, HandleSignal::Terminate); }",
+            "[settle]",
+        ),
+        (
+            "a settlement of another handle",
+            EXECUTOR_MODULE,
+            "\nfn f() { table.settle(other, HandleSignal::Terminate); }",
+            "[settle]",
+        ),
+        (
+            "a settlement by path",
+            EXECUTOR_MODULE,
+            "\nfn f() { ProcessHandles::settle(&mut table, id, HandleSignal::Terminate); }",
+            "[settle]",
+        ),
+        (
+            "a second table in main",
+            "src/main.rs",
+            "\nfn f() { let _ = ProcessHandles::live(); }",
+            "[table]",
+        ),
+        (
+            "a second table, identical",
+            EXECUTOR_MODULE,
+            "\nfn f() -> ProcessHandles { ProcessHandles::live() }",
+            "[count]",
+        ),
+        (
+            "a table over another system",
+            EXECUTOR_MODULE,
+            "\nfn f() { let _ = ProcessHandles::new(system, clock, source); }",
+            "[table]",
+        ),
+        (
+            "a table constructor taken as a value",
+            EXECUTOR_MODULE,
+            "\nfn f() { let make = ProcessHandles::live; }",
+            "[table]",
+        ),
+        (
+            "a second terminator in main",
+            "src/main.rs",
+            "\nfn f() { let _ = PidfdTerminator::live(); }",
+            "[count]",
+        ),
+        (
+            "a terminator built elsewhere",
+            "src/lib.rs",
+            "\nfn f() { let _ = PidfdTerminator::with_handles(table); }",
+            "[executor]",
+        ),
+    ] {
+        let found = handle_reach_violations(&with(file, extra));
+        assert!(
+            found.iter().any(|violation| violation.contains(rule)),
+            "{name} is refused as {rule}: {found:?}"
+        );
+    }
+    // Without the settlement, the count is wrong too: the rule is exact.
+    let removed = executor.replace(EXECUTOR_SETTLE_SOURCE, "");
+    assert_ne!(removed, executor, "the anchor is in the module");
+    let mut without = files.clone();
+    without
+        .iter_mut()
+        .find(|(file, _)| file == EXECUTOR_MODULE)
+        .unwrap()
+        .1 = removed;
+    assert!(handle_reach_violations(&without)
+        .iter()
+        .any(|violation| violation.contains("0 settlements")));
+
+    // In the executor module: the handle items it needs pass; the seam, and
+    // every system-call, signal and process-control construct, are refused.
+    assert_eq!(
+        token_violations(
+            EXECUTOR_MODULE,
+            "use crate::handle::{AcquireError, HandleId, HandleSignal, ProcessHandles, SignalOutcome};"
+        ),
+        Vec::<String>::new()
+    );
+    assert!(token_violations(
+        "src/actions.rs",
+        "use crate::handle::{AcquireError, HandleId, HandleSignal, ProcessHandles, SignalOutcome};"
+    )
+    .iter()
+    .any(|v| v.contains("[handle]")));
+    for snippet in [
+        "fn f(system: &dyn PidfdSystem) {}",
+        "let _ = LivePidfds;",
+        "impl Pidfd for Mine {}",
+    ] {
+        assert!(
+            token_violations(EXECUTOR_MODULE, snippet)
+                .iter()
+                .any(|v| v.contains("[handle]")),
+            "{snippet} is refused in the executor module"
+        );
+    }
+    for snippet in [
+        "let _ = libc::kill(pid, 15);",
+        "let _ = kill(pid, 15);",
+        "let _ = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, fd, 15, 0, 0) };",
+        "let _ = libc::syscall(libc::SYS_pidfd_open, pid, 0);",
+        "let _ = nix::sys::signal::kill(Pid::from_raw(pid), None);",
+        "std::process::Command::new(\"kill\").arg(pid).status();",
+    ] {
+        assert!(
+            token_violations(EXECUTOR_MODULE, snippet)
+                .iter()
+                .any(|v| v.contains("[ident]")),
+            "{snippet} is refused in the executor module"
+        );
+    }
+
+    // The panels' Confirm handlers: exactly `on(panel_confirm, ACTIVATE, ..)`,
+    // in `src/lib.rs` only.
+    let registration = "session.on(panel_confirm, ACTIVATE, move |session, event| { actions::confirm_requested(&gate, &view, session, event, slot); });";
+    assert_eq!(
+        token_violations(PANEL_CONFIRM.0, registration),
+        Vec::<String>::new()
+    );
+    for (file, snippet) in [
+        ("src/actions.rs", registration),
+        (EXECUTOR_MODULE, registration),
+        (
+            PANEL_CONFIRM.0,
+            "session.on(panel_confirm, VALUE_CHANGED, |_, _| {});",
+        ),
+        (
+            PANEL_CONFIRM.0,
+            "session.on(panel_confirm + 1, ACTIVATE, |_, _| {});",
+        ),
+        (PANEL_CONFIRM.0, "session.on(confirm, ACTIVATE, |_, _| {});"),
+        (
+            PANEL_CONFIRM.0,
+            "session.on(ids.confirm, ACTIVATE, |_, _| {});",
+        ),
+        (
+            PANEL_CONFIRM.0,
+            "session.on(ACTION_CONFIRM, ACTIVATE, |_, _| {});",
+        ),
+    ] {
+        assert!(
+            token_violations(file, snippet)
+                .iter()
+                .any(|v| v.contains("[handler]")),
+            "{snippet} in {file} is refused"
+        );
+    }
+}
+
+/// The one settlement as the executor module writes it.
+const EXECUTOR_SETTLE_SOURCE: &str = "handles.settle(id, HandleSignal::Terminate)";
 
 #[test]
 fn line_numbers_point_at_the_violation() {

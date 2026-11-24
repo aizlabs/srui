@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-030",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Confirmed graceful termination of one process (D1 §§6.2, 7.7, 18.2, 27; D2 T24, T32; K2): --actions terminate adds Terminate…, which prepares an immutable intent and an inline confirmation panel of fresh, never-reused nodes (Row, Text, Button) bound to that intent; the panel's Confirm sends SIGTERM through ProcessActions to the one PidfdTerminator, which acquires a PX-029 handle at Confirm from its one table, checks key_of against the intent's key and settles it at once. Cancel, expiry, navigation (the server's resolved selection leaving the intent's process), read-only mode and identity replacement withdraw the intent and delete its panel. PID 1, --protect-pid PIDs and the server-derived support chain (srtop, its ancestors, each connected transport by socket peer PID and its ancestors) are refused, after the PX-028 owner, identity and freshness checks. Where PID file descriptors are unavailable Terminate… stays disabled with the reason and nothing falls back to kill(pid). Without --actions the package is unchanged and read-only. No protocol, registry, SDK, runtime, renderer or client change. Contributes to HTOP-R1-001 (owner PX-028/PX-031), which stays planned until PX-031 observes the outcome",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md",
+      "K2": "https://man7.org/linux/man-pages/man2/pidfd_send_signal.2.html",
+      "K3": "https://man7.org/linux/man-pages/man2/pidfd_open.2.html"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX030-001",
+      "feature": "Terminate… and a fresh confirmation panel per intent: --actions terminate labels Prepare 'Terminate…'; a prepared intent is shown in a panel (Row, Text naming the exact process and owner, Button 'Confirm: terminate PID n · name') whose three node IDs are PANEL_ID_BASE + 3n.. for the n-th intent of a run, never reused (§6.2), at most DEFAULT_CONFIRMATION_PANELS (4096) per run, then Prepare is refused; one Confirm handler per slot is registered at start (the runtime cannot remove a handler), and a slot's handler confirms only the intent shown in that slot; a consumed, cancelled or withdrawn intent's panel is deleted, so its Confirm names no node; PX-028's generic Confirm (node 85) is gone; repeated cycles leave the live node count, handler table and descriptors unchanged",
+      "scope": "PX-030/apps/srtop/src/actions.rs PanelIds, ActionGate::confirm_panel, create_panel, publish_view; src/lib.rs install_actions; tests/terminate_test.rs repeated_cycles_leak_no_node_handler_or_handle; src/actions.rs a_panels_confirm_confirms_only_the_intent_shown_in_its_slot, panel_ids_are_fresh_bounded_and_clear_of_the_shell",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-030",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-030.md"]
+    },
+    {
+      "feature_id": "SRUI-PX030-002",
+      "feature": "Confirm sends SIGTERM to exactly the confirmed instance through the one production executor that can reach a process: PidfdTerminator holds one ProcessHandles table, acquires at Confirm (identity re-checked after pidfd_open), refuses a handle whose key_of is not the intent's key, settles it with HandleSignal::Terminate and closes it; a replaced PID is refused after the open and the newcomer receives nothing; Sent is reported as Requested ('SIGTERM was sent; the process may handle or ignore it, and whether it exits is not yet observed'), never as complete; a live test-owned worker that handles SIGTERM exits 0",
+      "scope": "PX-030/apps/srtop/src/terminate.rs PidfdTerminator, signal_held; tests/terminate_test.rs a_confirmed_terminate_sends_sigterm_to_exactly_the_confirmed_instance_once, a_pid_taken_or_left_after_the_scan_is_refused_and_nothing_is_sent, a_handle_is_settled_only_for_the_key_it_was_acquired_for; tests/terminate_live_test.rs live_terminate_reaches_exactly_the_confirmed_owned_worker; client-macos ProcessExplorerTerminateDevboxTests",
+      "source_refs": ["D1", "D2", "K2", "K3"],
+      "owner": "PX-030",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-030.md"]
+    },
+    {
+      "feature_id": "SRUI-PX030-003",
+      "feature": "Cancel, expiry, navigation, read-only mode and identity replacement invalidate the intent: navigation is the server's resolved selection no longer naming the intent's process instance (another row, a cleared selection, or a filter, search or view change that moves it); Confirm refuses a navigated intent (Refusal::Navigated) and ActionGate::revalidate, run on every selection change, republication and sample, withdraws an expired, navigated or no-longer-eligible intent and deletes its panel; prepare A, select B, confirm: A's intent is rejected and nothing is opened or sent; a paused or resuming view holds the intent with Confirm disabled; cancelled and expired intents never reach the executor",
+      "scope": "PX-030/apps/srtop/src/actions.rs ActionGate::revalidate, withdrawal, authorize, ActionIntent::still_selected; src/refresh.rs sync_actions; tests/actions_test.rs selecting_another_process_withdraws_the_intent_and_its_panel, ineligible_targets_never_reach_the_executor; tests/terminate_test.rs prepare_a_select_b_and_confirm_rejects_the_old_intent, cancel_and_expired_intents_open_and_send_nothing",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-030",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-030.md"]
+    },
+    {
+      "feature_id": "SRUI-PX030-004",
+      "feature": "Protected targets: PID 1 and --protect-pid PIDs (repeatable, at most 64, only with --actions) in every source; for this host's live processes the support chain the server derives from its own process tree and connections, never from a client: srtop itself and its ancestors (/proc/<pid>/stat parents), each connected client's transport (the socket peer PID, the srui-ssh-bridge) and its ancestors (the SSH session); an unreadable chain refuses every live target; checked after the owner, identity and freshness checks, at Prepare, Confirm and revalidation",
+      "scope": "PX-030/apps/srtop/src/support.rs ServerSupportChain, Transport; src/actions.rs SupportChain, SupportRole, Refusal::SupportChain, Refusal::SupportChainUnknown, ActionGate::admit; src/main.rs --protect-pid, peer_cred registration; tests/terminate_test.rs the_support_chain_and_configured_pids_are_refused_before_any_handle; tests/actions_wire_test.rs a_configured_protected_pid_is_refused; tests/terminate_live_test.rs; client-macos ProcessExplorerTerminateDevboxTests",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-030",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-030.md"]
+    },
+    {
+      "feature_id": "SRUI-PX030-005",
+      "feature": "Unsupported hosts keep Terminate disabled with a truthful status and never fall back to kill(pid): PidfdTerminator probes once at start; Unsupported (not Linux, ENOSYS, a filter's EPERM, ENODEV) makes ProcessActions::unavailable report the reason, the gate publishes Terminate… disabled with 'Terminate unavailable: …; nothing can be sent to any process' and refuses a click that gets through as Unsupported",
+      "scope": "PX-030/apps/srtop/src/terminate.rs PidfdTerminator::with_handles; src/actions.rs ProcessActions::unavailable, ActionGate::view; tests/terminate_test.rs without_pid_file_descriptors_terminate_stays_disabled_and_nothing_falls_back; tests/actions_wire_test.rs a_terminate_instance_is_truthful_about_what_it_can_send; client-macos dryRunActionControlsPrepareAndConfirmOnTheServerAndReadOnlyDisablesThem (terminate on macOS)",
+      "source_refs": ["D1", "D2", "K3"],
+      "owner": "PX-030",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-030.md"]
+    },
+    {
+      "feature_id": "SRUI-PX030-006",
+      "feature": "PX-008's audit, adjusted minimally: src/terminate.rs alone besides src/handle.rs may name the handle module, and only ProcessHandles, HandleSignal, SignalOutcome, AcquireError and HandleId (not the system-call seam); production holds exactly one handle table construction (ProcessHandles::live() in src/terminate.rs), exactly one settlement (.settle(id, HandleSignal::Terminate) there) and one PidfdTerminator::live() in src/main.rs; the production ProcessActions are exactly DryRunExecutor (src/actions.rs) and PidfdTerminator (src/terminate.rs); kill, libc, unsafe and syscall stay refused outside src/handle.rs, the only system-call site; the panels' Confirm handlers are allowed only as on(panel_confirm, ACTIVATE, ..) in src/lib.rs",
+      "scope": "PX-030/apps/srtop/tests/no_process_control_test.rs EXECUTOR_MODULE, EXECUTOR_HANDLE_ITEMS, EXECUTOR_SETTLE, EXECUTOR_TABLE, EXECUTOR_CONSTRUCTION, PRODUCTION_EXECUTORS, PANEL_CONFIRM, handle_reach_violations, the_termination_executor_is_the_one_reach_into_the_handle_module, the_production_action_executors_are_the_dry_run_executor_and_the_pidfd_terminator",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-030",
+      "status": "in_progress",
+      "evidence": ["docs/process-explorer/completions/PX-030.md"]
+    }
+  ]
+}

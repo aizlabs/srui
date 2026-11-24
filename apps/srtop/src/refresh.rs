@@ -1177,15 +1177,21 @@ impl ProcessView {
     }
 
     /// Tells the action gate whether this view's rows are the latest scan
-    /// (PX-028): paused, resuming before its first sample, or current. The
-    /// gate republishes its controls when that changes what they show, or
-    /// when an earlier publication of them failed.
+    /// (PX-028): paused, resuming before its first sample, or current; and
+    /// has it withdraw a pending intent this view no longer supports
+    /// (PX-030): expired, the selection moved off it, or its target no longer
+    /// the latest scan's eligible instance. The gate republishes its controls
+    /// when that changes what they show, or when an earlier publication of
+    /// them failed. Called after every sample, pause, resume, republication
+    /// and inspector publication, so a selection change withdraws a stale
+    /// confirmation in the same handler.
     fn sync_actions(&self, session: &Session) {
         let Some(gate) = &self.actions else {
             return;
         };
         let mut gate = crate::actions::lock_actions(gate);
         gate.hold_for(self);
+        gate.revalidate(self);
         if let Err(error) = gate.publish_if_changed(session) {
             eprintln!("srtop: action controls not published: {error}");
         }
@@ -2267,6 +2273,9 @@ impl ProcessView {
     ) -> Result<Refreshed, SessionError> {
         let published = self.republish_rows(session, plan, switch);
         self.debug_check_tag_accounting();
+        // A filter, search, sort, thread or view change can move the
+        // selection off a prepared intent's process (PX-030).
+        self.sync_actions(session);
         published
     }
 
@@ -2795,6 +2804,8 @@ impl ProcessView {
     ) -> (Result<Refreshed, SessionError>, usize) {
         let mut result = Refreshed::default();
         if plan.is_empty() {
+            // The selection may still have moved (PX-030).
+            self.sync_actions(session);
             return (Ok(result), 0);
         }
         count(&plan, &mut result);
@@ -2807,6 +2818,9 @@ impl ProcessView {
             &mut self.published(),
         );
         result.transactions = transactions;
+        // An inspector publication follows a selection change: one that
+        // moved off a prepared intent's process withdraws it (PX-030).
+        self.sync_actions(session);
         (outcome.map(|()| result), reached)
     }
 

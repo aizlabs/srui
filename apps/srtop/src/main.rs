@@ -8,13 +8,22 @@
 //! mints a new incarnation and restores nothing, so a client resuming an
 //! earlier instance is answered `REPLACED` (§§17–18).
 //!
-//! `--actions read-only|dry-run` adds the action controls under the inspector
-//! (PX-028, §§7.7, 27). In `read-only` the server refuses every action and the
-//! controls are disabled; in `dry-run` Prepare and Confirm are authorized in
-//! full and handed to the dry-run executor, which sends nothing. Without the
-//! option no action control or handler exists.
+//! `--actions read-only|dry-run|terminate` adds the action controls under the
+//! inspector (PX-028, PX-030, §§7.7, 27). In `read-only` the server refuses
+//! every action and the controls are disabled; in `dry-run` Prepare and
+//! Confirm are authorized in full and handed to the dry-run executor, which
+//! sends nothing; in `terminate` a confirmed intent is handed to the PID file
+//! descriptor terminator, which sends SIGTERM to exactly the confirmed
+//! process instance, and where this host has no PID file descriptors the
+//! controls say so and stay disabled. Without the option no action control or
+//! handler exists, and the package stays read-only. `--protect-pid PID`
+//! (repeatable, at most 64, only with `--actions`) adds a PID no action may
+//! target, besides PID 1 and the support chain the server derives itself.
 use srui_process_explorer::{
-    actions::{ActionGate, ActionMode, DryRunExecutor},
+    actions::{
+        ActionGate, ActionMode, DryRunExecutor, ProcessActions, DEFAULT_PROTECTED_PIDS,
+        MAX_CONFIGURED_PROTECTED_PIDS,
+    },
     initialize, install_actions, install_column_handlers, install_filter_handlers,
     install_follow_handlers, install_inspector, install_owner_handlers, install_sampling_handlers,
     install_search_handlers, install_sort_handlers, install_tag_handlers, install_thread_handlers,
@@ -26,6 +35,8 @@ use srui_process_explorer::{
         FakeProcessSource, FollowSource, ProcessSource, RepeatedNamesSource, ScriptedFakeSource,
         SyntheticProcessSource, ThreadsSource, TreeSource,
     },
+    support::ServerSupportChain,
+    terminate::PidfdTerminator,
     update_title, FIXTURE_TITLE,
 };
 use srui_sessiond::{handle_connection, Session, SessionConfig};
@@ -63,12 +74,22 @@ enum Collection {
     Scale(usize),
 }
 
+/// How this instance's action controls are set up, when it has them.
+struct Actions {
+    mode: ActionMode,
+    /// The PIDs `--protect-pid` named.
+    protected: Vec<u32>,
+    /// The processes serving this session, with every connected transport
+    /// registered as it connects (PX-030).
+    support: Arc<ServerSupportChain>,
+}
+
 /// Publishes the first snapshot and starts the refresh loop for one source.
 fn collect<S>(
     session: &Arc<Session>,
     mut source: S,
     interval: Duration,
-    actions: Option<ActionMode>,
+    actions: Option<&Actions>,
     shutdown: &CancellationToken,
     connections: &mut JoinSet<()>,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -105,14 +126,22 @@ where
     // The inspector reads details through its own reader of the source's
     // records, on its own bounded worker (PX-013).
     install_inspector(session, &view, source.details());
-    // The action controls act on the inspector's resolved selection, through
-    // the dry-run executor only (PX-028).
-    if let Some(mode) = actions {
-        let gate = Arc::new(Mutex::new(ActionGate::new(
-            mode,
-            Arc::new(DryRunExecutor::default()),
-        )));
-        install_actions(session, &view, &gate)?;
+    // The action controls act on the inspector's resolved selection (PX-028),
+    // through the dry-run executor, or through the one PID file descriptor
+    // terminator of `--actions terminate` (PX-030).
+    if let Some(actions) = actions {
+        let executor: Arc<dyn ProcessActions> = match actions.mode {
+            ActionMode::Terminate => Arc::new(PidfdTerminator::live()),
+            ActionMode::ReadOnly | ActionMode::DryRun => Arc::new(DryRunExecutor::default()),
+        };
+        let gate = ActionGate::new(actions.mode, executor)
+            .with_protected_pids(
+                DEFAULT_PROTECTED_PIDS
+                    .into_iter()
+                    .chain(actions.protected.iter().copied()),
+            )
+            .with_support_chain(Arc::clone(&actions.support) as _);
+        install_actions(session, &view, &Arc::new(Mutex::new(gate)))?;
     }
     let session = Arc::clone(session);
     let shutdown = shutdown.child_token();
@@ -129,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              | --fake-sequence \
              | --live-source | --procfs | --scale-source COUNT] \
              [--refresh-interval-ms MS | --scale-interval-ms MS] [--journal-capacity N] \
-             [--actions read-only|dry-run]"
+             [--actions read-only|dry-run|terminate [--protect-pid PID]...]"
             .into());
     }
     let socket_path = PathBuf::from(args.next().ok_or("missing --socket PATH")?);
@@ -138,6 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut interval = None;
     let mut journal_capacity = None;
     let mut actions = None;
+    let mut protected: Vec<u32> = Vec::new();
     let mut args = args.peekable();
     while let Some(value) = args.next() {
         let select = |current: &mut Collection, chosen| {
@@ -193,11 +223,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some("--actions") if actions.is_none() => {
                 let mode = args
                     .next()
-                    .ok_or("missing --actions read-only|dry-run")?
+                    .ok_or("missing --actions read-only|dry-run|terminate")?
                     .to_str()
                     .and_then(ActionMode::parse)
-                    .ok_or("--actions must be read-only or dry-run")?;
+                    .ok_or("--actions must be read-only, dry-run or terminate")?;
                 actions = Some(mode);
+            }
+            Some("--protect-pid") => {
+                // A positive PID; 0 names no process.
+                let pid = args
+                    .next()
+                    .ok_or("missing --protect-pid PID")?
+                    .to_str()
+                    .and_then(|text| text.parse::<u32>().ok())
+                    .filter(|pid| *pid > 0)
+                    .ok_or("--protect-pid PID must be a positive integer")?;
+                if protected.len() >= MAX_CONFIGURED_PROTECTED_PIDS {
+                    return Err(format!(
+                        "--protect-pid may be given at most {MAX_CONFIGURED_PROTECTED_PIDS} times"
+                    )
+                    .into());
+                }
+                protected.push(pid);
             }
             _ => return Err("unknown or repeated option".into()),
         }
@@ -206,6 +253,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if actions.is_some() && collection == Collection::None {
         return Err("--actions needs a process source".into());
     }
+    if !protected.is_empty() && actions.is_none() {
+        return Err("--protect-pid needs --actions".into());
+    }
+    // The chain serving this session is derived here, from this process and
+    // the transports that connect to it (PX-030); nothing a client sends
+    // names a member.
+    let support = Arc::new(ServerSupportChain::new());
+    let actions = actions.map(|mode| Actions {
+        mode,
+        protected,
+        support: Arc::clone(&support),
+    });
+    let actions = actions.as_ref();
     let uid = effective_uid();
     require_unprivileged_uid(uid, "srtop")?;
     // Install both handlers before publishing the socket so a ready instance
@@ -327,9 +387,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("srtop: rejected peer: {error}");
                     continue;
                 }
+                // The process at the other end of the socket (the SSH
+                // bridge) and its ancestors serve this session while the
+                // connection lasts, so no action may target them (PX-030).
+                let peer = stream
+                    .peer_cred()
+                    .ok()
+                    .and_then(|credentials| credentials.pid())
+                    .and_then(|pid| u32::try_from(pid).ok())
+                    .filter(|pid| *pid > 0);
+                let transport = support.connected(peer);
                 let session = Arc::clone(&session);
                 let token = shutdown.child_token();
                 connections.spawn(async move {
+                    let _transport = transport;
                     if let Err(error) = handle_connection(stream, session, token).await {
                         eprintln!("srtop: connection ended: {error}");
                     }

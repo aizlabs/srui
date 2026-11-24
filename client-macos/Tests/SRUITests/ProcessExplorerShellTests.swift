@@ -2194,16 +2194,18 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
-    /// PX-028 over real SSH and the generic client: `srtop --actions dry-run` adds standard
-    /// Prepare, Confirm and Cancel buttons and a status line under the inspector. Confirm and Cancel
-    /// are disabled natively until Prepare has prepared a request for the selected process on the
-    /// server; selecting another row afterwards does not retarget it; Confirm reports the dry run as
-    /// requested, never as complete, and disables itself; another account's process is refused at
-    /// Prepare. `--actions read-only` shows the same controls, all disabled.
-    @Test(.timeLimit(.minutes(2)))
+    /// PX-028 and PX-030 over real SSH and the generic client: `srtop --actions dry-run` adds
+    /// standard Prepare and Cancel buttons and a status line under the inspector. There is no Confirm
+    /// until Prepare has prepared a request for the selected process on the server, which then shows
+    /// an inline confirmation panel of fresh nodes naming it, with its own Confirm. Selecting another
+    /// row withdraws the request and the panel goes; Confirm on a new request reports the dry run as
+    /// requested, never as complete, and the panel goes; another account's process is refused at
+    /// Prepare. `--actions read-only` shows the controls all disabled, and `--actions terminate` on
+    /// this Mac, which has no PID file descriptors, shows Terminate… disabled with the reason.
+    @Test(.timeLimit(.minutes(3)))
     @MainActor
     func dryRunActionControlsPrepareAndConfirmOnTheServerAndReadOnlyDisablesThem() async throws {
-        for mode in ["dry-run", "read-only"] {
+        for mode in ["dry-run", "read-only", "terminate"] {
             let harness = try await Self.launch(arguments: ["--fake-source", "--actions", mode, "--refresh-interval-ms", "300000"])
             defer { Self.shutDown(harness) }
             _ = NSApplication.shared
@@ -2217,69 +2219,105 @@ struct ProcessExplorerShellTests {
             }
             let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
             defer { window.orderOut(nil); window.close() }
-            func view<T>(_ id: UInt64, as _: T.Type = T.self) throws -> T {
-                try #require(renderer.registry.handle(for: NodeId(id))?.view as? T, "node \(id)")
+            // A confirmation panel is created and deleted as intents come and go, and the generic
+            // renderer remounts on every structural commit (§23), so every native view is looked up
+            // afresh rather than held across one.
+            func button(_ id: UInt64) -> NSButton? { renderer.registry.handle(for: NodeId(id))?.view as? NSButton }
+            func text(_ id: UInt64) -> String {
+                (renderer.registry.handle(for: NodeId(id))?.view as? NSTextField)?.stringValue ?? ""
             }
-            let table = try #require((renderer.registry.handle(for: NodeId(5))?.view as? NSScrollView)?.documentView as? NSTableView)
-            let prepare: NSButton = try view(Self.actionPrepareID)
-            let confirm: NSButton = try view(Self.actionConfirmID)
-            let cancel: NSButton = try view(Self.actionCancelID)
-            let status: NSTextField = try view(Self.actionsStatusID)
-            let inspectorStatus: NSTextField = try view(Self.inspectorLineIDs[0])
+            func table() throws -> NSTableView {
+                try #require((renderer.registry.handle(for: NodeId(5))?.view as? NSScrollView)?.documentView as? NSTableView)
+            }
+            func status() -> String { text(Self.actionsStatusID) }
+            func inspector() -> String { text(Self.inspectorLineIDs[0]) }
+            func prepare() throws -> NSButton { try #require(button(Self.actionPrepareID)) }
+            func cancelEnabled() -> Bool { button(Self.actionCancelID)?.isEnabled == true }
+            func panelConfirm(_ slot: UInt64) -> NSButton? { button(Self.panelConfirmID(slot)) }
+            func select(_ row: Int, _ pid: Int) async throws {
+                try table().selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on \(pid)") {
+                    inspector() == "Selected process: PID \(pid) · worker"
+                }
+            }
             try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the fixture rows (\(mode))") {
-                Self.nativeRows(table) == Self.fakeRows
+                ((try? table()).map(Self.nativeRows) ?? []) == Self.fakeRows
             }
-            #expect([prepare.title, confirm.title, cancel.title] == ["Prepare dry run: terminate selected", "Confirm", "Cancel"])
-            #expect(!confirm.isEnabled && !cancel.isEnabled, "nothing is prepared")
+            #expect(renderer.registry.handle(for: NodeId(85)) == nil, "PX-028's generic Confirm is gone")
+            #expect(panelConfirm(0) == nil && !cancelEnabled(), "nothing is prepared, so there is no Confirm")
+            #expect(button(Self.actionCancelID)?.title == "Cancel")
             if mode == "read-only" {
-                #expect(!prepare.isEnabled)
-                #expect(status.stringValue == "Read-only: this server refuses every process action; nothing can be prepared or sent")
-                print("PX-028 native SSH evidence (read-only): window \(window.windowNumber); status=\(status.stringValue); enabled=\([prepare.isEnabled, confirm.isEnabled, cancel.isEnabled])")
+                #expect(try prepare().title == "Prepare dry run: terminate selected")
+                #expect(try !prepare().isEnabled)
+                #expect(status() == "Read-only: this server refuses every process action; nothing can be prepared or sent")
+                print("PX-028 native SSH evidence (read-only): window \(window.windowNumber); status=\(status()); enabled=\([try prepare().isEnabled, cancelEnabled()])")
                 await controller.stop()
                 continue
             }
-            #expect(prepare.isEnabled)
-            #expect(status.stringValue.hasPrefix("Dry run: Prepare checks the selected process"))
+            if mode == "terminate" {
+                // This Mac has no PID file descriptors: Terminate… stays disabled, says why, and
+                // nothing falls back to signalling by PID.
+                #expect(try prepare().title == "Terminate…")
+                #expect(try !prepare().isEnabled)
+                #expect(status() == "Terminate unavailable: this system has no PID file descriptors (Linux 5.3 or later is needed); nothing can be sent to any process")
+                print("PX-030 native SSH evidence (terminate on macOS): window \(window.windowNumber); prepare=\"\(try prepare().title)\" enabled=\(try prepare().isEnabled); status=\(status())")
+                await controller.stop()
+                continue
+            }
+            #expect(try prepare().title == "Prepare dry run: terminate selected")
+            #expect(try prepare().isEnabled)
+            #expect(status().hasPrefix("Dry run: Prepare checks the selected process"))
 
             // Select PID 4101, the fixture account's own process, natively; prepare.
-            table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on 4101") {
-                inspectorStatus.stringValue == "Selected process: PID 4101 · worker"
+            try await select(0, 4101)
+            NativeActivation.click(try prepare())
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "prepared for 4101, its panel shown") {
+                status().hasPrefix("Prepared #1: terminate PID 4101 · worker (dry run)")
+                    && cancelEnabled()
+                    && panelConfirm(0)?.isEnabled == true
+                    && panelConfirm(0)?.title == "Confirm dry run: terminate PID 4101 · worker"
             }
-            NativeActivation.click(prepare)
-            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "prepared for 4101") {
-                status.stringValue.hasPrefix("Prepared #1: terminate PID 4101 · worker (dry run)")
-                    && confirm.isEnabled && cancel.isEnabled
-                    && confirm.title == "Confirm dry run: terminate PID 4101 · worker"
+            #expect(text(Self.panelQuestionID(0)) == "Dry run: terminate PID 4101 · worker (UID 1000)? Confirm records the request; nothing is sent to the process.")
+            #expect(inspector() == "Selected process: PID 4101 · worker", "the remount keeps the selection")
+            // Another row is selected: the request for 4101 is withdrawn and its panel goes.
+            try table().selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the request for 4101 withdrawn") {
+                inspector() == "Selected process: PID 4102 · worker"
+                    && status().hasPrefix("Withdrawn #1 (terminate PID 4101 · worker): the selection moved off the process this request names")
+                    && panelConfirm(0) == nil && !cancelEnabled()
             }
-            // Another row is selected: the prepared request still names 4101.
-            table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
-            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on 4102") {
-                inspectorStatus.stringValue == "Selected process: PID 4102 · worker"
+            // Back on 4101: a new request, a new panel with fresh nodes; Confirm.
+            try await select(0, 4101)
+            NativeActivation.click(try prepare())
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "prepared #2 in a fresh panel") {
+                panelConfirm(1)?.isEnabled == true && panelConfirm(0) == nil
             }
-            #expect(confirm.title == "Confirm dry run: terminate PID 4101 · worker")
-            NativeActivation.click(confirm)
+            NativeActivation.click(try #require(panelConfirm(1)))
             try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the dry run requested for 4101") {
-                status.stringValue.hasPrefix("Dry run #1 requested (terminate PID 4101 · worker): nothing was sent")
-                    && !confirm.isEnabled && !cancel.isEnabled && confirm.title == "Confirm"
+                status().hasPrefix("Dry run #2 requested (terminate PID 4101 · worker): nothing was sent")
+                    && panelConfirm(1) == nil && !cancelEnabled()
             }
-            #expect(!status.stringValue.contains("complete"), "a request is never reported complete")
+            #expect(!status().contains("complete"), "a request is never reported complete")
             // 4102 belongs to another account: refused at Prepare, nothing to confirm.
-            NativeActivation.click(prepare)
+            try await select(1, 4102)
+            NativeActivation.click(try prepare())
             try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "4102 refused") {
-                status.stringValue.hasPrefix("Refused: the process is owned by UID 1001, not this account (UID 1000)")
+                status().hasPrefix("Refused: the process is owned by UID 1001, not this account (UID 1000)")
             }
-            #expect(!confirm.isEnabled)
-            print("PX-028 native SSH evidence (dry-run): window \(window.windowNumber); status=\(status.stringValue); revision=\(applier.lastAppliedRevision.value)")
+            #expect(panelConfirm(2) == nil)
+            print("PX-030 native SSH evidence (dry-run): window \(window.windowNumber); status=\(status()); revision=\(applier.lastAppliedRevision.value)")
             await controller.stop()
         }
     }
 
     // PX-028: the action controls, present only with `--actions`.
     fileprivate static let actionPrepareID: UInt64 = 84
-    fileprivate static let actionConfirmID: UInt64 = 85
     fileprivate static let actionCancelID: UInt64 = 86
     fileprivate static let actionsStatusID: UInt64 = 87
+    // PX-030: confirmation panel `slot`'s nodes, fresh for every intent: 1_000_000 + 3·slot is its
+    // row, + 1 its question and + 2 its Confirm (`actions::PanelIds`).
+    fileprivate static func panelQuestionID(_ slot: UInt64) -> UInt64 { 1_000_000 + 3 * slot + 1 }
+    fileprivate static func panelConfirmID(_ slot: UInt64) -> UInt64 { 1_000_000 + 3 * slot + 2 }
 
     // PX-020: the tag controls.
     fileprivate static let tagToggleID: UInt64 = 79
@@ -5390,5 +5428,170 @@ actor RecordingConnectionAttempt: ConnectionAttempt {
         await forwarding?.value
         continuation.finish()
         await recorder.ended(generation)
+    }
+}
+
+// MARK: - PX-030: confirmed graceful termination against the devbox
+
+/// Whether a devbox that offers termination is configured (see the suite below).
+fileprivate func px030TerminateBoxConfigured() -> Bool {
+    DevboxScenario.fromEnvironment() != nil
+        && ProcessInfo.processInfo.environment["SRTOP_PX030_TERMINATE_BOX"] == "1"
+}
+
+/// PX-030 end to end on a live Linux `/proc`: the devbox's `srtop --live-source --actions terminate`
+/// behind the real `srui-ssh-bridge` subsystem and the box's own OpenSSH, with the unchanged generic
+/// client. A disposable worker the test starts inside the box as the box's own user, under its own
+/// name (`px030-worker`, a `bash` that exits on SIGTERM), is selected in the native table; Terminate…
+/// shows a confirmation naming exactly it; Confirm sends it SIGTERM through a PID file descriptor,
+/// and it is gone from the box's own process list. The support chain is refused by the server:
+/// srtop's own row and the row of the bridge serving this client.
+///
+/// Opt-in twice over, because it needs a box that offers termination: the R0 coordinates
+/// (`SRTOP_R0_*`, as `apps/srtop/devbox/r0-scenario.sh` exports them) and
+/// `SRTOP_PX030_TERMINATE_BOX=1`, set only for a box started with
+/// `SRTOP_ARGS="--live-source --refresh-interval-ms 1000 --actions terminate"`. The default,
+/// read-only package offers no process-changing action (PX-026-G01's
+/// `theLivePackageOffersNoProcessChangingActionAndIsLabelledAndKeyboardOperable`); without both, the
+/// suite is reported as skipped, never as passed. The only process the test signals itself, and only
+/// if it is still there when the test ends, is its own worker, after `ps -p PID -o comm=` confirms it.
+@Suite(.serialized, .enabled(if: px030TerminateBoxConfigured(),
+                             "needs the srtop devbox started with --actions terminate and SRTOP_PX030_TERMINATE_BOX=1"))
+struct ProcessExplorerTerminateDevboxTests {
+    static let workerPath = "/home/srui/px030-worker"
+    static let workerName = "px030-worker"
+    /// Exits with status 0 on SIGTERM; otherwise runs until the test ends it.
+    static let workerScript = "trap 'exit 0' TERM; while :; do sleep 0.1; done"
+
+    /// The PIDs of processes named exactly `comm` in the box.
+    private static func boxPIDs(_ box: DevboxScenario, comm: String) async throws -> [String] {
+        let listed = try await runToCompletion(box.docker, ["exec", box.container, "ps", "-eo", "pid=,comm="])
+        try #require(listed.status == 0, "\(listed.output)")
+        return listed.output.split(whereSeparator: \.isNewline).compactMap { line in
+            let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+            return fields.count == 2 && fields[1] == comm ? String(fields[0]) : nil
+        }
+    }
+
+    @Test(.timeLimit(.minutes(3)))
+    @MainActor
+    func terminateConfirmsAnOwnedWorkerByNameAndRefusesTheSupportChain() async throws {
+        let box = try #require(DevboxScenario.fromEnvironment())
+        let link = try await runToCompletion(
+            box.docker, ["exec", "-u", "srui", box.container, "ln", "-sf", "/bin/bash", Self.workerPath])
+        try #require(link.status == 0, "could not prepare the worker: \(link.output)")
+        try #require(try await Self.boxPIDs(box, comm: Self.workerName).isEmpty, "no worker of an earlier run is left")
+        let spawn = try await runToCompletion(
+            box.docker, ["exec", "-d", "-u", "srui", box.container, Self.workerPath, "-c", Self.workerScript])
+        try #require(spawn.status == 0, "could not start the worker: \(spawn.output)")
+        var workers: [String] = []
+        try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(10), description: "the worker in the box") {
+            workers = (try? await Self.boxPIDs(box, comm: Self.workerName)) ?? []
+            return workers.count == 1
+        }
+        let workerPID = workers[0]
+        var ended = false
+        defer {
+            // Only the test's own worker, and only after its name is confirmed.
+            if !ended {
+                let docker = box.docker, container = box.container
+                Task {
+                    let named = try? await runToCompletion(docker, ["exec", container, "ps", "-p", workerPID, "-o", "comm="])
+                    if named?.status == 0 && named?.output == Self.workerName {
+                        _ = try? await runToCompletion(docker, ["exec", container, "kill", "-KILL", workerPID])
+                    }
+                }
+            }
+        }
+
+        _ = NSApplication.shared
+        let (controller, applier, renderer) = ProcessExplorerShellTests.genericClient(SSHTransport(configuration: box.configuration))
+        try await controller.start()
+        try await AsyncTestSupport.eventually(timeout: .seconds(20), description: "the live explorer with Terminate…") {
+            applier.lastAppliedRevision.value >= 1 && controller.isEventDispatchEnabled
+                && renderer.registry.handle(for: NodeId(5)) != nil
+                && renderer.registry.handle(for: NodeId(ProcessExplorerShellTests.actionPrepareID)) != nil
+        }
+        let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        defer { window.orderOut(nil); window.close() }
+        SurfacePresentation.forHostApplication().present(window)
+        // A confirmation panel is created and deleted as intents come and go, and the generic
+        // renderer remounts on every structural commit (§23): every native view is looked up afresh.
+        func button(_ id: UInt64) -> NSButton? { renderer.registry.handle(for: NodeId(id))?.view as? NSButton }
+        func text(_ id: UInt64) -> String {
+            (renderer.registry.handle(for: NodeId(id))?.view as? NSTextField)?.stringValue ?? ""
+        }
+        func rows() -> [[String]] {
+            ((renderer.registry.handle(for: NodeId(5))?.view as? NSScrollView)?.documentView as? NSTableView)
+                .map(ProcessExplorerShellTests.nativeRows) ?? []
+        }
+        func prepare() throws -> NSButton { try #require(button(ProcessExplorerShellTests.actionPrepareID)) }
+        func status() -> String { text(ProcessExplorerShellTests.actionsStatusID) }
+        func panelConfirm(_ slot: UInt64) -> NSButton? { button(ProcessExplorerShellTests.panelConfirmID(slot)) }
+        #expect(try prepare().title == "Terminate…")
+        #expect(try prepare().isEnabled, "the box has PID file descriptors: \(status())")
+        #expect(status().hasPrefix("Terminate… checks the selected process"), "\(status())")
+        /// Selects the first native row named `name`, and returns its PID once the inspector names it.
+        func select(_ name: String) async throws -> String {
+            var row: Int?
+            try await AsyncTestSupport.eventually(timeout: .seconds(20), description: "a row named \(name)") {
+                row = rows().firstIndex { $0.count > 1 && $0[1] == name }
+                return row != nil
+            }
+            let index = try #require(row)
+            let pid = rows()[index][0]
+            let table = try #require((renderer.registry.handle(for: NodeId(5))?.view as? NSScrollView)?.documentView as? NSTableView)
+            table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on \(name)") {
+                text(ProcessExplorerShellTests.inspectorLineIDs[0]).hasPrefix("Selected process: PID \(pid) · \(name)")
+            }
+            return pid
+        }
+
+        // The support chain, refused by the server before anything is held.
+        var refusals: [String] = []
+        for (name, role) in [("srtop", "this server (srtop) itself"), ("srui-ssh-bridge", "a connected client's transport (its SSH bridge)")] {
+            let pid = try await select(name)
+            NativeActivation.click(try prepare())
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "\(name) refused") {
+                status().hasPrefix("Refused: PID \(pid) is \(role), which serves this session; nothing was requested")
+            }
+            #expect(panelConfirm(0) == nil, "no confirmation for \(name)")
+            refusals.append(status())
+        }
+        #expect(try await Self.boxPIDs(box, comm: "srtop").count == 1, "srtop still runs")
+
+        // The owned worker: selected natively, named in the confirmation, confirmed.
+        let shownPID = try await select(Self.workerName)
+        #expect(shownPID == workerPID, "the row is the worker the test started in the box")
+        NativeActivation.click(try prepare())
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the confirmation naming the worker") {
+            panelConfirm(0)?.isEnabled == true
+                && panelConfirm(0)?.title == "Confirm: terminate PID \(workerPID) · \(Self.workerName)"
+        }
+        let question = text(ProcessExplorerShellTests.panelQuestionID(0))
+        #expect(question.hasPrefix("Terminate PID \(workerPID) · \(Self.workerName) (UID "), "\(question)")
+        #expect(question.hasSuffix("? Confirm sends it SIGTERM, which asks it to exit; it may handle or ignore it."), "\(question)")
+        #expect(try await Self.boxPIDs(box, comm: Self.workerName) == [workerPID], "nothing was sent at Prepare")
+        NativeActivation.click(try #require(panelConfirm(0)))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the request reported") {
+            status().hasPrefix("Requested #1 (terminate PID \(workerPID) · \(Self.workerName)): SIGTERM was sent")
+                && panelConfirm(0) == nil
+        }
+        let requested = status()
+        #expect(!requested.contains("complete"), "a request is never reported complete: \(requested)")
+        try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(15), description: "the worker gone from the box") {
+            ((try? await Self.boxPIDs(box, comm: Self.workerName)) ?? [workerPID]).isEmpty
+        }
+        ended = true
+        try await AsyncTestSupport.eventually(timeout: .seconds(20), description: "the worker's row gone") {
+            !rows().contains { $0.count > 1 && $0[1] == Self.workerName }
+        }
+        #expect(try await Self.boxPIDs(box, comm: "srtop").count == 1, "srtop still runs")
+        #expect(try await Self.boxPIDs(box, comm: "srui-ssh-bridge").count == 1, "the bridge still runs")
+        print("PX-030 devbox evidence: window \(window.windowNumber); worker \(Self.workerName) PID \(workerPID); "
+            + "confirmation \"\(question)\"; \(requested); worker gone from the box's ps; support chain: \(refusals); "
+            + "revision \(applier.lastAppliedRevision.value)")
+        await controller.stop()
     }
 }

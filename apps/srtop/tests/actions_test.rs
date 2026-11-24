@@ -1,5 +1,8 @@
 //! PX-028 acceptance through the real event path: action authorization and
-//! the dry-run action contract (D1 §§7.7, 18.2, 27; D2 T24, T32).
+//! the dry-run action contract (D1 §§7.7, 18.2, 27; D2 T24, T32), with
+//! PX-030's confirmation panel: a prepared intent is confirmed through its own
+//! panel's Confirm, which is deleted when the intent is consumed, cancelled
+//! or withdrawn, so a click on it afterwards names no node.
 //!
 //! Every click here is a wire `ACTIVATE` admitted, validated and dispatched by
 //! the runtime's session (`Session::process_event`), every commit is applied by
@@ -11,7 +14,8 @@
 //! * an unknown, historical, unconfirmed, replaced-incarnation, unowned or
 //!   protected target never reaches the executor, at prepare or at confirm;
 //! * forged event arguments neither widen nor change the target set, and a
-//!   new selection after Prepare does not retarget the intent;
+//!   new selection after Prepare does not retarget the intent: it withdraws
+//!   it (PX-030);
 //! * telemetry commits between Prepare and Confirm leave a valid intent
 //!   valid; an expired intent, a click made before the confirmation was
 //!   published, another client's click and a paused view are refused;
@@ -24,7 +28,7 @@
 
 use srui_process_explorer::actions::{
     lock_actions, ActionGate, ActionMode, ActionOutcome, Authorized, DryRunExecutor, Execution,
-    IntentId, ProcessActions, Refusal, SharedActions, READ_ONLY_STATUS,
+    IntentId, PanelIds, ProcessActions, Refusal, SharedActions, READ_ONLY_STATUS,
 };
 use srui_process_explorer::catalogue::ProcessField;
 use srui_process_explorer::on_demand::{MonotonicClock, SourceTime};
@@ -33,7 +37,7 @@ use srui_process_explorer::refresh::{lock_view, SharedView};
 use srui_process_explorer::source::*;
 use srui_process_explorer::{
     install_actions, install_inspector, install_sampling_handlers, start_from_source,
-    ACTIONS_STATUS, ACTION_CANCEL, ACTION_CONFIRM, ACTION_PREPARE, MODEL, SAMPLING_PAUSE, TABLE,
+    ACTIONS_STATUS, ACTION_CANCEL, ACTION_PREPARE, MODEL, SAMPLING_PAUSE, TABLE,
 };
 use srui_sdk::{
     ItemId, NodeId, PropertyRef, TypeRef, Value, ACTIVATE, COLUMNS, ENABLED, LABEL, TEXT,
@@ -293,6 +297,30 @@ impl Harness {
         );
     }
 
+    /// The pending intent's panel (PX-030).
+    fn panel(&self) -> Option<PanelIds> {
+        lock_actions(&self.gate).pending_panel()
+    }
+
+    /// The pending intent's own Confirm button (PX-030).
+    fn confirm(&self) -> NodeId {
+        self.panel().expect("an intent is pending").confirm
+    }
+
+    /// Clicks the pending intent's Confirm and expects it processed.
+    fn confirmed(&mut self) {
+        let confirm = self.confirm();
+        self.processed(confirm);
+    }
+
+    /// Why the latest intent was withdrawn (PX-030).
+    fn withdrawn(&self) -> Refusal {
+        lock_actions(&self.gate)
+            .withdrawn()
+            .map(|(_, reason)| reason.clone())
+            .unwrap_or_else(|| panic!("not withdrawn: {}", self.status()))
+    }
+
     fn select(&mut self, pid: u64) {
         let item = self.item_of(pid);
         let observed = self.revision();
@@ -312,15 +340,24 @@ impl Harness {
     /// As if a client, or a bug, had every action button enabled: the store
     /// says so, so event validation lets a click through to its handler.
     fn enable_all(&mut self) {
+        let panel = self.panel();
         self.session
             .transaction(|ui| {
-                for button in [ACTION_PREPARE, ACTION_CONFIRM, ACTION_CANCEL] {
+                for button in [ACTION_PREPARE, ACTION_CANCEL] {
                     ui.set(button, ENABLED, true)?;
+                }
+                if let Some(panel) = panel {
+                    ui.set(panel.confirm, ENABLED, true)?;
                 }
                 Ok(())
             })
             .unwrap();
         self.sync();
+    }
+
+    /// Whether the replica holds `node` at all.
+    fn exists(&self, node: NodeId) -> bool {
+        self.replica.get_node(node).is_some()
     }
 
     /// The view's sampling epoch now: a sample taken now is published only
@@ -415,12 +452,27 @@ fn rejected_as_disabled(outcome: &EventOutcome) -> bool {
     )
 }
 
+/// A click on a node that does not exist: a deleted panel's Confirm.
+fn rejected_as_gone(outcome: &EventOutcome) -> bool {
+    matches!(
+        outcome,
+        EventOutcome::Rejected {
+            error: srui_semantic_tree::EventValidationError::NodeNotFound(_),
+            ..
+        }
+    )
+}
+
 #[test]
 fn a_confirmed_dry_run_reaches_the_executor_with_exactly_the_prepared_instance() {
     let mut source = Steps::new(vec![host(10), host(20), host(30)]);
     let mut h = harness(ActionMode::DryRun, &mut source);
     assert!(h.enabled(ACTION_PREPARE));
-    assert!(!h.enabled(ACTION_CONFIRM) && !h.enabled(ACTION_CANCEL));
+    assert!(!h.enabled(ACTION_CANCEL));
+    assert!(
+        h.panel().is_none() && !h.exists(PanelIds::of(0).row),
+        "no panel before Prepare"
+    );
     h.select(4101);
     // Prepare carries forged arguments naming other processes: an item ID,
     // PIDs as text and a list. `spare` (4103) is this account's own, so a
@@ -459,27 +511,33 @@ fn a_confirmed_dry_run_reaches_the_executor_with_exactly_the_prepared_instance()
     assert!(h
         .status()
         .starts_with("Prepared #1: terminate PID 4101 · worker (dry run)"));
-    assert!(h.enabled(ACTION_CONFIRM) && h.enabled(ACTION_CANCEL));
+    // The panel: fresh nodes, a question naming the process, its Confirm.
+    let panel = h.panel().unwrap();
+    assert_eq!(panel, PanelIds::of(0));
+    assert!(h.enabled(panel.confirm) && h.enabled(ACTION_CANCEL));
     assert_eq!(
-        h.property(ACTION_CONFIRM, LABEL),
+        h.property(panel.confirm, LABEL),
         Some(Value::String(
             "Confirm dry run: terminate PID 4101 · worker".into()
         ))
     );
-    // Another row is selected, and two telemetry commits land: the intent
-    // still names 4101, and is still valid.
-    h.select(4103);
+    assert_eq!(
+        h.text(panel.question),
+        "Dry run: terminate PID 4101 · worker (UID 1000)? Confirm records the request; nothing is sent to the process."
+    );
+    // Two telemetry commits land: the intent still names 4101 and is valid.
     h.sample(&mut source);
     h.sample(&mut source);
     assert!(
         h.revision() > prepared_at + 1,
         "telemetry advanced the revision"
     );
+    assert_eq!(h.panel(), Some(panel), "telemetry keeps the panel");
     // Confirm, again with forged arguments.
     let observed = h.revision();
     let confirm = h.wire(
         CLIENT,
-        ACTION_CONFIRM,
+        panel.confirm,
         ACTIVATE,
         observed,
         vec![(PropertyRef::VALUE, Value::ItemId(spare))],
@@ -509,43 +567,121 @@ fn a_confirmed_dry_run_reaches_the_executor_with_exactly_the_prepared_instance()
         !status.contains("complete") && !status.contains("ended"),
         "{status}"
     );
-    assert!(!h.enabled(ACTION_CONFIRM), "a confirm is single-use");
+    assert!(
+        !h.exists(panel.row) && !h.exists(panel.confirm),
+        "a confirm is single-use: its panel is deleted"
+    );
     // Redelivery of the same Confirm is answered from the dedupe cache and
     // never reaches the executor again (§18.2).
     assert!(matches!(
         h.deliver(&confirm),
         EventOutcome::Duplicate { accepted: true, .. }
     ));
-    // A new Confirm click is refused by validation: nothing is prepared.
-    assert!(rejected_as_disabled(&h.click(ACTION_CONFIRM)));
+    // A new click on the consumed panel's Confirm names no node.
+    assert!(rejected_as_gone(&h.click(panel.confirm)));
     assert_eq!(h.executor.reached().len(), 1);
+}
+
+/// PX-030: prepare A, select B, confirm. Navigation withdraws the intent:
+/// its panel is deleted in the selection's own handler, a click on its
+/// Confirm names no node, and nothing reaches the executor. B is acted on
+/// only after B's own Prepare and Confirm.
+#[test]
+fn selecting_another_process_withdraws_the_intent_and_its_panel() {
+    let mut source = Steps::new(vec![host(10)]);
+    let mut h = harness(ActionMode::DryRun, &mut source);
+    h.select(4101);
+    h.processed(ACTION_PREPARE);
+    let panel = h.panel().unwrap();
+    let stale = h.wire(CLIENT, panel.confirm, ACTIVATE, h.revision(), Vec::new());
+    h.select(4103);
+    assert_eq!(h.withdrawn(), Refusal::Navigated);
+    assert!(h.panel().is_none() && !h.exists(panel.row));
+    assert!(
+        h.status().starts_with(
+            "Withdrawn #1 (terminate PID 4101 · worker): the selection moved off the process this request names"
+        ),
+        "{}",
+        h.status()
+    );
+    assert!(!h.enabled(ACTION_CANCEL));
+    // The click the client made before the withdrawal reached it.
+    assert!(rejected_as_gone(&h.deliver(&stale)));
+    assert!(h.executor.reached().is_empty());
+    // Clearing the selection withdraws one too.
+    h.processed(ACTION_PREPARE);
+    assert!(h.panel().is_some());
+    let observed = h.revision();
+    let clear = h.wire(
+        CLIENT,
+        TABLE,
+        TypeRef::EVENT_SELECTION_CHANGED,
+        observed,
+        Vec::new(),
+    );
+    assert!(matches!(h.deliver(&clear), EventOutcome::Processed { .. }));
+    assert_eq!(h.withdrawn(), Refusal::Navigated);
+    // B, explicitly: its own panel, its own confirm.
+    h.select(4103);
+    h.processed(ACTION_PREPARE);
+    assert_eq!(h.panel(), Some(PanelIds::of(2)), "never a reused panel");
+    h.confirmed();
+    let reached = h.executor.reached();
+    assert_eq!(reached.len(), 1, "only B, and only once");
+    assert_eq!(reached[0].1, vec![key(4103, "spare")]);
+}
+
+/// PX-030 verification round 1 (F4): a new Prepare replaces the pending
+/// intent whatever its result. Paused, a pending intent is held; a Prepare
+/// that gets through and is refused leaves nothing pending, and the held
+/// intent's panel goes with it.
+#[test]
+fn a_refused_prepare_replaces_the_pending_intent_and_its_panel() {
+    let mut source = Steps::new(vec![host(10)]);
+    let mut h = harness(ActionMode::DryRun, &mut source);
+    h.select(4101);
+    h.processed(ACTION_PREPARE);
+    let panel = h.panel().unwrap();
+    h.processed(SAMPLING_PAUSE);
+    assert_eq!(h.panel(), Some(panel), "held while paused");
+    h.enable_all();
+    h.processed(ACTION_PREPARE);
+    assert_eq!(h.refused(), Refusal::Paused);
+    assert!(lock_actions(&h.gate).pending().is_none());
+    assert!(!h.exists(panel.row), "the held intent's panel is deleted");
+    assert!(rejected_as_gone(&h.click(panel.confirm)));
+    assert!(h.executor.reached().is_empty());
 }
 
 #[test]
 fn disabled_controls_are_refused_by_event_validation() {
     // Read-only: every control is disabled, and a click is rejected before
-    // any handler runs.
+    // any handler runs; no panel is ever created.
     let mut source = Steps::new(vec![host(10)]);
     let mut h = harness(ActionMode::ReadOnly, &mut source);
     assert_eq!(h.status(), READ_ONLY_STATUS);
     h.select(4101);
-    for button in [ACTION_PREPARE, ACTION_CONFIRM, ACTION_CANCEL] {
+    for button in [ACTION_PREPARE, ACTION_CANCEL] {
         assert!(!h.enabled(button), "{button:?}");
         assert!(rejected_as_disabled(&h.click(button)), "{button:?}");
     }
-    // Dry run: Confirm and Cancel are disabled until something is prepared,
-    // and again once it is cancelled.
+    assert!(rejected_as_gone(&h.click(PanelIds::of(0).confirm)));
+    // Dry run: there is no Confirm until something is prepared, Cancel is
+    // disabled, and once it is cancelled the panel is gone again.
     let mut source = Steps::new(vec![host(10)]);
     let mut h = harness(ActionMode::DryRun, &mut source);
     h.select(4101);
-    assert!(rejected_as_disabled(&h.click(ACTION_CONFIRM)));
+    assert!(rejected_as_gone(&h.click(PanelIds::of(0).confirm)));
+    assert!(rejected_as_disabled(&h.click(ACTION_CANCEL)));
     h.processed(ACTION_PREPARE);
+    let panel = h.panel().unwrap();
     h.processed(ACTION_CANCEL);
     assert!(h
         .status()
         .starts_with("Cancelled #1: nothing was requested"));
     assert!(lock_actions(&h.gate).pending().is_none());
-    assert!(rejected_as_disabled(&h.click(ACTION_CONFIRM)));
+    assert!(!h.exists(panel.row));
+    assert!(rejected_as_gone(&h.click(panel.confirm)));
     assert!(rejected_as_disabled(&h.click(ACTION_CANCEL)));
     assert!(h.executor.reached().is_empty());
 }
@@ -557,32 +693,37 @@ fn read_only_mode_is_enforced_by_the_server_even_with_the_buttons_enabled() {
     h.select(4101);
     // As if a client, or a bug, had the buttons enabled: the store says so,
     // so event validation lets each click through to its handler.
-    let enable = |h: &mut Harness| {
-        h.session
-            .transaction(|ui| {
-                for button in [ACTION_PREPARE, ACTION_CONFIRM, ACTION_CANCEL] {
-                    ui.set(button, ENABLED, true)?;
-                }
-                Ok(())
-            })
-            .unwrap();
-        h.sync();
-    };
-    for button in [ACTION_PREPARE, ACTION_CONFIRM] {
-        enable(&mut h);
-        h.processed(button);
-        assert_eq!(h.refused(), Refusal::ReadOnly, "{button:?}");
-        assert!(lock_actions(&h.gate).pending().is_none());
-        assert!(
-            h.status().starts_with("Refused: this server is read-only"),
-            "{}",
-            h.status()
-        );
-        // The server republishes the controls it holds: disabled.
-        for button in [ACTION_PREPARE, ACTION_CONFIRM, ACTION_CANCEL] {
-            assert!(!h.enabled(button), "{button:?}");
-        }
+    h.enable_all();
+    h.processed(ACTION_PREPARE);
+    assert_eq!(h.refused(), Refusal::ReadOnly);
+    assert!(lock_actions(&h.gate).pending().is_none());
+    assert!(h.panel().is_none(), "read-only shows no confirmation");
+    assert!(
+        h.status().starts_with("Refused: this server is read-only"),
+        "{}",
+        h.status()
+    );
+    // The server republishes the controls it holds: disabled.
+    for button in [ACTION_PREPARE, ACTION_CANCEL] {
+        assert!(!h.enabled(button), "{button:?}");
     }
+    // A panel's Confirm that something else created: its handler runs and
+    // refuses, with nothing pending to confirm.
+    let forged = PanelIds::of(0);
+    h.session
+        .transaction(|ui| {
+            srui_sdk::Button::builder(forged.confirm)
+                .parent(srui_process_explorer::COLUMN)
+                .label("Confirm")
+                .create(ui)?;
+            Ok(())
+        })
+        .unwrap();
+    h.sync();
+    assert!(matches!(
+        h.click(forged.confirm),
+        EventOutcome::Processed { .. }
+    ));
     assert!(h.executor.reached().is_empty());
 }
 
@@ -592,24 +733,37 @@ fn stale_intents_are_refused_through_dispatch() {
     let mut h = harness(ActionMode::DryRun, &mut source);
     h.select(4101);
 
-    // Expired: the lifetime passed between Prepare and Confirm.
+    // Expired: the lifetime passed between Prepare and Confirm, and no
+    // sample has withdrawn it yet: the click is refused at Confirm.
     h.processed(ACTION_PREPARE);
+    let panel = h.panel().unwrap();
     h.clock
         .advance(srui_process_explorer::actions::DEFAULT_INTENT_LIFETIME);
-    h.processed(ACTION_CONFIRM);
+    h.confirmed();
     assert_eq!(h.refused(), Refusal::Expired);
     assert!(h
         .status()
         .starts_with("Refused #1 (terminate PID 4101 · worker): the prepared request expired"));
-    assert!(!h.enabled(ACTION_CONFIRM));
-
-    // A click made on an earlier confirmation: #2 is published, then #3
-    // replaces it; a Confirm observed between the two is refused.
+    assert!(!h.exists(panel.row));
+    // Expired and then sampled: withdrawn by the sample, panel gone.
     h.processed(ACTION_PREPARE);
+    h.clock
+        .advance(srui_process_explorer::actions::DEFAULT_INTENT_LIFETIME);
+    h.sample(&mut source);
+    assert_eq!(h.withdrawn(), Refusal::Expired);
+    assert!(h.panel().is_none());
+
+    // A click made before this confirmation was published: #3 is shown,
+    // then #4 replaces it; a click on #4's Confirm observed before #4 was
+    // published is refused, and #3's Confirm is gone.
+    h.processed(ACTION_PREPARE);
+    let third = h.panel().unwrap();
     let second = h.revision();
     h.processed(ACTION_PREPARE);
-    assert_eq!(lock_actions(&h.gate).pending().unwrap().id().get(), 3);
-    let stale = h.wire(CLIENT, ACTION_CONFIRM, ACTIVATE, second, Vec::new());
+    assert_eq!(lock_actions(&h.gate).pending().unwrap().id().get(), 4);
+    assert!(rejected_as_gone(&h.click(third.confirm)));
+    let fourth = h.confirm();
+    let stale = h.wire(CLIENT, fourth, ACTIVATE, second, Vec::new());
     assert!(matches!(h.deliver(&stale), EventOutcome::Processed { .. }));
     assert!(matches!(
         h.refused(),
@@ -619,7 +773,7 @@ fn stale_intents_are_refused_through_dispatch() {
     // Another client instance's click.
     h.processed(ACTION_PREPARE);
     let observed = h.revision();
-    let foreign = h.wire(OTHER_CLIENT, ACTION_CONFIRM, ACTIVATE, observed, Vec::new());
+    let foreign = h.wire(OTHER_CLIENT, h.confirm(), ACTIVATE, observed, Vec::new());
     assert!(matches!(
         h.deliver(&foreign),
         EventOutcome::Processed { .. }
@@ -631,14 +785,15 @@ fn stale_intents_are_refused_through_dispatch() {
     // through all the same.
     h.processed(ACTION_PREPARE);
     h.processed(SAMPLING_PAUSE);
-    assert!(!h.enabled(ACTION_PREPARE) && !h.enabled(ACTION_CONFIRM));
+    let paused = h.confirm();
+    assert!(!h.enabled(ACTION_PREPARE) && !h.enabled(paused));
     assert!(
         h.enabled(ACTION_CANCEL),
         "a pending intent can still be discarded"
     );
-    assert!(rejected_as_disabled(&h.click(ACTION_CONFIRM)));
+    assert!(rejected_as_disabled(&h.click(paused)));
     h.enable_all();
-    h.processed(ACTION_CONFIRM);
+    h.processed(paused);
     assert_eq!(h.refused(), Refusal::Paused);
     h.enable_all();
     h.processed(ACTION_PREPARE);
@@ -653,7 +808,7 @@ fn stale_intents_are_refused_through_dispatch() {
     // And a valid one still goes through, exactly at the publishing revision.
     h.processed(ACTION_PREPARE);
     let published = h.revision();
-    let exact = h.wire(CLIENT, ACTION_CONFIRM, ACTIVATE, published, Vec::new());
+    let exact = h.wire(CLIENT, h.confirm(), ACTIVATE, published, Vec::new());
     assert!(matches!(h.deliver(&exact), EventOutcome::Processed { .. }));
     assert!(matches!(h.outcome(), Some(ActionOutcome::Requested { .. })));
     assert_eq!(
@@ -677,26 +832,27 @@ fn a_resumed_view_refuses_actions_until_its_first_sample_is_published() {
     h.select(4101);
     // Prepared before the pause, while 4101 was the latest scan's own.
     h.processed(ACTION_PREPARE);
-    assert!(h.enabled(ACTION_CONFIRM));
+    let panel = h.panel().unwrap();
+    assert!(h.enabled(panel.confirm));
     h.processed(SAMPLING_PAUSE);
     // 4101 exits while the view is paused; Resume view is applied, and the
     // sample it asked for has not been taken yet.
     h.processed(SAMPLING_PAUSE);
     assert!(lock_actions(&h.gate).pending().is_some());
     assert!(!h.enabled(ACTION_PREPARE), "Prepare on hold while resuming");
-    assert!(!h.enabled(ACTION_CONFIRM), "Confirm on hold while resuming");
+    assert!(!h.enabled(panel.confirm), "Confirm on hold while resuming");
     assert!(h.enabled(ACTION_CANCEL));
     let status = h.status();
     assert!(
         status.contains("on hold: the view is resuming: waiting for a fresh sample"),
         "{status}"
     );
-    assert!(rejected_as_disabled(&h.click(ACTION_CONFIRM)));
+    assert!(rejected_as_disabled(&h.click(panel.confirm)));
     assert!(rejected_as_disabled(&h.click(ACTION_PREPARE)));
     // A click that gets through anyway is refused by the server: the frozen
     // row still says 4101 is current, but that is not the latest scan.
     h.enable_all();
-    h.processed(ACTION_CONFIRM);
+    h.processed(panel.confirm);
     assert_eq!(h.refused(), Refusal::Resuming);
     assert!(h
         .status()
@@ -706,7 +862,7 @@ fn a_resumed_view_refuses_actions_until_its_first_sample_is_published() {
     h.processed(ACTION_PREPARE);
     assert_eq!(h.refused(), Refusal::Resuming);
     assert!(lock_actions(&h.gate).pending().is_none());
-    assert!(!h.enabled(ACTION_PREPARE) && !h.enabled(ACTION_CONFIRM));
+    assert!(!h.enabled(ACTION_PREPARE));
     assert!(
         h.executor.reached().is_empty(),
         "nothing reached the executor"
@@ -716,13 +872,13 @@ fn a_resumed_view_refuses_actions_until_its_first_sample_is_published() {
     // check is made on its rows. 4101 exited during the pause.
     h.sample(&mut source);
     assert!(h.enabled(ACTION_PREPARE), "republished enabled");
-    assert!(!h.enabled(ACTION_CONFIRM), "nothing is prepared");
+    assert!(h.panel().is_none(), "nothing is prepared");
     h.processed(ACTION_PREPARE);
     assert_eq!(h.refused(), Refusal::Historical);
     // A process the fresh sample confirmed can be prepared and confirmed.
     h.select(4103);
     h.processed(ACTION_PREPARE);
-    h.processed(ACTION_CONFIRM);
+    h.confirmed();
     assert!(matches!(h.outcome(), Some(ActionOutcome::Requested { .. })));
     let reached = h.executor.reached();
     assert_eq!(reached.len(), 1);
@@ -730,21 +886,20 @@ fn a_resumed_view_refuses_actions_until_its_first_sample_is_published() {
 
     // An intent prepared before the pause and left pending is not
     // confirmable during the resume, and once the sample is published it is
-    // re-checked on the fresh rows: its target exited, so it is refused.
+    // re-checked on the fresh rows: its target exited, so it is withdrawn
+    // and its panel deleted (PX-030).
     let mut source = Steps::new(vec![host(10), exited]);
     let mut h = harness(ActionMode::DryRun, &mut source);
     h.select(4101);
     h.processed(ACTION_PREPARE);
+    let panel = h.panel().unwrap();
     h.processed(SAMPLING_PAUSE);
     h.processed(SAMPLING_PAUSE);
-    assert!(rejected_as_disabled(&h.click(ACTION_CONFIRM)));
+    assert!(rejected_as_disabled(&h.click(panel.confirm)));
     h.sample(&mut source);
-    assert!(
-        h.enabled(ACTION_CONFIRM),
-        "the pending intent is shown again"
-    );
-    h.processed(ACTION_CONFIRM);
-    assert_eq!(h.refused(), Refusal::Historical);
+    assert_eq!(h.withdrawn(), Refusal::Historical);
+    assert!(!h.exists(panel.row));
+    assert!(rejected_as_gone(&h.click(panel.confirm)));
     assert!(h.executor.reached().is_empty());
 }
 
@@ -760,6 +915,7 @@ fn a_sample_discarded_for_its_epoch_does_not_end_the_resume_hold() {
     let mut h = harness(ActionMode::DryRun, &mut source);
     h.select(4101);
     h.processed(ACTION_PREPARE);
+    let panel = h.panel().unwrap();
     let before_pause = h.epoch();
     h.processed(SAMPLING_PAUSE);
     h.processed(SAMPLING_PAUSE);
@@ -767,7 +923,7 @@ fn a_sample_discarded_for_its_epoch_does_not_end_the_resume_hold() {
     // The scan taken under the pre-pause epoch returns: discarded.
     h.sample_under(&mut source, before_pause);
     assert!(lock_view(&h.view).sampling().resuming(), "still resuming");
-    assert!(!h.enabled(ACTION_PREPARE) && !h.enabled(ACTION_CONFIRM));
+    assert!(!h.enabled(ACTION_PREPARE) && !h.enabled(panel.confirm));
     assert!(
         h.status()
             .contains("on hold: the view is resuming: waiting for a fresh sample"),
@@ -777,12 +933,12 @@ fn a_sample_discarded_for_its_epoch_does_not_end_the_resume_hold() {
     // The frozen row still says 4101 is current; a click that gets through
     // is refused all the same.
     h.enable_all();
-    h.processed(ACTION_CONFIRM);
+    h.processed(panel.confirm);
     assert_eq!(h.refused(), Refusal::Resuming);
     h.enable_all();
     h.processed(ACTION_PREPARE);
     assert_eq!(h.refused(), Refusal::Resuming);
-    assert!(!h.enabled(ACTION_PREPARE) && !h.enabled(ACTION_CONFIRM));
+    assert!(!h.enabled(ACTION_PREPARE));
     assert!(h.executor.reached().is_empty());
 
     // The sample taken under the current epoch ends the resume: the
@@ -795,7 +951,7 @@ fn a_sample_discarded_for_its_epoch_does_not_end_the_resume_hold() {
     assert_eq!(h.refused(), Refusal::Historical, "4101 exited");
     h.select(4103);
     h.processed(ACTION_PREPARE);
-    h.processed(ACTION_CONFIRM);
+    h.confirmed();
     assert!(matches!(h.outcome(), Some(ActionOutcome::Requested { .. })));
     let reached = h.executor.reached();
     assert_eq!(reached.len(), 1);
@@ -842,7 +998,7 @@ fn a_first_scan_that_confirms_nothing_ends_the_resume_and_leaves_every_row_uncon
         h.sample(&mut source);
         h.processed(ACTION_PREPARE);
         assert!(lock_actions(&h.gate).pending().is_some(), "{name}");
-        h.processed(ACTION_CONFIRM);
+        h.confirmed();
         assert!(
             matches!(h.outcome(), Some(ActionOutcome::Requested { .. })),
             "{name}: {:?}",
@@ -852,6 +1008,11 @@ fn a_first_scan_that_confirms_nothing_ends_the_resume_and_leaves_every_row_uncon
     }
 }
 
+/// A target that stops being the latest scan's eligible instance between
+/// Prepare and Confirm never reaches the executor: the sample that shows it
+/// withdraws the intent and deletes its panel (PX-030), so the Confirm the
+/// client still holds names no node. (Each refusal at Confirm itself, with
+/// the panel still shown, is `actions::tests`'s.)
 #[test]
 fn ineligible_targets_never_reach_the_executor() {
     let mut replaced = host(10);
@@ -861,30 +1022,22 @@ fn ineligible_targets_never_reach_the_executor() {
     let mut exited = host(10);
     exited.remove(1);
     // Each case: the step to sample between Prepare and Confirm, whether it
-    // is unenumerable, whether 4101 is still the selection, and the refusal.
-    let cases: Vec<(&str, Vec<ProcessRecord>, bool, bool, Refusal)> = vec![
-        (
-            "historical",
-            exited.clone(),
-            false,
-            true,
-            Refusal::Historical,
-        ),
-        ("unknown", exited.clone(), false, false, Refusal::Unknown),
-        ("unconfirmed", exited, true, true, Refusal::Unconfirmed),
-        ("replaced", replaced, false, true, Refusal::Replaced),
+    // is unenumerable, and the reason it is withdrawn.
+    let cases: Vec<(&str, Vec<ProcessRecord>, bool, Refusal)> = vec![
+        ("historical", exited.clone(), false, Refusal::Historical),
+        ("unconfirmed", exited, true, Refusal::Unconfirmed),
+        ("replaced", replaced, false, Refusal::Replaced),
         (
             "another owner",
             setuid,
             false,
-            true,
             Refusal::NotOwned {
                 owner: Observed::Known(SOMEONE),
                 account: ME,
             },
         ),
     ];
-    for (name, step, unenumerable, still_selected, reason) in cases {
+    for (name, step, unenumerable, reason) in cases {
         let mut source = Steps::new(vec![host(10), step]);
         if unenumerable {
             source.unenumerable.insert(1);
@@ -892,18 +1045,17 @@ fn ineligible_targets_never_reach_the_executor() {
         let mut h = harness(ActionMode::DryRun, &mut source);
         h.select(4101);
         h.processed(ACTION_PREPARE);
-        if !still_selected {
-            // Nothing watches 4101 any more, so it leaves no record.
-            h.select(4103);
-        }
+        let panel = h.panel().unwrap();
+        let held = h.wire(CLIENT, panel.confirm, ACTIVATE, h.revision(), Vec::new());
         h.sample(&mut source);
-        h.processed(ACTION_CONFIRM);
-        assert_eq!(h.refused(), reason, "{name}");
+        assert_eq!(h.withdrawn(), reason, "{name}");
         assert!(
-            h.status().starts_with("Refused #1"),
+            h.status().starts_with("Withdrawn #1"),
             "{name}: {}",
             h.status()
         );
+        assert!(!h.exists(panel.row), "{name}: the panel is deleted");
+        assert!(rejected_as_gone(&h.deliver(&held)), "{name}");
         assert!(
             h.executor.reached().is_empty(),
             "{name} reached the executor"
@@ -925,7 +1077,7 @@ fn ineligible_targets_never_reach_the_executor() {
     assert!(h
         .status()
         .starts_with("Refused: the process is owned by UID 1001, not this account (UID 1000)"));
-    assert!(!h.enabled(ACTION_CONFIRM));
+    assert!(h.panel().is_none());
     h.select(1);
     h.processed(ACTION_PREPARE);
     assert_eq!(h.refused(), Refusal::Protected(1));
@@ -950,8 +1102,7 @@ fn ineligible_targets_never_reach_the_executor() {
 }
 
 #[test]
-fn the_dry_run_executor_is_what_main_installs_and_it_reports_requested() {
-    // The production executor, behind the real handlers.
+fn the_dry_run_executor_reports_requested_behind_the_real_handlers() {
     let mut source = Steps::new(vec![host(10)]);
     let session = Arc::new(Session::mint());
     let (view, _) = start_from_source(&session, &mut source).unwrap();
@@ -974,7 +1125,7 @@ fn the_dry_run_executor_is_what_main_installs_and_it_reports_requested() {
     h.sync();
     h.select(4101);
     h.processed(ACTION_PREPARE);
-    h.processed(ACTION_CONFIRM);
+    h.confirmed();
     assert!(matches!(
         h.outcome(),
         Some(ActionOutcome::Requested { intent, dry_run: true }) if intent.get() == 1

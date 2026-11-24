@@ -36,7 +36,9 @@ pub mod search;
 pub mod sort;
 pub mod source;
 pub mod summary;
+pub mod support;
 pub mod tags;
+pub mod terminate;
 pub mod threads;
 pub mod tree;
 
@@ -208,14 +210,17 @@ pub const TAG_DESCENDANTS: NodeId = NodeId::new(80);
 pub const TAGS_CLEAR: NodeId = NodeId::new(81);
 pub const TAGS_STATUS: NodeId = NodeId::new(82);
 pub const TAGS_NODE_COUNT: usize = 5;
-/// The action controls (PX-028): a Row under the inspector holding the
-/// "Prepare dry run: terminate selected", Confirm and Cancel buttons and the
-/// actions status. Created only when an instance is started with `--actions`
+/// The action controls (PX-028, PX-030): a Row under the inspector holding
+/// the prepare button ("Prepare dry run: terminate selected", or
+/// "Terminate…" with `--actions terminate`), Cancel and the actions status.
+/// Created only when an instance is started with `--actions`
 /// ([`install_actions`]), so they are not part of the shell; the row ceiling
-/// charges their reserve whether they exist or not.
+/// charges their reserve whether they exist or not. A prepared intent's
+/// confirmation panel takes fresh node IDs of its own
+/// ([`actions::PanelIds`]). Node 85 was PX-028's generic Confirm, which a
+/// panel's own Confirm replaced in PX-030; it is never created.
 pub const ACTIONS_ROW: NodeId = NodeId::new(83);
 pub const ACTION_PREPARE: NodeId = NodeId::new(84);
-pub const ACTION_CONFIRM: NodeId = NodeId::new(85);
 pub const ACTION_CANCEL: NodeId = NodeId::new(86);
 pub const ACTIONS_STATUS: NodeId = NodeId::new(87);
 pub const VIEW_LABEL: &str = "Show process tree";
@@ -656,17 +661,23 @@ pub fn install_follow_handlers(session: &Session, view: &refresh::SharedView) {
     });
 }
 
-/// Creates the action controls (PX-028) under the shell's column, as
-/// `gate`'s mode calls for, and installs their three `ACTIVATE` handlers.
+/// Creates the action controls (PX-028, PX-030) under the shell's column, as
+/// `gate`'s mode calls for, and installs their `ACTIVATE` handlers: Prepare,
+/// Cancel, and one Confirm per confirmation panel the gate may show.
 ///
 /// Prepare builds an immutable intent for the process the server resolved as
-/// selected; Confirm hands it, re-checked in full, to the gate's executor;
-/// Cancel discards it. Each click names only its button: no handler reads an
-/// event argument, and the gate refuses every action in read-only mode
-/// whatever the store says about the buttons. While the view is paused, or
-/// resumed and not yet sampled, Prepare and Confirm are refused and published
-/// disabled: its rows are not the latest scan. The only executor this build
-/// constructs is [`actions::DryRunExecutor`], which sends nothing.
+/// selected and the gate shows it in a panel of fresh nodes; that panel's
+/// Confirm hands it, re-checked in full, to the gate's executor; Cancel
+/// discards it. The runtime cannot remove a handler, so every panel's
+/// Confirm handler is registered here, once, bound to its slot
+/// ([`actions::PanelIds`]): the handler table never grows afterwards, and a
+/// slot's handler confirms only the intent shown in that slot. Each click
+/// names only its button: no handler reads an event argument, and the gate
+/// refuses every action in read-only mode whatever the store says about the
+/// buttons. While the view is paused, or resumed and not yet sampled,
+/// Prepare and Confirm are refused and published disabled: its rows are not
+/// the latest scan. The executor is the gate's: the dry-run executor, or the
+/// PID file descriptor terminator of `--actions terminate`.
 pub fn install_actions(
     session: &Session,
     view: &refresh::SharedView,
@@ -675,15 +686,23 @@ pub fn install_actions(
     // The view tells the gate when its rows stop or start being the latest
     // scan (paused, resuming, current), so the controls follow it.
     refresh::ProcessView::attach_actions(view, session, gate);
-    actions::lock_actions(gate).create_controls(session, COLUMN)?;
+    let slots = {
+        let mut gate = actions::lock_actions(gate);
+        gate.create_controls(session, COLUMN)?;
+        gate.panel_slots()
+    };
     let (prepare_gate, prepare_view) = (std::sync::Arc::clone(gate), std::sync::Arc::clone(view));
     session.on(ACTION_PREPARE, ACTIVATE, move |session, event| {
         actions::prepare_requested(&prepare_gate, &prepare_view, session, event);
     });
-    let (confirm_gate, confirm_view) = (std::sync::Arc::clone(gate), std::sync::Arc::clone(view));
-    session.on(ACTION_CONFIRM, ACTIVATE, move |session, event| {
-        actions::confirm_requested(&confirm_gate, &confirm_view, session, event);
-    });
+    for slot in 0..slots {
+        let panel_confirm = actions::PanelIds::of(slot).confirm;
+        let (confirm_gate, confirm_view) =
+            (std::sync::Arc::clone(gate), std::sync::Arc::clone(view));
+        session.on(panel_confirm, ACTIVATE, move |session, event| {
+            actions::confirm_requested(&confirm_gate, &confirm_view, session, event, slot);
+        });
+    }
     let cancel_gate = std::sync::Arc::clone(gate);
     session.on(ACTION_CANCEL, ACTIVATE, move |session, _| {
         actions::cancel_requested(&cancel_gate, session);

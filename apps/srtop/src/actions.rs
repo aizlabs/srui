@@ -1,9 +1,10 @@
-//! Process action authorization and the dry-run action contract (D1 §7.7
-//! semantic input routing, §18.2 event deduplication, §27 server security
-//! controls; D2 T24, T32; PX-028).
+//! Process action authorization, the dry-run action contract and confirmed
+//! graceful termination (D1 §6.2 node identity, §7.7 semantic input routing,
+//! §18.2 event deduplication, §27 server security controls; D2 T24, T32;
+//! PX-028, PX-030).
 //!
 //! Everything that decides whether a process may be acted on lives here, on
-//! the server, and nothing here can act on one:
+//! the server:
 //!
 //! * [`ActionIntent`] is the immutable record of one prepared action: an
 //!   intent ID minted by the server, the exact [`ProcessKey`]s it targets, the
@@ -13,32 +14,69 @@
 //!   on the selection the client holds when it confirms.
 //! * [`ProcessActions`] is the server-only interface an authorized intent
 //!   reaches. It is handed an [`Authorized`], which only [`ActionGate`] can
-//!   construct, after it re-checked every target against the latest scan. The
-//!   only implementation is [`DryRunExecutor`], which sends nothing: it has no
-//!   way to reach a process (PX-008's audit holds for this module like any
-//!   other). PX-029 adds identity-checked process handles
-//!   ([`crate::handle`]), which no action path reaches yet; termination
-//!   through them is PX-030.
+//!   construct, after it re-checked every target against the latest scan.
+//!   Production has exactly two implementations, which PX-008's audit pins:
+//!   [`DryRunExecutor`], which sends nothing, and
+//!   [`crate::terminate::PidfdTerminator`] (PX-030), which sends SIGTERM
+//!   through an identity-checked PID file descriptor ([`crate::handle`]) and
+//!   never by PID.
 //! * [`ActionOutcome`] keeps the six results apart: refused, unsupported,
 //!   requested, observed complete, failed and outcome unknown. An executor
 //!   reports only what it did ([`Execution`]); it cannot report an observed
 //!   completion, which only a later observation of the process can establish
-//!   (PX-031).
+//!   (PX-031). A sent SIGTERM is *requested*: the process may handle or ignore
+//!   it, and whether it exited is not observed here.
 //! * Read-only mode is enforced here, at both entry points, not only by the
 //!   disabled buttons: a click that reaches a handler in read-only mode is
 //!   refused whatever the store says about the button.
 //!
+//! **The confirmation panel (PX-030).** Prepare ("Terminate…") builds the
+//! intent, and the gate publishes an inline confirmation for it from standard
+//! widgets: a `Row` holding a `Text` that names the exact process and its
+//! owner, and a `Button` that confirms exactly that intent. The three nodes
+//! are fresh for every intent and never reused (§6.2): the `n`-th intent of a
+//! run (from 0) takes [`PanelIds::of`]`(n)`, IDs `PANEL_ID_BASE + 3n` to
+//! `PANEL_ID_BASE + 3n + 2`, and a run shows at most
+//! [`DEFAULT_CONFIRMATION_PANELS`] of them; past that Prepare is refused until
+//! srtop restarts. The runtime has no way to remove an event handler, so the
+//! panel handlers are all registered once, before the socket is served
+//! ([`crate::install_actions`]), each bound to its slot: a click on slot `n`
+//! can confirm only the intent shown in slot `n`, never a later one. A
+//! withdrawn panel is deleted in the commit that withdraws it, so a click
+//! still in flight names a node that no longer exists and event validation
+//! rejects it (§7.4). Repeated prepare/cancel cycles leave the live node
+//! count, the handler table and the handle table as they were.
+//!
+//! **What withdraws an intent (PX-030).** Cancel; expiry; navigation — the
+//! server's resolved selection no longer naming the intent's process
+//! instance (another row selected, the selection cleared, or a filter,
+//! search or view switch that moves it); read-only mode; and the target no
+//! longer being the latest scan's eligible instance (it exited, another
+//! process took its PID, its owner changed, it became protected). Confirm
+//! checks every one of them itself; the view also asks the gate to
+//! [`ActionGate::revalidate`] on a selection change and on every sample, so
+//! the panel is withdrawn as soon as it is stale. A paused or resuming view
+//! holds the intent, its Confirm disabled, rather than withdrawing it; expiry
+//! and navigation still withdraw it.
+//!
+//! **Protected targets.** PID 1, the namespace's init; any PID configured
+//! with `--protect-pid`; and, for this host's live processes, the support
+//! chain the server derives from its own process tree ([`SupportChain`],
+//! [`crate::support`]): srtop itself and its ancestors, and each connected
+//! client's transport (the socket peer, the SSH bridge) and its ancestors
+//! (the SSH session serving it). None of this is the only boundary: the
+//! owner, identity and freshness checks apply to every target first.
+//!
 //! Freshness is the intent's own, never the session's revision. A confirm
 //! click is accepted when it was observed at or after the revision that
 //! published this intent's confirmation (§7.7 `observed_revision`), by the
-//! client instance that prepared it, before its expiry, while every target is
-//! still the instance the latest scan confirmed, owned by the account and not
-//! protected. Telemetry commits between the two clicks advance the revision
-//! and change nothing here; a click observed before the confirmation was
-//! published was a click on something else, and is refused. A confirm is
-//! single-use: the intent is consumed whatever the result, and redelivery of
-//! the same event is answered from the runtime's dedupe cache without
-//! re-running this handler (§18.2).
+//! client instance that prepared it, before its expiry, while the selection
+//! still names it and every target is still the instance the latest scan
+//! confirmed, owned by the account and not protected. Telemetry commits
+//! between the two clicks advance the revision and change nothing here. A
+//! confirm is single-use: the intent is consumed whatever the result, its
+//! panel deleted, and redelivery of the same event is answered from the
+//! runtime's dedupe cache without re-running this handler (§18.2).
 //!
 //! The handlers read no event argument. A click names only its button; the
 //! target is the process the server resolved as selected when Prepare was
@@ -48,7 +86,7 @@
 use crate::on_demand::{MonotonicClock, SuspendAwareClock};
 use crate::refresh::{lock_view, ProcessView};
 use crate::source::{Observed, ProcessKey};
-use crate::{bounded, ACTIONS_ROW, ACTIONS_STATUS, ACTION_CANCEL, ACTION_CONFIRM, ACTION_PREPARE};
+use crate::{bounded, ACTIONS_ROW, ACTIONS_STATUS, ACTION_CANCEL, ACTION_PREPARE};
 use srui_sdk::{Button, NodeId, Row, SpacingRole, Text, TextRole, ENABLED, LABEL, TEXT};
 use srui_sessiond::{Session, SessionError};
 use std::collections::BTreeSet;
@@ -62,29 +100,52 @@ pub const DEFAULT_INTENT_LIFETIME: Duration = Duration::from_secs(30);
 pub const MAX_ACTIONS_STATUS_BYTES: usize = 1024;
 /// The longest Confirm label, before the cut mark.
 pub const MAX_CONFIRM_LABEL_BYTES: usize = 512;
+/// The longest confirmation question, before the cut mark (PX-030).
+pub const MAX_PANEL_TEXT_BYTES: usize = 512;
 /// The longest process description an intent carries.
 const MAX_WHO_BYTES: usize = 256;
-/// The PIDs no intent may target unless configured otherwise: PID 1, the
-/// namespace's init. PX-030 adds the app's own support chain; this set is
-/// never the only authorization boundary.
+/// The PIDs no intent may target, whatever the source: PID 1, the
+/// namespace's init. `--protect-pid` adds to it, and the live support chain
+/// is checked besides (PX-030); this set is never the only authorization
+/// boundary.
 pub const DEFAULT_PROTECTED_PIDS: [u32; 1] = [1];
+/// The most PIDs `--protect-pid` may name (PX-030).
+pub const MAX_CONFIGURED_PROTECTED_PIDS: usize = 64;
+
+/// The first node ID of the confirmation panels (PX-030), far above every
+/// fixed node of the shell.
+pub const PANEL_ID_BASE: u64 = 1_000_000;
+/// The nodes one confirmation panel takes: its row, question and Confirm.
+pub const PANEL_IDS: u64 = 3;
+/// How many confirmation panels one run of srtop shows at most (PX-030):
+/// every intent takes fresh node IDs, which the session never reuses (§6.2),
+/// and every panel's Confirm handler is registered at start. Past this many
+/// prepared intents, Prepare is refused until srtop restarts.
+pub const DEFAULT_CONFIRMATION_PANELS: u32 = 4096;
 
 pub const PREPARE_LABEL: &str = "Prepare dry run: terminate selected";
 pub const PREPARE_DESCRIPTION: &str =
     "Checks the process selected in the table on the server and prepares a dry-run request for it alone. Nothing is sent to any process.";
-pub const CONFIRM_LABEL: &str = "Confirm";
+/// The prepare button of `--actions terminate` (PX-030).
+pub const TERMINATE_LABEL: &str = "Terminate…";
+pub const TERMINATE_DESCRIPTION: &str =
+    "Checks the process selected in the table on the server and asks you to confirm it by name below. Nothing is sent until you confirm.";
 pub const CONFIRM_DESCRIPTION: &str =
-    "Confirms the prepared request for the process it names, which the server checks again first. In this build the request is recorded and never sent.";
+    "Confirms the prepared request for the process it names, which the server checks again first.";
 pub const CANCEL_LABEL: &str = "Cancel";
 pub const CANCEL_DESCRIPTION: &str = "Discards the prepared request without acting on it.";
 pub const READ_ONLY_STATUS: &str =
     "Read-only: this server refuses every process action; nothing can be prepared or sent";
 pub const DRY_RUN_STATUS: &str =
     "Dry run: Prepare checks the selected process and Confirm records the request; nothing is ever sent to a process";
-/// The action controls' nodes: the row, three buttons and the status.
-pub const ACTIONS_NODE_COUNT: usize = 5;
+/// The idle status of `--actions terminate` (PX-030).
+pub const TERMINATE_STATUS: &str =
+    "Terminate… checks the selected process and asks you to confirm it by name; Confirm sends it SIGTERM, a request it may handle or ignore";
+/// The fixed action controls' nodes: the row, Prepare, Cancel and the
+/// status. A pending intent adds its panel's [`PANEL_IDS`] nodes.
+pub const ACTIONS_NODE_COUNT: usize = 4;
 
-/// Whether this server may act on processes at all (PX-028).
+/// Whether this server may act on processes at all (PX-028, PX-030).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionMode {
     /// Every action is refused on the server; the controls are disabled.
@@ -92,22 +153,45 @@ pub enum ActionMode {
     /// Actions are authorized exactly as a real one would be and handed to
     /// the dry-run executor, which sends nothing.
     DryRun,
+    /// Actions are authorized and a confirmed one is handed to the real
+    /// executor, which sends SIGTERM through a process handle (PX-030).
+    Terminate,
 }
 
 impl ActionMode {
-    /// The `--actions` argument: `read-only` or `dry-run`.
+    /// The `--actions` argument: `read-only`, `dry-run` or `terminate`.
     pub fn parse(text: &str) -> Option<Self> {
         match text {
             "read-only" => Some(Self::ReadOnly),
             "dry-run" => Some(Self::DryRun),
+            "terminate" => Some(Self::Terminate),
             _ => None,
         }
     }
 }
 
+/// The three nodes of one confirmation panel (PX-030): slot `n` is
+/// `PANEL_ID_BASE + 3n` (the row), `+ 1` (the question) and `+ 2` (Confirm).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanelIds {
+    pub row: NodeId,
+    pub question: NodeId,
+    pub confirm: NodeId,
+}
+
+impl PanelIds {
+    pub fn of(slot: u32) -> Self {
+        let row = PANEL_ID_BASE + PANEL_IDS * u64::from(slot);
+        Self {
+            row: NodeId::new(row),
+            question: NodeId::new(row + 1),
+            confirm: NodeId::new(row + 2),
+        }
+    }
+}
+
 /// What an intent asks for. The only operation is a graceful termination
-/// request (PX-030 implements it for real); further families are later
-/// tickets.
+/// request (SIGTERM); further families are later tickets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActionOperation {
     Terminate,
@@ -117,6 +201,13 @@ impl ActionOperation {
     pub fn verb(self) -> &'static str {
         match self {
             Self::Terminate => "terminate",
+        }
+    }
+
+    /// "Terminate".
+    fn title(self) -> &'static str {
+        match self {
+            Self::Terminate => "Terminate",
         }
     }
 }
@@ -200,7 +291,7 @@ impl ActionTarget {
 
 /// One prepared action (PX-028). Immutable: built once by
 /// [`ActionGate::prepare`], read through getters, consumed by
-/// [`ActionGate::confirm`] or [`ActionGate::cancel`].
+/// [`ActionGate::confirm`], [`ActionGate::cancel`] or a withdrawal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionIntent {
     id: IntentId,
@@ -246,8 +337,26 @@ impl ActionIntent {
 
     /// "terminate PID 4101 · worker".
     fn subject(&self) -> String {
+        format!("{} {}", self.operation.verb(), self.whom())
+    }
+
+    /// "PID 4101 · worker".
+    fn whom(&self) -> String {
         let whom: Vec<&str> = self.targets.iter().map(|target| target.who()).collect();
-        format!("{} {}", self.operation.verb(), whom.join(", "))
+        whom.join(", ")
+    }
+
+    /// Whether the server's resolved selection still names this intent's
+    /// process (PX-030): navigating away withdraws it.
+    fn still_selected(&self, targets: &dyn ActionTargets) -> bool {
+        match self.parameters.scope {
+            TargetScope::SelectedProcess => {
+                let selected = targets.selected();
+                self.targets
+                    .iter()
+                    .all(|target| selected.as_ref() == Some(&target.key))
+            }
+        }
     }
 }
 
@@ -286,7 +395,43 @@ pub trait ActionTargets {
     fn state_of(&self, key: &ProcessKey) -> TargetState;
 }
 
-/// Why an action was refused (PX-028).
+/// Which part of the chain that serves this session a process is (PX-030).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupportRole {
+    /// srtop itself: the daemon that holds the session.
+    ThisServer,
+    /// A process srtop descends from.
+    ServerAncestor,
+    /// A connected client's transport: the process at the other end of its
+    /// socket (the SSH bridge).
+    ClientTransport,
+    /// A process a client's transport descends from (its SSH session).
+    TransportAncestor,
+}
+
+impl SupportRole {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::ThisServer => "this server (srtop) itself",
+            Self::ServerAncestor => "an ancestor of this server",
+            Self::ClientTransport => "a connected client's transport (its SSH bridge)",
+            Self::TransportAncestor => {
+                "an ancestor of a connected client's transport (its SSH session)"
+            }
+        }
+    }
+}
+
+/// The processes that serve this session, which no action may target
+/// (PX-030). Derived on the server from its own process tree and its own
+/// connections, never from anything a client names.
+pub trait SupportChain: Send + Sync {
+    /// `Err` when `key`, PID `pid`, is part of the chain, or when the chain
+    /// cannot be established for the processes `key` belongs to.
+    fn protects(&self, key: &ProcessKey, pid: u32) -> Result<(), Refusal>;
+}
+
+/// Why an action was refused (PX-028, PX-030).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
     /// The server is read-only.
@@ -316,10 +461,17 @@ pub enum Refusal {
     /// The process is not the account's own: another owner, or one the scan
     /// could not read.
     NotOwned { owner: Observed<u32>, account: u32 },
-    /// The process is protected.
+    /// The process is protected: PID 1 or a configured PID.
     Protected(u32),
+    /// The process serves this session (PX-030).
+    SupportChain { pid: u32, role: SupportRole },
+    /// The chain that serves this session could not be established, so no
+    /// process of this host may be acted on (PX-030).
+    SupportChainUnknown(String),
     /// Confirm or Cancel with no prepared intent.
     NoPendingIntent,
+    /// A click on a confirmation that is no longer the one shown (PX-030).
+    Withdrawn,
     /// Another client instance prepared the intent.
     OtherClient,
     /// The click was observed before the confirmation it would confirm was
@@ -332,6 +484,14 @@ pub enum Refusal {
     Expired,
     /// The account the server acts as is not the one it was prepared for.
     AccountChanged,
+    /// The server's resolved selection no longer names the intent's process
+    /// (PX-030).
+    Navigated,
+    /// This run has shown every confirmation panel it may (PX-030).
+    PanelsExhausted { limit: u32 },
+    /// The executor could not hold the process for signalling, so nothing was
+    /// sent (PX-030).
+    NotHeld(String),
 }
 
 impl Refusal {
@@ -368,13 +528,25 @@ impl Refusal {
                 reason.describe()
             ),
             Self::Protected(pid) => format!("PID {pid} is protected"),
+            Self::SupportChain { pid, role } => {
+                format!("PID {pid} is {}, which serves this session", role.describe())
+            }
+            Self::SupportChainUnknown(why) => format!(
+                "the processes serving this session could not be established ({why}), so no process of this host can be acted on"
+            ),
             Self::NoPendingIntent => "nothing is prepared".into(),
+            Self::Withdrawn => "this confirmation was withdrawn".into(),
             Self::OtherClient => "another client prepared this request".into(),
             Self::StaleConfirmation { .. } => {
                 "the click was made before this request's confirmation was shown".into()
             }
             Self::Expired => "the prepared request expired".into(),
             Self::AccountChanged => "the account changed since the request was prepared".into(),
+            Self::Navigated => "the selection moved off the process this request names".into(),
+            Self::PanelsExhausted { limit } => format!(
+                "this server has shown the {limit} confirmations it allows in one run; restart srtop to prepare more"
+            ),
+            Self::NotHeld(why) => format!("the process could not be held for signalling: {why}"),
         }
     }
 }
@@ -400,6 +572,9 @@ pub fn hold_of(targets: &dyn ActionTargets) -> Option<Refusal> {
 pub enum Execution {
     Requested,
     Unsupported,
+    /// The executor refused before sending anything (PX-030): the process
+    /// could not be held, or is not the instance confirmed.
+    Refused(Refusal),
     Failed(String),
     OutcomeUnknown(String),
 }
@@ -408,7 +583,7 @@ pub enum Execution {
 /// another: a request is not a completion, and a refusal is not a failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionOutcome {
-    /// The server refused it; nothing reached the executor.
+    /// The server refused it; nothing was sent.
     Refused {
         intent: Option<IntentId>,
         reason: Refusal,
@@ -441,6 +616,10 @@ impl ActionOutcome {
             Execution::Unsupported => Self::Unsupported {
                 intent: Some(intent),
                 operation,
+            },
+            Execution::Refused(reason) => Self::Refused {
+                intent: Some(intent),
+                reason,
             },
             Execution::Failed(reason) => Self::Failed { intent, reason },
             Execution::OutcomeUnknown(reason) => Self::OutcomeUnknown { intent, reason },
@@ -490,7 +669,7 @@ impl ActionOutcome {
                 intent,
                 dry_run: false,
             } => format!(
-                "Requested #{}{about}: whether it took effect is not yet observed",
+                "Requested #{}{about}: SIGTERM was sent; the process may handle or ignore it, and whether it exits is not yet observed",
                 intent.get()
             ),
             Self::ObservedComplete { intent } => {
@@ -524,13 +703,18 @@ impl Authorized<'_> {
 pub trait ProcessActions: Send + Sync {
     /// Whether this executor offers `operation` at all.
     fn supports(&self, operation: ActionOperation) -> bool;
+    /// Why this executor can act on nothing on this host, when it cannot
+    /// (PX-030): the controls are then published disabled with this reason.
+    fn unavailable(&self) -> Option<String> {
+        None
+    }
     /// Acts on `action`, whose every target the gate has just re-checked.
     fn execute(&self, action: &Authorized<'_>) -> Execution;
 }
 
-/// The only executor in this build: it reports each supported request as
-/// requested and sends nothing. It holds no handle and calls nothing that
-/// could reach a process.
+/// The executor that reports each supported request as requested and sends
+/// nothing (PX-028). It holds no handle and calls nothing that could reach a
+/// process; `--actions dry-run` uses it.
 #[derive(Debug, Clone)]
 pub struct DryRunExecutor {
     supported: Vec<ActionOperation>,
@@ -565,20 +749,31 @@ impl ProcessActions for DryRunExecutor {
     }
 }
 
+/// One confirmation panel as the client holds it (PX-030).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelView {
+    pub slot: u32,
+    pub question: String,
+    pub confirm_label: String,
+    pub confirm_enabled: bool,
+}
+
 /// The action controls as the client holds them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionsView {
     pub prepare_enabled: bool,
-    pub confirm_enabled: bool,
     pub cancel_enabled: bool,
-    pub confirm_label: String,
     pub status: String,
+    /// The pending intent's confirmation panel, when one is pending.
+    pub panel: Option<PanelView>,
 }
 
-/// A prepared intent and the revision that published its confirmation.
+/// A prepared intent, its panel slot, and the revision that published it.
 #[derive(Debug, Clone)]
 struct Pending {
     intent: ActionIntent,
+    /// The panel this intent alone is confirmed through (PX-030).
+    slot: u32,
     /// `None` until the transaction publishing it commits.
     confirmable_from: Option<u64>,
 }
@@ -589,6 +784,12 @@ enum Report {
     Idle,
     Prepared,
     Cancelled(IntentId),
+    /// Withdrawn before it was confirmed (PX-030).
+    Withdrawn {
+        intent: IntentId,
+        subject: String,
+        reason: Refusal,
+    },
     Outcome {
         outcome: ActionOutcome,
         subject: Option<String>,
@@ -603,14 +804,24 @@ pub struct ActionGate {
     clock: Arc<dyn MonotonicClock>,
     lifetime: Duration,
     protected: BTreeSet<u32>,
+    /// The processes serving this session (PX-030).
+    support: Arc<dyn SupportChain>,
     next_intent: u64,
+    /// How many confirmation panels this gate may show, and the next unused
+    /// one (PX-030). A slot is never used twice.
+    panel_slots: u32,
+    next_slot: u32,
     pending: Option<Pending>,
     report: Report,
     /// Why the view's rows are not the latest scan, as the view last said
     /// ([`Self::hold_for`]): Prepare and Confirm are published disabled while
     /// this is `Some`. The checks themselves always ask the view again.
     hold: Option<Refusal>,
+    /// Where the controls live, once created.
+    parent: Option<NodeId>,
     published: Option<ActionsView>,
+    /// The slot of the panel this gate last committed to the store.
+    shown: Option<u32>,
 }
 
 impl std::fmt::Debug for ActionGate {
@@ -636,7 +847,8 @@ pub fn lock_actions(gate: &Mutex<ActionGate>) -> std::sync::MutexGuard<'_, Actio
 
 impl ActionGate {
     /// A gate in `mode` over `executor`, on a suspend-aware clock, with the
-    /// default lifetime and protected PIDs.
+    /// default lifetime, protected PIDs and panel count, and this process's
+    /// own support chain (no connection registered).
     pub fn new(mode: ActionMode, executor: Arc<dyn ProcessActions>) -> Self {
         Self {
             mode,
@@ -644,11 +856,16 @@ impl ActionGate {
             clock: Arc::new(SuspendAwareClock::new()),
             lifetime: DEFAULT_INTENT_LIFETIME,
             protected: DEFAULT_PROTECTED_PIDS.into_iter().collect(),
+            support: Arc::new(crate::support::ServerSupportChain::new()),
             next_intent: 1,
+            panel_slots: DEFAULT_CONFIRMATION_PANELS,
+            next_slot: 0,
             pending: None,
             report: Report::Idle,
             hold: None,
+            parent: None,
             published: None,
+            shown: None,
         }
     }
 
@@ -682,13 +899,43 @@ impl ActionGate {
         self
     }
 
+    /// This gate refusing the processes `support` names (PX-030).
+    pub fn with_support_chain(mut self, support: Arc<dyn SupportChain>) -> Self {
+        self.support = support;
+        self
+    }
+
+    /// This gate showing at most `slots` confirmation panels (PX-030).
+    pub fn with_panel_slots(mut self, slots: u32) -> Self {
+        self.panel_slots = slots;
+        self
+    }
+
     pub fn mode(&self) -> ActionMode {
         self.mode
+    }
+
+    /// How many confirmation panels this gate may show: one Confirm handler
+    /// is registered for each (PX-030).
+    pub fn panel_slots(&self) -> u32 {
+        self.panel_slots
+    }
+
+    /// The PIDs this gate protects in every source.
+    pub fn protected_pids(&self) -> &BTreeSet<u32> {
+        &self.protected
     }
 
     /// The prepared intent, if any.
     pub fn pending(&self) -> Option<&ActionIntent> {
         self.pending.as_ref().map(|pending| &pending.intent)
+    }
+
+    /// The panel the pending intent is confirmed through (PX-030).
+    pub fn pending_panel(&self) -> Option<PanelIds> {
+        self.pending
+            .as_ref()
+            .map(|pending| PanelIds::of(pending.slot))
     }
 
     /// The revision that published the pending intent's confirmation.
@@ -706,17 +953,25 @@ impl ActionGate {
         }
     }
 
+    /// Why the latest intent was withdrawn, when it was (PX-030).
+    pub fn withdrawn(&self) -> Option<(IntentId, &Refusal)> {
+        match &self.report {
+            Report::Withdrawn { intent, reason, .. } => Some((*intent, reason)),
+            _ => None,
+        }
+    }
+
     /// Read-only mode, checked by the server at every entry point.
     fn writable(&self) -> Result<(), Refusal> {
         match self.mode {
             ActionMode::ReadOnly => Err(Refusal::ReadOnly),
-            ActionMode::DryRun => Ok(()),
+            ActionMode::DryRun | ActionMode::Terminate => Ok(()),
         }
     }
 
     /// Admits `key` as a target for `account`: the latest scan's own
     /// instance, a process, with a known PID, owned by `account`, not
-    /// protected.
+    /// protected and not part of the chain serving this session.
     fn admit(
         &self,
         targets: &dyn ActionTargets,
@@ -747,6 +1002,7 @@ impl ActionGate {
         if self.protected.contains(&pid) {
             return Err(Refusal::Protected(pid));
         }
+        self.support.protects(key, pid)?;
         Ok(ActionTarget {
             key: key.clone(),
             pid,
@@ -773,14 +1029,17 @@ impl ActionGate {
         client: &[u8],
         operation: ActionOperation,
     ) -> Result<IntentId, ActionOutcome> {
-        // A new Prepare replaces the old intent whatever its result.
+        // A new Prepare replaces the old intent whatever its result: a
+        // refused one leaves nothing pending, and the old panel goes with the
+        // next publication.
         self.pending = None;
         let prepared = self.prepare_intent(targets, client, operation);
         match prepared {
-            Ok(intent) => {
+            Ok((intent, slot)) => {
                 let id = intent.id;
                 self.pending = Some(Pending {
                     intent,
+                    slot,
                     confirmable_from: None,
                 });
                 self.report = Report::Prepared;
@@ -801,7 +1060,7 @@ impl ActionGate {
         targets: &dyn ActionTargets,
         client: &[u8],
         operation: ActionOperation,
-    ) -> Result<ActionIntent, ActionOutcome> {
+    ) -> Result<(ActionIntent, u32), ActionOutcome> {
         let refused = |reason| ActionOutcome::Refused {
             intent: None,
             reason,
@@ -821,23 +1080,34 @@ impl ActionGate {
             .selected()
             .ok_or_else(|| refused(Refusal::NothingSelected))?;
         let target = self.admit(targets, &key, account).map_err(refused)?;
+        if self.next_slot >= self.panel_slots {
+            return Err(refused(Refusal::PanelsExhausted {
+                limit: self.panel_slots,
+            }));
+        }
+        // Fresh node IDs for this intent's panel, never used again (§6.2).
+        let slot = self.next_slot;
+        self.next_slot += 1;
         let id = IntentId(self.next_intent);
         self.next_intent += 1;
         let created_at = self.clock.now().0;
-        Ok(ActionIntent {
-            id,
-            targets: vec![target],
-            operation,
-            parameters: ActionParameters {
-                scope: TargetScope::SelectedProcess,
+        Ok((
+            ActionIntent {
+                id,
+                targets: vec![target],
+                operation,
+                parameters: ActionParameters {
+                    scope: TargetScope::SelectedProcess,
+                },
+                context: ActionContext {
+                    account,
+                    client_instance_id: client.to_vec(),
+                },
+                created_at,
+                expires_at: created_at.saturating_add(self.lifetime),
             },
-            context: ActionContext {
-                account,
-                client_instance_id: client.to_vec(),
-            },
-            created_at,
-            expires_at: created_at.saturating_add(self.lifetime),
-        })
+            slot,
+        ))
     }
 
     /// Confirms the pending intent for the client instance `client`, whose
@@ -873,6 +1143,26 @@ impl ActionGate {
         outcome
     }
 
+    /// A click on the Confirm of panel `slot` (PX-030): it confirms the
+    /// pending intent only when that intent is the one shown in `slot`. Any
+    /// other click is refused and changes nothing: the pending intent, if
+    /// any, is another panel's.
+    pub fn confirm_panel(
+        &mut self,
+        targets: &dyn ActionTargets,
+        client: &[u8],
+        observed: u64,
+        slot: u32,
+    ) -> ActionOutcome {
+        if self.pending.as_ref().map(|pending| pending.slot) != Some(slot) {
+            return ActionOutcome::Refused {
+                intent: None,
+                reason: Refusal::Withdrawn,
+            };
+        }
+        self.confirm(targets, client, observed)
+    }
+
     /// Every check a confirmation must pass, in full, at the moment of
     /// confirmation.
     fn authorize<'p>(
@@ -906,6 +1196,11 @@ impl ActionGate {
         if Self::account(targets)? != intent.context.account {
             return Err(Refusal::AccountChanged);
         }
+        // Navigation withdraws an intent (PX-030): confirming acts only on
+        // the process the selection still names.
+        if !intent.still_selected(targets) {
+            return Err(Refusal::Navigated);
+        }
         if let Some(hold) = hold_of(targets) {
             return Err(hold);
         }
@@ -913,6 +1208,54 @@ impl ActionGate {
             self.admit(targets, &target.key, intent.context.account)?;
         }
         Ok(intent)
+    }
+
+    /// Withdraws the pending intent when it can no longer be confirmed
+    /// (PX-030): expired, navigated away from, the server read-only, or its
+    /// target no longer the latest scan's eligible instance. A paused or
+    /// resuming view keeps it on hold instead, unless it expired or the
+    /// selection moved. The panel goes with the next publication.
+    pub fn revalidate(&mut self, targets: &dyn ActionTargets) {
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        let Some(reason) = self.withdrawal(&pending.intent, targets) else {
+            return;
+        };
+        if let Some(pending) = self.pending.take() {
+            self.report = Report::Withdrawn {
+                intent: pending.intent.id,
+                subject: pending.intent.subject(),
+                reason,
+            };
+        }
+    }
+
+    /// Why `intent` can no longer be confirmed, if it cannot.
+    fn withdrawal(&self, intent: &ActionIntent, targets: &dyn ActionTargets) -> Option<Refusal> {
+        if let Err(reason) = self.writable() {
+            return Some(reason);
+        }
+        if self.clock.now().0 >= intent.expires_at {
+            return Some(Refusal::Expired);
+        }
+        if !intent.still_selected(targets) {
+            return Some(Refusal::Navigated);
+        }
+        if hold_of(targets).is_some() {
+            return None;
+        }
+        match Self::account(targets) {
+            Err(reason) => return Some(reason),
+            Ok(account) if account != intent.context.account => {
+                return Some(Refusal::AccountChanged)
+            }
+            Ok(_) => {}
+        }
+        intent.targets.iter().find_map(|target| {
+            self.admit(targets, &target.key, intent.context.account)
+                .err()
+        })
     }
 
     /// Discards the pending intent. Returns what it discarded.
@@ -931,59 +1274,131 @@ impl ActionGate {
         cancelled
     }
 
+    /// The prepare button's label in this mode.
+    pub fn prepare_label(&self) -> &'static str {
+        match self.mode {
+            ActionMode::Terminate => TERMINATE_LABEL,
+            ActionMode::ReadOnly | ActionMode::DryRun => PREPARE_LABEL,
+        }
+    }
+
+    fn prepare_description(&self) -> &'static str {
+        match self.mode {
+            ActionMode::Terminate => TERMINATE_DESCRIPTION,
+            ActionMode::ReadOnly | ActionMode::DryRun => PREPARE_DESCRIPTION,
+        }
+    }
+
+    /// The question the panel asks about `intent`: the exact process and
+    /// its owner, and what Confirm does.
+    fn question(&self, intent: &ActionIntent) -> String {
+        let owner = intent
+            .targets
+            .first()
+            .map_or(String::new(), |target| format!(" (UID {})", target.owner));
+        match self.mode {
+            ActionMode::DryRun | ActionMode::ReadOnly => format!(
+                "Dry run: {} {}{owner}? Confirm records the request; nothing is sent to the process.",
+                intent.operation.verb(),
+                intent.whom()
+            ),
+            ActionMode::Terminate => format!(
+                "{} {}{owner}? Confirm sends it SIGTERM, which asks it to exit; it may handle or ignore it.",
+                intent.operation.title(),
+                intent.whom()
+            ),
+        }
+    }
+
+    fn confirm_label(&self, intent: &ActionIntent) -> String {
+        match self.mode {
+            ActionMode::DryRun | ActionMode::ReadOnly => {
+                format!("Confirm dry run: {}", intent.subject())
+            }
+            ActionMode::Terminate => format!("Confirm: {}", intent.subject()),
+        }
+    }
+
     /// The controls this gate's state calls for.
     pub fn view(&self) -> ActionsView {
         let writable = self.writable().is_ok();
-        let pending = self.pending.as_ref().map(|pending| &pending.intent);
+        let unavailable = self.executor.unavailable();
+        let pending = self.pending.as_ref();
+        let dry_run = if self.mode == ActionMode::DryRun {
+            " (dry run)"
+        } else {
+            ""
+        };
         let status = match (&self.report, pending) {
-            (Report::Prepared, Some(intent)) if self.hold.is_some() => format!(
-                "Prepared #{}: {} (dry run), on hold: {}; Confirm is unavailable until it is current, and Cancel discards it",
-                intent.id.get(),
-                intent.subject(),
+            (Report::Prepared, Some(pending)) if self.hold.is_some() => format!(
+                "Prepared #{}: {}{dry_run}, on hold: {}; Confirm is unavailable until it is current, and Cancel discards it",
+                pending.intent.id.get(),
+                pending.intent.subject(),
                 self.hold.as_ref().map(Refusal::describe).unwrap_or_default()
             ),
-            (Report::Prepared, Some(intent)) => format!(
-                "Prepared #{}: {} (dry run). Confirm within {} s or Cancel; only this process can be acted on",
-                intent.id.get(),
-                intent.subject(),
+            (Report::Prepared, Some(pending)) => format!(
+                "Prepared #{}: {}{dry_run}. Confirm within {} s or Cancel; only this process can be acted on, and selecting another withdraws it",
+                pending.intent.id.get(),
+                pending.intent.subject(),
                 self.lifetime.as_secs()
             ),
             (Report::Cancelled(id), _) => {
                 format!("Cancelled #{}: nothing was requested", id.get())
             }
+            (
+                Report::Withdrawn {
+                    intent,
+                    subject,
+                    reason,
+                },
+                _,
+            ) => format!(
+                "Withdrawn #{} ({subject}): {}; nothing was requested",
+                intent.get(),
+                reason.describe()
+            ),
             (Report::Outcome { outcome, subject }, _) => outcome.describe(subject.as_deref()),
-            _ if writable => match &self.hold {
-                Some(hold) => format!("Actions on hold: {}", hold.describe()),
-                None => DRY_RUN_STATUS.to_string(),
+            _ if writable => match (&unavailable, &self.hold) {
+                (Some(why), _) => format!(
+                    "{} unavailable: {why}; nothing can be sent to any process",
+                    ActionOperation::Terminate.title()
+                ),
+                (None, Some(hold)) => format!("Actions on hold: {}", hold.describe()),
+                (None, None) if self.mode == ActionMode::Terminate => TERMINATE_STATUS.to_string(),
+                (None, None) => DRY_RUN_STATUS.to_string(),
             },
             _ => READ_ONLY_STATUS.to_string(),
         };
         // Paused or resuming, nothing can be prepared or confirmed: the rows
         // are not the latest scan. Cancel only discards, so it stays.
-        let actionable = writable && self.hold.is_none();
+        let actionable = writable && self.hold.is_none() && unavailable.is_none();
         ActionsView {
             prepare_enabled: actionable,
-            confirm_enabled: actionable && pending.is_some(),
             cancel_enabled: writable && pending.is_some(),
-            confirm_label: match pending {
-                Some(intent) => bounded(
-                    &format!("Confirm dry run: {}", intent.subject()),
+            status: bounded(&status, MAX_ACTIONS_STATUS_BYTES),
+            panel: pending.map(|pending| PanelView {
+                slot: pending.slot,
+                question: bounded(&self.question(&pending.intent), MAX_PANEL_TEXT_BYTES),
+                confirm_label: bounded(
+                    &self.confirm_label(&pending.intent),
                     MAX_CONFIRM_LABEL_BYTES,
                 ),
-                None => CONFIRM_LABEL.to_string(),
-            },
-            status: bounded(&status, MAX_ACTIONS_STATUS_BYTES),
+                confirm_enabled: actionable,
+            }),
         }
     }
 
-    /// Creates the action controls under `parent`, in one transaction, as
-    /// this gate's state calls for.
+    /// Creates the fixed action controls under `parent`, in one transaction,
+    /// as this gate's state calls for. Confirmation panels are created under
+    /// the same parent, after them, as intents are prepared.
     pub fn create_controls(
         &mut self,
         session: &Session,
         parent: NodeId,
     ) -> Result<(), SessionError> {
         let view = self.view();
+        let (prepare_label, prepare_description) =
+            (self.prepare_label(), self.prepare_description());
         session.transaction(|ui| {
             Row::builder(ACTIONS_ROW)
                 .parent(parent)
@@ -992,15 +1407,9 @@ impl ActionGate {
             for (button, label, description, enabled) in [
                 (
                     ACTION_PREPARE,
-                    PREPARE_LABEL,
-                    PREPARE_DESCRIPTION,
+                    prepare_label,
+                    prepare_description,
                     view.prepare_enabled,
-                ),
-                (
-                    ACTION_CONFIRM,
-                    view.confirm_label.as_str(),
-                    CONFIRM_DESCRIPTION,
-                    view.confirm_enabled,
                 ),
                 (
                     ACTION_CANCEL,
@@ -1021,16 +1430,22 @@ impl ActionGate {
                 .text(view.status.as_str())
                 .role(TextRole::Status)
                 .create(ui)?;
+            if let Some(panel) = &view.panel {
+                create_panel(ui, parent, panel)?;
+            }
             Ok(())
         })?;
+        self.parent = Some(parent);
+        self.shown = view.panel.as_ref().map(|panel| panel.slot);
         self.published = Some(view);
         Ok(())
     }
 
     /// Publishes what changed in the controls, in one transaction. A pending
     /// intent becomes confirmable from the revision of the commit that first
-    /// shows it; one whose confirmation never committed is discarded, so a
-    /// client can confirm only a confirmation it can have seen.
+    /// shows its panel; one whose panel never committed is discarded, so a
+    /// client can confirm only a confirmation it can have seen. A withdrawn,
+    /// cancelled or confirmed intent's panel is deleted in the same commit.
     pub fn publish(&mut self, session: &Session) -> Result<(), SessionError> {
         let target = self.view();
         self.publish_view(session, target)
@@ -1048,12 +1463,13 @@ impl ActionGate {
     }
 
     fn publish_view(&mut self, session: &Session, target: ActionsView) -> Result<(), SessionError> {
-        if self.published.is_none() {
+        let Some(parent) = self.parent else {
             // The controls were never created: nothing can be shown, so
             // nothing may stay confirmable.
             self.pending = None;
             return Ok(());
-        }
+        };
+        let shown = self.shown;
         // Diffed against what the store holds, not what this gate last
         // wrote, so a control enabled by anything else is put back.
         let published = session.with_store(|store| {
@@ -1070,10 +1486,18 @@ impl ActionGate {
             };
             ActionsView {
                 prepare_enabled: enabled(ACTION_PREPARE),
-                confirm_enabled: enabled(ACTION_CONFIRM),
                 cancel_enabled: enabled(ACTION_CANCEL),
-                confirm_label: text(ACTION_CONFIRM, LABEL),
                 status: text(ACTIONS_STATUS, TEXT),
+                panel: shown.and_then(|slot| {
+                    let ids = PanelIds::of(slot);
+                    store.get_node(ids.row)?;
+                    Some(PanelView {
+                        slot,
+                        question: text(ids.question, TEXT),
+                        confirm_label: text(ids.confirm, LABEL),
+                        confirm_enabled: enabled(ids.confirm),
+                    })
+                }),
             }
         });
         if published == target {
@@ -1094,11 +1518,6 @@ impl ActionGate {
                     target.prepare_enabled,
                 ),
                 (
-                    ACTION_CONFIRM,
-                    published.confirm_enabled,
-                    target.confirm_enabled,
-                ),
-                (
                     ACTION_CANCEL,
                     published.cancel_enabled,
                     target.cancel_enabled,
@@ -1108,16 +1527,38 @@ impl ActionGate {
                     ui.set(button, ENABLED, now)?;
                 }
             }
-            if published.confirm_label != target.confirm_label {
-                ui.set(ACTION_CONFIRM, LABEL, target.confirm_label.as_str())?;
-            }
             if published.status != target.status {
                 ui.set(ACTIONS_STATUS, TEXT, target.status.as_str())?;
+            }
+            match (&published.panel, &target.panel) {
+                (Some(was), Some(now)) if was.slot == now.slot => {
+                    let ids = PanelIds::of(now.slot);
+                    if was.confirm_enabled != now.confirm_enabled {
+                        ui.set(ids.confirm, ENABLED, now.confirm_enabled)?;
+                    }
+                    if was.confirm_label != now.confirm_label {
+                        ui.set(ids.confirm, LABEL, now.confirm_label.as_str())?;
+                    }
+                    if was.question != now.question {
+                        ui.set(ids.question, TEXT, now.question.as_str())?;
+                    }
+                }
+                (was, now) => {
+                    // Another intent, or none: the old panel goes, with its
+                    // button, and a new one gets fresh node IDs.
+                    if let Some(was) = was {
+                        ui.delete(PanelIds::of(was.slot).row)?;
+                    }
+                    if let Some(now) = now {
+                        create_panel(ui, parent, now)?;
+                    }
+                }
             }
             Ok(())
         });
         match committed {
             Ok(result) => {
+                self.shown = target.panel.as_ref().map(|panel| panel.slot);
                 self.published = Some(target);
                 if let Some(pending) = &mut self.pending {
                     pending
@@ -1138,6 +1579,32 @@ impl ActionGate {
             }
         }
     }
+}
+
+/// Creates one confirmation panel (PX-030) under `parent`: a `Row` with the
+/// question naming the process and the Confirm button bound to its slot.
+fn create_panel(
+    ui: &mut srui_sdk::UiTransaction,
+    parent: NodeId,
+    panel: &PanelView,
+) -> Result<(), srui_semantic_tree::StoreError> {
+    let ids = PanelIds::of(panel.slot);
+    Row::builder(ids.row)
+        .parent(parent)
+        .spacing_role(SpacingRole::Normal)
+        .create(ui)?;
+    Text::builder(ids.question)
+        .parent(ids.row)
+        .text(panel.question.as_str())
+        .role(TextRole::Warning)
+        .create(ui)?;
+    Button::builder(ids.confirm)
+        .parent(ids.row)
+        .label(panel.confirm_label.as_str())
+        .accessible_description(CONFIRM_DESCRIPTION)
+        .create(ui)?;
+    ui.set(ids.confirm, ENABLED, panel.confirm_enabled)?;
+    Ok(())
 }
 
 /// Dispatches one `ACTIVATE` on Prepare (PX-028). Only the event's
@@ -1164,18 +1631,25 @@ pub fn prepare_requested(
     }
 }
 
-/// Dispatches one `ACTIVATE` on Confirm (PX-028). Only the event's
-/// `client_instance_id` and `observed_revision` are read.
+/// Dispatches one `ACTIVATE` on the Confirm of panel `slot` (PX-028,
+/// PX-030). Only the event's `client_instance_id` and `observed_revision`
+/// are read.
 pub fn confirm_requested(
     gate: &Mutex<ActionGate>,
     view: &Mutex<ProcessView>,
     session: &Session,
     event: &srui_protocol::Event,
+    slot: u32,
 ) {
     // The view, then the gate: the order every holder of both takes them.
     let view = lock_view(view);
     let mut gate = lock_actions(gate);
-    gate.confirm(&*view, &event.client_instance_id, event.observed_revision);
+    gate.confirm_panel(
+        &*view,
+        &event.client_instance_id,
+        event.observed_revision,
+        slot,
+    );
     gate.hold_for(&*view);
     if let Err(error) = gate.publish(session) {
         eprintln!("srtop: action controls not published: {error}");
@@ -1191,7 +1665,6 @@ pub fn cancel_requested(gate: &Mutex<ActionGate>, session: &Session) {
         eprintln!("srtop: action controls not published: {error}");
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1655,12 +2128,10 @@ mod tests {
             }
         ));
         let view = gate.view();
-        assert!(!view.prepare_enabled && !view.confirm_enabled && !view.cancel_enabled);
+        assert!(!view.prepare_enabled && !view.cancel_enabled && view.panel.is_none());
         assert_eq!(recording.reached.lock().unwrap().len(), reached);
     }
 
-    /// The action controls, at their widest, fit the reserve the row ceiling
-    /// charges for them in every catch-up snapshot.
     #[test]
     fn a_failed_publication_of_the_controls_is_retried_by_the_next_call() {
         // PX-028 round 2 verification (V6). No transient store failure can
@@ -1684,7 +2155,13 @@ mod tests {
             }) != Some(srui_sdk::Value::Bool(false))
         };
         assert!(enabled(&session, ACTION_PREPARE));
+        // A prepared intent's panel is shown, its Confirm enabled.
         let (mut fake, _) = mine(4101);
+        gate.prepare(&fake, CLIENT, ActionOperation::Terminate)
+            .unwrap();
+        gate.publish(&session).unwrap();
+        let panel = gate.pending_panel().unwrap();
+        assert!(enabled(&session, panel.confirm));
         fake.resuming = true;
         gate.hold_for(&fake);
         let elsewhere = Session::mint();
@@ -1693,43 +2170,40 @@ mod tests {
             "the controls do not exist there"
         );
         assert!(enabled(&session, ACTION_PREPARE), "nothing reached it yet");
+        assert!(gate.pending().is_some(), "a shown intent is kept");
         let before = session.current_revision();
         gate.hold_for(&fake);
         gate.publish_if_changed(&session).unwrap();
         assert!(session.current_revision() > before, "retried");
         assert!(!enabled(&session, ACTION_PREPARE));
-        assert!(!enabled(&session, ACTION_CONFIRM));
+        assert!(!enabled(&session, panel.confirm));
         // Published now: an unchanged gate commits nothing more.
         let after = session.current_revision();
         gate.publish_if_changed(&session).unwrap();
         assert_eq!(session.current_revision(), after);
     }
 
+    /// The action controls, at their widest, fit the reserve the row ceiling
+    /// charges for them in every catch-up snapshot: the fixed controls and a
+    /// confirmation panel (PX-030), each text at its bound with the cut mark.
     #[test]
     fn the_widest_action_controls_fit_their_snapshot_reserve() {
         use srui_sdk::Operation;
         let session = Session::mint();
         crate::initialize(&session).unwrap();
-        let mut gate = ActionGate::new(ActionMode::DryRun, Arc::new(DryRunExecutor::default()));
+        let mut gate = ActionGate::new(ActionMode::Terminate, Arc::new(DryRunExecutor::default()));
         gate.create_controls(&session, crate::COLUMN).unwrap();
+        let (fake, _) = mine(4101);
+        gate.prepare(&fake, CLIENT, ActionOperation::Terminate)
+            .unwrap();
+        gate.publish(&session).unwrap();
+        let panel = gate.pending_panel().unwrap();
+        let wide = |limit: usize| bounded(&"\u{20000}".repeat(limit / 4 + 1), limit);
         session
             .transaction(|ui| {
-                ui.set(
-                    ACTIONS_STATUS,
-                    TEXT,
-                    bounded(
-                        &"\u{20000}".repeat(MAX_ACTIONS_STATUS_BYTES / 4 + 1),
-                        MAX_ACTIONS_STATUS_BYTES,
-                    ),
-                )?;
-                ui.set(
-                    ACTION_CONFIRM,
-                    LABEL,
-                    bounded(
-                        &"\u{20000}".repeat(MAX_CONFIRM_LABEL_BYTES / 4 + 1),
-                        MAX_CONFIRM_LABEL_BYTES,
-                    ),
-                )?;
+                ui.set(ACTIONS_STATUS, TEXT, wide(MAX_ACTIONS_STATUS_BYTES))?;
+                ui.set(panel.question, TEXT, wide(MAX_PANEL_TEXT_BYTES))?;
+                ui.set(panel.confirm, LABEL, wide(MAX_CONFIRM_LABEL_BYTES))?;
                 Ok(())
             })
             .unwrap();
@@ -1737,9 +2211,11 @@ mod tests {
             [
                 ACTIONS_ROW,
                 ACTION_PREPARE,
-                ACTION_CONFIRM,
                 ACTION_CANCEL,
                 ACTIONS_STATUS,
+                panel.row,
+                panel.question,
+                panel.confirm,
             ]
             .iter()
             .map(|id| {
@@ -1771,8 +2247,423 @@ mod tests {
             "the widest action controls encode to {encoded} bytes"
         );
         assert!(
-            encoded > crate::refresh::ACTIONS_RESERVE_BYTES / 4,
+            encoded > crate::refresh::ACTIONS_RESERVE_BYTES / 2,
             "measured against controls that really are wide: {encoded}"
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // PX-030
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn confirm_acts_only_while_the_selection_names_the_intents_process() {
+        let recording = Arc::new(Recording::default());
+        let clock = Arc::new(ManualClock::default());
+        let mut gate = gate(&recording, &clock);
+        let (mut fake, a) = mine(4101);
+        let b = key(4103, "b");
+        fake.current(&b, Observed::Known(ME));
+        // Prepared for A; B is selected; Confirm: refused, nothing reached.
+        let id = prepared(&mut gate, &fake);
+        fake.selected = Some(b.clone());
+        assert_eq!(
+            gate.confirm(&fake, CLIENT, 10),
+            ActionOutcome::Refused {
+                intent: Some(id),
+                reason: Refusal::Navigated
+            }
+        );
+        // The selection cleared: refused too.
+        fake.selected = Some(a.clone());
+        prepared(&mut gate, &fake);
+        fake.selected = None;
+        assert!(matches!(
+            gate.confirm(&fake, CLIENT, 10),
+            ActionOutcome::Refused {
+                reason: Refusal::Navigated,
+                ..
+            }
+        ));
+        // Back on A: only A is ever acted on.
+        fake.selected = Some(a.clone());
+        prepared(&mut gate, &fake);
+        assert!(matches!(
+            gate.confirm(&fake, CLIENT, 10),
+            ActionOutcome::Requested { .. }
+        ));
+        let reached = recording.reached.lock().unwrap();
+        assert_eq!(reached.len(), 1);
+        assert_eq!(reached[0].targets()[0].key(), &a);
+    }
+
+    #[test]
+    fn revalidation_withdraws_a_stale_intent_and_holds_one_while_paused() {
+        let recording = Arc::new(Recording::default());
+        let clock = Arc::new(ManualClock::default());
+        type Change = Box<dyn Fn(&mut Fake, &ProcessKey, &ManualClock)>;
+        let cases: Vec<(&str, Change, Refusal)> = vec![
+            (
+                "navigated",
+                Box::new(|fake, _, _| fake.selected = Some(key(4103, "b"))),
+                Refusal::Navigated,
+            ),
+            (
+                "expired",
+                Box::new(|_, _, clock| clock.advance(DEFAULT_INTENT_LIFETIME)),
+                Refusal::Expired,
+            ),
+            (
+                "replaced",
+                Box::new(|fake, key, _| {
+                    fake.states.insert(key.clone(), TargetState::Replaced);
+                }),
+                Refusal::Replaced,
+            ),
+            (
+                "exited",
+                Box::new(|fake, key, _| {
+                    fake.states.insert(key.clone(), TargetState::Historical);
+                }),
+                Refusal::Historical,
+            ),
+            (
+                "owner changed",
+                Box::new(|fake, key, _| fake.current(key, Observed::Known(ME + 1))),
+                Refusal::NotOwned {
+                    owner: Observed::Known(ME + 1),
+                    account: ME,
+                },
+            ),
+        ];
+        for (name, change, reason) in cases {
+            let mut gate = gate(&recording, &clock);
+            let (mut fake, target) = mine(4101);
+            let id = prepared(&mut gate, &fake);
+            gate.revalidate(&fake);
+            assert_eq!(gate.pending().map(ActionIntent::id), Some(id), "{name}");
+            change(&mut fake, &target, &clock);
+            gate.revalidate(&fake);
+            assert!(gate.pending().is_none(), "{name} withdraws it");
+            assert_eq!(gate.withdrawn(), Some((id, &reason)), "{name}");
+            let view = gate.view();
+            assert!(view.panel.is_none(), "{name}: the panel goes");
+            assert!(
+                view.status.starts_with(&format!("Withdrawn #{}", id.get()))
+                    && view.status.ends_with("nothing was requested"),
+                "{name}: {}",
+                view.status
+            );
+        }
+        // Paused: held, not withdrawn; Confirm disabled; still navigation
+        // and expiry withdraw it.
+        let mut gate = gate(&recording, &clock);
+        let (mut fake, target) = mine(4101);
+        prepared(&mut gate, &fake);
+        fake.paused = true;
+        fake.states.insert(target.clone(), TargetState::Unconfirmed);
+        gate.hold_for(&fake);
+        gate.revalidate(&fake);
+        assert!(gate.pending().is_some(), "held while paused");
+        assert!(!gate.view().panel.unwrap().confirm_enabled);
+        fake.selected = None;
+        gate.revalidate(&fake);
+        assert_eq!(
+            gate.withdrawn().map(|(_, why)| why),
+            Some(&Refusal::Navigated)
+        );
+        assert!(recording.reached.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_panels_confirm_confirms_only_the_intent_shown_in_its_slot() {
+        let recording = Arc::new(Recording::default());
+        let clock = Arc::new(ManualClock::default());
+        let mut gate = gate(&recording, &clock);
+        let (fake, _) = mine(4101);
+        prepared(&mut gate, &fake);
+        let first = gate.pending_panel().unwrap();
+        let second_id = prepared(&mut gate, &fake);
+        let second = gate.pending_panel().unwrap();
+        assert_ne!(first, second, "a new intent takes fresh node IDs");
+        // The first panel's Confirm is not the second's: refused, and the
+        // second stays pending.
+        assert_eq!(
+            gate.confirm_panel(&fake, CLIENT, 10, 0),
+            ActionOutcome::Refused {
+                intent: None,
+                reason: Refusal::Withdrawn
+            }
+        );
+        assert_eq!(gate.pending().map(ActionIntent::id), Some(second_id));
+        assert!(recording.reached.lock().unwrap().is_empty());
+        assert!(matches!(
+            gate.confirm_panel(&fake, CLIENT, 10, 1),
+            ActionOutcome::Requested { intent, .. } if intent == second_id
+        ));
+        // Consumed: the same slot again confirms nothing.
+        assert!(matches!(
+            gate.confirm_panel(&fake, CLIENT, 10, 1),
+            ActionOutcome::Refused {
+                reason: Refusal::Withdrawn,
+                ..
+            }
+        ));
+        assert_eq!(recording.reached.lock().unwrap().len(), 1);
+    }
+
+    /// PX-030 verification round 1 (F4): a new Prepare replaces the pending
+    /// intent whatever its result. A refused one leaves nothing pending, and
+    /// no panel, even where the old intent would otherwise be kept (a paused
+    /// view holds a pending intent; the selection has not moved).
+    #[test]
+    fn a_refused_prepare_leaves_no_earlier_intent_pending() {
+        let recording = Arc::new(Recording::default());
+        let clock = Arc::new(ManualClock::default());
+        let mut gate = gate(&recording, &clock);
+        let (mut fake, _) = mine(4101);
+        let first = prepared(&mut gate, &fake);
+        fake.paused = true;
+        gate.hold_for(&fake);
+        gate.revalidate(&fake);
+        assert_eq!(gate.pending().map(ActionIntent::id), Some(first), "held");
+        assert!(matches!(
+            gate.prepare(&fake, CLIENT, ActionOperation::Terminate),
+            Err(ActionOutcome::Refused {
+                reason: Refusal::Paused,
+                ..
+            })
+        ));
+        assert!(gate.pending().is_none(), "the refused Prepare replaced it");
+        assert!(gate.view().panel.is_none());
+        // The old panel's slot confirms nothing.
+        fake.paused = false;
+        assert!(matches!(
+            gate.confirm_panel(&fake, CLIENT, 10, 0),
+            ActionOutcome::Refused {
+                reason: Refusal::Withdrawn,
+                ..
+            }
+        ));
+        assert!(recording.reached.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn panel_ids_are_fresh_bounded_and_clear_of_the_shell() {
+        let recording = Arc::new(Recording::default());
+        let clock = Arc::new(ManualClock::default());
+        let mut gate = gate(&recording, &clock).with_panel_slots(3);
+        let (fake, _) = mine(4101);
+        let mut seen = BTreeSet::new();
+        for _ in 0..3 {
+            prepared(&mut gate, &fake);
+            let ids = gate.pending_panel().unwrap();
+            for id in [ids.row, ids.question, ids.confirm] {
+                assert!(id.0 >= PANEL_ID_BASE, "{id:?} is clear of the shell");
+                assert!(seen.insert(id.0), "{id:?} is never reused");
+            }
+            assert!(gate.cancel().is_some());
+        }
+        assert!(matches!(
+            gate.prepare(&fake, CLIENT, ActionOperation::Terminate),
+            Err(ActionOutcome::Refused {
+                reason: Refusal::PanelsExhausted { limit: 3 },
+                ..
+            })
+        ));
+        assert!(gate.view().status.contains("restart srtop"));
+        // The default bound's last panel ends where the scheme says.
+        let last = PanelIds::of(DEFAULT_CONFIRMATION_PANELS - 1);
+        assert_eq!(
+            last.confirm.0,
+            PANEL_ID_BASE + PANEL_IDS * u64::from(DEFAULT_CONFIRMATION_PANELS) - 1
+        );
+        for fixed in [ACTIONS_ROW, ACTION_PREPARE, ACTION_CANCEL, ACTIONS_STATUS] {
+            assert!(fixed.0 < PANEL_ID_BASE);
+        }
+    }
+
+    /// A support chain that names fixed PIDs, for any source.
+    struct Chain(Mutex<Result<Vec<(u32, SupportRole)>, String>>);
+
+    impl SupportChain for Chain {
+        fn protects(&self, _: &ProcessKey, pid: u32) -> Result<(), Refusal> {
+            match &*self.0.lock().unwrap() {
+                Err(why) => Err(Refusal::SupportChainUnknown(why.clone())),
+                Ok(members) => match members.iter().find(|(member, _)| *member == pid) {
+                    Some((pid, role)) => Err(Refusal::SupportChain {
+                        pid: *pid,
+                        role: *role,
+                    }),
+                    None => Ok(()),
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn the_support_chain_and_configured_pids_are_refused_at_prepare_and_confirm() {
+        let recording = Arc::new(Recording::default());
+        let clock = Arc::new(ManualClock::default());
+        let chain = Arc::new(Chain(Mutex::new(Ok(vec![(
+            4102,
+            SupportRole::ClientTransport,
+        )]))));
+        let mut gate = gate(&recording, &clock)
+            .with_protected_pids([1, 4104])
+            .with_support_chain(Arc::clone(&chain) as Arc<dyn SupportChain>);
+        let (fake, _) = mine(4102);
+        assert_eq!(
+            gate.prepare(&fake, CLIENT, ActionOperation::Terminate),
+            Err(ActionOutcome::Refused {
+                intent: None,
+                reason: Refusal::SupportChain {
+                    pid: 4102,
+                    role: SupportRole::ClientTransport
+                }
+            })
+        );
+        assert!(gate
+            .view()
+            .status
+            .contains("PID 4102 is a connected client's transport (its SSH bridge)"));
+        let (fake, _) = mine(4104);
+        assert!(matches!(
+            gate.prepare(&fake, CLIENT, ActionOperation::Terminate),
+            Err(ActionOutcome::Refused {
+                reason: Refusal::Protected(4104),
+                ..
+            })
+        ));
+        // Prepared while not in the chain; a client connects whose transport
+        // it is before Confirm: refused there.
+        let (fake, _) = mine(4101);
+        let id = prepared(&mut gate, &fake);
+        *chain.0.lock().unwrap() = Ok(vec![(4101, SupportRole::TransportAncestor)]);
+        assert_eq!(
+            gate.confirm(&fake, CLIENT, 10),
+            ActionOutcome::Refused {
+                intent: Some(id),
+                reason: Refusal::SupportChain {
+                    pid: 4101,
+                    role: SupportRole::TransportAncestor
+                }
+            }
+        );
+        // A chain that cannot be read refuses everything.
+        *chain.0.lock().unwrap() = Err("unreadable".into());
+        assert!(matches!(
+            gate.prepare(&fake, CLIENT, ActionOperation::Terminate),
+            Err(ActionOutcome::Refused {
+                reason: Refusal::SupportChainUnknown(_),
+                ..
+            })
+        ));
+        // The owner check comes first: the chain is not the only boundary.
+        *chain.0.lock().unwrap() = Ok(Vec::new());
+        let mut other = Fake {
+            account: Some(ME),
+            ..Fake::default()
+        };
+        let theirs = key(4105, "t");
+        other.current(&theirs, Observed::Known(ME + 1));
+        other.selected = Some(theirs);
+        assert!(matches!(
+            gate.prepare(&other, CLIENT, ActionOperation::Terminate),
+            Err(ActionOutcome::Refused {
+                reason: Refusal::NotOwned { .. },
+                ..
+            })
+        ));
+        assert!(recording.reached.lock().unwrap().is_empty());
+    }
+
+    /// An executor that cannot act on this host (PX-030).
+    struct Unavailable;
+
+    impl ProcessActions for Unavailable {
+        fn supports(&self, _: ActionOperation) -> bool {
+            false
+        }
+        fn unavailable(&self) -> Option<String> {
+            Some("this system has no PID file descriptors".into())
+        }
+        fn execute(&self, _: &Authorized<'_>) -> Execution {
+            panic!("an unavailable executor is never reached")
+        }
+    }
+
+    #[test]
+    fn an_unavailable_executor_keeps_terminate_disabled_with_its_reason() {
+        let mut gate = ActionGate::new(ActionMode::Terminate, Arc::new(Unavailable));
+        let view = gate.view();
+        assert!(!view.prepare_enabled && !view.cancel_enabled);
+        assert_eq!(
+            view.status,
+            "Terminate unavailable: this system has no PID file descriptors; nothing can be sent to any process"
+        );
+        assert_eq!(gate.prepare_label(), TERMINATE_LABEL);
+        let (fake, _) = mine(4101);
+        assert_eq!(
+            gate.prepare(&fake, CLIENT, ActionOperation::Terminate),
+            Err(ActionOutcome::Unsupported {
+                intent: None,
+                operation: ActionOperation::Terminate
+            })
+        );
+        assert!(gate.pending().is_none());
+    }
+
+    #[test]
+    fn a_terminate_gate_names_the_process_and_reports_a_sent_signal_as_requested() {
+        let recording = Arc::new(Recording::default());
+        let clock = Arc::new(ManualClock::default());
+        let mut gate = ActionGate::new(
+            ActionMode::Terminate,
+            Arc::clone(&recording) as Arc<dyn ProcessActions>,
+        )
+        .with_clock(Arc::clone(&clock) as Arc<dyn MonotonicClock>);
+        let (fake, _) = mine(4101);
+        let id = prepared(&mut gate, &fake);
+        let view = gate.view();
+        let panel = view.panel.expect("a panel");
+        assert_eq!(
+            panel.question,
+            "Terminate PID · worker (UID 1000)? Confirm sends it SIGTERM, which asks it to exit; it may handle or ignore it."
+        );
+        assert_eq!(panel.confirm_label, "Confirm: terminate PID · worker");
+        assert!(panel.confirm_enabled);
+        assert!(!view.status.contains("dry run"), "{}", view.status);
+        assert_eq!(
+            gate.confirm(&fake, CLIENT, 10),
+            ActionOutcome::Requested {
+                intent: id,
+                dry_run: false
+            }
+        );
+        let status = gate.view().status;
+        assert!(
+            status.starts_with("Requested #1 (terminate PID · worker): SIGTERM was sent"),
+            "{status}"
+        );
+        assert!(
+            !status.contains("complete") && !status.contains("exited."),
+            "a sent signal is not an ended process: {status}"
+        );
+        // An executor's refusal is a refusal, with the intent's number.
+        *recording.answer.lock().unwrap() =
+            Some(Execution::Refused(Refusal::NotHeld("gone".into())));
+        let id = prepared(&mut gate, &fake);
+        assert_eq!(
+            gate.confirm(&fake, CLIENT, 10),
+            ActionOutcome::Refused {
+                intent: Some(id),
+                reason: Refusal::NotHeld("gone".into())
+            }
+        );
+        assert!(gate
+            .view()
+            .status
+            .starts_with("Refused #2 (terminate PID · worker): the process could not be held for signalling: gone; nothing was requested"));
     }
 }

@@ -28,7 +28,8 @@
 //!   `kill(2)`: this module names no such call and the audit refuses one.
 //! * **Requested is not ended.** `Sent` means the kernel accepted SIGTERM for
 //!   that process, which may handle or ignore it; a zombie accepts it too.
-//!   Observing whether it exited is PX-031's.
+//!   Whether it exited is observed by the gate from the view's own scans
+//!   (PX-031, [`crate::actions::ObservedOutcome`]), never reported here.
 
 use crate::actions::{ActionOperation, Authorized, Execution, ProcessActions, Refusal};
 use crate::handle::{AcquireError, HandleId, HandleSignal, ProcessHandles, SignalOutcome};

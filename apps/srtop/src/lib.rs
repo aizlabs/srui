@@ -222,7 +222,13 @@ pub const TAGS_NODE_COUNT: usize = 5;
 pub const ACTIONS_ROW: NodeId = NodeId::new(83);
 pub const ACTION_PREPARE: NodeId = NodeId::new(84);
 pub const ACTION_CANCEL: NodeId = NodeId::new(86);
+/// What the server did with the latest request: refused, requested (the OS
+/// accepted the signal), failed, and so on.
 pub const ACTIONS_STATUS: NodeId = NodeId::new(87);
+/// What was observed of the process after a sent request (PX-031), kept
+/// apart from [`ACTIONS_STATUS`]: a signal requested is not a process
+/// exited.
+pub const ACTIONS_OBSERVED: NodeId = NodeId::new(88);
 pub const VIEW_LABEL: &str = "Show process tree";
 pub const VIEW_DESCRIPTION: &str =
     "When on, the same processes are shown as a tree under their parents instead of the table. The server resolves each parent from the latest scan and never guesses one: a process whose parent is not in the scan, unreadable, a newer process reusing its PID, hidden by the filters, or caught in a cycle is shown at the top, and its Parent column says why. Expanding and collapsing are local; sorting orders each parent's children. The selection and follow carry over.";

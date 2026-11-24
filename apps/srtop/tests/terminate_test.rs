@@ -25,8 +25,9 @@
 //! * a handle is settled only for the key it was acquired for.
 
 use srui_process_explorer::actions::{
-    lock_actions, ActionGate, ActionMode, ActionOutcome, Execution, PanelIds, ProcessActions,
-    Refusal, SharedActions, SupportChain, SupportRole, TERMINATE_LABEL, TERMINATE_STATUS,
+    lock_actions, ActionGate, ActionLog, ActionMode, ActionOutcome, Execution, ObservedOutcome,
+    PanelIds, ProcessActions, Refusal, SharedActions, SupportChain, SupportRole, Unobserved,
+    MAX_ACTION_LOG_BYTES, OBSERVED_IDLE, TERMINATE_LABEL, TERMINATE_STATUS,
 };
 use srui_process_explorer::catalogue::ProcessField;
 use srui_process_explorer::handle::{HandleSignal, Pidfd, PidfdSystem, ProcessHandles};
@@ -37,7 +38,7 @@ use srui_process_explorer::source::*;
 use srui_process_explorer::terminate::{signal_held, PidfdTerminator};
 use srui_process_explorer::{
     install_actions, install_inspector, install_sampling_handlers, start_from_source,
-    ACTIONS_STATUS, ACTION_CANCEL, ACTION_PREPARE, MODEL, TABLE,
+    ACTIONS_OBSERVED, ACTIONS_STATUS, ACTION_CANCEL, ACTION_PREPARE, MODEL, SAMPLING_PAUSE, TABLE,
 };
 use srui_sdk::{
     ItemId, NodeId, PropertyRef, TypeRef, Value, ACTIVATE, COLUMNS, ENABLED, LABEL, TEXT,
@@ -429,6 +430,31 @@ impl Harness {
 
     fn status(&self) -> String {
         self.text(ACTIONS_STATUS, TEXT)
+    }
+
+    /// The observed-outcome line the client holds (PX-031).
+    fn observed_line(&self) -> String {
+        self.text(ACTIONS_OBSERVED, TEXT)
+    }
+
+    fn observed(&self) -> Option<ObservedOutcome> {
+        lock_actions(&self.gate).observed().cloned()
+    }
+
+    /// What the refresh loop's deadline timer does (PX-031).
+    fn deadline_timer(&mut self) {
+        lock_view(&self.view).observe_actions(&self.session);
+        self.sync();
+    }
+
+    /// Selects `pid`, prepares and confirms it; returns the confirm event.
+    fn confirm_pid(&mut self, pid: u64) -> (srui_protocol::Event, EventOutcome) {
+        self.select(pid);
+        self.processed(ACTION_PREPARE);
+        let panel = self.panel().expect("prepared");
+        let confirm = self.wire(panel.confirm, ACTIVATE, Vec::new());
+        let outcome = self.deliver(&confirm);
+        (confirm, outcome)
     }
 
     fn enabled(&self, node: NodeId) -> bool {
@@ -876,4 +902,431 @@ fn a_handle_is_settled_only_for_the_key_it_was_acquired_for() {
     let id = table.acquire(&a).unwrap();
     assert_eq!(signal_held(&mut table, id, &a), Execution::Requested);
     assert_eq!(kernel.delivered(), vec![(4101, 500, SIGTERM)]);
+}
+
+// --------------------------------------------------------------------------
+// PX-031: the request and the observed outcome, apart
+// --------------------------------------------------------------------------
+
+const WINDOW: Duration = srui_process_explorer::actions::DEFAULT_OBSERVATION_WINDOW;
+
+/// `host(ticks)` without the processes `gone` names: they exited and were
+/// reaped, and this complete scan accounts for their absence.
+fn without(ticks: u64, gone: &[u32]) -> Vec<ProcessRecord> {
+    host(ticks)
+        .into_iter()
+        .filter(|record| !matches!(record.key.pid, Observed::Known(pid) if gone.contains(&pid)))
+        .collect()
+}
+
+/// The acceptance case: a process that handles or ignores SIGTERM. The
+/// request is reported as what it was, requested; every scan keeps listing
+/// the instance (as the scan lists a zombie too); at the deadline the
+/// observed line says still running, and nothing more is ever sent: no
+/// second SIGTERM, no other signal, no retry.
+#[test]
+fn a_process_that_ignores_sigterm_shows_a_successful_request_and_remains_running() {
+    let mut source = steps(vec![host(10), host(20), host(30), host(40)]);
+    let mut h = harness(&mut source);
+    assert_eq!(h.observed_line(), OBSERVED_IDLE);
+    let (_, outcome) = h.confirm_pid(4101);
+    assert!(
+        matches!(outcome, EventOutcome::Processed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(h.kernel.delivered(), vec![(4101, 500, SIGTERM)]);
+    let status = h.status();
+    assert!(
+        status.starts_with("Requested #1 (terminate PID 4101 · worker): SIGTERM was sent; the process may handle or ignore it, and what is observed of it afterwards is reported separately"),
+        "{status}"
+    );
+    assert!(
+        h.observed_line().starts_with(
+            "Watching #1 (terminate PID 4101 · worker): SIGTERM was sent; for 10 s srtop checks whether this process instance exits, and sends nothing else"
+        ),
+        "{}",
+        h.observed_line()
+    );
+    for _ in 0..3 {
+        h.clock.advance(Duration::from_secs(2));
+        h.sample(&mut source);
+    }
+    assert_eq!(h.observed(), Some(ObservedOutcome::Watching));
+    h.clock.advance(WINDOW);
+    h.deadline_timer();
+    assert_eq!(h.observed(), Some(ObservedOutcome::StillRunning));
+    let line = h.observed_line();
+    assert!(
+        line.starts_with("Still running #1 (terminate PID 4101 · worker): 10 s after SIGTERM was sent the latest scan still lists this process instance")
+            && line.contains("a zombie stays listed")
+            && line.ends_with("Nothing else was sent"),
+        "{line}"
+    );
+    assert!(!line.contains("exited after"), "{line}");
+    assert!(h.status().starts_with("Requested #1"), "{}", h.status());
+    for _ in 0..3 {
+        h.clock.advance(Duration::from_secs(1200));
+        h.sample(&mut source);
+        h.deadline_timer();
+    }
+    assert_eq!(
+        h.kernel.delivered(),
+        vec![(4101, 500, SIGTERM)],
+        "exactly one signal: never SIGKILL, never a retry"
+    );
+    assert_eq!(h.kernel.opens(), 1);
+    assert!(h.panel().is_none());
+}
+
+/// A process that exits on SIGTERM is reported exited after the request, by
+/// the exact instance, once a scan sampled after the settlement establishes
+/// it: the first scan after the settlement may have been taken before the
+/// signal, so even its established exit is not attributed. Navigating away
+/// after the request does not end the watch, and the line never claims that
+/// srtop ended the process.
+#[test]
+fn an_exit_is_attributed_only_after_a_scan_sampled_after_the_request() {
+    let mut source = steps(vec![host(10), without(20, &[4101]), without(30, &[4101])]);
+    let mut h = harness(&mut source);
+    h.confirm_pid(4101);
+    h.kernel.state().processes.remove(&4101);
+    h.select(4103);
+    h.sample(&mut source);
+    assert_eq!(
+        h.observed(),
+        Some(ObservedOutcome::Watching),
+        "the first scan after the settlement may predate the signal"
+    );
+    h.clock.advance(Duration::from_millis(2300));
+    h.sample(&mut source);
+    assert_eq!(
+        h.observed(),
+        Some(ObservedOutcome::ExitedAfterRequest {
+            within: Duration::from_millis(2300)
+        })
+    );
+    let line = h.observed_line();
+    assert_eq!(
+        line,
+        "Exited after the request #1 (terminate PID 4101 · worker): within 2.3 s of SIGTERM being sent a scan established that this process instance is gone; whether SIGTERM or something else ended it is not known"
+    );
+    assert!(h.status().starts_with("Requested #1"), "{}", h.status());
+    // Settled once: the deadline changes nothing.
+    h.clock.advance(WINDOW);
+    h.deadline_timer();
+    assert_eq!(h.observed_line(), line);
+    assert_eq!(h.kernel.delivered().len(), 1);
+}
+
+/// A process that ends by itself is never credited to a request: one that a
+/// scan saw exit before Confirm withdraws the intent; one that exited and was
+/// reaped after the last scan cannot be held, so nothing is sent and nothing
+/// is watched; and a process the request did not target exiting during the
+/// watch is not the target's exit.
+#[test]
+fn a_natural_exit_is_never_attributed_to_the_request() {
+    // Seen by a scan before Confirm.
+    let mut source = steps(vec![host(10), without(20, &[4101])]);
+    let mut h = harness(&mut source);
+    h.select(4101);
+    h.processed(ACTION_PREPARE);
+    let panel = h.panel().unwrap();
+    h.kernel.state().processes.remove(&4101);
+    h.sample(&mut source);
+    assert!(h.withdrawn().is_some(), "{}", h.status());
+    assert!(gone(&h.click(panel.confirm)));
+    assert_eq!(h.observed(), None);
+    assert_eq!(h.observed_line(), OBSERVED_IDLE);
+    assert!(h.kernel.delivered().is_empty());
+
+    // Exited and reaped after the last scan, before Confirm.
+    let mut source = steps(vec![host(10)]);
+    let mut h = harness(&mut source);
+    h.select(4101);
+    h.processed(ACTION_PREPARE);
+    let panel = h.panel().unwrap();
+    h.kernel.state().processes.remove(&4101);
+    assert!(matches!(
+        h.click(panel.confirm),
+        EventOutcome::Processed { .. }
+    ));
+    assert!(
+        matches!(h.outcome(), Some(ActionOutcome::Refused { .. })),
+        "{:?}",
+        h.outcome()
+    );
+    let status = h.status();
+    assert!(
+        status.starts_with("Refused #1 (terminate PID 4101 · worker)")
+            && status.ends_with("nothing was requested"),
+        "{status}"
+    );
+    assert_eq!(h.observed(), None);
+    assert_eq!(h.observed_line(), OBSERVED_IDLE);
+    assert!(h.kernel.delivered().is_empty());
+
+    // Another process exits during the watch.
+    let mut source = steps(vec![host(10), without(20, &[4103]), without(30, &[4103])]);
+    let mut h = harness(&mut source);
+    h.confirm_pid(4101);
+    h.kernel.state().processes.remove(&4103);
+    h.sample(&mut source);
+    h.sample(&mut source);
+    assert_eq!(h.observed(), Some(ObservedOutcome::Watching));
+    h.clock.advance(WINDOW);
+    h.deadline_timer();
+    assert_eq!(h.observed(), Some(ObservedOutcome::StillRunning));
+    assert!(!h.observed_line().contains("4103"), "{}", h.observed_line());
+    assert_eq!(h.kernel.delivered(), vec![(4101, 500, SIGTERM)]);
+}
+
+/// The deadline settles on time with no sample: while paused (no scan is
+/// taken, and the rows are not the latest scan) it is outcome unknown, and
+/// with only the scan that may predate the signal it is unknown too, never
+/// still running. Nothing is sent either way.
+#[test]
+fn the_deadline_settles_without_a_sample_and_sends_nothing() {
+    let mut source = steps(vec![host(10), host(20)]);
+    let mut h = harness(&mut source);
+    h.confirm_pid(4101);
+    h.processed(SAMPLING_PAUSE);
+    assert_eq!(
+        lock_view(&h.view).action_observation_due(),
+        Some(WINDOW),
+        "the loop's timer is armed for the window"
+    );
+    h.clock.advance(WINDOW);
+    assert_eq!(
+        lock_view(&h.view).action_observation_due(),
+        Some(Duration::ZERO)
+    );
+    h.deadline_timer();
+    assert_eq!(
+        h.observed(),
+        Some(ObservedOutcome::Unknown(Unobserved::NotCurrent))
+    );
+    assert!(
+        h.observed_line().starts_with(
+            "Outcome unknown #1 (terminate PID 4101 · worker): the view was paused or resuming at the deadline"
+        ),
+        "{}",
+        h.observed_line()
+    );
+    assert_eq!(lock_view(&h.view).action_observation_due(), None);
+    assert_eq!(h.kernel.delivered().len(), 1);
+
+    let mut source = steps(vec![host(10), host(20)]);
+    let mut h = harness(&mut source);
+    h.confirm_pid(4101);
+    h.sample(&mut source);
+    h.clock.advance(WINDOW);
+    h.deadline_timer();
+    assert_eq!(
+        h.observed(),
+        Some(ObservedOutcome::Unknown(Unobserved::NoScan))
+    );
+    assert_eq!(h.kernel.delivered().len(), 1);
+}
+
+/// Settlement (§18.2, Appendix B): every handler result — refused at
+/// Prepare, requested, refused by the terminator, unsupported — settles
+/// `PROCESSED` with the result committed in the state, and its redelivery is
+/// `DUPLICATE`, accepted, at the same `revision_after_effect`, sending
+/// nothing. `REJECTED` comes only from event validation: a disabled control,
+/// a node that does not exist, a future observed revision.
+#[test]
+fn every_handler_result_settles_processed_and_only_event_validation_rejects() {
+    let mut source = steps(vec![host(10)]);
+    let mut h = harness(&mut source);
+    let mut settled = Vec::new();
+    h.select(4102);
+    let prepare = h.wire(ACTION_PREPARE, ACTIVATE, Vec::new());
+    let outcome = h.deliver(&prepare);
+    assert!(h.status().starts_with("Refused: "), "{}", h.status());
+    settled.push(("refused at prepare", prepare, outcome, h.status()));
+    let (confirm, outcome) = h.confirm_pid(4103);
+    assert!(h.status().starts_with("Requested #1"), "{}", h.status());
+    settled.push(("requested", confirm, outcome, h.status()));
+    h.select(4101);
+    h.processed(ACTION_PREPARE);
+    h.kernel.state().processes.remove(&4101);
+    let confirm = h.wire(h.panel().unwrap().confirm, ACTIVATE, Vec::new());
+    let outcome = h.deliver(&confirm);
+    assert!(h.status().starts_with("Refused #2"), "{}", h.status());
+    settled.push(("refused by the terminator", confirm, outcome, h.status()));
+    h.kernel.state().processes.insert(4101, 500);
+    h.processed(ACTION_PREPARE);
+    h.kernel.state().no_system_call = true;
+    let confirm = h.wire(h.panel().unwrap().confirm, ACTIVATE, Vec::new());
+    let outcome = h.deliver(&confirm);
+    assert!(h.status().starts_with("Unsupported #3"), "{}", h.status());
+    settled.push(("unsupported", confirm, outcome, h.status()));
+    let revision = h.revision();
+    for (name, event, outcome, _) in &settled {
+        let EventOutcome::Processed {
+            revision_after_effect,
+            ..
+        } = outcome
+        else {
+            panic!("{name}: {outcome:?}")
+        };
+        match h.deliver(event) {
+            EventOutcome::Duplicate {
+                accepted: true,
+                revision_after_effect: replayed,
+                ..
+            } => assert_eq!(replayed, *revision_after_effect, "{name}"),
+            other => panic!("{name}: replay {other:?}"),
+        }
+    }
+    assert_eq!(h.revision(), revision, "a replay commits nothing");
+    assert_eq!(h.kernel.delivered(), vec![(4103, 700, SIGTERM)]);
+    assert!(matches!(
+        h.click(ACTION_CANCEL),
+        EventOutcome::Rejected {
+            error: EventValidationError::NodeDisabled(_),
+            ..
+        }
+    ));
+    assert!(gone(&h.click(PanelIds::of(0).confirm)));
+    let mut future = h.wire(ACTION_PREPARE, ACTIVATE, Vec::new());
+    future.observed_revision = h.revision() + 1000;
+    assert!(matches!(
+        h.deliver(&future),
+        EventOutcome::Rejected {
+            error: EventValidationError::FutureRevision { .. },
+            ..
+        }
+    ));
+}
+
+#[derive(Default)]
+struct Lines(Mutex<Vec<String>>);
+
+impl ActionLog for Lines {
+    fn record(&self, line: &str) {
+        self.0.lock().unwrap().push(line.to_string());
+    }
+}
+
+/// The action log (PX-031) records each intent and its settlement through
+/// the real handlers, as fixed words and numbers: the process's name, which
+/// the row shows, and every reason's text stay out of it, and each line is
+/// bounded.
+#[test]
+fn the_action_log_records_intents_and_settlements_without_names_or_reasons() {
+    let hostile = |ticks: u64, gone: &[u32]| {
+        let mut records = without(ticks, gone);
+        for record in &mut records {
+            if record.key.pid == Observed::Known(4101) {
+                record.display_name = DisplayName::from("tok=hunter2");
+            }
+        }
+        records
+    };
+    let mut source = steps(vec![
+        hostile(10, &[]),
+        hostile(20, &[4101]),
+        hostile(30, &[4101]),
+    ]);
+    let lines = Arc::new(Lines::default());
+    let log = Arc::clone(&lines) as Arc<dyn ActionLog>;
+    let mut h = harness_with(&mut source, Kernel::new(true), move |gate| {
+        gate.with_log(log)
+    });
+    h.confirm_pid(4101);
+    assert!(
+        h.status().contains("tok=hunter2"),
+        "the row's name is public"
+    );
+    h.kernel.state().processes.remove(&4101);
+    h.sample(&mut source);
+    h.sample(&mut source);
+    h.select(4102);
+    h.processed(ACTION_PREPARE);
+    h.select(4103);
+    h.processed(ACTION_PREPARE);
+    h.processed(ACTION_CANCEL);
+    h.processed(ACTION_PREPARE);
+    h.select(1);
+    let lines = lines.0.lock().unwrap().clone();
+    assert_eq!(
+        lines,
+        vec![
+            "srtop: action #1 prepared: terminate PID 4101 (UID 1000)",
+            "srtop: action #1 requested: terminate PID 4101 (UID 1000)",
+            "srtop: action #1 watching PID 4101 for 10 s",
+            "srtop: action #1 observed: PID 4101 exited after the request (within 0.0 s)",
+            "srtop: action prepare refused",
+            "srtop: action #2 prepared: terminate PID 4103 (UID 1000)",
+            "srtop: action #2 cancelled",
+            "srtop: action #3 prepared: terminate PID 4103 (UID 1000)",
+            "srtop: action #3 withdrawn",
+        ]
+    );
+    for line in &lines {
+        assert!(line.len() <= MAX_ACTION_LOG_BYTES, "{line}");
+        assert!(
+            !line.contains("hunter2") && !line.contains("worker") && !line.contains("spare"),
+            "{line}"
+        );
+    }
+}
+
+/// The production refresh loop settles a watched request at its deadline by
+/// its own timer, with no sample: the interval here is five minutes, so the
+/// loop's ticker never fires during the test, and the outcome is unknown
+/// (no scan after the request), not still running. Nothing more is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_refresh_loop_settles_a_watch_at_its_deadline_without_sampling() {
+    use srui_process_explorer::on_demand::SuspendAwareClock;
+    let mut source = steps(vec![host(10), host(20)]);
+    let mut h = harness_with(&mut source, Kernel::new(true), |gate| {
+        gate.with_clock(Arc::new(SuspendAwareClock::new()) as Arc<dyn MonotonicClock>)
+            .with_observation_window(Duration::from_millis(400))
+    });
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let polling = tokio::spawn(srui_process_explorer::refresh::poll(
+        Arc::clone(&h.view),
+        source,
+        Arc::clone(&h.session),
+        Duration::from_secs(300),
+        shutdown.child_token(),
+    ));
+    let revision = h.revision();
+    let (_, outcome) = h.confirm_pid(4101);
+    assert!(matches!(outcome, EventOutcome::Processed { .. }));
+    assert_eq!(h.observed(), Some(ObservedOutcome::Watching));
+    let settled = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if h.observed() != Some(ObservedOutcome::Watching) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "the loop's deadline timer settled the watch"
+    );
+    h.sync();
+    assert_eq!(
+        h.observed(),
+        Some(ObservedOutcome::Unknown(Unobserved::NoScan))
+    );
+    assert!(
+        h.observed_line().starts_with(
+            "Outcome unknown #1 (terminate PID 4101 · worker): no scan taken after the request"
+        ),
+        "{}",
+        h.observed_line()
+    );
+    assert!(h.revision() > revision);
+    assert_eq!(h.kernel.delivered(), vec![(4101, 500, SIGTERM)]);
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(20), polling)
+        .await
+        .expect("the loop stops")
+        .expect("the loop does not panic");
 }

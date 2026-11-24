@@ -381,10 +381,18 @@ fn no_output_carries_a_secret_argument() {
 /// I/O error, whose text carries sizes and kinds, never a value), and nothing
 /// outside a test prints to standard output or uses `dbg!`. A command line
 /// therefore has no route to a log.
+///
+/// One exception (PX-031): the action log's sink, `eprintln!("{line}")`,
+/// exactly once and only in `src/actions.rs`. Its lines are composed by the
+/// action gate from fixed words, the intent number, PID and UID; the gate
+/// holds no command line, and `terminate_test`'s
+/// `the_action_log_records_intents_and_settlements_without_names_or_reasons`
+/// asserts what its lines carry.
 #[test]
 fn no_production_log_line_formats_a_value() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut checked = 0;
+    let mut action_sinks = 0;
     for entry in std::fs::read_dir(&root).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
@@ -414,6 +422,12 @@ fn no_production_log_line_formats_a_value() {
                     number + 1
                 );
             }
+            if line == "eprintln!(\"{line}\");"
+                && path.file_name().and_then(|name| name.to_str()) == Some("actions.rs")
+            {
+                action_sinks += 1;
+                continue;
+            }
             if line.contains("eprintln!") {
                 checked += 1;
                 let format = line
@@ -431,4 +445,5 @@ fn no_production_log_line_formats_a_value() {
         }
     }
     assert!(checked >= 10, "the audit read the log lines ({checked})");
+    assert_eq!(action_sinks, 1, "exactly one action log sink");
 }

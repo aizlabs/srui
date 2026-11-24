@@ -1,7 +1,8 @@
-//! Process action authorization, the dry-run action contract and confirmed
-//! graceful termination (D1 §6.2 node identity, §7.7 semantic input routing,
-//! §18.2 event deduplication, §27 server security controls; D2 T24, T32;
-//! PX-028, PX-030).
+//! Process action authorization, the dry-run action contract, confirmed
+//! graceful termination and the observed outcome of a sent request (D1 §6.2
+//! node identity, §7.7 semantic input routing, §18.2 event deduplication and
+//! Appendix B settlement, §27 server security controls; D2 T24, T32; PX-028,
+//! PX-030, PX-031).
 //!
 //! Everything that decides whether a process may be acted on lives here, on
 //! the server:
@@ -82,11 +83,63 @@
 //! target is the process the server resolved as selected when Prepare was
 //! clicked, so no argument a client attaches can widen, narrow or change the
 //! target set.
+//!
+//! **Request and observed outcome are published apart (PX-031).** The
+//! actions status ([`crate::ACTIONS_STATUS`]) says what the server did with
+//! the request: `Requested` means the kernel accepted SIGTERM for that
+//! instance, nothing more. What was seen of the process afterwards is a
+//! separate line ([`crate::ACTIONS_OBSERVED`]), driven by the server's own
+//! scans, never by the executor:
+//!
+//! * a sent request is **watched** for [`DEFAULT_OBSERVATION_WINDOW`] on
+//!   the gate's suspend-aware clock, by the exact [`ProcessKey`] it was sent
+//!   to; nothing is sent again, and nothing else is sent, whatever is seen;
+//! * **exited after the request** only when a scan *sampled after the
+//!   settlement* (the second scan the view applies after it; the first may
+//!   have been taken before the signal) establishes, before the deadline,
+//!   that this instance is gone: another instance holds its PID, or its
+//!   last-observed record says it exited ([`crate::lastseen`]: a positive
+//!   absence, never an unreadable, capped or evicted row). It is never
+//!   called terminated by srtop: a process that was exiting anyway, or a
+//!   zombie (which accepts the signal), is reported the same way, and the
+//!   line says the cause is not known. An exit seen before the settlement
+//!   is never attributed: the request then fails or is refused ("nothing was
+//!   sent"), and no watch starts;
+//! * **still running** when, at the deadline, the latest such scan still
+//!   lists the instance. A zombie stays listed until it is reaped and the
+//!   scan does not read its state, so the line says that too rather than
+//!   calling it exited;
+//! * **outcome unknown** when, at the deadline, no such scan was applied,
+//!   the view is paused or resuming, or the latest scan neither lists the
+//!   instance nor establishes an exit.
+//!
+//! The deadline is enforced by the refresh loop's timer
+//! ([`crate::refresh::poll`]) as well as by every sample, so it fires while
+//! the view is paused too. One request is watched at a time; a newer sent
+//! request replaces the watch. The watch lives only in this process: a
+//! restarted srtop holds no intent and no watch, so nothing from an earlier
+//! run can be confirmed, retried or reported against a replacement.
+//!
+//! **Settlement.** Every refusal, failure or unsupported result of a handler
+//! is a reported action result: the handler commits the status and returns,
+//! so the runtime settles the event `PROCESSED` and its result cache answers
+//! a redelivery `DUPLICATE` at the same `revision_after_effect`, whose
+//! committed state carries the result (§18.2, Appendix B). `REJECTED` comes
+//! only from event validation (unknown or disabled node, a future
+//! `observed_revision`, a client binding mismatch), never from a handler.
+//!
+//! **Log.** Each prepared intent and its settlement — prepared, refused,
+//! requested, failed, cancelled, withdrawn, watched and observed — is one
+//! bounded stderr line of fixed words and numbers ([`ActionLog`]): the
+//! intent number, the operation, PID and owner UID. No process name, command
+//! line, environment, path or error text is logged.
 
 use crate::on_demand::{MonotonicClock, SuspendAwareClock};
 use crate::refresh::{lock_view, ProcessView};
 use crate::source::{Observed, ProcessKey};
-use crate::{bounded, ACTIONS_ROW, ACTIONS_STATUS, ACTION_CANCEL, ACTION_PREPARE};
+use crate::{
+    bounded, ACTIONS_OBSERVED, ACTIONS_ROW, ACTIONS_STATUS, ACTION_CANCEL, ACTION_PREPARE,
+};
 use srui_sdk::{Button, NodeId, Row, SpacingRole, Text, TextRole, ENABLED, LABEL, TEXT};
 use srui_sessiond::{Session, SessionError};
 use std::collections::BTreeSet;
@@ -141,9 +194,23 @@ pub const DRY_RUN_STATUS: &str =
 /// The idle status of `--actions terminate` (PX-030).
 pub const TERMINATE_STATUS: &str =
     "Terminate… checks the selected process and asks you to confirm it by name; Confirm sends it SIGTERM, a request it may handle or ignore";
-/// The fixed action controls' nodes: the row, Prepare, Cancel and the
-/// status. A pending intent adds its panel's [`PANEL_IDS`] nodes.
-pub const ACTIONS_NODE_COUNT: usize = 4;
+/// The fixed action controls' nodes: the row, Prepare, Cancel, the status
+/// and the observed outcome (PX-031). A pending intent adds its panel's
+/// [`PANEL_IDS`] nodes.
+pub const ACTIONS_NODE_COUNT: usize = 5;
+
+/// How long, after the kernel accepted SIGTERM for a process, srtop watches
+/// whether that instance exits (PX-031). Long enough for several scans at
+/// the devbox's 1 s interval and for a cooperative process to clean up;
+/// after it the watch settles as still running or outcome unknown, and
+/// nothing is ever sent again.
+pub const DEFAULT_OBSERVATION_WINDOW: Duration = Duration::from_secs(10);
+/// The longest observed-outcome line, before the cut mark (PX-031).
+pub const MAX_OBSERVED_BYTES: usize = 512;
+/// The longest action log line, before the cut mark (PX-031).
+pub const MAX_ACTION_LOG_BYTES: usize = 160;
+/// The observed-outcome line while no sent request was watched (PX-031).
+pub const OBSERVED_IDLE: &str = "Observed outcome: no sent request is being watched";
 
 /// Whether this server may act on processes at all (PX-028, PX-030).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,6 +460,15 @@ pub trait ActionTargets {
     fn selected(&self) -> Option<ProcessKey>;
     /// What the latest scan says about `key`.
     fn state_of(&self, key: &ProcessKey) -> TargetState;
+    /// How many samples the view has applied (PX-031): strictly increasing,
+    /// so the gate can tell a scan sampled after a request from one that may
+    /// have been taken before it.
+    fn scans(&self) -> u64;
+    /// Whether the scans so far *established* that `key` exited (PX-031):
+    /// another instance holds its PID, or its last-observed record says it
+    /// exited. A row that is merely absent, unreadable, capped or evicted is
+    /// not an exit.
+    fn exited(&self, key: &ProcessKey) -> bool;
 }
 
 /// Which part of the chain that serves this session a process is (PX-030).
@@ -669,7 +745,7 @@ impl ActionOutcome {
                 intent,
                 dry_run: false,
             } => format!(
-                "Requested #{}{about}: SIGTERM was sent; the process may handle or ignore it, and whether it exits is not yet observed",
+                "Requested #{}{about}: SIGTERM was sent; the process may handle or ignore it, and what is observed of it afterwards is reported separately",
                 intent.get()
             ),
             Self::ObservedComplete { intent } => {
@@ -682,6 +758,124 @@ impl ActionOutcome {
                 format!("Outcome unknown #{}{about}: {reason}", intent.get())
             }
         }
+    }
+}
+
+/// What srtop's own scans showed of a process after the kernel accepted
+/// SIGTERM for it (PX-031). Never an executor's answer, and never a claim
+/// about why the process did what it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObservedOutcome {
+    /// The deadline has not passed and no exit was established.
+    Watching,
+    /// A scan sampled after the request established, before the deadline,
+    /// that this instance is gone; `within` is how long after the request
+    /// that was seen. Whether SIGTERM or something else ended it is not
+    /// known.
+    ExitedAfterRequest { within: Duration },
+    /// At the deadline the latest scan sampled after the request still
+    /// listed the instance: it handled or ignored the request, or it is a
+    /// zombie, which stays listed until reaped.
+    StillRunning,
+    /// At the deadline nothing established either.
+    Unknown(Unobserved),
+}
+
+/// Why a watched request's outcome is unknown at its deadline (PX-031).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unobserved {
+    /// No scan sampled after the request was applied before the deadline.
+    NoScan,
+    /// The view was paused or resuming at the deadline, so its rows were
+    /// not the latest scan.
+    NotCurrent,
+    /// The latest scan neither listed the instance nor established that it
+    /// exited (an unreadable, capped or evicted row).
+    Unaccounted,
+}
+
+impl ObservedOutcome {
+    /// "watching", "exited after the request", "still running" or "outcome
+    /// unknown".
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Watching => "watching",
+            Self::ExitedAfterRequest { .. } => "exited after the request",
+            Self::StillRunning => "still running",
+            Self::Unknown(_) => "outcome unknown",
+        }
+    }
+}
+
+/// What the latest scan sampled after a request said of its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sighting {
+    /// No such scan yet.
+    None,
+    /// It listed the instance as the latest scan's own.
+    Listed,
+    /// It neither listed it nor established that it exited.
+    Unaccounted,
+}
+
+/// The one sent request being watched, or the last one settled (PX-031).
+#[derive(Debug, Clone)]
+struct Watch {
+    intent: IntentId,
+    subject: String,
+    key: ProcessKey,
+    pid: u32,
+    /// When the kernel accepted the signal, on the gate's clock.
+    sent_at: Duration,
+    deadline: Duration,
+    /// The view's [`ActionTargets::scans`] at the settlement: a scan counts
+    /// as sampled after the request from two more on.
+    scans_at_send: u64,
+    sighting: Sighting,
+    outcome: ObservedOutcome,
+}
+
+impl Watch {
+    /// The observed-outcome line.
+    fn describe(&self, window: Duration) -> String {
+        let (id, subject, seconds) = (self.intent.get(), &self.subject, window.as_secs());
+        match &self.outcome {
+            ObservedOutcome::Watching => format!(
+                "Watching #{id} ({subject}): SIGTERM was sent; for {seconds} s srtop checks whether this process instance exits, and sends nothing else"
+            ),
+            ObservedOutcome::ExitedAfterRequest { within } => format!(
+                "Exited after the request #{id} ({subject}): within {:.1} s of SIGTERM being sent a scan established that this process instance is gone; whether SIGTERM or something else ended it is not known",
+                within.as_secs_f64()
+            ),
+            ObservedOutcome::StillRunning => format!(
+                "Still running #{id} ({subject}): {seconds} s after SIGTERM was sent the latest scan still lists this process instance; it handled or ignored the request, or exited without being reaped (a zombie stays listed). Nothing else was sent"
+            ),
+            ObservedOutcome::Unknown(why) => format!(
+                "Outcome unknown #{id} ({subject}): {}, so whether it exited within {seconds} s of SIGTERM is not known. Nothing else was sent",
+                match why {
+                    Unobserved::NoScan => "no scan taken after the request was applied before the deadline",
+                    Unobserved::NotCurrent => "the view was paused or resuming at the deadline, so its rows were not the latest scan",
+                    Unobserved::Unaccounted => "the latest scan neither lists this process instance nor establishes that it exited",
+                }
+            ),
+        }
+    }
+}
+
+/// Where the gate records each intent and its settlement (PX-031): one
+/// bounded line of fixed words and numbers per event, never a process name,
+/// command line, environment, path or error text.
+pub trait ActionLog: Send + Sync {
+    fn record(&self, line: &str);
+}
+
+/// The production [`ActionLog`]: srtop's stderr.
+#[derive(Debug, Default)]
+pub struct StderrActionLog;
+
+impl ActionLog for StderrActionLog {
+    fn record(&self, line: &str) {
+        eprintln!("{line}");
     }
 }
 
@@ -764,6 +958,9 @@ pub struct ActionsView {
     pub prepare_enabled: bool,
     pub cancel_enabled: bool,
     pub status: String,
+    /// What was observed of the process after the latest sent request
+    /// (PX-031).
+    pub observed: String,
     /// The pending intent's confirmation panel, when one is pending.
     pub panel: Option<PanelView>,
 }
@@ -822,6 +1019,12 @@ pub struct ActionGate {
     published: Option<ActionsView>,
     /// The slot of the panel this gate last committed to the store.
     shown: Option<u32>,
+    /// How long a sent request is watched (PX-031).
+    observation_window: Duration,
+    /// The sent request being watched, or the last one settled (PX-031).
+    watch: Option<Watch>,
+    /// Where intents and their settlement are recorded (PX-031).
+    log: Arc<dyn ActionLog>,
 }
 
 impl std::fmt::Debug for ActionGate {
@@ -831,6 +1034,7 @@ impl std::fmt::Debug for ActionGate {
             .field("mode", &self.mode)
             .field("pending", &self.pending)
             .field("report", &self.report)
+            .field("watch", &self.watch)
             .finish_non_exhaustive()
     }
 }
@@ -866,7 +1070,173 @@ impl ActionGate {
             parent: None,
             published: None,
             shown: None,
+            observation_window: DEFAULT_OBSERVATION_WINDOW,
+            watch: None,
+            log: Arc::new(StderrActionLog),
         }
+    }
+
+    /// This gate watching a sent request for `window` (PX-031).
+    pub fn with_observation_window(mut self, window: Duration) -> Self {
+        self.observation_window = window;
+        self
+    }
+
+    /// This gate recording intents and their settlement in `log` (PX-031).
+    pub fn with_log(mut self, log: Arc<dyn ActionLog>) -> Self {
+        self.log = log;
+        self
+    }
+
+    /// What was observed of the latest sent request, if one was sent
+    /// (PX-031).
+    pub fn observed(&self) -> Option<&ObservedOutcome> {
+        self.watch.as_ref().map(|watch| &watch.outcome)
+    }
+
+    /// The process instance being watched, while its deadline has not
+    /// passed and no exit was established (PX-031): the view keeps its
+    /// last-observed record so an exit can be established.
+    pub fn observing(&self) -> Option<&ProcessKey> {
+        self.watch
+            .as_ref()
+            .filter(|watch| watch.outcome == ObservedOutcome::Watching)
+            .map(|watch| &watch.key)
+    }
+
+    /// How long until the watched request's deadline, while one is watched
+    /// (PX-031): when the refresh loop's timer has to wake.
+    pub fn observation_due(&self) -> Option<Duration> {
+        let now = self.clock.now().0;
+        self.watch
+            .as_ref()
+            .filter(|watch| watch.outcome == ObservedOutcome::Watching)
+            .map(|watch| watch.deadline.saturating_sub(now))
+    }
+
+    /// Records one bounded log line (PX-031).
+    fn record(&self, line: String) {
+        self.log.record(&bounded(&line, MAX_ACTION_LOG_BYTES));
+    }
+
+    /// Records how a confirmation of `intent` settled (PX-031): its number,
+    /// the outcome's kind, the operation, PID and owner. Never a reason's
+    /// text, which can quote a system error.
+    fn record_settlement(&self, intent: Option<&ActionIntent>, outcome: &ActionOutcome) {
+        let dry_run = matches!(outcome, ActionOutcome::Requested { dry_run: true, .. });
+        let line = match intent.and_then(|intent| Some((intent, intent.targets.first()?))) {
+            Some((intent, target)) => format!(
+                "srtop: action #{} {}{}: {} PID {} (UID {})",
+                intent.id.get(),
+                outcome.kind(),
+                if dry_run { " (dry run)" } else { "" },
+                intent.operation.verb(),
+                target.pid,
+                target.owner
+            ),
+            None => format!(
+                "srtop: action confirm {}: nothing is prepared",
+                outcome.kind()
+            ),
+        };
+        self.record(line);
+    }
+
+    /// Watches the request the kernel just accepted for `intent`'s target
+    /// (PX-031), replacing any earlier watch.
+    fn watch_sent(&mut self, intent: &ActionIntent, targets: &dyn ActionTargets) {
+        let Some(target) = intent.targets.first() else {
+            return;
+        };
+        if let Some(earlier) = self
+            .watch
+            .as_ref()
+            .filter(|watch| watch.outcome == ObservedOutcome::Watching)
+        {
+            self.record(format!(
+                "srtop: action #{} no longer watched: superseded by #{}",
+                earlier.intent.get(),
+                intent.id.get()
+            ));
+        }
+        let now = self.clock.now().0;
+        self.watch = Some(Watch {
+            intent: intent.id,
+            subject: intent.subject(),
+            key: target.key.clone(),
+            pid: target.pid,
+            sent_at: now,
+            deadline: now.saturating_add(self.observation_window),
+            scans_at_send: targets.scans(),
+            sighting: Sighting::None,
+            outcome: ObservedOutcome::Watching,
+        });
+        self.record(format!(
+            "srtop: action #{} watching PID {} for {} s",
+            intent.id.get(),
+            target.pid,
+            self.observation_window.as_secs()
+        ));
+    }
+
+    /// Observes the watched request on `targets` (PX-031), after a sample or
+    /// at the deadline. Before the deadline, an exit established by a scan
+    /// sampled after the request settles it as exited after the request,
+    /// and a listing is remembered; at the deadline the last such sighting
+    /// settles it as still running or outcome unknown. Sends nothing.
+    pub fn observe(&mut self, targets: &dyn ActionTargets) {
+        let now = self.clock.now().0;
+        let current = hold_of(targets).is_none();
+        let Some(watch) = self
+            .watch
+            .as_mut()
+            .filter(|watch| watch.outcome == ObservedOutcome::Watching)
+        else {
+            return;
+        };
+        let settled = if now >= watch.deadline {
+            Some(match (current, watch.sighting) {
+                (false, _) => ObservedOutcome::Unknown(Unobserved::NotCurrent),
+                (true, Sighting::Listed) => ObservedOutcome::StillRunning,
+                (true, Sighting::Unaccounted) => ObservedOutcome::Unknown(Unobserved::Unaccounted),
+                (true, Sighting::None) => ObservedOutcome::Unknown(Unobserved::NoScan),
+            })
+        } else if current && targets.scans() >= watch.scans_at_send.saturating_add(2) {
+            // Sampled after the request: the scan before it may have been
+            // taken while the signal was being sent.
+            if targets.exited(&watch.key) {
+                Some(ObservedOutcome::ExitedAfterRequest {
+                    within: now.saturating_sub(watch.sent_at),
+                })
+            } else {
+                watch.sighting = match targets.state_of(&watch.key) {
+                    TargetState::Current { .. } => Sighting::Listed,
+                    _ => Sighting::Unaccounted,
+                };
+                None
+            }
+        } else {
+            None
+        };
+        let Some(outcome) = settled else {
+            return;
+        };
+        watch.outcome = outcome;
+        let line = match &watch.outcome {
+            ObservedOutcome::ExitedAfterRequest { within } => format!(
+                "srtop: action #{} observed: PID {} exited after the request (within {:.1} s)",
+                watch.intent.get(),
+                watch.pid,
+                within.as_secs_f64()
+            ),
+            other => format!(
+                "srtop: action #{} observed: PID {} {} at the deadline; nothing else was sent",
+                watch.intent.get(),
+                watch.pid,
+                other.kind()
+            ),
+        };
+        self.record(line);
     }
 
     /// Records whether `targets`' rows are the latest scan, so the controls
@@ -1037,6 +1407,15 @@ impl ActionGate {
         match prepared {
             Ok((intent, slot)) => {
                 let id = intent.id;
+                if let Some(target) = intent.targets.first() {
+                    self.record(format!(
+                        "srtop: action #{} prepared: {} PID {} (UID {})",
+                        id.get(),
+                        intent.operation.verb(),
+                        target.pid,
+                        target.owner
+                    ));
+                }
                 self.pending = Some(Pending {
                     intent,
                     slot,
@@ -1046,6 +1425,7 @@ impl ActionGate {
                 Ok(id)
             }
             Err(outcome) => {
+                self.record(format!("srtop: action prepare {}", outcome.kind()));
                 self.report = Report::Outcome {
                     outcome: outcome.clone(),
                     subject: None,
@@ -1136,6 +1516,15 @@ impl ActionGate {
                 reason,
             },
         };
+        let intent = pending.as_ref().map(|pending| &pending.intent);
+        self.record_settlement(intent, &outcome);
+        // Only a signal the kernel accepted is watched (PX-031): a dry run
+        // sent nothing, and a refusal or failure says nothing was sent. Only
+        // an authorized intent reaches the executor, so `Requested` names it.
+        if let (Some(intent), ActionOutcome::Requested { dry_run: false, .. }) = (intent, &outcome)
+        {
+            self.watch_sent(intent, targets);
+        }
         self.report = Report::Outcome {
             outcome: outcome.clone(),
             subject,
@@ -1155,6 +1544,7 @@ impl ActionGate {
         slot: u32,
     ) -> ActionOutcome {
         if self.pending.as_ref().map(|pending| pending.slot) != Some(slot) {
+            self.record("srtop: action confirm refused: that confirmation was withdrawn".into());
             return ActionOutcome::Refused {
                 intent: None,
                 reason: Refusal::Withdrawn,
@@ -1223,6 +1613,10 @@ impl ActionGate {
             return;
         };
         if let Some(pending) = self.pending.take() {
+            self.record(format!(
+                "srtop: action #{} withdrawn",
+                pending.intent.id.get()
+            ));
             self.report = Report::Withdrawn {
                 intent: pending.intent.id,
                 subject: pending.intent.subject(),
@@ -1262,7 +1656,10 @@ impl ActionGate {
     pub fn cancel(&mut self) -> Option<IntentId> {
         let cancelled = self.pending.take().map(|pending| pending.intent.id);
         self.report = match cancelled {
-            Some(id) => Report::Cancelled(id),
+            Some(id) => {
+                self.record(format!("srtop: action #{} cancelled", id.get()));
+                Report::Cancelled(id)
+            }
             None => Report::Outcome {
                 outcome: ActionOutcome::Refused {
                     intent: None,
@@ -1372,10 +1769,15 @@ impl ActionGate {
         // Paused or resuming, nothing can be prepared or confirmed: the rows
         // are not the latest scan. Cancel only discards, so it stays.
         let actionable = writable && self.hold.is_none() && unavailable.is_none();
+        let observed = match &self.watch {
+            Some(watch) => watch.describe(self.observation_window),
+            None => OBSERVED_IDLE.to_string(),
+        };
         ActionsView {
             prepare_enabled: actionable,
             cancel_enabled: writable && pending.is_some(),
             status: bounded(&status, MAX_ACTIONS_STATUS_BYTES),
+            observed: bounded(&observed, MAX_OBSERVED_BYTES),
             panel: pending.map(|pending| PanelView {
                 slot: pending.slot,
                 question: bounded(&self.question(&pending.intent), MAX_PANEL_TEXT_BYTES),
@@ -1428,6 +1830,11 @@ impl ActionGate {
             Text::builder(ACTIONS_STATUS)
                 .parent(ACTIONS_ROW)
                 .text(view.status.as_str())
+                .role(TextRole::Status)
+                .create(ui)?;
+            Text::builder(ACTIONS_OBSERVED)
+                .parent(ACTIONS_ROW)
+                .text(view.observed.as_str())
                 .role(TextRole::Status)
                 .create(ui)?;
             if let Some(panel) = &view.panel {
@@ -1488,6 +1895,7 @@ impl ActionGate {
                 prepare_enabled: enabled(ACTION_PREPARE),
                 cancel_enabled: enabled(ACTION_CANCEL),
                 status: text(ACTIONS_STATUS, TEXT),
+                observed: text(ACTIONS_OBSERVED, TEXT),
                 panel: shown.and_then(|slot| {
                     let ids = PanelIds::of(slot);
                     store.get_node(ids.row)?;
@@ -1529,6 +1937,9 @@ impl ActionGate {
             }
             if published.status != target.status {
                 ui.set(ACTIONS_STATUS, TEXT, target.status.as_str())?;
+            }
+            if published.observed != target.observed {
+                ui.set(ACTIONS_OBSERVED, TEXT, target.observed.as_str())?;
             }
             match (&published.panel, &target.panel) {
                 (Some(was), Some(now)) if was.slot == now.slot => {
@@ -1650,6 +2061,10 @@ pub fn confirm_requested(
         event.observed_revision,
         slot,
     );
+    if gate.observation_due().is_some() {
+        // A watch started (PX-031): the refresh loop arms its deadline timer.
+        view.wake_sampling();
+    }
     gate.hold_for(&*view);
     if let Err(error) = gate.publish(session) {
         eprintln!("srtop: action controls not published: {error}");
@@ -1730,6 +2145,8 @@ mod tests {
         resuming: bool,
         selected: Option<ProcessKey>,
         states: HashMap<ProcessKey, TargetState>,
+        scans: u64,
+        exited: Vec<ProcessKey>,
     }
 
     impl Fake {
@@ -1768,6 +2185,12 @@ mod tests {
                 .get(key)
                 .cloned()
                 .unwrap_or(TargetState::Unknown)
+        }
+        fn scans(&self) -> u64 {
+            self.scans
+        }
+        fn exited(&self, key: &ProcessKey) -> bool {
+            self.exited.contains(key)
         }
     }
 
@@ -2202,6 +2625,7 @@ mod tests {
         session
             .transaction(|ui| {
                 ui.set(ACTIONS_STATUS, TEXT, wide(MAX_ACTIONS_STATUS_BYTES))?;
+                ui.set(ACTIONS_OBSERVED, TEXT, wide(MAX_OBSERVED_BYTES))?;
                 ui.set(panel.question, TEXT, wide(MAX_PANEL_TEXT_BYTES))?;
                 ui.set(panel.confirm, LABEL, wide(MAX_CONFIRM_LABEL_BYTES))?;
                 Ok(())
@@ -2213,6 +2637,7 @@ mod tests {
                 ACTION_PREPARE,
                 ACTION_CANCEL,
                 ACTIONS_STATUS,
+                ACTIONS_OBSERVED,
                 panel.row,
                 panel.question,
                 panel.confirm,
@@ -2665,5 +3090,259 @@ mod tests {
             .view()
             .status
             .starts_with("Refused #2 (terminate PID · worker): the process could not be held for signalling: gone; nothing was requested"));
+    }
+
+    // ----------------------------------------------------------------------
+    // PX-031
+    // ----------------------------------------------------------------------
+
+    /// A terminate gate over `recording` on `clock`, with a 10 s window.
+    fn terminate_gate(recording: &Arc<Recording>, clock: &Arc<ManualClock>) -> ActionGate {
+        ActionGate::new(
+            ActionMode::Terminate,
+            Arc::clone(recording) as Arc<dyn ProcessActions>,
+        )
+        .with_clock(Arc::clone(clock) as Arc<dyn MonotonicClock>)
+    }
+
+    /// Prepares and confirms on `fake`; the executor answers `Requested`.
+    fn sent(gate: &mut ActionGate, fake: &Fake) -> IntentId {
+        let id = prepared(gate, fake);
+        assert_eq!(
+            gate.confirm(fake, CLIENT, 10),
+            ActionOutcome::Requested {
+                intent: id,
+                dry_run: false
+            }
+        );
+        id
+    }
+
+    #[test]
+    fn a_sent_request_is_watched_and_settles_still_running_at_its_deadline() {
+        let recording = Arc::new(Recording::default());
+        let clock = Arc::new(ManualClock::default());
+        let mut gate = terminate_gate(&recording, &clock);
+        let (mut fake, target) = mine(4101);
+        assert_eq!(gate.view().observed, OBSERVED_IDLE);
+        sent(&mut gate, &fake);
+        assert_eq!(gate.observed(), Some(&ObservedOutcome::Watching));
+        assert_eq!(gate.observing(), Some(&target));
+        assert_eq!(gate.observation_due(), Some(DEFAULT_OBSERVATION_WINDOW));
+        let view = gate.view();
+        assert!(
+            view.status
+                .starts_with("Requested #1 (terminate PID · worker): SIGTERM was sent")
+                && view.observed.starts_with(
+                    "Watching #1 (terminate PID · worker): SIGTERM was sent; for 10 s"
+                ),
+            "{view:?}"
+        );
+        // Scans keep listing it; 1 ns before the deadline it is still watched.
+        for _ in 0..3 {
+            fake.scans += 1;
+            gate.observe(&fake);
+        }
+        clock.advance(DEFAULT_OBSERVATION_WINDOW - Duration::from_nanos(1));
+        gate.observe(&fake);
+        assert_eq!(gate.observed(), Some(&ObservedOutcome::Watching));
+        clock.advance(Duration::from_nanos(1));
+        assert_eq!(gate.observation_due(), Some(Duration::ZERO));
+        gate.observe(&fake);
+        assert_eq!(gate.observed(), Some(&ObservedOutcome::StillRunning));
+        assert_eq!(gate.observing(), None, "the watch ended");
+        assert_eq!(gate.observation_due(), None);
+        let view = gate.view();
+        assert!(
+            view.observed.starts_with("Still running #1 (terminate PID · worker): 10 s after SIGTERM was sent the latest scan still lists this process instance")
+                && view.observed.contains("a zombie stays listed")
+                && view.observed.ends_with("Nothing else was sent"),
+            "{}",
+            view.observed
+        );
+        assert!(
+            view.status.starts_with("Requested #1"),
+            "the request line stays: {}",
+            view.status
+        );
+        // Nothing escalates: more observations and scans reach no executor.
+        clock.advance(Duration::from_secs(60));
+        fake.scans += 5;
+        gate.observe(&fake);
+        assert_eq!(gate.observed(), Some(&ObservedOutcome::StillRunning));
+        assert_eq!(recording.reached.lock().unwrap().len(), 1, "one request");
+    }
+
+    #[test]
+    fn only_an_exit_established_by_a_scan_after_the_request_is_attributed() {
+        let recording = Arc::new(Recording::default());
+        let clock = Arc::new(ManualClock::default());
+        let mut gate = terminate_gate(&recording, &clock);
+        let (mut fake, target) = mine(4101);
+        fake.scans = 7;
+        sent(&mut gate, &fake);
+        // The first scan after the settlement may have been sampled before
+        // the signal: even an established exit is not attributed yet.
+        fake.scans = 8;
+        fake.exited.push(target.clone());
+        fake.states.insert(target.clone(), TargetState::Historical);
+        gate.observe(&fake);
+        assert_eq!(gate.observed(), Some(&ObservedOutcome::Watching));
+        clock.advance(Duration::from_millis(1500));
+        fake.scans = 9;
+        gate.observe(&fake);
+        assert_eq!(
+            gate.observed(),
+            Some(&ObservedOutcome::ExitedAfterRequest {
+                within: Duration::from_millis(1500)
+            })
+        );
+        let observed = gate.view().observed;
+        assert!(
+            observed.starts_with("Exited after the request #1 (terminate PID · worker): within 1.5 s of SIGTERM being sent a scan established that this process instance is gone")
+                && observed.ends_with("whether SIGTERM or something else ended it is not known"),
+            "{observed}"
+        );
+        assert!(!observed.contains("terminated"), "{observed}");
+        // While held, a scan is not the latest: nothing is attributed.
+        let (mut held, target) = mine(4101);
+        let mut gate = terminate_gate(&recording, &clock);
+        sent(&mut gate, &held);
+        held.paused = true;
+        held.scans = 5;
+        held.exited.push(target);
+        gate.observe(&held);
+        assert_eq!(gate.observed(), Some(&ObservedOutcome::Watching));
+    }
+
+    #[test]
+    fn an_absence_that_establishes_nothing_is_an_unknown_outcome() {
+        let recording = Arc::new(Recording::default());
+        let clock = Arc::new(ManualClock::default());
+        // No scan after the request before the deadline.
+        let mut gate = terminate_gate(&recording, &clock);
+        let (mut fake, target) = mine(4101);
+        sent(&mut gate, &fake);
+        fake.scans = 1;
+        gate.observe(&fake);
+        clock.advance(DEFAULT_OBSERVATION_WINDOW);
+        gate.observe(&fake);
+        assert_eq!(
+            gate.observed(),
+            Some(&ObservedOutcome::Unknown(Unobserved::NoScan))
+        );
+        assert!(gate.view().observed.starts_with("Outcome unknown #1 (terminate PID · worker): no scan taken after the request was applied before the deadline"));
+        // Gone from the rows without an established exit: unknown, not exited.
+        let mut gate = terminate_gate(&recording, &clock);
+        sent(&mut gate, &fake);
+        fake.states.insert(target.clone(), TargetState::Unknown);
+        fake.scans += 2;
+        gate.observe(&fake);
+        assert_eq!(gate.observed(), Some(&ObservedOutcome::Watching));
+        clock.advance(DEFAULT_OBSERVATION_WINDOW);
+        gate.observe(&fake);
+        assert_eq!(
+            gate.observed(),
+            Some(&ObservedOutcome::Unknown(Unobserved::Unaccounted))
+        );
+        // Paused at the deadline: the rows are not the latest scan.
+        let (mut fake, _) = mine(4101);
+        let mut gate = terminate_gate(&recording, &clock);
+        sent(&mut gate, &fake);
+        fake.scans = 2;
+        gate.observe(&fake);
+        fake.paused = true;
+        clock.advance(DEFAULT_OBSERVATION_WINDOW);
+        gate.observe(&fake);
+        assert_eq!(
+            gate.observed(),
+            Some(&ObservedOutcome::Unknown(Unobserved::NotCurrent))
+        );
+    }
+
+    #[test]
+    fn only_a_signal_the_kernel_accepted_is_watched() {
+        let clock = Arc::new(ManualClock::default());
+        // A dry run sent nothing.
+        let recording = Arc::new(Recording::default());
+        let mut dry = gate(&recording, &clock);
+        let (fake, _) = mine(4101);
+        let id = prepared(&mut dry, &fake);
+        dry.confirm(&fake, CLIENT, 10);
+        assert_eq!(dry.observed(), None);
+        assert_eq!(dry.view().observed, OBSERVED_IDLE);
+        let _ = id;
+        // Refused, failed, unsupported or unknown: nothing to watch.
+        for answer in [
+            Execution::Refused(Refusal::NotHeld("gone".into())),
+            Execution::Failed("no".into()),
+            Execution::Unsupported,
+            Execution::OutcomeUnknown("?".into()),
+        ] {
+            let recording = Arc::new(Recording::default());
+            *recording.answer.lock().unwrap() = Some(answer.clone());
+            let mut gate = terminate_gate(&recording, &clock);
+            prepared(&mut gate, &fake);
+            gate.confirm(&fake, CLIENT, 10);
+            assert_eq!(gate.observed(), None, "{answer:?}");
+            assert_eq!(gate.observation_due(), None);
+        }
+        // A newer sent request replaces the watch.
+        let recording = Arc::new(Recording::default());
+        let mut gate = terminate_gate(&recording, &clock);
+        sent(&mut gate, &fake);
+        let second = sent(&mut gate, &fake);
+        assert!(gate
+            .view()
+            .observed
+            .starts_with(&format!("Watching #{}", second.get())));
+    }
+
+    #[derive(Default)]
+    struct Lines(Mutex<Vec<String>>);
+
+    impl ActionLog for Lines {
+        fn record(&self, line: &str) {
+            self.0.lock().unwrap().push(line.to_string());
+        }
+    }
+
+    #[test]
+    fn the_log_records_numbers_and_kinds_only() {
+        let recording = Arc::new(Recording::default());
+        let clock = Arc::new(ManualClock::default());
+        let lines = Arc::new(Lines::default());
+        let mut gate =
+            terminate_gate(&recording, &clock).with_log(Arc::clone(&lines) as Arc<dyn ActionLog>);
+        let (mut fake, target) = mine(4101);
+        fake.current(&target, Observed::Known(ME));
+        if let Some(TargetState::Current { who, .. }) = fake.states.get_mut(&target) {
+            *who = "PID 4101 · tok=hunter2 ".repeat(40);
+        }
+        sent(&mut gate, &fake);
+        fake.scans = 2;
+        fake.exited.push(target);
+        gate.observe(&fake);
+        prepared(&mut gate, &fake);
+        gate.cancel();
+        let lines = lines.0.lock().unwrap().clone();
+        assert_eq!(
+            lines,
+            vec![
+                "srtop: action #1 prepared: terminate PID 4101 (UID 1000)",
+                "srtop: action #1 requested: terminate PID 4101 (UID 1000)",
+                "srtop: action #1 watching PID 4101 for 10 s",
+                "srtop: action #1 observed: PID 4101 exited after the request (within 0.0 s)",
+                "srtop: action #2 prepared: terminate PID 4101 (UID 1000)",
+                "srtop: action #2 cancelled",
+            ]
+        );
+        for line in &lines {
+            assert!(line.len() <= MAX_ACTION_LOG_BYTES, "{line}");
+            assert!(
+                !line.contains("hunter2") && !line.contains("tok="),
+                "{line}"
+            );
+        }
     }
 }

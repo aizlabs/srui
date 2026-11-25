@@ -680,6 +680,10 @@ pub struct ProcessView {
     /// How many deadline-timer observations the loop made (PX-031): a
     /// counter only, never reset, for the bound a test checks.
     observation_rechecks: std::sync::atomic::AtomicU64,
+    /// Wakes the refresh loop when the action gate starts watching a
+    /// request (PX-031, verification round 3 F1): its own notify, so it
+    /// never consumes or stands in for a sampling wake.
+    observation_wake: Arc<tokio::sync::Notify>,
 }
 
 /// The rows every active filter keeps, and what the filters' controls say
@@ -955,6 +959,7 @@ impl ProcessView {
                 actions: None,
                 scans: 0,
                 observation_rechecks: std::sync::atomic::AtomicU64::new(0),
+                observation_wake: Arc::new(tokio::sync::Notify::new()),
             },
             snapshot,
         ))
@@ -1231,10 +1236,12 @@ impl ProcessView {
             .and_then(|gate| crate::actions::lock_actions(gate).observation_due())
     }
 
-    /// Wakes the refresh loop without asking for a sample (PX-031), so it
-    /// arms the deadline timer of a request the gate started watching.
-    pub fn wake_sampling(&self) {
-        self.sampling.wake_handle().notify_one();
+    /// Tells the refresh loop the action gate started watching a request
+    /// (PX-031), so it arms that request's deadline timer, between samples
+    /// or while a scan is in flight (verification round 3, F1). Asks for no
+    /// sample and leaves the sampling wake's permit alone.
+    pub fn wake_observation(&self) {
+        self.observation_wake.notify_one();
     }
 
     /// Tells the action gate whether this view's rows are the latest scan
@@ -6565,7 +6572,9 @@ fn ticker_every(interval: Duration) -> tokio::time::Interval {
 /// view resumes, and not polled at all while the view is paused, when no
 /// sample is taken. Besides it, only the deadline of a watched action
 /// request (PX-031) wakes the loop, to settle that request's observed
-/// outcome on time, paused or not; it takes no sample. A
+/// outcome on time, paused or not; it takes no sample. The start of a watch
+/// wakes it through a notify of its own to arm that timer, also while a scan
+/// is in flight; nothing arms it while nothing is watched. A
 /// Refresh now press, a Resume view or a change of "Show user threads"
 /// (PX-019) wakes it through the view's one
 /// [`tokio::sync::Notify`] for one sample through this same path. A sample is
@@ -6581,12 +6590,15 @@ pub async fn poll<S>(
 ) where
     S: ProcessSource + Send + 'static,
 {
-    let wake = {
+    let (wake, watch_started) = {
         let mut held = lock_view(&view);
         if let Err(error) = held.adopt_interval(&session, interval) {
             eprintln!("srtop: interval not published: {error}");
         }
-        held.sampling.wake_handle()
+        (
+            held.sampling.wake_handle(),
+            Arc::clone(&held.observation_wake),
+        )
     };
     let mut interval = lock_view(&view).sampling.interval();
     let mut ticker = ticker_every(interval);
@@ -6613,6 +6625,8 @@ pub async fn poll<S>(
                 lock_view(&view).observe_actions(&session);
                 continue;
             }
+            // A watch started: re-read its deadline.
+            () = watch_started.notified() => continue,
         };
         // The request's epoch and the thread setting are read together, so a
         // sample is always taken under the setting of the epoch it is
@@ -6649,13 +6663,16 @@ pub async fn poll<S>(
         // while it runs, cannot hold a watch past its deadline. The scan's
         // own result is applied afterwards like any other; a watch already
         // settled ignores it. The view is locked only to read the due time
-        // and to observe, never while the scan runs.
+        // and to observe, never while the scan runs. A watch started during
+        // the scan re-arms the timer (verification round 3, F1), so the due
+        // time is re-read whenever one starts, not only once per scan.
         let sampled = loop {
             let deadline = observation_timer(lock_view(&view).action_observation_due());
             tokio::select! {
                 biased;
                 sampled = &mut scan => break sampled,
                 () = deadline => lock_view(&view).observe_actions(&session),
+                () = watch_started.notified() => {}
             }
         };
         let (returned, snapshot) = match sampled {

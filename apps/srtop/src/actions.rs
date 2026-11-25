@@ -2131,8 +2131,9 @@ pub fn confirm_requested(
         slot,
     );
     if gate.observation_due().is_some() {
-        // A watch started (PX-031): the refresh loop arms its deadline timer.
-        view.wake_sampling();
+        // A watch started (PX-031): the refresh loop arms its deadline
+        // timer, also during a scan in flight (verification round 3, F1).
+        view.wake_observation();
     }
     gate.hold_for(&*view);
     if let Err(error) = gate.publish(session) {

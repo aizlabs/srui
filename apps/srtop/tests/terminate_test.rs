@@ -1650,10 +1650,22 @@ async fn a_watch_settles_while_a_scan_is_in_flight(pause: bool) {
     if pause {
         h.processed(SAMPLING_PAUSE);
     }
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-    h.sync();
+    // Polled, not a fixed wait (verification round 3, W2): the released
+    // scan and at least one after it are applied.
+    let scans = srui_process_explorer::actions::ActionTargets::scans(&*lock_view(&h.view));
+    let applied = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            h.sync();
+            let now = srui_process_explorer::actions::ActionTargets::scans(&*lock_view(&h.view));
+            if h.item_of_checked(4101).is_none() && now >= scans + 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
     assert!(
-        h.item_of_checked(4101).is_none(),
+        applied.is_ok(),
         "the released scan and later ones were applied"
     );
     assert_eq!(h.observed(), Some(expected), "the settled outcome is kept");
@@ -1711,4 +1723,158 @@ async fn the_deadline_timer_rechecks_about_once_a_second_and_never_spins() {
         .await
         .expect("the loop stops")
         .expect("the loop does not panic");
+}
+
+// --------------------------------------------------------------------------
+// PX-031 verification round 3: a watch started during a scan, and no timer
+// while nothing is watched
+// --------------------------------------------------------------------------
+
+/// The production loop over `source`, its first scan blocked until
+/// [`BlockedPoll::release`]; returned once that scan has started.
+struct BlockedPoll {
+    release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    shutdown: tokio_util::sync::CancellationToken,
+    polling: tokio::task::JoinHandle<()>,
+}
+
+impl BlockedPoll {
+    async fn start(h: &Harness, source: Steps) -> Self {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let blocking = BlockingSteps {
+            inner: source,
+            calls: 0,
+            entered: entered_tx,
+            release: Arc::clone(&release),
+        };
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let polling = tokio::spawn(srui_process_explorer::refresh::poll(
+            Arc::clone(&h.view),
+            blocking,
+            Arc::clone(&h.session),
+            Duration::from_millis(200),
+            shutdown.child_token(),
+        ));
+        let started =
+            tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(20)))
+                .await
+                .unwrap();
+        assert!(started.is_ok(), "the loop's first scan started and blocks");
+        Self {
+            release,
+            shutdown,
+            polling,
+        }
+    }
+
+    fn released(&self) -> bool {
+        *self.release.0.lock().unwrap()
+    }
+
+    fn release(&self) {
+        *self.release.0.lock().unwrap() = true;
+        self.release.1.notify_all();
+    }
+
+    async fn stop(self) {
+        self.release();
+        self.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(20), self.polling)
+            .await
+            .expect("the loop stops")
+            .expect("the loop does not panic");
+    }
+}
+
+fn rechecks(h: &Harness) -> u64 {
+    lock_view(&h.view).observation_rechecks()
+}
+
+/// Confirm 4101 while the loop's scan is blocked (then paused when
+/// `pause`), on the harness's manual gate clock with a 10 s window. The
+/// start of the watch arms the deadline timer although the scan began with
+/// nothing watched: it re-checks before the deadline, and once the clock
+/// passes the deadline the watch settles while the scan is still blocked.
+async fn a_watch_started_during_a_scan_settles_at_its_deadline(pause: bool) {
+    let mut source = steps(vec![host(10), host(20)]);
+    let mut h = harness_with(&mut source, Kernel::new(true), |gate| {
+        gate.with_observation_window(Duration::from_secs(10))
+    });
+    let polling = BlockedPoll::start(&h, source).await;
+    assert_eq!(rechecks(&h), 0, "nothing watched when the scan started");
+    let (_, outcome) = h.confirm_pid(4101);
+    assert!(matches!(outcome, EventOutcome::Processed { .. }));
+    assert_eq!(h.observed(), Some(ObservedOutcome::Watching));
+    if pause {
+        // A paused view offers no Confirm, so it pauses once the watch runs.
+        h.processed(SAMPLING_PAUSE);
+    }
+    let armed = tokio::time::timeout(Duration::from_secs(5), async {
+        while rechecks(&h) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        armed.is_ok(),
+        "the watch's start armed the deadline timer during the scan"
+    );
+    assert_eq!(
+        h.observed(),
+        Some(ObservedOutcome::Watching),
+        "not before the deadline"
+    );
+    h.clock.advance(Duration::from_secs(11));
+    let settled = tokio::time::timeout(Duration::from_secs(5), async {
+        while h.observed() == Some(ObservedOutcome::Watching) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(settled.is_ok(), "the watch settled at its deadline");
+    assert!(!polling.released(), "the scan is still blocked");
+    let expected = if pause {
+        ObservedOutcome::Unknown(Unobserved::NotCurrent)
+    } else {
+        ObservedOutcome::Unknown(Unobserved::NoScan)
+    };
+    assert_eq!(h.observed(), Some(expected));
+    assert_eq!(h.kernel.delivered(), vec![(4101, 500, SIGTERM)]);
+    polling.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_watch_started_during_a_scan_settles_at_its_deadline_unpaused() {
+    a_watch_started_during_a_scan_settles_at_its_deadline(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_watch_started_during_a_scan_settles_at_its_deadline_paused() {
+    a_watch_started_during_a_scan_settles_at_its_deadline(true).await;
+}
+
+/// No deadline timer runs while nothing is watched (verification round 3,
+/// W1): not while a scan is blocked, and not while the view is paused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_deadline_timer_runs_while_nothing_is_watched() {
+    let mut source = steps(vec![host(10), host(20)]);
+    let mut h = harness_with(&mut source, Kernel::new(true), |gate| gate);
+    let polling = BlockedPoll::start(&h, source).await;
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert_eq!(rechecks(&h), 0, "no timer while a scan is blocked");
+    let scans = srui_process_explorer::actions::ActionTargets::scans(&*lock_view(&h.view));
+    polling.release();
+    let applied = tokio::time::timeout(Duration::from_secs(10), async {
+        while srui_process_explorer::actions::ActionTargets::scans(&*lock_view(&h.view)) == scans {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(applied.is_ok(), "the released scan was applied");
+    h.processed(SAMPLING_PAUSE);
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert_eq!(rechecks(&h), 0, "no timer while paused");
+    assert_eq!(h.observed(), None);
+    polling.stop().await;
 }

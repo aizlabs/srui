@@ -677,6 +677,9 @@ pub struct ProcessView {
     /// the gate can tell a scan sampled after a request from one that may
     /// have been taken before it.
     scans: u64,
+    /// How many deadline-timer observations the loop made (PX-031): a
+    /// counter only, never reset, for the bound a test checks.
+    observation_rechecks: std::sync::atomic::AtomicU64,
 }
 
 /// The rows every active filter keeps, and what the filters' controls say
@@ -951,6 +954,7 @@ impl ProcessView {
                 unconfirmed_since: HashMap::new(),
                 actions: None,
                 scans: 0,
+                observation_rechecks: std::sync::atomic::AtomicU64::new(0),
             },
             snapshot,
         ))
@@ -1206,7 +1210,17 @@ impl ProcessView {
     /// even while the view is paused and no sample is taken. Takes the
     /// gate's lock after this view's.
     pub fn observe_actions(&self, session: &Session) {
+        self.observation_rechecks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.sync_actions(session);
+    }
+
+    /// How many times the refresh loop's deadline timer has had the gate
+    /// observe (PX-031): bounded by one per [`OBSERVATION_RECHECK`] while a
+    /// request is watched, which a test checks so the timer cannot spin.
+    pub fn observation_rechecks(&self) -> u64 {
+        self.observation_rechecks
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// How long until the deadline of the request the action gate watches,
@@ -6516,6 +6530,16 @@ pub fn lock_view(view: &Mutex<ProcessView>) -> std::sync::MutexGuard<'_, Process
 /// the host sleeps, the deadline on one that does not.
 pub const OBSERVATION_RECHECK: Duration = Duration::from_secs(1);
 
+/// Completes when the refresh loop should observe a watched action request
+/// (PX-031): at its deadline, and at least every [`OBSERVATION_RECHECK`]
+/// before it; never while nothing is watched.
+async fn observation_timer(due: Option<Duration>) {
+    match due {
+        Some(due) => tokio::time::sleep(due.min(OBSERVATION_RECHECK)).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// The loop's one ticker: its first tick one `interval` from now, never at
 /// once, so a new interval neither fires a burst nor keeps the old phase.
 fn ticker_every(interval: Duration) -> tokio::time::Interval {
@@ -6579,13 +6603,7 @@ pub async fn poll<S>(
         // not, so it re-checks at least every OBSERVATION_RECHECK: after the
         // host sleeps past a deadline, it settles within that much of waking
         // (verification round 1, W3).
-        let due = lock_view(&view).action_observation_due();
-        let deadline = async move {
-            match due {
-                Some(due) => tokio::time::sleep(due.min(OBSERVATION_RECHECK)).await,
-                None => std::future::pending().await,
-            }
-        };
+        let deadline = observation_timer(lock_view(&view).action_observation_due());
         let mut ticked = tokio::select! {
             biased;
             _ = shutdown.cancelled() => return,
@@ -6621,12 +6639,25 @@ pub async fn poll<S>(
         }
         // User threads are read only while they are shown (PX-019).
         // Reading a host's process filesystem blocks; keep it off the runtime.
-        let sampled = tokio::task::spawn_blocking(move || {
+        let mut scan = tokio::task::spawn_blocking(move || {
             source.collect_threads(threads);
             let snapshot = source.snapshot();
             (source, snapshot)
-        })
-        .await;
+        });
+        // A watched request's deadline stays armed while the scan runs
+        // (PX-031, Codex review round 1): a slow or stalled scan, or a pause
+        // while it runs, cannot hold a watch past its deadline. The scan's
+        // own result is applied afterwards like any other; a watch already
+        // settled ignores it. The view is locked only to read the due time
+        // and to observe, never while the scan runs.
+        let sampled = loop {
+            let deadline = observation_timer(lock_view(&view).action_observation_due());
+            tokio::select! {
+                biased;
+                sampled = &mut scan => break sampled,
+                () = deadline => lock_view(&view).observe_actions(&session),
+            }
+        };
         let (returned, snapshot) = match sampled {
             Ok(sampled) => sampled,
             Err(error) => {

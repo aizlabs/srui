@@ -1545,3 +1545,170 @@ fn each_run_draws_its_own_panel_range() {
         assert_eq!(first.session.handler_count(ids.confirm, ACTIVATE), 1);
     }
 }
+
+// --------------------------------------------------------------------------
+// PX-031 Codex review round 1: the deadline while a scan is in flight
+// --------------------------------------------------------------------------
+
+/// A source whose first snapshot blocks until the test releases it (or a
+/// 30 s backstop passes), and says when that scan has started.
+struct BlockingSteps {
+    inner: Steps,
+    calls: usize,
+    entered: std::sync::mpsc::Sender<()>,
+    release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl ProcessSource for BlockingSteps {
+    fn status_text(&self) -> &str {
+        self.inner.status_text()
+    }
+
+    fn accounts(&self) -> Accounts {
+        self.inner.accounts()
+    }
+
+    fn snapshot(&mut self) -> ProcessSnapshot {
+        self.calls += 1;
+        if self.calls == 1 {
+            let _ = self.entered.send(());
+            let (released, wakeup) = &*self.release;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut released = released.lock().unwrap();
+            while !*released && std::time::Instant::now() < deadline {
+                released = wakeup
+                    .wait_timeout(released, Duration::from_millis(50))
+                    .unwrap()
+                    .0;
+            }
+        }
+        self.inner.snapshot()
+    }
+}
+
+/// Confirms 4101, then lets the production loop start a scan that blocks
+/// past the deadline (paused meanwhile when `pause`). The watch settles by
+/// the loop's timer while the scan is still blocked; releasing the scan, which
+/// shows 4101 gone, and the scans after it change nothing: the settled
+/// outcome is kept, no exit is attributed, nothing more is sent.
+async fn a_watch_settles_while_a_scan_is_in_flight(pause: bool) {
+    use srui_process_explorer::on_demand::SuspendAwareClock;
+    let mut source = steps(vec![host(10), without(20, &[4101])]);
+    let mut h = harness_with(&mut source, Kernel::new(true), |gate| {
+        gate.with_clock(Arc::new(SuspendAwareClock::new()) as Arc<dyn MonotonicClock>)
+            .with_observation_window(Duration::from_millis(1500))
+    });
+    let (_, outcome) = h.confirm_pid(4101);
+    assert!(matches!(outcome, EventOutcome::Processed { .. }));
+    h.kernel.state().processes.remove(&4101);
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let blocking = BlockingSteps {
+        inner: source,
+        calls: 0,
+        entered: entered_tx,
+        release: Arc::clone(&release),
+    };
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let polling = tokio::spawn(srui_process_explorer::refresh::poll(
+        Arc::clone(&h.view),
+        blocking,
+        Arc::clone(&h.session),
+        Duration::from_millis(200),
+        shutdown.child_token(),
+    ));
+    let started =
+        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(20)))
+            .await
+            .unwrap();
+    assert!(started.is_ok(), "the loop's first scan started and blocks");
+    if pause {
+        h.processed(SAMPLING_PAUSE);
+    }
+    let settled = tokio::time::timeout(Duration::from_secs(10), async {
+        while h.observed() == Some(ObservedOutcome::Watching) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "the deadline settled while the scan was in flight"
+    );
+    assert!(!*release.0.lock().unwrap(), "the scan is still blocked");
+    let expected = if pause {
+        ObservedOutcome::Unknown(Unobserved::NotCurrent)
+    } else {
+        ObservedOutcome::Unknown(Unobserved::NoScan)
+    };
+    h.sync();
+    assert_eq!(h.observed(), Some(expected.clone()));
+    let line = h.observed_line();
+    // Release the scan (it shows 4101 gone), and let later scans run.
+    *release.0.lock().unwrap() = true;
+    release.1.notify_all();
+    if pause {
+        h.processed(SAMPLING_PAUSE);
+    }
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    h.sync();
+    assert!(
+        h.item_of_checked(4101).is_none(),
+        "the released scan and later ones were applied"
+    );
+    assert_eq!(h.observed(), Some(expected), "the settled outcome is kept");
+    assert_eq!(h.observed_line(), line);
+    assert_eq!(h.kernel.delivered(), vec![(4101, 500, SIGTERM)]);
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(20), polling)
+        .await
+        .expect("the loop stops")
+        .expect("the loop does not panic");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_deadline_settles_while_a_scan_is_in_flight() {
+    a_watch_settles_while_a_scan_is_in_flight(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_deadline_settles_while_a_scan_is_in_flight_and_the_view_is_paused() {
+    a_watch_settles_while_a_scan_is_in_flight(true).await;
+}
+
+/// The deadline timer re-checks at most about once per
+/// `OBSERVATION_RECHECK` while a request is watched: over 2.5 s of a paused
+/// view (no tick, no scan) with a 4 s window it observes about twice, never
+/// in a busy loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_deadline_timer_rechecks_about_once_a_second_and_never_spins() {
+    use srui_process_explorer::on_demand::SuspendAwareClock;
+    let mut source = steps(vec![host(10)]);
+    let mut h = harness_with(&mut source, Kernel::new(true), |gate| {
+        gate.with_clock(Arc::new(SuspendAwareClock::new()) as Arc<dyn MonotonicClock>)
+            .with_observation_window(Duration::from_secs(4))
+    });
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let polling = tokio::spawn(srui_process_explorer::refresh::poll(
+        Arc::clone(&h.view),
+        source,
+        Arc::clone(&h.session),
+        Duration::from_secs(300),
+        shutdown.child_token(),
+    ));
+    h.confirm_pid(4101);
+    h.processed(SAMPLING_PAUSE);
+    let before = lock_view(&h.view).observation_rechecks();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let rechecks = lock_view(&h.view).observation_rechecks() - before;
+    assert!(
+        (1..=4).contains(&rechecks),
+        "{rechecks} rechecks in 2.5 s: about one a second"
+    );
+    assert_eq!(h.observed(), Some(ObservedOutcome::Watching));
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(20), polling)
+        .await
+        .expect("the loop stops")
+        .expect("the loop does not panic");
+}

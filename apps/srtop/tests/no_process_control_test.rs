@@ -70,9 +70,12 @@
 //!   and `.write_all`: the per-user settings store, which replaces the
 //!   settings file and its backup through fresh temporary files renamed into
 //!   place. Its writes are pinned ([`settings_write_violations`]): exactly
-//!   one `OpenOptions::new()` and one `create_new`, and no `truncate`,
-//!   `append` or `.create(true)`. Every other rule holds there as everywhere;
-//!   no file but it may write, and no client input names its path.
+//!   one `OpenOptions::new()` and one `create_new(true)`, and no `truncate`,
+//!   `append`, `.create(true)`, `custom_flags`, `clone`, `clone_from` or
+//!   `to_owned`. Every other rule holds there as everywhere; no file but it
+//!   may write, and only `src/main.rs` constructs a `SettingsStore`, once,
+//!   from its command line or the per-user default path
+//!   ([`settings_store_constructions`]), so no client input names its path.
 //!   The only signal API is receiving SIGINT, SIGTERM and the
 //!   `--smoke-fixture` SIGUSR1.
 //! * **The one raw system-call allowance (PX-029).** `src/handle.rs`, and no
@@ -595,20 +598,46 @@ const SETTINGS_FS_ALLOWED: &[&str] = &[
     "remove_file",
 ];
 
+/// Whether the token after `level[i]` is a parenthesized group holding
+/// exactly the identifier `true`.
+fn called_with_true(level: &[Tok], i: usize) -> bool {
+    matches!(
+        level.get(i + 1),
+        Some(Tok::Group(Delimiter::Parenthesis, inner, _))
+            if matches!(inner.as_slice(), [Tok::Ident(value, _, _)] if value == "true")
+    )
+}
+
 /// How [`SETTINGS_MODULE`]'s writes are pinned (PX-069): exactly one
-/// `OpenOptions::new()`, exactly one `create_new` (so every file it opens for
-/// writing is a fresh one, never an existing file or a link), and no
-/// `truncate`, `append` or `.create(true)`, which would open an existing file
-/// to rewrite it in place.
+/// `OpenOptions::new()` and exactly one `create_new`, called with exactly
+/// `true` (so every file it opens for writing is a fresh one, never an
+/// existing file or a link); no `truncate`, `append`, `.create(true)` or
+/// `custom_flags` (`O_TRUNC`, `O_APPEND`), which would open an existing file
+/// to rewrite it in place; and no `clone`, `clone_from` or `to_owned` of
+/// anything, so the one pinned builder cannot be copied and reconfigured.
 fn settings_write_violations(source: &str) -> Vec<String> {
     fn walk(level: &[Tok], counts: &mut (usize, usize), found: &mut Vec<String>) {
         for (i, tok) in level.iter().enumerate() {
+            let prev = i.checked_sub(1).and_then(|p| level.get(p));
             match tok {
                 Tok::Ident(name, _, line) => match name.as_str() {
-                    "truncate" | "append" => {
+                    "truncate" | "append" | "custom_flags" => {
                         found.push(format!("line {line}: `{name}` rewrites a file in place"))
                     }
-                    "create_new" => counts.1 += 1,
+                    "clone" | "clone_from" | "to_owned"
+                        if is_punct(prev, '.') || is_path_sep(prev) =>
+                    {
+                        found.push(format!(
+                            "line {line}: `{name}` could copy the pinned file builder"
+                        ))
+                    }
+                    "Clone" if is_path_sep(level.get(i + 1)) => found.push(format!(
+                        "line {line}: `Clone::` could copy the pinned file builder"
+                    )),
+                    "create_new" if called_with_true(level, i) => counts.1 += 1,
+                    "create_new" => found.push(format!(
+                        "line {line}: `create_new` not called with exactly `true`"
+                    )),
                     "create" if is_punct(i.checked_sub(1).and_then(|p| level.get(p)), '.') => {
                         if let Some(Tok::Group(Delimiter::Parenthesis, inner, _)) = level.get(i + 1)
                         {
@@ -648,9 +677,77 @@ fn settings_write_violations(source: &str) -> Vec<String> {
         ));
     }
     if counts.1 != 1 {
-        found.push(format!("{} `create_new`, not exactly one", counts.1));
+        found.push(format!("{} `create_new(true)`, not exactly one", counts.1));
     }
     found
+}
+
+/// The one file that may construct a settings store (PX-069): `main`, from
+/// `--settings-path` or the per-user default path, never from client input.
+const SETTINGS_STORE_CONSTRUCTOR: &str = "src/main.rs";
+
+/// Every way production file `file` breaks the constructor pin: a
+/// construction anywhere but [`SETTINGS_STORE_CONSTRUCTOR`], more than one
+/// there, or a renamed or aliased type.
+fn settings_store_violations(file: &str, source: &str) -> Vec<String> {
+    let (constructions, hidden) = settings_store_constructions(source);
+    let mut found: Vec<String> = hidden
+        .into_iter()
+        .map(|violation| format!("{file}: [settings-store] {violation}"))
+        .collect();
+    let allowed = usize::from(file == SETTINGS_STORE_CONSTRUCTOR);
+    if constructions != allowed {
+        found.push(format!(
+            "{file}: [settings-store] {constructions} `SettingsStore::new`, {allowed} allowed"
+        ));
+    }
+    found
+}
+
+/// How many times a production file constructs a `SettingsStore`
+/// (`SettingsStore::new`, `<SettingsStore>::new`), and every way it could
+/// hide one: the type renamed on import or aliased.
+fn settings_store_constructions(source: &str) -> (usize, Vec<String>) {
+    fn walk(level: &[Tok], count: &mut usize, found: &mut Vec<String>) {
+        for (i, tok) in level.iter().enumerate() {
+            match tok {
+                Tok::Ident(name, _, line) if name == "SettingsStore" => {
+                    let next = level.get(i + 1);
+                    let member = if is_path_sep(next) {
+                        ident(level.get(i + 2))
+                    } else if is_punct(next, '>') && is_path_sep(level.get(i + 2)) {
+                        ident(level.get(i + 3))
+                    } else {
+                        None
+                    };
+                    if member == Some("new") {
+                        *count += 1;
+                    }
+                    if ident(next) == Some("as") {
+                        found.push(format!("line {line}: `SettingsStore` renamed"));
+                    }
+                }
+                Tok::Ident(name, raw, line) if name == "type" && !*raw => {
+                    let end = level[i..]
+                        .iter()
+                        .position(|tok| matches!(tok, Tok::Punct(';', _)))
+                        .map_or(level.len(), |offset| i + offset);
+                    if contains_ident(&level[i + 1..end], &["SettingsStore"]) {
+                        found.push(format!("line {line}: a type alias of `SettingsStore`"));
+                    }
+                }
+                Tok::Group(_, inner, _) => walk(inner, count, found),
+                _ => {}
+            }
+        }
+    }
+    let Ok(stream) = TokenStream::from_str(source) else {
+        return (0, vec!["does not tokenize".into()]);
+    };
+    let tokens = production(&lower(stream));
+    let (mut count, mut found) = (0, Vec::new());
+    walk(&tokens, &mut count, &mut found);
+    (count, found)
 }
 
 fn contains_ident(level: &[Tok], names: &[&str]) -> bool {
@@ -2821,6 +2918,7 @@ fn no_production_source_can_signal_or_reconfigure_a_process() {
                     .map(|violation| format!("{name}: [settings] {violation}")),
             );
         }
+        found.extend(settings_store_violations(&name, &text));
         if name == HANDLE_MODULE {
             found.extend(
                 handle_unsafe_violations(&text)
@@ -2988,6 +3086,33 @@ fn the_settings_allowance_is_exactly_the_settings_modules_atomic_writes() {
             "a second OpenOptions",
             format!("{writer}\nfn again() {{ let _ = OpenOptions::new().write(true).open(p); }}"),
         ),
+        // PX-069 verification round 1, F3.
+        (
+            "create_new(false)",
+            writer.replace(".create_new(true)", ".create_new(false)"),
+        ),
+        (
+            "create_new(computed)",
+            writer.replace(".create_new(true)", ".create_new(fresh)"),
+        ),
+        (
+            "a cloned builder with custom_flags(O_TRUNC)",
+            format!(
+                "{writer}\nfn v2(path: &Path, options: &OpenOptions) {{ let mut again = options.clone(); again.custom_flags(0o1000); let _ = again.open(path); }}"
+            ),
+        ),
+        (
+            "custom_flags alone",
+            writer.replace(".mode(0o600)", ".mode(0o600).custom_flags(0o2000)"),
+        ),
+        (
+            "a builder copied by to_owned",
+            format!("{writer}\nfn v2(o: &OpenOptions) {{ let _ = o.to_owned().open(p); }}"),
+        ),
+        (
+            "a builder copied by Clone::clone",
+            format!("{writer}\nfn v2(o: &OpenOptions) {{ let _ = Clone::clone(o).open(p); }}"),
+        ),
     ] {
         assert!(
             !settings_write_violations(&snippet).is_empty(),
@@ -3004,6 +3129,12 @@ fn the_settings_allowance_is_exactly_the_settings_modules_atomic_writes() {
         ("fs::write", "std::fs::write(p, b);", "fs"),
         ("File::create", "let _ = File::create(p);", "file"),
         ("set_permissions", "file.set_permissions(mode);", "method"),
+        // V1 of verification round 1: an in-place rewrite through `File::options`.
+        (
+            "File::options",
+            "if let Ok(mut file) = File::options().write(true).open(path) { let _ = file.write_all(b\"x\"); }",
+            "file",
+        ),
         (
             "a handler",
             "session.on(TABLE, ACTIVATE, |_, _| {});",
@@ -3031,6 +3162,51 @@ fn the_settings_allowance_is_exactly_the_settings_modules_atomic_writes() {
             "{innocent}"
         );
     }
+    // Only `main` constructs a store (F3 of verification round 1, W1): every
+    // form of a construction is counted, and a renamed or aliased type is
+    // reported, so another file cannot write at a path of its choosing.
+    for (snippet, constructions) in [
+        (
+            "let store = crate::settings_file::SettingsStore::new(path_from_client);",
+            1,
+        ),
+        ("let store = <SettingsStore>::new(path);", 1),
+        (
+            "let a = SettingsStore::new(p); let b = SettingsStore::new(q);",
+            2,
+        ),
+        (
+            "fn f(store: &SettingsStore) { store.save(&settings).ok(); }",
+            0,
+        ),
+    ] {
+        assert_eq!(
+            settings_store_constructions(snippet),
+            (constructions, Vec::new()),
+            "{snippet}"
+        );
+    }
+    for hidden in [
+        "use crate::settings_file::SettingsStore as Store;",
+        "type Store = crate::settings_file::SettingsStore;",
+    ] {
+        assert!(
+            !settings_store_constructions(hidden).1.is_empty(),
+            "{hidden}"
+        );
+    }
+    // The per-file policy: one construction in `main`, none elsewhere.
+    let one = "let store = SettingsStore::new(path);";
+    assert_eq!(
+        settings_store_violations(SETTINGS_STORE_CONSTRUCTOR, one),
+        Vec::<String>::new()
+    );
+    assert!(!settings_store_violations("src/zz_verify1_store_bypass.rs", one).is_empty());
+    assert!(!settings_store_violations(SETTINGS_MODULE, one).is_empty());
+    assert!(
+        !settings_store_violations(SETTINGS_STORE_CONSTRUCTOR, &format!("{one}\n{one}")).is_empty()
+    );
+    assert!(!settings_store_violations(SETTINGS_STORE_CONSTRUCTOR, "fn f() {}").is_empty());
     for bypass in [
         "session.on(SAVED_VIEW_SLOT_1, VALUE_CHANGED, slot(0));",
         "session.on(SAVED_VIEW_NAME_INPUT, ACTIVATE, |_, _| {});",

@@ -413,7 +413,9 @@ pub fn unescape(value: &str) -> Option<String> {
 pub enum Problem {
     /// More than [`MAX_SETTINGS_FILE_BYTES`].
     Oversized,
-    /// Not a settings file: no `srtop-settings` first line.
+    /// Not a settings file at all: a non-empty file whose first bytes are
+    /// not even the start of `srtop-settings `. Never overwritten: it is
+    /// some other file the settings path happens to name.
     NotSettings,
     /// No complete last line, or no checksum line: cut short.
     Truncated,
@@ -478,23 +480,43 @@ fn malformed(line: usize, what: &'static str) -> Problem {
     Problem::Malformed { line, what }
 }
 
-/// The version a settings file's first line declares, read from nothing
-/// else: what decides whether the rest may be interpreted at all.
+/// The most bytes [`declared_version`] reads: the magic, a space and at most
+/// ten version digits, then the line break.
+pub const HEAD_BYTES: usize = MAGIC.len() + 1 + 11;
+
+/// The version a settings file's first line declares, read from its first
+/// [`HEAD_BYTES`] bytes and nothing else: what decides whether the rest may
+/// be interpreted at all, and whether the file may ever be replaced.
+///
+/// * An empty file, or one that holds only the start of `srtop-settings `, was
+///   cut short ([`Problem::Truncated`]): a damaged settings file.
+/// * Any other file that does not start `srtop-settings ` is not a settings
+///   file ([`Problem::NotSettings`]).
+/// * A version above [`CURRENT_VERSION`] is [`Problem::NewerVersion`],
+///   whatever the rest of the file holds or how large it is.
 pub fn declared_version(bytes: &[u8]) -> Result<u32, Problem> {
-    let first = bytes
-        .split(|byte| *byte == b'\n')
-        .next()
-        .filter(|first| first.len() <= MAX_LINE_BYTES)
-        .ok_or(Problem::NotSettings)?;
-    let first = std::str::from_utf8(first).map_err(|_| Problem::NotSettings)?;
-    let version = first
-        .strip_prefix(MAGIC)
-        .and_then(|rest| rest.strip_prefix(' '))
-        .ok_or(Problem::NotSettings)?;
-    if version.is_empty() || version.len() > 9 || !version.bytes().all(|b| b.is_ascii_digit()) {
+    let lead_len = MAGIC.len() + 1;
+    let head = &bytes[..bytes.len().min(lead_len)];
+    let lead = format!("{MAGIC} ");
+    if head != lead.as_bytes() {
+        return Err(if lead.as_bytes().starts_with(head) {
+            Problem::Truncated
+        } else {
+            Problem::NotSettings
+        });
+    }
+    let rest = &bytes[lead_len..bytes.len().min(HEAD_BYTES)];
+    let digits = rest
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(rest, |end| &rest[..end]);
+    if digits.is_empty() || digits.len() > 9 || !digits.iter().all(u8::is_ascii_digit) {
         return Err(Problem::BadVersion);
     }
-    let version: u32 = version.parse().map_err(|_| Problem::BadVersion)?;
+    let version: u32 = std::str::from_utf8(digits)
+        .ok()
+        .and_then(|digits| digits.parse().ok())
+        .ok_or(Problem::BadVersion)?;
     if version > CURRENT_VERSION {
         return Err(Problem::NewerVersion(version));
     }
@@ -504,12 +526,40 @@ pub fn declared_version(bytes: &[u8]) -> Result<u32, Problem> {
     Ok(version)
 }
 
+/// Whether the second line names another application (`app <other>`), read
+/// from at most [`MAX_LINE_BYTES`] bytes after the first line. Like the
+/// version, this decides before any bound whether a file may be replaced.
+fn names_another_app(bytes: &[u8]) -> bool {
+    let Some(first_end) = bytes
+        .iter()
+        .take(HEAD_BYTES)
+        .position(|byte| *byte == b'\n')
+    else {
+        return false;
+    };
+    let second = &bytes[first_end + 1..bytes.len().min(first_end + 2 + MAX_LINE_BYTES)];
+    // Only a complete line says anything: a file cut inside it is damaged.
+    let Some(end) = second.iter().position(|byte| *byte == b'\n') else {
+        return false;
+    };
+    second[..end]
+        .strip_prefix(b"app ")
+        .is_some_and(|app| unescape(&String::from_utf8_lossy(app)).as_deref() != Some(APP))
+}
+
 /// Reads one settings file. Every refusal is a [`Problem`]; nothing panics.
+///
+/// The version and the application are decided first, from the file's head,
+/// so a newer srtop's or another application's file is recognised as such
+/// however large or long it is; only then are the bounds applied.
 pub fn parse(bytes: &[u8]) -> Result<Parsed, Problem> {
+    let version = declared_version(bytes)?;
+    if names_another_app(bytes) {
+        return Err(Problem::ForeignApp);
+    }
     if bytes.len() > MAX_SETTINGS_FILE_BYTES {
         return Err(Problem::Oversized);
     }
-    let version = declared_version(bytes)?;
     if bytes.last() != Some(&b'\n') {
         return Err(Problem::Truncated);
     }
@@ -828,6 +878,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// From verification round 1's probes: random insertions, deletions and
+    /// replacements of one to four bytes are refused, never panic, and the
+    /// head decides first: no mutated file is accepted.
+    #[test]
+    fn random_byte_mutations_are_refused_without_panicking() {
+        let base = sample().encode().unwrap().into_bytes();
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let mut bytes = base.clone();
+            for _ in 0..1 + next() % 4 {
+                let at = (next() as usize) % bytes.len();
+                match next() % 3 {
+                    0 => bytes[at] = next() as u8,
+                    1 => {
+                        bytes.remove(at);
+                    }
+                    _ => bytes.insert(at, next() as u8),
+                }
+            }
+            if bytes != base {
+                assert!(
+                    parse(&bytes).is_err(),
+                    "accepted {:?}",
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_head_decides_before_any_bound() {
+        let mut newer = format!("srtop-settings {}\napp srtop\n", CURRENT_VERSION + 1).into_bytes();
+        newer.resize(MAX_SETTINGS_FILE_BYTES * 2, b'#');
+        assert_eq!(
+            parse(&newer),
+            Err(Problem::NewerVersion(CURRENT_VERSION + 1))
+        );
+        let mut foreign = b"srtop-settings 2\napp other\n".to_vec();
+        foreign.resize(MAX_SETTINGS_FILE_BYTES * 2, b'#');
+        assert_eq!(parse(&foreign), Err(Problem::ForeignApp));
+        // A file cut inside the app line is damaged, not foreign.
+        assert_eq!(parse(b"srtop-settings 2\napp sr"), Err(Problem::Truncated));
+        assert_eq!(parse(b""), Err(Problem::Truncated));
+        assert_eq!(parse(b"srtop-sett"), Err(Problem::Truncated));
+        assert_eq!(parse(b"notes\n"), Err(Problem::NotSettings));
+        assert_eq!(
+            parse(b"srtop-settings 1234567890\n"),
+            Err(Problem::BadVersion)
+        );
+        let mut current = b"srtop-settings 2\napp srtop\n".to_vec();
+        current.resize(MAX_SETTINGS_FILE_BYTES + 1, b'#');
+        assert_eq!(parse(&current), Err(Problem::Oversized));
     }
 
     #[test]

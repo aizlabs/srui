@@ -30,11 +30,22 @@
 //! **Reading (§26).** A read takes at most
 //! [`crate::settings::MAX_SETTINGS_FILE_BYTES`] plus one byte, of a regular
 //! file only (a symbolic link, directory or FIFO is refused, never followed
-//! or opened for reading). A damaged settings file falls back to a valid
+//! or opened for reading). The version and application are decided from the
+//! file's head before any bound, so an oversized file of a newer srtop is
+//! still a newer srtop's. A damaged settings file falls back to a valid
 //! backup. A file this build must not replace — a newer version, another
-//! application's, another source's, unreadable, or not a regular file —
-//! makes the store read-only: the defaults are shown, and every save is
-//! refused, so the file is never overwritten.
+//! application's, another source's, a file that is not settings at all,
+//! unreadable, or not a regular file — makes the store read-only: the
+//! defaults are shown, and every save is refused, so the file is never
+//! overwritten. The same holds for the backup whenever a save would replace
+//! it.
+//!
+//! **Temporary names.** `<pid>` is this process's ID in its own PID
+//! namespace. Two instances in different namespaces sharing one settings
+//! directory (containers with a shared `HOME`) can hold the same PID and
+//! remove each other's temporary file; the one renamed then may be cut
+//! short, which its checksum refuses on the next read, falling back to the
+//! backup. Like concurrent saves, this is not serialized.
 //!
 //! **Not covered.** Two srtop instances of the same user saving at once are
 //! not serialized: the last rename wins, whole. The directory and file
@@ -108,6 +119,13 @@ pub enum ReadOnly {
     Unreadable(String),
     /// The settings path names a directory, link, FIFO or other non-file.
     NotAFile,
+    /// The settings path names some other file: not an srtop settings file
+    /// at all.
+    NotSettings,
+    /// The backup is a file the store must not replace, which the next save
+    /// would: a newer version's, another application's, an unreadable file
+    /// or not a settings file.
+    Backup(Box<ReadOnly>),
 }
 
 impl std::fmt::Display for ReadOnly {
@@ -123,6 +141,10 @@ impl std::fmt::Display for ReadOnly {
             }
             Self::Unreadable(kind) => write!(formatter, "the settings file is unreadable ({kind})"),
             Self::NotAFile => formatter.write_str("the settings path is not a regular file"),
+            Self::NotSettings => {
+                formatter.write_str("the settings path holds a file that is not srtop settings")
+            }
+            Self::Backup(reason) => write!(formatter, "the backup cannot be replaced: {reason}"),
         }
     }
 }
@@ -168,6 +190,10 @@ pub enum SaveError {
     Io(String),
     /// The save stopped at the step a test asked for ([`SaveStep`]).
     Interrupted(SaveStep),
+    /// The new settings file is in place, but flushing its directory failed
+    /// (`std::io::ErrorKind`, by name): the views are saved, and a crash
+    /// before the system writes the directory back may undo the change.
+    NotFlushed(String),
 }
 
 impl std::fmt::Display for SaveError {
@@ -177,6 +203,10 @@ impl std::fmt::Display for SaveError {
             Self::Invalid(problem) => write!(formatter, "the views are {problem}"),
             Self::Io(kind) => write!(formatter, "the settings file could not be written ({kind})"),
             Self::Interrupted(step) => write!(formatter, "interrupted at {step:?}"),
+            Self::NotFlushed(kind) => write!(
+                formatter,
+                "saved, but the settings directory could not be flushed ({kind}); a crash may undo this change"
+            ),
         }
     }
 }
@@ -198,6 +228,9 @@ pub enum SaveStep {
     Written,
     /// The new file was renamed into place; the directory was not flushed.
     Renamed,
+    /// The new file was renamed into place and flushing the directory
+    /// failed: the save reports [`SaveError::NotFlushed`].
+    FlushFailed,
 }
 
 /// What the settings path holds.
@@ -272,15 +305,16 @@ impl SettingsStore {
                 return defaults(Origin::ReadOnly, Some(ReadOnly::OtherSource));
             }
             Found::Valid { parsed, .. } => {
+                // The next save would replace the backup with this file.
                 return Loaded {
                     origin: Origin::Primary {
                         migrated_from: (parsed.version < settings::CURRENT_VERSION)
                             .then_some(parsed.version),
                     },
                     settings: parsed.settings,
-                    read_only: None,
+                    read_only: self.protected_backup(),
                     notes: parsed.notes,
-                }
+                };
             }
             Found::Refused(problem) => problem,
         };
@@ -339,6 +373,9 @@ impl SettingsStore {
                 return Err(SaveError::Refused(ReadOnly::OtherSource));
             }
             Found::Valid { bytes, .. } => {
+                if let Some(reason) = self.protected_backup() {
+                    return Err(SaveError::Refused(reason));
+                }
                 self.replace(&self.backup_path(), &bytes, None)?;
                 self.stop_at(SaveStep::BackupReplaced)?;
             }
@@ -351,11 +388,30 @@ impl SettingsStore {
         }
         self.replace(&self.path, text.as_bytes(), self.interrupt)?;
         self.stop_at(SaveStep::Renamed)?;
-        File::open(directory)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| io(&error))?;
+        let flushed = if self.interrupt == Some(SaveStep::FlushFailed) {
+            Err(std::io::Error::from(std::io::ErrorKind::Other))
+        } else {
+            File::open(directory).and_then(|directory| directory.sync_all())
+        };
+        if let Err(error) = flushed {
+            return Err(SaveError::NotFlushed(format!("{:?}", error.kind())));
+        }
         self.sweep(directory);
         Ok(())
+    }
+
+    /// Why the backup must not be replaced, if it must not: a file whose
+    /// head names a newer version or another application, a file that is not
+    /// settings at all, or one that cannot be read. A damaged backup, a
+    /// missing one or a link (renamed over, never followed) may be replaced.
+    fn protected_backup(&self) -> Option<ReadOnly> {
+        match classify(&self.backup_path()) {
+            Found::Refused(Problem::NotAFile) => None,
+            Found::Refused(problem) => {
+                read_only(&problem).map(|reason| ReadOnly::Backup(Box::new(reason)))
+            }
+            Found::Missing | Found::Valid { .. } => None,
+        }
     }
 
     fn stop_at(&self, step: SaveStep) -> Result<(), SaveError> {
@@ -453,14 +509,17 @@ fn read_only(problem: &Problem) -> Option<ReadOnly> {
     match problem {
         Problem::NewerVersion(version) => Some(ReadOnly::NewerVersion(*version)),
         Problem::ForeignApp => Some(ReadOnly::ForeignApp),
-        Problem::Unreadable(kind) => Some(ReadOnly::Unreadable(kind.clone())),
+        Problem::Unreadable(kind) => Some(ReadOnly::Unreadable(kind.to_string())),
         Problem::NotAFile => Some(ReadOnly::NotAFile),
+        Problem::NotSettings => Some(ReadOnly::NotSettings),
         _ => None,
     }
 }
 
 /// Reads and parses the file at `path`, at most one byte past the bound, and
-/// only when it is a regular file.
+/// only when it is a regular file. The parser decides the version and the
+/// application from the head before it applies the size bound, so an
+/// oversized newer or foreign file is still never replaced.
 fn classify(path: &Path) -> Found {
     match read_bounded(path) {
         Ok(None) => Found::Missing,
@@ -482,9 +541,6 @@ fn read_bounded(path: &Path) -> Result<Option<Vec<u8>>, Problem> {
     if !metadata.is_file() {
         return Err(Problem::NotAFile);
     }
-    if metadata.len() > MAX_SETTINGS_FILE_BYTES as u64 {
-        return Err(Problem::Oversized);
-    }
     let file = File::open(path).map_err(unreadable)?;
     if !file.metadata().map_err(unreadable)?.is_file() {
         return Err(Problem::NotAFile);
@@ -493,9 +549,8 @@ fn read_bounded(path: &Path) -> Result<Option<Vec<u8>>, Problem> {
     file.take(MAX_SETTINGS_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(unreadable)?;
-    if bytes.len() > MAX_SETTINGS_FILE_BYTES {
-        return Err(Problem::Oversized);
-    }
+    // One byte past the bound is enough for the parser to refuse it as
+    // oversized, after it has read the version and application.
     Ok(Some(bytes))
 }
 

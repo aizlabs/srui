@@ -656,22 +656,200 @@ fn an_oversized_file_is_refused_as_oversized_without_losing_the_backup() {
     assert_eq!(loaded.settings, old);
     store.save(&settings_with(&["After"])).unwrap();
     assert_eq!(read(&store.backup_path()), backup);
-    // And one byte past the bound, read through the same bounded path.
-    assert_eq!(
-        settings::parse(&vec![b'x'; MAX_SETTINGS_FILE_BYTES + 1]),
-        Err(Problem::Oversized)
-    );
-    // The bound is the file's size, checked before it is opened: an oversized
-    // file nobody may read is refused as oversized, never read at all.
+    // And one byte past the bound, once the head says it is this build's.
+    let mut past = b"srtop-settings 2\napp srtop\n".to_vec();
+    past.resize(MAX_SETTINGS_FILE_BYTES + 1, b'x');
+    assert_eq!(settings::parse(&past), Err(Problem::Oversized));
+    // An oversized file nobody may read could be anything, a newer srtop's
+    // among them: the store is read-only and never replaces it.
     std::fs::write(store.path(), &big).unwrap();
     std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
-    assert_eq!(
-        store.load(SOURCE).origin,
-        Origin::Backup {
-            primary: Problem::Oversized
-        }
-    );
+    assert!(matches!(
+        store.load(SOURCE).read_only,
+        Some(ReadOnly::Unreadable(_))
+    ));
+    assert!(matches!(
+        store.save(&settings_with(&["Later"])),
+        Err(SaveError::Refused(ReadOnly::Unreadable(_)))
+    ));
     std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(read(store.path()), big);
+}
+
+/// PX-069 verification round 1, F1: the version and the application are read
+/// from the head before any bound, so a newer srtop's or another
+/// application's file is never replaced however large or long it is, at the
+/// settings path or at the backup's.
+#[test]
+fn an_oversized_or_long_newer_or_foreign_file_is_never_overwritten() {
+    let dir = TempDir::new("bignewer");
+    let (store, _, new) = two_saves(&dir);
+    let backup = read(&store.backup_path());
+    let oversized = |head: &str| {
+        let mut bytes = head.as_bytes().to_vec();
+        bytes.resize(MAX_SETTINGS_FILE_BYTES + 10_000, b'#');
+        bytes.push(b'\n');
+        bytes
+    };
+    let newer = oversized(&format!(
+        "srtop-settings {}\napp srtop\n",
+        CURRENT_VERSION + 1
+    ));
+    let foreign = oversized("srtop-settings 2\napp other\n");
+    let mut long = format!("srtop-settings {}\n", CURRENT_VERSION + 1);
+    for line in 0..settings::MAX_LINES + 50 {
+        long.push_str(&format!("k{line} v\n"));
+    }
+    for (name, bytes, reason) in [
+        (
+            "oversized newer",
+            newer.clone(),
+            ReadOnly::NewerVersion(CURRENT_VERSION + 1),
+        ),
+        ("oversized foreign", foreign, ReadOnly::ForeignApp),
+        (
+            "long newer",
+            long.into_bytes(),
+            ReadOnly::NewerVersion(CURRENT_VERSION + 1),
+        ),
+    ] {
+        std::fs::write(store.path(), &bytes).unwrap();
+        let loaded = store.load(SOURCE);
+        assert_eq!(loaded.read_only, Some(reason.clone()), "{name}");
+        assert_eq!(loaded.settings, Settings::defaults(SOURCE), "{name}");
+        assert_eq!(
+            store.save(&settings_with(&["Third"])),
+            Err(SaveError::Refused(reason)),
+            "{name}"
+        );
+        assert_eq!(read(store.path()), bytes, "{name}: the file was replaced");
+        assert_eq!(
+            read(&store.backup_path()),
+            backup,
+            "{name}: the backup was replaced"
+        );
+    }
+
+    // The backup too: with a valid settings file, a save would replace the
+    // backup, so a newer srtop's backup makes the store read-only.
+    std::fs::write(store.path(), new.encode().unwrap()).unwrap();
+    std::fs::write(store.backup_path(), &newer).unwrap();
+    let loaded = store.load(SOURCE);
+    assert_eq!(
+        loaded.settings, new,
+        "the settings file itself is still shown"
+    );
+    let protected = ReadOnly::Backup(Box::new(ReadOnly::NewerVersion(CURRENT_VERSION + 1)));
+    assert_eq!(loaded.read_only, Some(protected.clone()));
+    assert_eq!(
+        store.save(&settings_with(&["Third"])),
+        Err(SaveError::Refused(protected))
+    );
+    assert_eq!(read(&store.backup_path()), newer);
+    // With a damaged settings file the backup is not replaced, so the save
+    // goes ahead and the newer backup stays.
+    std::fs::write(store.path(), b"srtop-settings 2\napp srtop\ncut").unwrap();
+    assert_eq!(store.load(SOURCE).read_only, None);
+    store.save(&settings_with(&["Third"])).unwrap();
+    assert_eq!(read(&store.backup_path()), newer);
+    assert_eq!(store.load(SOURCE).settings, settings_with(&["Third"]));
+}
+
+/// PX-069 verification round 1, F2: an explicit `--settings-path` naming some
+/// other file never destroys it; an empty file or the start of the magic is
+/// a cut-short settings file and may be replaced.
+#[test]
+fn an_unrelated_file_at_the_settings_path_is_never_replaced() {
+    let dir = TempDir::new("unrelated");
+    let path = dir.0.join("notes.txt");
+    for content in [
+        &b"my important notes\n"[..],
+        b"#!/bin/sh\n",
+        b"srtop-settingsX 2\n",
+        b"\xff\xfe",
+    ] {
+        std::fs::write(&path, content).unwrap();
+        let store = SettingsStore::new(&path);
+        let loaded = store.load(SOURCE);
+        assert_eq!(loaded.read_only, Some(ReadOnly::NotSettings), "{content:?}");
+        assert_eq!(
+            store.save(&settings_with(&["A"])),
+            Err(SaveError::Refused(ReadOnly::NotSettings))
+        );
+        assert_eq!(read(&path), content);
+        assert!(!store.backup_path().exists());
+    }
+    for damaged in [&b""[..], b"srtop-set", b"srtop-settings "] {
+        std::fs::write(&path, damaged).unwrap();
+        let store = SettingsStore::new(&path);
+        assert_eq!(store.load(SOURCE).read_only, None, "{damaged:?}");
+        store.save(&settings_with(&["A"])).unwrap();
+        assert_eq!(store.load(SOURCE).settings, settings_with(&["A"]));
+        assert!(
+            !store.backup_path().exists(),
+            "a damaged file became the backup"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+}
+
+/// PX-069 verification round 1, F5: a directory flush that fails after the
+/// rename leaves the new file in place, and the views say they were saved,
+/// with the warning.
+#[test]
+fn a_failed_directory_flush_after_the_rename_keeps_the_new_views_and_says_so() {
+    let dir = TempDir::new("flush");
+    let store = SettingsStore::new(dir.settings());
+    store.save(&settings_with(&["Old"])).unwrap();
+    let mut explorer = Explorer::start(store.clone().interrupted_at(SaveStep::FlushFailed), false);
+    explorer.type_name("Flushed");
+    explorer.processed(SAVED_VIEW_CREATE);
+    let names: Vec<String> = explorer
+        .settings()
+        .views
+        .iter()
+        .map(|view| view.name.to_string())
+        .collect();
+    assert_eq!(names, ["Default", "Old", "Flushed"]);
+    assert_eq!(store.load(SOURCE).settings, explorer.settings());
+    assert_eq!(
+        explorer.label(SAVED_VIEW_SLOTS[2]),
+        "View: Flushed (active)"
+    );
+    assert!(
+        explorer.status().contains(
+            "Saved view “Flushed”, saved, but the settings directory could not be flushed"
+        ),
+        "{}",
+        explorer.status()
+    );
+}
+
+/// From verification round 1's probes: links planted at the backup's and at
+/// this process's temporary name are replaced or removed as links, never
+/// followed; their targets are untouched.
+#[test]
+fn links_at_the_backup_or_temporary_name_are_never_followed() {
+    let dir = TempDir::new("links");
+    let store = SettingsStore::new(dir.settings());
+    store.save(&settings_with(&["A"])).unwrap();
+    let target = dir.0.join("bak-target");
+    std::fs::write(&target, b"BAKTARGET").unwrap();
+    std::os::unix::fs::symlink(&target, store.backup_path()).unwrap();
+    store.save(&settings_with(&["B"])).unwrap();
+    assert_eq!(read(&target), b"BAKTARGET");
+    assert!(std::fs::symlink_metadata(store.backup_path())
+        .unwrap()
+        .is_file());
+    let target = dir.0.join("tmp-target");
+    std::fs::write(&target, b"TMPTARGET").unwrap();
+    let temporary = dir
+        .settings()
+        .with_file_name(format!("settings.tmp.{}", std::process::id()));
+    std::os::unix::fs::symlink(&target, &temporary).unwrap();
+    store.save(&settings_with(&["C"])).unwrap();
+    assert_eq!(read(&target), b"TMPTARGET");
+    assert_eq!(store.load(SOURCE).settings, settings_with(&["C"]));
 }
 
 #[test]

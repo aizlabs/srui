@@ -443,6 +443,14 @@ impl SavedViews {
                 self.last = Some(done);
                 true
             }
+            Err(error @ SaveError::NotFlushed(_)) => {
+                // The file holds the new views; only its directory entry may
+                // not have reached the disk yet.
+                self.settings = next;
+                self.loaded_note = None;
+                self.last = Some(format!("{done}, {error}"));
+                true
+            }
             Err(error) => {
                 if let SaveError::Refused(reason) = &error {
                     self.read_only = Some(reason.clone());

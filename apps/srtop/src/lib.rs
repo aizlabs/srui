@@ -265,8 +265,16 @@ pub const SAVED_VIEW_RENAME: NodeId = NodeId::new(100);
 pub const SAVED_VIEW_DELETE: NodeId = NodeId::new(101);
 pub const SAVED_VIEWS_RESTORE: NodeId = NodeId::new(102);
 pub const SAVED_VIEWS_STATUS: NodeId = NodeId::new(103);
-/// The nodes the saved views' controls take (PX-069).
-pub const SAVED_VIEWS_NODE_COUNT: usize = 15;
+/// The nodes the saved views' controls take (PX-069): the row, the slots,
+/// the name field, the four buttons and the status, numbered consecutively
+/// from [`SAVED_VIEWS_ROW`] to [`SAVED_VIEWS_STATUS`], all below the action
+/// panels' range.
+pub const SAVED_VIEWS_NODE_COUNT: usize = 1 + SAVED_VIEW_SLOTS.len() + 1 + 4 + 1;
+const _: () = assert!(
+    SAVED_VIEWS_STATUS.get() - SAVED_VIEWS_ROW.get() + 1 == SAVED_VIEWS_NODE_COUNT as u64
+        && SAVED_VIEWS_ROW.get() == ACTIONS_OBSERVED.get() + 1
+        && SAVED_VIEWS_STATUS.get() < actions::PANEL_RANGE_START
+);
 pub const VIEW_LABEL: &str = "Show process tree";
 pub const VIEW_DESCRIPTION: &str =
     "When on, the same processes are shown as a tree under their parents instead of the table. The server resolves each parent from the latest scan and never guesses one: a process whose parent is not in the scan, unreadable, a newer process reusing its PID, hidden by the filters, or caught in a cycle is shown at the top, and its Parent column says why. Expanding and collapsing are local; sorting orders each parent's children. The selection and follow carry over.";

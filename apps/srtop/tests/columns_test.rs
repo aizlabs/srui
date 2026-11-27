@@ -552,6 +552,8 @@ fn chooser_control(session: &Session, field: ProcessField, verbs: &[&str]) -> No
             let label = label.to_lowercase();
             *enabled
                 && !label.contains("sort")
+                // A meter layout button (PX-070) names CPU too.
+                && !label.contains("meter")
                 && names_column(&label, field)
                 && verbs.iter().any(|verb| label.contains(verb))
         })

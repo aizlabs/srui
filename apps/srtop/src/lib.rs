@@ -5,15 +5,16 @@
 //! sampling interval, Pause view/Resume view and manual refresh, PX-016
 //! keyboard shortcuts, PX-017 follow selected process, PX-018 parent/child
 //! process tree, PX-019 threads, PX-020 tags, PX-021 last-observed records,
-//! PX-069 saved views, §§6.3, 26–27).
+//! PX-069 saved views, §§6.3, 26–27; PX-070 meter layout, §§7.4, 10–12).
 //! No process
 //! is ever opened for control: the only client-input handlers are the sort
 //! buttons', the filter input's, the column chooser buttons', the search
 //! controls', the sampling controls', the follow toggle's, the view switch's,
 //! the tree's selection and disclosure reports, the thread checkboxes', the
-//! tag buttons' and the saved views controls', which reorder, filter, re-lay
-//! out, locate, freeze, re-sample, follow, re-arrange, mark or save the
-//! presentation of the published rows and touch no process. A
+//! tag buttons', the saved views controls' and the meter layout buttons',
+//! which reorder, filter, re-lay out, locate, freeze, re-sample, follow,
+//! re-arrange, mark or save the presentation of the published rows or the
+//! summary and touch no process. A
 //! keyboard shortcut (design §§7.4, 7.6, 22.5; PX-016-G01's standard
 //! `shortcut` property) sends the same event its control's click sends, or
 //! only moves local focus; it adds no handler.
@@ -26,6 +27,7 @@ pub mod follow;
 pub mod handle;
 pub mod inspector;
 pub mod lastseen;
+pub mod meters;
 pub mod metric;
 pub mod on_demand;
 pub mod owner;
@@ -275,6 +277,63 @@ const _: () = assert!(
         && SAVED_VIEWS_ROW.get() == ACTIONS_OBSERVED.get() + 1
         && SAVED_VIEWS_STATUS.get() < actions::PANEL_RANGE_START
 );
+/// The meter layout controls (PX-070): a Row under the system summary holding,
+/// per meter, Hide/Show, Move earlier and Move later buttons and, for CPU,
+/// memory and swap, a bar/text button; then Hide/Show meters, Restore
+/// default meters and the layout status. The summary's own group nodes are
+/// [`summary::METER_GROUPS`], [`summary::METER_GROUP_1`] and
+/// [`summary::METER_GROUP_2`], with [`summary::METER_HIDDEN`] (104–107).
+pub const METER_CONTROLS_ROW: NodeId = NodeId::new(108);
+pub const METER_TOGGLE_CPU: NodeId = NodeId::new(109);
+pub const METER_EARLIER_CPU: NodeId = NodeId::new(110);
+pub const METER_LATER_CPU: NodeId = NodeId::new(111);
+pub const METER_MODE_CPU: NodeId = NodeId::new(112);
+pub const METER_TOGGLE_MEMORY: NodeId = NodeId::new(113);
+pub const METER_EARLIER_MEMORY: NodeId = NodeId::new(114);
+pub const METER_LATER_MEMORY: NodeId = NodeId::new(115);
+pub const METER_MODE_MEMORY: NodeId = NodeId::new(116);
+pub const METER_TOGGLE_SWAP: NodeId = NodeId::new(117);
+pub const METER_EARLIER_SWAP: NodeId = NodeId::new(118);
+pub const METER_LATER_SWAP: NodeId = NodeId::new(119);
+pub const METER_MODE_SWAP: NodeId = NodeId::new(120);
+pub const METER_TOGGLE_LOAD: NodeId = NodeId::new(121);
+pub const METER_EARLIER_LOAD: NodeId = NodeId::new(122);
+pub const METER_LATER_LOAD: NodeId = NodeId::new(123);
+pub const METER_TOGGLE_UPTIME: NodeId = NodeId::new(124);
+pub const METER_EARLIER_UPTIME: NodeId = NodeId::new(125);
+pub const METER_LATER_UPTIME: NodeId = NodeId::new(126);
+pub const METER_TOGGLE_PROCESSES: NodeId = NodeId::new(127);
+pub const METER_EARLIER_PROCESSES: NodeId = NodeId::new(128);
+pub const METER_LATER_PROCESSES: NodeId = NodeId::new(129);
+pub const METERS_HEADER: NodeId = NodeId::new(130);
+pub const METERS_RESTORE: NodeId = NodeId::new(131);
+pub const METERS_STATUS: NodeId = NodeId::new(132);
+/// The meter layout controls' nodes (PX-070): the row, the buttons and the
+/// status, numbered consecutively from [`METER_CONTROLS_ROW`].
+pub const METER_CONTROLS_NODE_COUNT: usize = 1 + meters::METER_BUTTONS.len() + 1;
+const _: () = assert!(
+    METERS_STATUS.get() - METER_CONTROLS_ROW.get() + 1 == METER_CONTROLS_NODE_COUNT as u64
+        && METER_CONTROLS_ROW.get() == summary::METER_HIDDEN.get() + 1
+        && summary::METER_GROUPS.get() == SAVED_VIEWS_STATUS.get() + 1
+        && METERS_STATUS.get() < actions::PANEL_RANGE_START
+);
+/// The shell's nodes numbered from 1 without a gap: everything up to the tag
+/// controls (PX-020). The meter groups and controls (PX-070) are numbered
+/// after the action and saved views nodes, so [`SHELL_NODE_COUNT`] is this
+/// plus [`SHELL_METER_NODE_COUNT`].
+pub const SHELL_CONTIGUOUS_NODE_COUNT: usize = SHELL_NODE_COUNT - SHELL_METER_NODE_COUNT;
+/// The shell's meter nodes (PX-070), 104 to 132: the row of groups, the two
+/// group columns and the hidden meters' container of the summary, and the
+/// meter layout controls.
+pub const SHELL_METER_NODE_COUNT: usize = 4 + METER_CONTROLS_NODE_COUNT;
+/// Every shell node ID, in ascending order (PX-070): 1 to
+/// [`SHELL_CONTIGUOUS_NODE_COUNT`], then [`summary::METER_GROUPS`] to
+/// [`METERS_STATUS`].
+pub fn shell_node_ids() -> impl Iterator<Item = NodeId> {
+    (1..=SHELL_CONTIGUOUS_NODE_COUNT as u64)
+        .chain(summary::METER_GROUPS.get()..=METERS_STATUS.get())
+        .map(NodeId::new)
+}
 pub const VIEW_LABEL: &str = "Show process tree";
 pub const VIEW_DESCRIPTION: &str =
     "When on, the same processes are shown as a tree under their parents instead of the table. The server resolves each parent from the latest scan and never guesses one: a process whose parent is not in the scan, unreadable, a newer process reusing its PID, hidden by the filters, or caught in a cycle is shown at the top, and its Parent column says why. Expanding and collapsing are local; sorting orders each parent's children. The selection and follow carry over.";
@@ -417,10 +476,12 @@ pub const STATUS_TEXT: &str = "Read-only · Process collection not started";
 /// controls (PX-011), the six user-filter controls (PX-012), the six of
 /// the inspector (PX-013, PX-014), the six sampling controls (PX-015) and the
 /// three follow controls (PX-017), the view switch and tree (PX-018), the
-/// four thread controls (PX-019) and the five tag controls (PX-020). Rows are
-/// model items, never nodes.
+/// four thread controls (PX-019) and the five tag controls (PX-020), and the
+/// meter layout controls (PX-070). Rows are model items, never nodes. The
+/// summary's count is the default meter layout's, which shows every meter.
 pub const SHELL_NODE_COUNT: usize = 5
     + summary::NODE_COUNT
+    + METER_CONTROLS_NODE_COUNT
     + SAMPLING_NODE_COUNT
     + FILTER_NODE_COUNT
     + 1
@@ -504,6 +565,60 @@ pub fn install_column_handlers(session: &Session, view: &refresh::SharedView) {
     session.on(COLUMN_EARLIER_CPU, ACTIVATE, handler(Earlier(Cpu)));
     session.on(COLUMN_LATER_CPU, ACTIVATE, handler(Later(Cpu)));
     session.on(COLUMNS_RESTORE, ACTIVATE, handler(RestoreDefaults));
+}
+
+/// Installs the meter layout buttons' `ACTIVATE` handlers (§7.6, PX-070).
+///
+/// A click is applied before the event is acknowledged, so the
+/// acknowledgement's revision already holds the new layout. The action is
+/// the button's, fixed here; nothing the client sent is read, and no row or
+/// process is touched: only the summary's structure and the controls change.
+pub fn install_meter_handlers(session: &Session, view: &refresh::SharedView) {
+    use meters::Meter::*;
+    use meters::MeterAction::*;
+    let handler = |action: meters::MeterAction| {
+        let view = std::sync::Arc::clone(view);
+        move |session: &Session, _: &srui_protocol::Event| meter_clicked(&view, session, action)
+    };
+    session.on(METER_TOGGLE_CPU, ACTIVATE, handler(Toggle(Cpu)));
+    session.on(METER_EARLIER_CPU, ACTIVATE, handler(Earlier(Cpu)));
+    session.on(METER_LATER_CPU, ACTIVATE, handler(Later(Cpu)));
+    session.on(METER_MODE_CPU, ACTIVATE, handler(Presentation(Cpu)));
+    session.on(METER_TOGGLE_MEMORY, ACTIVATE, handler(Toggle(Memory)));
+    session.on(METER_EARLIER_MEMORY, ACTIVATE, handler(Earlier(Memory)));
+    session.on(METER_LATER_MEMORY, ACTIVATE, handler(Later(Memory)));
+    session.on(METER_MODE_MEMORY, ACTIVATE, handler(Presentation(Memory)));
+    session.on(METER_TOGGLE_SWAP, ACTIVATE, handler(Toggle(Swap)));
+    session.on(METER_EARLIER_SWAP, ACTIVATE, handler(Earlier(Swap)));
+    session.on(METER_LATER_SWAP, ACTIVATE, handler(Later(Swap)));
+    session.on(METER_MODE_SWAP, ACTIVATE, handler(Presentation(Swap)));
+    session.on(METER_TOGGLE_LOAD, ACTIVATE, handler(Toggle(Load)));
+    session.on(METER_EARLIER_LOAD, ACTIVATE, handler(Earlier(Load)));
+    session.on(METER_LATER_LOAD, ACTIVATE, handler(Later(Load)));
+    session.on(METER_TOGGLE_UPTIME, ACTIVATE, handler(Toggle(Uptime)));
+    session.on(METER_EARLIER_UPTIME, ACTIVATE, handler(Earlier(Uptime)));
+    session.on(METER_LATER_UPTIME, ACTIVATE, handler(Later(Uptime)));
+    session.on(METER_TOGGLE_PROCESSES, ACTIVATE, handler(Toggle(Processes)));
+    session.on(
+        METER_EARLIER_PROCESSES,
+        ACTIVATE,
+        handler(Earlier(Processes)),
+    );
+    session.on(METER_LATER_PROCESSES, ACTIVATE, handler(Later(Processes)));
+    session.on(METERS_HEADER, ACTIVATE, handler(Header));
+    session.on(METERS_RESTORE, ACTIVATE, handler(RestoreDefaults));
+}
+
+/// One click on a meter layout button.
+fn meter_clicked(
+    view: &std::sync::Mutex<refresh::ProcessView>,
+    session: &Session,
+    action: meters::MeterAction,
+) {
+    if let Err(error) = refresh::lock_view(view).click_meter(session, action) {
+        // As for a column click: the view still holds what committed.
+        eprintln!("srtop: meter layout not published: {error}");
+    }
 }
 
 /// One click on a column chooser button.
@@ -861,7 +976,10 @@ fn sort_clicked(
 /// source, so its summary says that nothing was sampled and its sort buttons
 /// are disabled: there is no collection for them to order.
 pub fn initialize(session: &Session) -> Result<(), SessionError> {
-    let summary = summary::properties(&summary::summarize(&summary::State::NotStarted));
+    let summary = meters::MeterLayout::default().properties(
+        &summary::properties(&summary::summarize(&summary::State::NotStarted)),
+        &summary::Properties::new(),
+    );
     initialize_rows(
         session,
         vec![],
@@ -1130,8 +1248,17 @@ pub(crate) fn initialize_rows(
             .create(ui)?;
         ui.set(STATUS, READ_ONLY, true)?;
         // The system summary, between the status line and the filter controls:
-        // standard Text and Progress nodes only (PX-007).
-        for operation in summary::create_operations(summary) {
+        // standard Text and Progress nodes only (PX-007), in the default
+        // meter layout (PX-070), and the meter layout controls under it.
+        // `summary` is already that layout's properties.
+        let meter_layout = meters::MeterLayout::default();
+        for operation in meters::create_operations(&meter_layout, summary)
+            .into_iter()
+            .chain(meters::create_control_operations(
+                &meter_layout,
+                sort_enabled,
+            ))
+        {
             ui.apply_op(&operation)?;
         }
         // The sampling controls, under the summary whose freshness they
@@ -1700,8 +1827,13 @@ mod tests {
             // status and the process tree (PX-018) and the thread controls'
             // row, two toggles and status (PX-019) and the tag controls' row,
             // three buttons and status (PX-020).
-            assert_eq!(store.node_count(), 82);
-            assert_eq!(SHELL_NODE_COUNT, 82);
+            // PX-070: the summary's row of meter groups, two group columns
+            // and hidden meters' container, and the meter layout controls'
+            // row, twenty-three buttons and status.
+            assert_eq!(store.node_count(), 111);
+            assert_eq!(SHELL_NODE_COUNT, 111);
+            assert_eq!(shell_node_ids().count(), SHELL_NODE_COUNT);
+            assert!(shell_node_ids().all(|id| store.get_node(id).is_some()));
             // A shell that samples nothing has nothing to tag, and says so
             // (PX-020).
             assert_eq!(
@@ -1813,6 +1945,7 @@ mod tests {
                         HEADING,
                         STATUS,
                         summary::SUMMARY,
+                        crate::METER_CONTROLS_ROW,
                         SAMPLING_ROW,
                         FILTER_ROW,
                         OWNER_ROW,
@@ -1873,17 +2006,57 @@ mod tests {
                 store.children_of(summary::SUMMARY),
                 Some(
                     [
+                        summary::METER_GROUPS,
+                        summary::FRESHNESS_TEXT,
+                        summary::METER_HIDDEN
+                    ]
+                    .as_slice()
+                )
+            );
+            assert_eq!(
+                store.children_of(summary::METER_HIDDEN),
+                Some([].as_slice())
+            );
+            assert_eq!(
+                store.children_of(summary::METER_GROUPS),
+                Some([summary::METER_GROUP_1, summary::METER_GROUP_2].as_slice())
+            );
+            assert_eq!(
+                store.children_of(summary::METER_GROUP_2),
+                Some([].as_slice())
+            );
+            assert_eq!(
+                store
+                    .get_node(summary::METER_GROUP_2)
+                    .unwrap()
+                    .get_property(VISIBILITY),
+                Some(&Value::from(EnumToken::from(Visibility::Collapsed)))
+            );
+            assert_eq!(
+                store.children_of(summary::METER_GROUP_1),
+                Some(
+                    [
                         summary::CPU_ROW,
                         summary::MEMORY_ROW,
                         summary::SWAP_ROW,
                         summary::LOAD_TEXT,
                         summary::UPTIME_TEXT,
                         summary::PROCESSES_TEXT,
-                        summary::FRESHNESS_TEXT,
                     ]
                     .as_slice()
                 )
             );
+            // The meter layout controls of a shell that samples nothing are
+            // disabled (PX-070).
+            let mut controls = vec![METER_CONTROLS_ROW];
+            controls.extend(meters::METER_BUTTONS.map(|(button, _)| button));
+            controls.push(METERS_STATUS);
+            assert_eq!(store.children_of(METER_CONTROLS_ROW), Some(&controls[1..]));
+            for (button, _) in meters::METER_BUTTONS {
+                let node = store.get_node(button).unwrap();
+                assert_eq!(node.node_type, TypeRef::BUTTON);
+                assert_eq!(node.get_property(ENABLED), Some(&Value::Bool(false)));
+            }
             // Each bar precedes its line in its row.
             for (row, bar, line) in [
                 (summary::CPU_ROW, summary::CPU_BAR, summary::CPU_TEXT),
@@ -2135,6 +2308,7 @@ mod tests {
                         HEADING,
                         STATUS,
                         summary::SUMMARY,
+                        crate::METER_CONTROLS_ROW,
                         SAMPLING_ROW,
                         FILTER_ROW,
                         OWNER_ROW,

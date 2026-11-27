@@ -118,6 +118,7 @@ fn assert_shell_intact(session: &Session) {
                     HEADING,
                     STATUS,
                     SUMMARY,
+                    srui_process_explorer::METER_CONTROLS_ROW,
                     SAMPLING_ROW,
                     FILTER_ROW,
                     OWNER_ROW,

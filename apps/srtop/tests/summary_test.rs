@@ -98,8 +98,8 @@ fn the_summary_is_published_as_text_and_progress_and_nothing_else() {
     initialize_from_source(&session, &mut FakeProcessSource).unwrap();
     session.with_store(|store| {
         assert_eq!(store.node_count(), SHELL_NODE_COUNT);
-        for id in 1..=SHELL_NODE_COUNT as u64 {
-            let node = store.get_node(NodeId::new(id)).unwrap();
+        for id in srui_process_explorer::shell_node_ids() {
+            let node = store.get_node(id).unwrap();
             assert!(
                 [
                     TypeRef::SURFACE,
@@ -376,7 +376,16 @@ fn a_collector_that_stays_broken_republishes_nothing_and_the_ui_stays_usable() {
     session.with_store(|store| {
         assert_eq!(store.node_count(), SHELL_NODE_COUNT);
         assert_eq!(store.get_model(MODEL).unwrap().item_count, 3);
-        assert_eq!(store.children_of(SUMMARY).map(<[NodeId]>::len), Some(7));
+        // The row of meter groups, the freshness line and the collapsed
+        // container of hidden meters (PX-070); the first group holds the six
+        // meters.
+        assert_eq!(store.children_of(SUMMARY).map(<[NodeId]>::len), Some(3));
+        assert_eq!(
+            store
+                .children_of(srui_process_explorer::summary::METER_GROUP_1)
+                .map(<[NodeId]>::len),
+            Some(6)
+        );
     });
 
     let recovery = view.refresh(&session, &mut source).unwrap();

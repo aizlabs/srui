@@ -4,11 +4,12 @@
 //! * Per-sample updates are scalar: a refresh sets or clears properties on
 //!   the meter nodes that exist and never creates, deletes or moves a node.
 //! * A layout change is structural exactly once: the click's one revision
-//!   holds the deletions, moves and creations, and no figure a client
-//!   already holds; an unchanged layout commits nothing, and a disabled
-//!   control is refused by event validation.
-//! * A hidden meter, or a meter shown as text, has no node to update; a
-//!   meter shown again arrives with the current figures.
+//!   holds only moves (no node is created or deleted after startup), and no
+//!   figure a client already holds; an unchanged layout commits nothing, and
+//!   a disabled control is refused by event validation.
+//! * A hidden meter, or the bar of a meter shown as text, sits in the
+//!   collapsed container and is not updated per sample; a meter shown again
+//!   arrives with the current figures in the same revision.
 //! * Unavailable, denied, warming-up and stale figures never become a zero
 //!   in any presentation: no bar is drawn and the line says why.
 //! * A host with thousands of logical CPUs publishes the same bounded

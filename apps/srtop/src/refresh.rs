@@ -2000,8 +2000,9 @@ impl ProcessView {
     /// and says whether anything was committed.
     ///
     /// The same layout commits nothing. Another one commits only structure —
-    /// the deletions, moves and creations [`crate::meters::transition`] plans
-    /// — with the group visibility and the controls whose label, enablement
+    /// the moves [`crate::meters::transition`] plans (no node is created or
+    /// deleted after startup; a hidden meter or bar moves into the collapsed
+    /// container) — with the group visibility and the controls whose label, enablement
     /// or status changes: no figure a client already holds is re-sent, and
     /// no row, sort, filter or selection changes. A paused view (PX-015)
     /// shows a meter again with the frozen sample's figures, which are the

@@ -302,6 +302,11 @@ impl Harness {
         lock_actions(&self.gate).pending_panel()
     }
 
+    /// This run's panel `slot` (PX-031: the base is drawn per run).
+    fn slot(&self, slot: u32) -> PanelIds {
+        lock_actions(&self.gate).panel_ids(slot)
+    }
+
     /// The pending intent's own Confirm button (PX-030).
     fn confirm(&self) -> NodeId {
         self.panel().expect("an intent is pending").confirm
@@ -470,7 +475,7 @@ fn a_confirmed_dry_run_reaches_the_executor_with_exactly_the_prepared_instance()
     assert!(h.enabled(ACTION_PREPARE));
     assert!(!h.enabled(ACTION_CANCEL));
     assert!(
-        h.panel().is_none() && !h.exists(PanelIds::of(0).row),
+        h.panel().is_none() && !h.exists(h.slot(0).row),
         "no panel before Prepare"
     );
     h.select(4101);
@@ -513,7 +518,7 @@ fn a_confirmed_dry_run_reaches_the_executor_with_exactly_the_prepared_instance()
         .starts_with("Prepared #1: terminate PID 4101 · worker (dry run)"));
     // The panel: fresh nodes, a question naming the process, its Confirm.
     let panel = h.panel().unwrap();
-    assert_eq!(panel, PanelIds::of(0));
+    assert_eq!(panel, h.slot(0));
     assert!(h.enabled(panel.confirm) && h.enabled(ACTION_CANCEL));
     assert_eq!(
         h.property(panel.confirm, LABEL),
@@ -624,7 +629,7 @@ fn selecting_another_process_withdraws_the_intent_and_its_panel() {
     // B, explicitly: its own panel, its own confirm.
     h.select(4103);
     h.processed(ACTION_PREPARE);
-    assert_eq!(h.panel(), Some(PanelIds::of(2)), "never a reused panel");
+    assert_eq!(h.panel(), Some(h.slot(2)), "never a reused panel");
     h.confirmed();
     let reached = h.executor.reached();
     assert_eq!(reached.len(), 1, "only B, and only once");
@@ -665,13 +670,13 @@ fn disabled_controls_are_refused_by_event_validation() {
         assert!(!h.enabled(button), "{button:?}");
         assert!(rejected_as_disabled(&h.click(button)), "{button:?}");
     }
-    assert!(rejected_as_gone(&h.click(PanelIds::of(0).confirm)));
+    assert!(rejected_as_gone(&h.click(h.slot(0).confirm)));
     // Dry run: there is no Confirm until something is prepared, Cancel is
     // disabled, and once it is cancelled the panel is gone again.
     let mut source = Steps::new(vec![host(10)]);
     let mut h = harness(ActionMode::DryRun, &mut source);
     h.select(4101);
-    assert!(rejected_as_gone(&h.click(PanelIds::of(0).confirm)));
+    assert!(rejected_as_gone(&h.click(h.slot(0).confirm)));
     assert!(rejected_as_disabled(&h.click(ACTION_CANCEL)));
     h.processed(ACTION_PREPARE);
     let panel = h.panel().unwrap();
@@ -709,7 +714,7 @@ fn read_only_mode_is_enforced_by_the_server_even_with_the_buttons_enabled() {
     }
     // A panel's Confirm that something else created: its handler runs and
     // refuses, with nothing pending to confirm.
-    let forged = PanelIds::of(0);
+    let forged = h.slot(0);
     h.session
         .transaction(|ui| {
             srui_sdk::Button::builder(forged.confirm)

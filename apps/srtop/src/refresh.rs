@@ -372,9 +372,10 @@ pub const THREADS_RESERVE_BYTES: usize = 4096;
 pub const TAGS_RESERVE_BYTES: usize = 4096;
 /// The action controls' allowance in the catch-up snapshot (PX-028): the
 /// row, the three buttons with their fixed labels and descriptions, the
-/// Confirm label at [`crate::actions::MAX_CONFIRM_LABEL_BYTES`] and the
-/// actions status at [`crate::actions::MAX_ACTIONS_STATUS_BYTES`], each with
-/// the cut mark. Charged whether or not the instance was started with
+/// Confirm label at [`crate::actions::MAX_CONFIRM_LABEL_BYTES`], the
+/// actions status at [`crate::actions::MAX_ACTIONS_STATUS_BYTES`] and the
+/// observed outcome at [`crate::actions::MAX_OBSERVED_BYTES`] (PX-031), each
+/// with the cut mark. Charged whether or not the instance was started with
 /// `--actions`, so the controls never change which rows fit.
 pub const ACTIONS_RESERVE_BYTES: usize = 4096;
 
@@ -672,6 +673,17 @@ pub struct ProcessView {
     /// (PX-028): set by [`crate::install_actions`]. Lock order is always this
     /// view, then the gate.
     actions: Option<crate::actions::SharedActions>,
+    /// How many samples this view has applied since the first (PX-031), so
+    /// the gate can tell a scan sampled after a request from one that may
+    /// have been taken before it.
+    scans: u64,
+    /// How many deadline-timer observations the loop made (PX-031): a
+    /// counter only, never reset, for the bound a test checks.
+    observation_rechecks: std::sync::atomic::AtomicU64,
+    /// Wakes the refresh loop when the action gate starts watching a
+    /// request (PX-031, verification round 3 F1): its own notify, so it
+    /// never consumes or stands in for a sampling wake.
+    observation_wake: Arc<tokio::sync::Notify>,
 }
 
 /// The rows every active filter keeps, and what the filters' controls say
@@ -945,6 +957,9 @@ impl ProcessView {
                 confirmed_at: snapshot.sampled_at.0,
                 unconfirmed_since: HashMap::new(),
                 actions: None,
+                scans: 0,
+                observation_rechecks: std::sync::atomic::AtomicU64::new(0),
+                observation_wake: Arc::new(tokio::sync::Notify::new()),
             },
             snapshot,
         ))
@@ -1014,8 +1029,14 @@ impl ProcessView {
         let now = self.clock.now();
         let (inspected, followed) = self.watched_keys();
         let tags = &self.tags;
+        // A process a sent request is watched for keeps its record too, so
+        // its exit can be established (PX-031).
+        let observed = self.action_watch();
         let watched = |key: &ProcessKey| {
-            inspected.as_ref() == Some(key) || followed.as_ref() == Some(key) || tags.is_tagged(key)
+            inspected.as_ref() == Some(key)
+                || followed.as_ref() == Some(key)
+                || observed.as_ref() == Some(key)
+                || tags.is_tagged(key)
         };
         let mut left = Vec::new();
         for row in &self.unfiltered_rows {
@@ -1059,6 +1080,15 @@ impl ProcessView {
         recorded_tags
     }
 
+    /// The process instance the action gate watches after a sent request
+    /// (PX-031). Takes the gate's lock, after this view's, which every caller
+    /// holds: never call it while the gate is held.
+    fn action_watch(&self) -> Option<ProcessKey> {
+        self.actions
+            .as_ref()
+            .and_then(|gate| crate::actions::lock_actions(gate).observing().cloned())
+    }
+
     /// The inspector's target and the followed process (PX-021).
     fn watched_keys(&self) -> (Option<ProcessKey>, Option<ProcessKey>) {
         (
@@ -1083,9 +1113,13 @@ impl ProcessView {
     fn expire_tombstones(&mut self) {
         let now = self.clock.now();
         let (inspected, followed) = self.watched_keys();
+        let observed = self.action_watch();
         let tags = &self.tags;
         self.last_seen.expire(now, |key| {
-            inspected.as_ref() == Some(key) || followed.as_ref() == Some(key) || tags.is_tagged(key)
+            inspected.as_ref() == Some(key)
+                || followed.as_ref() == Some(key)
+                || observed.as_ref() == Some(key)
+                || tags.is_tagged(key)
         });
     }
 
@@ -1176,6 +1210,40 @@ impl ProcessView {
         view.sync_actions(session);
     }
 
+    /// Has the action gate observe a watched request now (PX-031): what the
+    /// refresh loop's deadline timer calls, so a deadline settles on time
+    /// even while the view is paused and no sample is taken. Takes the
+    /// gate's lock after this view's.
+    pub fn observe_actions(&self, session: &Session) {
+        self.observation_rechecks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.sync_actions(session);
+    }
+
+    /// How many times the refresh loop's deadline timer has had the gate
+    /// observe (PX-031): bounded by one per [`OBSERVATION_RECHECK`] while a
+    /// request is watched, which a test checks so the timer cannot spin.
+    pub fn observation_rechecks(&self) -> u64 {
+        self.observation_rechecks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How long until the deadline of the request the action gate watches,
+    /// if it watches one (PX-031). Takes the gate's lock after this view's.
+    pub fn action_observation_due(&self) -> Option<Duration> {
+        self.actions
+            .as_ref()
+            .and_then(|gate| crate::actions::lock_actions(gate).observation_due())
+    }
+
+    /// Tells the refresh loop the action gate started watching a request
+    /// (PX-031), so it arms that request's deadline timer, between samples
+    /// or while a scan is in flight (verification round 3, F1). Asks for no
+    /// sample and leaves the sampling wake's permit alone.
+    pub fn wake_observation(&self) {
+        self.observation_wake.notify_one();
+    }
+
     /// Tells the action gate whether this view's rows are the latest scan
     /// (PX-028): paused, resuming before its first sample, or current; and
     /// has it withdraw a pending intent this view no longer supports
@@ -1192,6 +1260,8 @@ impl ProcessView {
         let mut gate = crate::actions::lock_actions(gate);
         gate.hold_for(self);
         gate.revalidate(self);
+        // What this sample, or the deadline, says of a sent request (PX-031).
+        gate.observe(self);
         if let Err(error) = gate.publish_if_changed(session) {
             eprintln!("srtop: action controls not published: {error}");
         }
@@ -1211,6 +1281,7 @@ impl ProcessView {
             self.sampling.discard();
             return Ok(Refreshed::default());
         }
+        self.scans = self.scans.saturating_add(1);
         // This sample ends a resume: the sampling status says live again.
         self.sampling.published_sample();
         // Tombstones age on every accepted sample, a failed one too (PX-021).
@@ -4097,6 +4168,26 @@ impl crate::actions::ActionTargets for ProcessView {
         self.inspector.selected_row().map(|row| row.key.clone())
     }
 
+    fn scans(&self) -> u64 {
+        self.scans
+    }
+
+    /// Another instance confirmed under its PID (a PID is reused only once
+    /// its holder is reaped), or a last-observed record whose verdict is an
+    /// exit (PX-021). Never a row that is only unconfirmed, evicted or gone
+    /// without a record.
+    fn exited(&self, key: &ProcessKey) -> bool {
+        use crate::actions::TargetState;
+        match self.state_of(key) {
+            TargetState::Replaced => true,
+            TargetState::Historical => self
+                .last_seen
+                .get(key)
+                .is_some_and(|tombstone| tombstone.departure().exited()),
+            _ => false,
+        }
+    }
+
     fn state_of(&self, key: &ProcessKey) -> crate::actions::TargetState {
         use crate::actions::TargetState;
         use crate::source::Observed;
@@ -6441,6 +6532,21 @@ pub fn lock_view(view: &Mutex<ProcessView>) -> std::sync::MutexGuard<'_, Process
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// The longest the refresh loop waits before re-checking a watched action
+/// request's deadline (PX-031): its timer runs on a clock that stops while
+/// the host sleeps, the deadline on one that does not.
+pub const OBSERVATION_RECHECK: Duration = Duration::from_secs(1);
+
+/// Completes when the refresh loop should observe a watched action request
+/// (PX-031): at its deadline, and at least every [`OBSERVATION_RECHECK`]
+/// before it; never while nothing is watched.
+async fn observation_timer(due: Option<Duration>) {
+    match due {
+        Some(due) => tokio::time::sleep(due.min(OBSERVATION_RECHECK)).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// The loop's one ticker: its first tick one `interval` from now, never at
 /// once, so a new interval neither fires a burst nor keeps the old phase.
 fn ticker_every(interval: Duration) -> tokio::time::Interval {
@@ -6461,9 +6567,14 @@ fn ticker_every(interval: Duration) -> tokio::time::Interval {
 /// result, which is published in the newer order.
 ///
 /// Since PX-015 the loop follows the view's sampling controls
-/// ([`crate::sampling`]). It owns the only timer: one ticker, replaced — never
-/// joined by a second — when the interval changes or the view resumes, and
-/// not polled at all while the view is paused, when no sample is taken. A
+/// ([`crate::sampling`]). It owns the only sampling timer: one ticker,
+/// replaced — never joined by a second — when the interval changes or the
+/// view resumes, and not polled at all while the view is paused, when no
+/// sample is taken. Besides it, only the deadline of a watched action
+/// request (PX-031) wakes the loop, to settle that request's observed
+/// outcome on time, paused or not; it takes no sample. The start of a watch
+/// wakes it through a notify of its own to arm that timer, also while a scan
+/// is in flight; nothing arms it while nothing is watched. A
 /// Refresh now press, a Resume view or a change of "Show user threads"
 /// (PX-019) wakes it through the view's one
 /// [`tokio::sync::Notify`] for one sample through this same path. A sample is
@@ -6479,12 +6590,15 @@ pub async fn poll<S>(
 ) where
     S: ProcessSource + Send + 'static,
 {
-    let wake = {
+    let (wake, watch_started) = {
         let mut held = lock_view(&view);
         if let Err(error) = held.adopt_interval(&session, interval) {
             eprintln!("srtop: interval not published: {error}");
         }
-        held.sampling.wake_handle()
+        (
+            held.sampling.wake_handle(),
+            Arc::clone(&held.observation_wake),
+        )
     };
     let mut interval = lock_view(&view).sampling.interval();
     let mut ticker = ticker_every(interval);
@@ -6495,11 +6609,24 @@ pub async fn poll<S>(
         // wins; which of the wake and the tick is taken when both are ready
         // decides nothing, because the request read below does: a tick of a
         // ticker the request retires is ignored either way (PR #95 review, F2).
+        // A watched action request's deadline (PX-031) is the one other
+        // timer: it samples nothing, and also fires while paused. The
+        // deadline is on the gate's suspend-aware clock and this timer's is
+        // not, so it re-checks at least every OBSERVATION_RECHECK: after the
+        // host sleeps past a deadline, it settles within that much of waking
+        // (verification round 1, W3).
+        let deadline = observation_timer(lock_view(&view).action_observation_due());
         let mut ticked = tokio::select! {
             biased;
             _ = shutdown.cancelled() => return,
             _ = wake.notified() => false,
             _ = ticker.tick(), if !paused => true,
+            () = deadline => {
+                lock_view(&view).observe_actions(&session);
+                continue;
+            }
+            // A watch started: re-read its deadline.
+            () = watch_started.notified() => continue,
         };
         // The request's epoch and the thread setting are read together, so a
         // sample is always taken under the setting of the epoch it is
@@ -6526,12 +6653,28 @@ pub async fn poll<S>(
         }
         // User threads are read only while they are shown (PX-019).
         // Reading a host's process filesystem blocks; keep it off the runtime.
-        let sampled = tokio::task::spawn_blocking(move || {
+        let mut scan = tokio::task::spawn_blocking(move || {
             source.collect_threads(threads);
             let snapshot = source.snapshot();
             (source, snapshot)
-        })
-        .await;
+        });
+        // A watched request's deadline stays armed while the scan runs
+        // (PX-031, Codex review round 1): a slow or stalled scan, or a pause
+        // while it runs, cannot hold a watch past its deadline. The scan's
+        // own result is applied afterwards like any other; a watch already
+        // settled ignores it. The view is locked only to read the due time
+        // and to observe, never while the scan runs. A watch started during
+        // the scan re-arms the timer (verification round 3, F1), so the due
+        // time is re-read whenever one starts, not only once per scan.
+        let sampled = loop {
+            let deadline = observation_timer(lock_view(&view).action_observation_due());
+            tokio::select! {
+                biased;
+                sampled = &mut scan => break sampled,
+                () = deadline => lock_view(&view).observe_actions(&session),
+                () = watch_started.notified() => {}
+            }
+        };
         let (returned, snapshot) = match sampled {
             Ok(sampled) => sampled,
             Err(error) => {

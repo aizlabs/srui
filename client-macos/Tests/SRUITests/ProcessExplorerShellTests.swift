@@ -2233,7 +2233,7 @@ struct ProcessExplorerShellTests {
             func inspector() -> String { text(Self.inspectorLineIDs[0]) }
             func prepare() throws -> NSButton { try #require(button(Self.actionPrepareID)) }
             func cancelEnabled() -> Bool { button(Self.actionCancelID)?.isEnabled == true }
-            func panelConfirm(_ slot: UInt64) -> NSButton? { button(Self.panelConfirmID(slot)) }
+            func panelConfirm(_ slot: UInt64) -> NSButton? { Self.panelConfirm(renderer.registry, slot) }
             func select(_ row: Int, _ pid: Int) async throws {
                 try table().selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
                 try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the inspector on \(pid)") {
@@ -2277,7 +2277,7 @@ struct ProcessExplorerShellTests {
                     && panelConfirm(0)?.isEnabled == true
                     && panelConfirm(0)?.title == "Confirm dry run: terminate PID 4101 · worker"
             }
-            #expect(text(Self.panelQuestionID(0)) == "Dry run: terminate PID 4101 · worker (UID 1000)? Confirm records the request; nothing is sent to the process.")
+            #expect(Self.panelQuestion(renderer.registry, 0) == "Dry run: terminate PID 4101 · worker (UID 1000)? Confirm records the request; nothing is sent to the process.")
             #expect(inspector() == "Selected process: PID 4101 · worker", "the remount keeps the selection")
             // Another row is selected: the request for 4101 is withdrawn and its panel goes.
             try table().selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
@@ -2314,10 +2314,29 @@ struct ProcessExplorerShellTests {
     fileprivate static let actionPrepareID: UInt64 = 84
     fileprivate static let actionCancelID: UInt64 = 86
     fileprivate static let actionsStatusID: UInt64 = 87
-    // PX-030: confirmation panel `slot`'s nodes, fresh for every intent: 1_000_000 + 3·slot is its
-    // row, + 1 its question and + 2 its Confirm (`actions::PanelIds`).
-    fileprivate static func panelQuestionID(_ slot: UInt64) -> UInt64 { 1_000_000 + 3 * slot + 1 }
-    fileprivate static func panelConfirmID(_ slot: UInt64) -> UInt64 { 1_000_000 + 3 * slot + 2 }
+    // PX-031: what was observed of the process after a sent request, apart from the request.
+    fileprivate static let actionsObservedID: UInt64 = 88
+    // PX-030: confirmation panel `slot`'s nodes, fresh for every intent: base + 3·slot is its row,
+    // + 1 its question and + 2 its Confirm (`actions::PanelIds`). PX-031: every run of srtop draws
+    // its own base, 2^32 + k·12288, so the native handle is found by its offset within the run's
+    // range rather than by a fixed ID.
+    fileprivate static let panelRangeStart: UInt64 = 1 << 32
+    fileprivate static let panelRunSpan: UInt64 = 3 * 4096
+    @MainActor
+    fileprivate static func panelHandle(_ registry: RenderRegistry, slot: UInt64, offset: UInt64) -> RenderHandle? {
+        registry.allHandles.first { handle in
+            let id = handle.nodeID.value
+            return id >= panelRangeStart && (id - panelRangeStart) % panelRunSpan == 3 * slot + offset
+        }
+    }
+    @MainActor
+    fileprivate static func panelConfirm(_ registry: RenderRegistry, _ slot: UInt64) -> NSButton? {
+        panelHandle(registry, slot: slot, offset: 2)?.view as? NSButton
+    }
+    @MainActor
+    fileprivate static func panelQuestion(_ registry: RenderRegistry, _ slot: UInt64) -> String {
+        (panelHandle(registry, slot: slot, offset: 1)?.view as? NSTextField)?.stringValue ?? ""
+    }
 
     // PX-020: the tag controls.
     fileprivate static let tagToggleID: UInt64 = 79
@@ -5447,6 +5466,12 @@ fileprivate func px030TerminateBoxConfigured() -> Bool {
 /// and it is gone from the box's own process list. The support chain is refused by the server:
 /// srtop's own row and the row of the bridge serving this client.
 ///
+/// PX-031 extends it with the observed outcome, published apart from the request: the cooperative
+/// worker's request is "Requested #1" while the observed line says "Exited after the request #1" once
+/// a scan establishes it; a second worker (`px031-stubborn`, a `bash` that records SIGTERM in a file
+/// and keeps running) is "Requested #2" and, at srtop's 10 s deadline, "Still running #2", having
+/// received exactly one SIGTERM, and is still in the box's process list.
+///
 /// Opt-in twice over, because it needs a box that offers termination: the R0 coordinates
 /// (`SRTOP_R0_*`, as `apps/srtop/devbox/r0-scenario.sh` exports them) and
 /// `SRTOP_PX030_TERMINATE_BOX=1`, set only for a box started with
@@ -5462,6 +5487,13 @@ struct ProcessExplorerTerminateDevboxTests {
     static let workerName = "px030-worker"
     /// Exits with status 0 on SIGTERM; otherwise runs until the test ends it.
     static let workerScript = "trap 'exit 0' TERM; while :; do sleep 0.1; done"
+    // PX-031: a worker that records each SIGTERM and keeps running; it ends by itself after
+    // about 120 s, a backstop should the test die before ending it.
+    static let stubbornPath = "/home/srui/px031-stubborn"
+    static let stubbornName = "px031-stubborn"
+    static let stubbornTerms = "/home/srui/px031-stubborn.terms"
+    static let stubbornScript =
+        "trap 'echo term >> /home/srui/px031-stubborn.terms' TERM; i=0; while [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done"
 
     /// The PIDs of processes named exactly `comm` in the box.
     private static func boxPIDs(_ box: DevboxScenario, comm: String) async throws -> [String] {
@@ -5527,7 +5559,7 @@ struct ProcessExplorerTerminateDevboxTests {
         }
         func prepare() throws -> NSButton { try #require(button(ProcessExplorerShellTests.actionPrepareID)) }
         func status() -> String { text(ProcessExplorerShellTests.actionsStatusID) }
-        func panelConfirm(_ slot: UInt64) -> NSButton? { button(ProcessExplorerShellTests.panelConfirmID(slot)) }
+        func panelConfirm(_ slot: UInt64) -> NSButton? { ProcessExplorerShellTests.panelConfirm(renderer.registry, slot) }
         #expect(try prepare().title == "Terminate…")
         #expect(try prepare().isEnabled, "the box has PID file descriptors: \(status())")
         #expect(status().hasPrefix("Terminate… checks the selected process"), "\(status())")
@@ -5569,7 +5601,7 @@ struct ProcessExplorerTerminateDevboxTests {
             panelConfirm(0)?.isEnabled == true
                 && panelConfirm(0)?.title == "Confirm: terminate PID \(workerPID) · \(Self.workerName)"
         }
-        let question = text(ProcessExplorerShellTests.panelQuestionID(0))
+        let question = ProcessExplorerShellTests.panelQuestion(renderer.registry, 0)
         #expect(question.hasPrefix("Terminate PID \(workerPID) · \(Self.workerName) (UID "), "\(question)")
         #expect(question.hasSuffix("? Confirm sends it SIGTERM, which asks it to exit; it may handle or ignore it."), "\(question)")
         #expect(try await Self.boxPIDs(box, comm: Self.workerName) == [workerPID], "nothing was sent at Prepare")
@@ -5589,9 +5621,79 @@ struct ProcessExplorerTerminateDevboxTests {
         }
         #expect(try await Self.boxPIDs(box, comm: "srtop").count == 1, "srtop still runs")
         #expect(try await Self.boxPIDs(box, comm: "srui-ssh-bridge").count == 1, "the bridge still runs")
+
+        // PX-031: the observed outcome, apart from the request.
+        func observed() -> String { text(ProcessExplorerShellTests.actionsObservedID) }
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the exit observed") {
+            observed().hasPrefix("Exited after the request #1 (terminate PID \(workerPID) · \(Self.workerName)): within ")
+        }
+        let exitedLine = observed()
+        #expect(exitedLine.hasSuffix("whether SIGTERM or something else ended it is not known"), "\(exitedLine)")
+        #expect(status() == requested, "the request line is unchanged: \(status())")
+
+        // A worker that ignores SIGTERM (it records it and keeps running).
+        let stubLink = try await runToCompletion(
+            box.docker, ["exec", "-u", "srui", box.container, "ln", "-sf", "/bin/bash", Self.stubbornPath])
+        try #require(stubLink.status == 0, "could not prepare the stubborn worker: \(stubLink.output)")
+        _ = try await runToCompletion(box.docker, ["exec", "-u", "srui", box.container, "rm", "-f", Self.stubbornTerms])
+        try #require(try await Self.boxPIDs(box, comm: Self.stubbornName).isEmpty, "no stubborn worker of an earlier run")
+        let stubSpawn = try await runToCompletion(
+            box.docker, ["exec", "-d", "-u", "srui", box.container, Self.stubbornPath, "-c", Self.stubbornScript])
+        try #require(stubSpawn.status == 0, "could not start the stubborn worker: \(stubSpawn.output)")
+        var stubborn: [String] = []
+        try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(10), description: "the stubborn worker in the box") {
+            stubborn = (try? await Self.boxPIDs(box, comm: Self.stubbornName)) ?? []
+            return stubborn.count == 1
+        }
+        let stubbornPID = stubborn[0]
+        defer {
+            // Only the test's own stubborn worker, and only after its name is confirmed.
+            let docker = box.docker, container = box.container
+            Task {
+                let named = try? await runToCompletion(docker, ["exec", container, "ps", "-p", stubbornPID, "-o", "comm="])
+                if named?.status == 0 && named?.output == Self.stubbornName {
+                    _ = try? await runToCompletion(docker, ["exec", container, "kill", "-KILL", stubbornPID])
+                }
+            }
+        }
+        // Let its trap be installed before anything can be sent.
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(try await select(Self.stubbornName) == stubbornPID)
+        NativeActivation.click(try prepare())
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the confirmation naming the stubborn worker") {
+            panelConfirm(1)?.isEnabled == true
+                && panelConfirm(1)?.title == "Confirm: terminate PID \(stubbornPID) · \(Self.stubbornName)"
+        }
+        NativeActivation.click(try #require(panelConfirm(1)))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the second request reported and watched") {
+            status().hasPrefix("Requested #2 (terminate PID \(stubbornPID) · \(Self.stubbornName)): SIGTERM was sent")
+                && observed().hasPrefix("Watching #2 (terminate PID \(stubbornPID) · \(Self.stubbornName))")
+        }
+        let watching = observed()
+        try await AsyncTestSupport.eventually(timeout: .seconds(25), description: "still running at the deadline") {
+            observed().hasPrefix("Still running #2 (terminate PID \(stubbornPID) · \(Self.stubbornName)): 10 s after SIGTERM was sent")
+        }
+        let stillRunning = observed()
+        #expect(status().hasPrefix("Requested #2"), "\(status())")
+        #expect(try await Self.boxPIDs(box, comm: Self.stubbornName) == [stubbornPID], "it is still running")
+        let terms = try await runToCompletion(box.docker, ["exec", box.container, "cat", Self.stubbornTerms])
+        #expect(terms.status == 0 && terms.output.split(whereSeparator: \.isNewline).count == 1,
+                "exactly one SIGTERM, nothing escalated: \(terms.output)")
+        #expect(rows().contains { $0.count > 1 && $0[0] == stubbornPID }, "its row stays")
+        // The test ends its own stubborn worker, after its name is confirmed, and waits for it to
+        // go, so no worker outlives the run (the deferred kill covers a failure before here).
+        let named = try await runToCompletion(box.docker, ["exec", box.container, "ps", "-p", stubbornPID, "-o", "comm="])
+        if named.status == 0 && named.output == Self.stubbornName {
+            _ = try await runToCompletion(box.docker, ["exec", box.container, "kill", "-KILL", stubbornPID])
+        }
+        try await AsyncTestSupport.eventuallyAsync(timeout: .seconds(15), description: "the stubborn worker ended") {
+            ((try? await Self.boxPIDs(box, comm: Self.stubbornName)) ?? [stubbornPID]).isEmpty
+        }
         print("PX-030 devbox evidence: window \(window.windowNumber); worker \(Self.workerName) PID \(workerPID); "
             + "confirmation \"\(question)\"; \(requested); worker gone from the box's ps; support chain: \(refusals); "
             + "revision \(applier.lastAppliedRevision.value)")
+        print("PX-031 devbox evidence: cooperative: \"\(exitedLine)\"; stubborn PID \(stubbornPID): \"\(status())\"; "
+            + "\"\(watching)\" then \"\(stillRunning)\"; SIGTERMs recorded: 1; still in the box's ps")
         await controller.stop()
     }
 }

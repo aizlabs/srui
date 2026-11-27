@@ -26,7 +26,7 @@
     {"feature_id":"HTOP-R0-005","feature":"Server-side user/PID filtering","scope":"R0/core/Linux","source_refs":["H2","H3"],"owner":"PX-010/PX-012","status":"planned","evidence":[]},
     {"feature_id":"HTOP-R0-006","feature":"Typed column sorting and reversal","scope":"R0/core","source_refs":["H2","H5"],"owner":"PX-009/PX-068","status":"planned","evidence":[]},
     {"feature_id":"HTOP-R0-007","feature":"Tree navigation and collapse/expand workflow","scope":"R0/core/Linux","source_refs":["H2","H5"],"owner":"PX-018","status":"planned","evidence":[]},
-    {"feature_id":"HTOP-R1-001","feature":"Safe process selection and termination workflow","scope":"R1/permission/Linux","source_refs":["H2","H5","H7"],"owner":"PX-028/PX-031","status":"planned","evidence":[]},
+    {"feature_id":"HTOP-R1-001","feature":"Safe process selection and termination workflow","scope":"R1/permission/Linux","source_refs":["H2","H5","H7"],"owner":"PX-028/PX-031","status":"in_progress","evidence":["docs/process-explorer/completions/PX-028.md","docs/process-explorer/completions/PX-029.md","docs/process-explorer/completions/PX-030.md","docs/process-explorer/completions/PX-031.md"]},
     {"feature_id":"HTOP-R1-002","feature":"Meters, layout, and display preferences","scope":"R1/native adaptation","source_refs":["H4","H6"],"owner":"PX-070/PX-074","status":"planned","evidence":[]},
     {"feature_id":"HTOP-R1-003","feature":"Startup flags, configuration, and platform scope","scope":"R1/native adaptation","source_refs":["H1","H2","H6","H8"],"owner":"PX-075/PX-088","status":"planned","evidence":[]}
   ]

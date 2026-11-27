@@ -222,7 +222,13 @@ pub const TAGS_NODE_COUNT: usize = 5;
 pub const ACTIONS_ROW: NodeId = NodeId::new(83);
 pub const ACTION_PREPARE: NodeId = NodeId::new(84);
 pub const ACTION_CANCEL: NodeId = NodeId::new(86);
+/// What the server did with the latest request: refused, requested (the OS
+/// accepted the signal), failed, and so on.
 pub const ACTIONS_STATUS: NodeId = NodeId::new(87);
+/// What was observed of the process after a sent request (PX-031), kept
+/// apart from [`ACTIONS_STATUS`]: a signal requested is not a process
+/// exited.
+pub const ACTIONS_OBSERVED: NodeId = NodeId::new(88);
 pub const VIEW_LABEL: &str = "Show process tree";
 pub const VIEW_DESCRIPTION: &str =
     "When on, the same processes are shown as a tree under their parents instead of the table. The server resolves each parent from the latest scan and never guesses one: a process whose parent is not in the scan, unreadable, a newer process reusing its PID, hidden by the filters, or caught in a cycle is shown at the top, and its Parent column says why. Expanding and collapsing are local; sorting orders each parent's children. The selection and follow carry over.";
@@ -686,17 +692,19 @@ pub fn install_actions(
     // The view tells the gate when its rows stop or start being the latest
     // scan (paused, resuming, current), so the controls follow it.
     refresh::ProcessView::attach_actions(view, session, gate);
-    let slots = {
+    // This run's panel range (PX-031): every slot's Confirm is registered at
+    // its node in that range, which no other run of srtop uses.
+    let (slots, base) = {
         let mut gate = actions::lock_actions(gate);
         gate.create_controls(session, COLUMN)?;
-        gate.panel_slots()
+        (gate.panel_slots(), gate.panel_base())
     };
     let (prepare_gate, prepare_view) = (std::sync::Arc::clone(gate), std::sync::Arc::clone(view));
     session.on(ACTION_PREPARE, ACTIVATE, move |session, event| {
         actions::prepare_requested(&prepare_gate, &prepare_view, session, event);
     });
     for slot in 0..slots {
-        let panel_confirm = actions::PanelIds::of(slot).confirm;
+        let panel_confirm = actions::PanelIds::at(base, slot).confirm;
         let (confirm_gate, confirm_view) =
             (std::sync::Arc::clone(gate), std::sync::Arc::clone(view));
         session.on(panel_confirm, ACTIVATE, move |session, event| {

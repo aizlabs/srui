@@ -75,7 +75,13 @@
 //!   `to_owned`. Every other rule holds there as everywhere; no file but it
 //!   may write, and only `src/main.rs` constructs a `SettingsStore`, once,
 //!   from its command line or the per-user default path
-//!   ([`settings_store_constructions`]), so no client input names its path.
+//!   ([`settings_store_constructions`]). Another file may not hold an `impl`
+//!   block for it or a struct literal of it, and the settings module holds
+//!   exactly one literal, in `fn new`, no `Self::new` and no trait `impl`
+//!   for it ([`settings_store_impl_violations`]). These are token rules: a
+//!   construction they do not recognise passes them. By design the module's
+//!   own `fs::rename` and `fs::remove_file` may name any path; that file is
+//!   the one place such a call can be, and it is reviewed with this test.
 //!   The only signal API is receiving SIGINT, SIGTERM and the
 //!   `--smoke-fixture` SIGUSR1.
 //! * **The one raw system-call allowance (PX-029).** `src/handle.rs`, and no
@@ -701,7 +707,120 @@ fn settings_store_violations(file: &str, source: &str) -> Vec<String> {
             "{file}: [settings-store] {constructions} `SettingsStore::new`, {allowed} allowed"
         ));
     }
+    found.extend(
+        settings_store_impl_violations(file == SETTINGS_MODULE, source)
+            .into_iter()
+            .map(|violation| format!("{file}: [settings-store] {violation}")),
+    );
     found
+}
+
+/// The other ways to make a `SettingsStore` (PX-069 verification round 2,
+/// V2-3): an `impl` block for it in another file, whose `Self::new` the
+/// constructor count cannot see (B1); a struct literal anywhere but the body
+/// of `fn new` in the settings module, which could name any path (B2); a
+/// trait implementation such as `Default`, even there (B3); and `Self::new`
+/// in the settings module. The settings module holds exactly one literal,
+/// in `fn new`, and only the one inherent `impl SettingsStore` block.
+fn settings_store_impl_violations(settings_module: bool, source: &str) -> Vec<String> {
+    struct Walk {
+        settings_module: bool,
+        literals: usize,
+        in_new: usize,
+        found: Vec<String>,
+    }
+    fn walk(level: &[Tok], inside_new: bool, state: &mut Walk) {
+        let mut next_body_is_new = false;
+        // Between `fn` and its body: a return type followed by the body
+        // (`-> Self { .. }`, `-> &SettingsStore { .. }`) is no literal.
+        let mut in_signature = false;
+        // Likewise between `impl` and its block (`impl a::SettingsStore {`).
+        let mut in_impl_header = false;
+        for (i, tok) in level.iter().enumerate() {
+            let prev = i.checked_sub(1).and_then(|p| level.get(p));
+            match tok {
+                Tok::Ident(name, raw, line) if name == "impl" && !*raw => {
+                    in_impl_header = true;
+                    // The header runs to the block it opens.
+                    let end = level[i..]
+                        .iter()
+                        .position(|tok| matches!(tok, Tok::Group(Delimiter::Brace, ..)))
+                        .map_or(level.len(), |offset| i + offset);
+                    let header = &level[i + 1..end];
+                    if contains_ident(header, &["SettingsStore"]) {
+                        let inherent =
+                            matches!(header, [Tok::Ident(only, _, _)] if only == "SettingsStore");
+                        if !state.settings_module {
+                            state.found.push(format!(
+                                "line {line}: an `impl` block for `SettingsStore` outside the settings module"
+                            ));
+                        } else if !inherent {
+                            state.found.push(format!(
+                                "line {line}: a trait implemented for `SettingsStore`"
+                            ));
+                        }
+                    }
+                }
+                Tok::Ident(name, _, _) if name == "fn" => {
+                    next_body_is_new = ident(level.get(i + 1)) == Some("new");
+                    in_signature = true;
+                }
+                Tok::Ident(name, _, line)
+                    if (name == "SettingsStore" || name == "Self")
+                        && matches!(level.get(i + 1), Some(Tok::Group(Delimiter::Brace, ..)))
+                        && !in_signature
+                        && !in_impl_header
+                        && !matches!(ident(prev), Some("struct" | "impl" | "for")) =>
+                {
+                    if name == "SettingsStore" || state.settings_module {
+                        state.literals += 1;
+                        state.in_new += usize::from(inside_new);
+                    }
+                    if !state.settings_module && name == "SettingsStore" {
+                        state.found.push(format!(
+                            "line {line}: a `SettingsStore` literal outside the settings module"
+                        ));
+                    }
+                }
+                Tok::Ident(name, _, line)
+                    if state.settings_module
+                        && name == "Self"
+                        && is_path_sep(level.get(i + 1))
+                        && ident(level.get(i + 2)) == Some("new") =>
+                {
+                    state
+                        .found
+                        .push(format!("line {line}: `Self::new` in the settings module"));
+                }
+                Tok::Group(Delimiter::Brace, inner, _) => {
+                    in_signature = false;
+                    in_impl_header = false;
+                    let body_is_new = std::mem::take(&mut next_body_is_new);
+                    walk(inner, inside_new || body_is_new, state);
+                }
+                Tok::Group(_, inner, _) => walk(inner, inside_new, state),
+                _ => {}
+            }
+        }
+    }
+    let Ok(stream) = TokenStream::from_str(source) else {
+        return vec!["does not tokenize".into()];
+    };
+    let tokens = production(&lower(stream));
+    let mut state = Walk {
+        settings_module,
+        literals: 0,
+        in_new: 0,
+        found: Vec::new(),
+    };
+    walk(&tokens, false, &mut state);
+    if settings_module && (state.literals != 1 || state.in_new != 1) {
+        state.found.push(format!(
+            "{} store literals, {} of them in `fn new`: exactly one, there, is allowed",
+            state.literals, state.in_new
+        ));
+    }
+    state.found
 }
 
 /// How many times a production file constructs a `SettingsStore`
@@ -3207,6 +3326,81 @@ fn the_settings_allowance_is_exactly_the_settings_modules_atomic_writes() {
         !settings_store_violations(SETTINGS_STORE_CONSTRUCTOR, &format!("{one}\n{one}")).is_empty()
     );
     assert!(!settings_store_violations(SETTINGS_STORE_CONSTRUCTOR, "fn f() {}").is_empty());
+    // Verification round 2, V2-3: the other ways to make a store.
+    let module = "pub struct SettingsStore { path: PathBuf, interrupt: Option<SaveStep> }\n\
+                  impl SettingsStore {\n\
+                      pub fn new(path: impl Into<PathBuf>) -> Self { Self { path: path.into(), interrupt: None } }\n\
+                      pub fn interrupted_at(mut self, step: SaveStep) -> Self { self.interrupt = Some(step); self }\n\
+                  }";
+    assert_eq!(
+        settings_store_violations(SETTINGS_MODULE, module),
+        Vec::<String>::new()
+    );
+    for (name, file, snippet) in [
+        (
+            "B1 an impl block in another file",
+            "src/zz_verify2_b1_impl_block.rs",
+            "impl crate::settings_file::SettingsStore { pub fn verify2_at(path: PathBuf) -> Self { Self::new(path) } }".to_string(),
+        ),
+        (
+            "B1 an impl block alone in another file",
+            "src/zz.rs",
+            "impl SettingsStore { pub fn at(path: PathBuf) -> Self { todo!() } }".to_string(),
+        ),
+        (
+            "B3 a trait impl alone in the settings module",
+            SETTINGS_MODULE,
+            format!("{module}\nimpl Default for SettingsStore {{ fn default() -> Self {{ todo!() }} }}"),
+        ),
+        (
+            "B1 a trait impl in another file",
+            "src/zz.rs",
+            "impl From<PathBuf> for SettingsStore { fn from(p: PathBuf) -> Self { todo!() } }".to_string(),
+        ),
+        (
+            "B2 a second literal in the settings module",
+            SETTINGS_MODULE,
+            format!("{module}\npub fn verify2_put(target: &Path, bytes: &[u8]) -> Result<(), SaveError> {{ let store = SettingsStore {{ path: target.to_path_buf(), interrupt: None }}; store.replace(target, bytes, None) }}"),
+        ),
+        (
+            "B2 a literal outside fn new",
+            SETTINGS_MODULE,
+            module.replace(
+                "pub fn new(path: impl Into<PathBuf>) -> Self { Self { path: path.into(), interrupt: None } }",
+                "pub fn at(path: impl Into<PathBuf>) -> Self { Self { path: path.into(), interrupt: None } }",
+            ),
+        ),
+        (
+            "B3 impl Default",
+            SETTINGS_MODULE,
+            format!("{module}\nimpl Default for SettingsStore {{ fn default() -> Self {{ Self::new(\"/tmp/anything\") }} }}"),
+        ),
+        (
+            "B3 Self::new in the settings module",
+            SETTINGS_MODULE,
+            format!("{module}\nimpl SettingsStore {{ pub fn tmp() -> Self {{ Self::new(\"/tmp/x\") }} }}"),
+        ),
+        (
+            "a literal in another file",
+            "src/zz.rs",
+            "let s = SettingsStore { path, interrupt: None };".to_string(),
+        ),
+        (
+            "B5 the constructor taken as a value",
+            "src/zz.rs",
+            "pub fn f(p: Option<PathBuf>) { let _ = p.map(SettingsStore::new); }".to_string(),
+        ),
+        (
+            "B6 a re-export under the same name",
+            "src/zz.rs",
+            "pub use crate::settings_file::SettingsStore as SettingsStore;".to_string(),
+        ),
+    ] {
+        assert!(
+            !settings_store_violations(file, &snippet).is_empty(),
+            "{name} passed the store pin"
+        );
+    }
     for bypass in [
         "session.on(SAVED_VIEW_SLOT_1, VALUE_CHANGED, slot(0));",
         "session.on(SAVED_VIEW_NAME_INPUT, ACTIVATE, |_, _| {});",

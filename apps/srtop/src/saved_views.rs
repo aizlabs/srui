@@ -44,7 +44,7 @@ use srui_sessiond::{Session, SessionError};
 use std::sync::{Arc, Mutex};
 
 /// The longest views status published, in encoded bytes.
-pub const MAX_VIEWS_STATUS_BYTES: usize = 512;
+pub const MAX_VIEWS_STATUS_BYTES: usize = 1024;
 /// The most bytes of the name field the server keeps.
 pub const MAX_NAME_INPUT_BYTES: usize = 4 * MAX_VIEW_NAME_BYTES;
 
@@ -179,7 +179,10 @@ pub fn lock_saved_views(views: &Mutex<SavedViews>) -> std::sync::MutexGuard<'_, 
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn describe_load(loaded: &Loaded) -> Option<String> {
+fn describe_load(loaded: &Loaded, store: &SettingsStore) -> Option<String> {
+    let path = store.path().display();
+    let backup = store.backup_path();
+    let backup = backup.display();
     let dropped = if loaded.notes.is_empty() {
         String::new()
     } else {
@@ -196,20 +199,33 @@ fn describe_load(loaded: &Loaded) -> Option<String> {
         )
     };
     let note = match (&loaded.origin, &loaded.read_only) {
+        // The backup is protected: the settings file's own views are shown.
+        (_, Some(reason)) if reason.is_backup() => format!(
+            "Not saving: the backup {backup} {}; it is left unchanged. The views of {path} are shown and can be switched; move {backup} away to save changes",
+            reason.predicate()
+        ),
+        (Origin::Backup { .. }, Some(reason)) => format!(
+            "Not saving: the settings file {path} {}; it is left unchanged and its backup {backup} is shown. To use the backup, move it over {path}; to start afresh, move {path} away",
+            reason.predicate()
+        ),
         (_, Some(reason)) => format!(
-            "Not saving: {reason}; it is left unchanged and the default view is shown"
+            "Not saving: the settings file {path} {}; it is left unchanged and the default view is shown",
+            reason.predicate()
         ),
         (Origin::Fresh, _) => return None,
+        (Origin::BackupOnly, _) => format!(
+            "There is no settings file {path}; its backup {backup} was loaded, and the next change saves a new settings file{dropped}"
+        ),
         (Origin::Primary { migrated_from: Some(version) }, _) => {
             format!("Settings from version {version} were upgraded; the next change saves them in the current version{dropped}")
         }
         (Origin::Primary { .. }, _) if dropped.is_empty() => return None,
         (Origin::Primary { .. }, _) => format!("Settings loaded{dropped}"),
-        (Origin::Backup { primary }, _) => {
-            format!("The settings file was {primary}; its backup was loaded{dropped}")
-        }
+        (Origin::Backup { primary }, _) => format!(
+            "The settings file {path} was {primary}; its backup {backup} was loaded{dropped}"
+        ),
         (Origin::Defaults { primary, .. }, _) => format!(
-            "The settings file was {primary} and no valid backup was found; the default view is shown"
+            "The settings file {path} was {primary} and no valid backup was found; the default view is shown"
         ),
         (Origin::ReadOnly, None) => return None,
     };
@@ -221,7 +237,7 @@ impl SavedViews {
     pub fn open(store: SettingsStore, source: &str) -> Self {
         let loaded = store.load(source);
         Self {
-            loaded_note: describe_load(&loaded),
+            loaded_note: describe_load(&loaded, &store),
             store,
             settings: loaded.settings,
             read_only: loaded.read_only,

@@ -683,7 +683,7 @@ fn an_oversized_file_is_refused_as_oversized_without_losing_the_backup() {
 #[test]
 fn an_oversized_or_long_newer_or_foreign_file_is_never_overwritten() {
     let dir = TempDir::new("bignewer");
-    let (store, _, new) = two_saves(&dir);
+    let (store, old, new) = two_saves(&dir);
     let backup = read(&store.backup_path());
     let oversized = |head: &str| {
         let mut bytes = head.as_bytes().to_vec();
@@ -716,7 +716,8 @@ fn an_oversized_or_long_newer_or_foreign_file_is_never_overwritten() {
         std::fs::write(store.path(), &bytes).unwrap();
         let loaded = store.load(SOURCE);
         assert_eq!(loaded.read_only, Some(reason.clone()), "{name}");
-        assert_eq!(loaded.settings, Settings::defaults(SOURCE), "{name}");
+        // The valid backup's views are shown, read-only (V2-1).
+        assert_eq!(loaded.settings, old, "{name}");
         assert_eq!(
             store.save(&settings_with(&["Third"])),
             Err(SaveError::Refused(reason)),
@@ -793,6 +794,222 @@ fn an_unrelated_file_at_the_settings_path_is_never_replaced() {
     }
 }
 
+/// PX-069 verification round 2, V2-1: damage to the settings file's head
+/// (zero-filled, a flipped magic byte, an unknown first line) keeps the file
+/// unreplaced, shows the valid backup read-only and says so with both paths;
+/// moving the backup over the file, or deleting only the file, recovers it.
+#[test]
+fn head_damage_shows_the_valid_backup_read_only_and_names_both_files() {
+    let dir = TempDir::new("head");
+    let (store, old, new) = two_saves(&dir);
+    let whole = read(store.path());
+    let backup = read(&store.backup_path());
+    let mut cases: Vec<(&str, Vec<u8>, ReadOnly)> = vec![
+        ("zero-filled", vec![0; whole.len()], ReadOnly::NotSettings),
+        (
+            "first 64 bytes zeroed",
+            {
+                let mut bytes = whole.clone();
+                bytes[..64].fill(0);
+                bytes
+            },
+            ReadOnly::NotSettings,
+        ),
+        (
+            "CRLF first line",
+            {
+                let mut bytes = b"srtop-settings 2\r\n".to_vec();
+                bytes.extend_from_slice(&whole[17..]);
+                bytes
+            },
+            ReadOnly::UnknownFormat,
+        ),
+    ];
+    for at in [0, 5, 13] {
+        let mut flipped = whole.clone();
+        flipped[at] ^= 0x01;
+        cases.push(("flipped magic", flipped, ReadOnly::NotSettings));
+    }
+    for (name, bytes, reason) in cases {
+        std::fs::write(store.path(), &bytes).unwrap();
+        let loaded = store.load(SOURCE);
+        assert_eq!(loaded.read_only, Some(reason.clone()), "{name}");
+        assert!(
+            matches!(loaded.origin, Origin::Backup { .. }),
+            "{name}: {:?}",
+            loaded.origin
+        );
+        assert_eq!(loaded.settings, old, "{name}: the backup is shown");
+        let status = SavedViews::open(store.clone(), SOURCE).status();
+        for expected in [
+            format!(
+                "the settings file {} {}",
+                store.path().display(),
+                reason.predicate()
+            ),
+            format!("its backup {} is shown", store.backup_path().display()),
+        ] {
+            assert!(status.contains(&expected), "{name}: {status}");
+        }
+        assert!(
+            !status.contains("default view is shown"),
+            "{name}: {status}"
+        );
+        assert_eq!(
+            store.save(&settings_with(&["Third"])),
+            Err(SaveError::Refused(reason)),
+            "{name}"
+        );
+        assert_eq!(
+            read(store.path()),
+            bytes,
+            "{name}: the damaged file was replaced"
+        );
+        assert_eq!(
+            read(&store.backup_path()),
+            backup,
+            "{name}: the backup was replaced"
+        );
+    }
+    // Through the controls: the backup's active view is applied, changes are
+    // disabled, Restore default views among them (it would replace the file).
+    let explorer = Explorer::start(store.clone(), false);
+    assert_eq!(explorer.settings(), old);
+    assert_eq!(
+        presentation(&explorer).0,
+        vec![ProcessField::Name, ProcessField::Cpu]
+    );
+    assert!(!explorer.enabled(SAVED_VIEWS_RESTORE));
+    drop(explorer);
+
+    // Recovery 1: move the backup over the settings file.
+    std::fs::rename(store.backup_path(), store.path()).unwrap();
+    let loaded = store.load(SOURCE);
+    assert_eq!((loaded.read_only, loaded.settings), (None, old.clone()));
+    // Recovery 2: delete only the settings file; the backup is shown, and the
+    // next save creates a new settings file without touching the backup.
+    store.save(&new).unwrap();
+    std::fs::write(store.path(), vec![0; 32]).unwrap();
+    std::fs::remove_file(store.path()).unwrap();
+    let loaded = store.load(SOURCE);
+    assert_eq!(loaded.origin, Origin::BackupOnly);
+    assert_eq!((loaded.read_only, loaded.settings), (None, old.clone()));
+    let status = SavedViews::open(store.clone(), SOURCE).status();
+    assert!(
+        status.contains(&format!(
+            "There is no settings file {}; its backup {} was loaded",
+            store.path().display(),
+            store.backup_path().display()
+        )),
+        "{status}"
+    );
+    let backup = read(&store.backup_path());
+    store.save(&settings_with(&["Recovered"])).unwrap();
+    assert_eq!(store.load(SOURCE).settings, settings_with(&["Recovered"]));
+    assert_eq!(read(&store.backup_path()), backup);
+}
+
+/// PX-069 verification round 2, V2-2: every read-only status says which file
+/// is protected and what is shown.
+#[test]
+fn each_read_only_status_names_the_protected_file_and_what_is_shown() {
+    let dir = TempDir::new("status");
+    let (store, _, new) = two_saves(&dir);
+    let (path, bak) = (
+        store.path().display().to_string(),
+        store.backup_path().display().to_string(),
+    );
+    // A valid settings file and a protected backup: the file's views are
+    // shown and applied; the backup is the one named.
+    for (backup_bytes, reason) in [
+        (
+            format!("srtop-settings {}\n", CURRENT_VERSION + 1).into_bytes(),
+            ReadOnly::NewerVersion(CURRENT_VERSION + 1),
+        ),
+        (
+            b"srtop-settings 2\napp other\nx\n".to_vec(),
+            ReadOnly::ForeignApp,
+        ),
+        (b"my notes\n".to_vec(), ReadOnly::NotSettings),
+    ] {
+        std::fs::write(store.backup_path(), &backup_bytes).unwrap();
+        let views = SavedViews::open(store.clone(), SOURCE);
+        assert_eq!(views.settings(), &new);
+        assert_eq!(
+            views.read_only(),
+            Some(&ReadOnly::Backup(Box::new(reason.clone())))
+        );
+        let status = views.status();
+        assert!(
+            status.contains(&format!("Not saving: the backup {bak} {}; it is left unchanged. The views of {path} are shown and can be switched", reason.predicate())),
+            "{status}"
+        );
+        assert!(!status.contains("default view"), "{status}");
+        assert!(
+            !status.contains("the settings file"),
+            "the settings file is fine: {status}"
+        );
+        let explorer = Explorer::start(store.clone(), false);
+        assert_eq!(
+            presentation(&explorer).0,
+            vec![ProcessField::Name, ProcessField::Cpu],
+            "the active view is applied"
+        );
+    }
+    // A protected settings file and no usable backup: the defaults.
+    std::fs::remove_file(store.backup_path()).unwrap();
+    std::fs::write(
+        store.path(),
+        format!("srtop-settings {}\n", CURRENT_VERSION + 1),
+    )
+    .unwrap();
+    let status = SavedViews::open(store.clone(), SOURCE).status();
+    assert!(
+        status.contains(&format!("Not saving: the settings file {path} was written by a newer srtop (version {}); it is left unchanged and the default view is shown", CURRENT_VERSION + 1)),
+        "{status}"
+    );
+    // A settings file of another source: the defaults, the file named.
+    let theirs = Settings {
+        source: "procfs:/proc".into(),
+        ..settings_with(&["Live"])
+    };
+    std::fs::write(store.path(), theirs.encode().unwrap()).unwrap();
+    let status = SavedViews::open(store.clone(), SOURCE).status();
+    assert!(
+        status.contains(&format!("Not saving: the settings file {path} was saved for another process source; it is left unchanged and the default view is shown")),
+        "{status}"
+    );
+}
+
+/// PX-069 verification round 2, V2-4: the first line's shape is frozen, so a
+/// first line that starts like a settings file's but has another shape is
+/// never replaced.
+#[test]
+fn an_unknown_first_line_shape_is_never_replaced() {
+    let dir = TempDir::new("shape");
+    let (store, old, _) = two_saves(&dir);
+    for (head, reason) in [
+        ("srtop-settings 3\r\n", ReadOnly::NewerVersion(3)),
+        ("srtop-settings 3 \n", ReadOnly::NewerVersion(3)),
+        ("srtop-settings 3.0\n", ReadOnly::NewerVersion(3)),
+        ("srtop-settings 2\r\n", ReadOnly::UnknownFormat),
+        ("srtop-settings 2.1\n", ReadOnly::UnknownFormat),
+        ("srtop-settings 1234567890\n", ReadOnly::UnknownFormat),
+    ] {
+        let bytes = format!("{head}app srtop\nfuture stuff\n");
+        std::fs::write(store.path(), &bytes).unwrap();
+        let loaded = store.load(SOURCE);
+        assert_eq!(loaded.read_only, Some(reason.clone()), "{head:?}");
+        assert_eq!(loaded.settings, old, "{head:?}");
+        assert_eq!(
+            store.save(&settings_with(&["X"])),
+            Err(SaveError::Refused(reason)),
+            "{head:?}"
+        );
+        assert_eq!(read(store.path()), bytes.as_bytes(), "{head:?}");
+    }
+}
+
 /// PX-069 verification round 1, F5: a directory flush that fails after the
 /// rename leaves the new file in place, and the views say they were saved,
 /// with the warning.
@@ -853,9 +1070,9 @@ fn links_at_the_backup_or_temporary_name_are_never_followed() {
 }
 
 #[test]
-fn a_newer_versions_file_is_read_only_shown_as_defaults_and_never_overwritten() {
+fn a_newer_versions_file_is_read_only_shows_the_backup_and_is_never_overwritten() {
     let dir = TempDir::new("newer");
-    let (store, _, _) = two_saves(&dir);
+    let (store, old, _) = two_saves(&dir);
     let backup = read(&store.backup_path());
     let future = format!(
         "srtop-settings {}\nwhatever a later srtop writes\n",
@@ -867,7 +1084,7 @@ fn a_newer_versions_file_is_read_only_shown_as_defaults_and_never_overwritten() 
         loaded.read_only,
         Some(ReadOnly::NewerVersion(CURRENT_VERSION + 1))
     );
-    assert_eq!(loaded.settings, Settings::defaults(SOURCE));
+    assert_eq!(loaded.settings, old, "the valid backup is shown, read-only");
     assert_eq!(
         store.save(&settings_with(&["Mine"])),
         Err(SaveError::Refused(ReadOnly::NewerVersion(

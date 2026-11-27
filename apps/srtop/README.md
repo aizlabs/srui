@@ -200,9 +200,22 @@ The file and its lifecycle:
 - **Format.** Versioned UTF-8 text (`srtop-settings 2`), every value escaped, ending in an FNV-1a checksum line. It is scoped to the application and to the process source it was saved for. Bounds: 64 KiB, 256 lines, 8 views, 64-byte names, the filter's and user field's own bounds. A version 1 file is read and migrated; the next change writes version 2.
 - **Writes.** Only a change writes: creating, renaming or deleting a view, switching the active view, or restoring defaults. Each save copies the current valid file to `settings.bak`, writes the new one to `settings.tmp.<pid>` (mode 0600, directory 0700), flushes it, renames it into place and flushes the directory. A temporary file a crash leaves is never read; a later save removes it after ten minutes.
 - **Damage.** A truncated, oversized, partly written or otherwise damaged file falls back to the backup, and a damaged file never replaces the backup. With no valid backup the default view is shown.
-- **Never overwritten.** A newer version's file, another application's, another source's, a file that is not srtop settings at all (any non-empty file not starting `srtop-settings `), an unreadable file, or a symbolic link, directory or other non-file at the path makes the store read-only: the default view is shown, view changes are disabled, and the file is left as it is. The version and application are read from the file's head before any size or line bound, so this holds however large the file is. The same holds for `settings.bak` whenever a save would replace it.
+- **Never overwritten.** Some files make the store read-only:
+  - a newer version's file;
+  - a first line that starts `srtop-settings ` and a digit but is not the frozen shape (one space, 1–9 ASCII digits, `\n`): for example `\r\n`, a trailing space, `.0`, or ten or more digits;
+  - another application's file, or another source's;
+  - a file that is not srtop settings at all (any non-empty file not starting `srtop-settings `, which includes a settings file whose first bytes were damaged);
+  - an unreadable file, or a symbolic link, directory or other non-file at the path.
+
+  The file is left as it is and view changes are disabled. If `settings.bak` is valid for the same source, its views are shown, read-only; otherwise the default view is. The status names the file and says which is shown. The version and application are read from the file's head before any size or line limit, so this holds however large the file is.
+- **The backup is protected too.** Whenever a save would replace `settings.bak`, it must not be one of the files above. If it is, the settings file's own views are still shown and can be switched, and the status names the backup as the reason nothing is saved.
 - **Flush.** If the directory cannot be flushed after the rename, the views are kept as saved and the status says a crash may undo the change.
-- **Reset.** `Restore default views`, which keeps the previous file as the backup, or delete the `srtop` settings directory. srtop never deletes the settings file or its backup.
+- **Recovery and reset.**
+  - To go back to the backup, move it over the settings file: `mv settings.bak settings`.
+  - To set aside a settings file srtop will not replace, move or delete only `settings`. With no settings file, a valid backup is shown and the next change writes a new settings file, leaving the backup as it was.
+  - `Restore default views` resets the views and keeps the previous file as the backup.
+  - Deleting the backup as well is a full reset. Do not delete the `srtop` directory to recover: that deletes the valid backup too.
+  - srtop never deletes the settings file or its backup.
 - **Not covered.** Two instances of one user saving at once are not serialized: the last save wins, whole. Two instances in different PID namespaces sharing one settings directory can collide on `settings.tmp.<pid>`; a cut-short result is refused by its checksum and the backup is used. A view saved before any sort keeps whatever order is active when applied.
 
 The settings store (`src/settings_file.rs`) is the one source file allowed to write. The PX-008 audit admits its write constructs there and nowhere else, and pins every write to a fresh `create_new` temporary file renamed into place.

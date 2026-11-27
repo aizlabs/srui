@@ -24,7 +24,10 @@
 //! unchanged. A temporary file a crash left behind is never read, and the
 //! next save removes those older than [`STALE_TEMPORARY`]. The user resets
 //! everything with "Restore default views" (which keeps the previous file as
-//! the backup), or by deleting the `srtop` settings directory; srtop never
+//! the backup); a settings file srtop will not replace is set aside by moving
+//! the valid backup over it (`mv settings.bak settings`) or by removing only
+//! `settings`, after which the backup is shown and the next save writes a new
+//! settings file. Deleting the backup as well is a full reset; srtop never
 //! deletes the settings file or the backup itself.
 //!
 //! **Reading (§26).** A read takes at most
@@ -35,10 +38,12 @@
 //! still a newer srtop's. A damaged settings file falls back to a valid
 //! backup. A file this build must not replace — a newer version, another
 //! application's, another source's, a file that is not settings at all,
-//! unreadable, or not a regular file — makes the store read-only: the
-//! defaults are shown, and every save is refused, so the file is never
-//! overwritten. The same holds for the backup whenever a save would replace
-//! it.
+//! unreadable, or not a regular file — makes the store read-only: every save
+//! is refused, so the file is never overwritten, and a valid backup of the
+//! same source is shown (the defaults otherwise). The same holds for the
+//! backup whenever a save would replace it; the settings file's own views are
+//! then shown. With no settings file, a valid backup is shown and the next
+//! save creates the settings file.
 //!
 //! **Temporary names.** `<pid>` is this process's ID in its own PID
 //! namespace. Two instances in different namespaces sharing one settings
@@ -54,7 +59,7 @@
 use crate::settings::{self, Parsed, Problem, Settings, MAX_SETTINGS_FILE_BYTES};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -111,6 +116,9 @@ pub fn default_path_from(
 pub enum ReadOnly {
     /// Written by a newer srtop, which this build cannot read.
     NewerVersion(u32),
+    /// A first line that starts like a settings file's but is not one this
+    /// build writes or knows ([`Problem::UnknownFormat`]).
+    UnknownFormat,
     /// Another application's file.
     ForeignApp,
     /// Saved for another process source.
@@ -128,24 +136,38 @@ pub enum ReadOnly {
     Backup(Box<ReadOnly>),
 }
 
+impl ReadOnly {
+    /// What is wrong with the protected file, without naming it.
+    pub fn predicate(&self) -> String {
+        match self {
+            Self::NewerVersion(version) => {
+                format!("was written by a newer srtop (version {version})")
+            }
+            Self::UnknownFormat => "starts with a version line this srtop does not know".into(),
+            Self::ForeignApp => "is another application's".into(),
+            Self::OtherSource => "was saved for another process source".into(),
+            Self::Unreadable(kind) => format!("is unreadable ({kind})"),
+            Self::NotAFile => "is not a regular file".into(),
+            Self::NotSettings => "is not srtop settings".into(),
+            Self::Backup(reason) => reason.predicate(),
+        }
+    }
+
+    /// Whether the protected file is the backup rather than the settings
+    /// file.
+    pub fn is_backup(&self) -> bool {
+        matches!(self, Self::Backup(_))
+    }
+}
+
 impl std::fmt::Display for ReadOnly {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NewerVersion(version) => write!(
-                formatter,
-                "the settings file was written by a newer srtop (version {version})"
-            ),
-            Self::ForeignApp => formatter.write_str("the settings file is not srtop's"),
-            Self::OtherSource => {
-                formatter.write_str("the settings file was saved for another process source")
-            }
-            Self::Unreadable(kind) => write!(formatter, "the settings file is unreadable ({kind})"),
-            Self::NotAFile => formatter.write_str("the settings path is not a regular file"),
-            Self::NotSettings => {
-                formatter.write_str("the settings path holds a file that is not srtop settings")
-            }
-            Self::Backup(reason) => write!(formatter, "the backup cannot be replaced: {reason}"),
-        }
+        let subject = if self.is_backup() {
+            "the backup"
+        } else {
+            "the settings file"
+        };
+        write!(formatter, "{subject} {}", self.predicate())
     }
 }
 
@@ -156,8 +178,13 @@ pub enum Origin {
     Fresh,
     /// The settings file; `migrated_from` names an older version read.
     Primary { migrated_from: Option<u32> },
-    /// The settings file was refused and the backup was valid.
+    /// The settings file was refused and the backup was valid: the backup's
+    /// views are shown. When the refusal makes the store read-only
+    /// ([`Loaded::read_only`]) the settings file is still never replaced.
     Backup { primary: Problem },
+    /// There is no settings file but the backup is valid: its views are
+    /// shown, and the next save creates the settings file.
+    BackupOnly,
     /// The settings file was refused and no backup was usable: the defaults.
     Defaults {
         primary: Problem,
@@ -300,7 +327,20 @@ impl SettingsStore {
             notes: Vec::new(),
         };
         let primary = match classify(&self.path) {
-            Found::Missing => return defaults(Origin::Fresh, None),
+            // A missing settings file is safe to create: the backup, when
+            // valid, is shown and the next save writes a new settings file
+            // without touching it.
+            Found::Missing => {
+                return match classify(&self.backup_path()) {
+                    Found::Valid { parsed, .. } if parsed.settings.source == source => Loaded {
+                        settings: parsed.settings,
+                        origin: Origin::BackupOnly,
+                        read_only: None,
+                        notes: parsed.notes,
+                    },
+                    _ => defaults(Origin::Fresh, None),
+                };
+            }
             Found::Valid { parsed, .. } if parsed.settings.source != source => {
                 return defaults(Origin::ReadOnly, Some(ReadOnly::OtherSource));
             }
@@ -318,38 +358,26 @@ impl SettingsStore {
             }
             Found::Refused(problem) => problem,
         };
-        if let Some(reason) = read_only(&primary) {
-            return defaults(Origin::ReadOnly, Some(reason));
+        // A settings file this build must not replace stays untouched, but a
+        // valid backup's views are still shown (read-only), so damage to the
+        // file's head does not hide them.
+        let read_only = read_only(&primary);
+        let backup = match classify(&self.backup_path()) {
+            Found::Valid { parsed, .. } if parsed.settings.source == source => {
+                return Loaded {
+                    settings: parsed.settings,
+                    origin: Origin::Backup { primary },
+                    read_only,
+                    notes: parsed.notes,
+                };
+            }
+            Found::Valid { .. } | Found::Missing => None,
+            Found::Refused(backup) => Some(backup),
+        };
+        if read_only.is_some() {
+            return defaults(Origin::ReadOnly, read_only);
         }
-        match classify(&self.backup_path()) {
-            Found::Valid { parsed, .. } if parsed.settings.source == source => Loaded {
-                settings: parsed.settings,
-                origin: Origin::Backup { primary },
-                read_only: None,
-                notes: parsed.notes,
-            },
-            Found::Valid { .. } => defaults(
-                Origin::Defaults {
-                    primary,
-                    backup: None,
-                },
-                None,
-            ),
-            Found::Missing => defaults(
-                Origin::Defaults {
-                    primary,
-                    backup: None,
-                },
-                None,
-            ),
-            Found::Refused(backup) => defaults(
-                Origin::Defaults {
-                    primary,
-                    backup: Some(backup),
-                },
-                None,
-            ),
-        }
+        defaults(Origin::Defaults { primary, backup }, None)
     }
 
     /// Replaces the settings file with `settings`, keeping the file it
@@ -508,6 +536,7 @@ impl SettingsStore {
 fn read_only(problem: &Problem) -> Option<ReadOnly> {
     match problem {
         Problem::NewerVersion(version) => Some(ReadOnly::NewerVersion(*version)),
+        Problem::UnknownFormat => Some(ReadOnly::UnknownFormat),
         Problem::ForeignApp => Some(ReadOnly::ForeignApp),
         Problem::Unreadable(kind) => Some(ReadOnly::Unreadable(kind.to_string())),
         Problem::NotAFile => Some(ReadOnly::NotAFile),
@@ -541,8 +570,16 @@ fn read_bounded(path: &Path) -> Result<Option<Vec<u8>>, Problem> {
     if !metadata.is_file() {
         return Err(Problem::NotAFile);
     }
+    // `File::open` follows a link and blocks on a FIFO, and std offers no
+    // `O_NOFOLLOW` or `O_NONBLOCK` without `custom_flags`, which the PX-008
+    // audit refuses here. A same-user swap between the check above and the
+    // open is therefore caught after the fact: the file opened must be the
+    // regular file checked, by device and inode, or nothing is read. A FIFO
+    // swapped in at that instant could still block this read; the directory
+    // is the user's own (0700), so only the user can stage that.
     let file = File::open(path).map_err(unreadable)?;
-    if !file.metadata().map_err(unreadable)?.is_file() {
+    let opened = file.metadata().map_err(unreadable)?;
+    if !opened.is_file() || (opened.dev(), opened.ino()) != (metadata.dev(), metadata.ino()) {
         return Err(Problem::NotAFile);
     }
     let mut bytes = Vec::new();

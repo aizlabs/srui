@@ -38,7 +38,11 @@
 //! from which version), and written back as version 2 only by the next save.
 //! A version above [`CURRENT_VERSION`] is never interpreted past its first
 //! line ([`Problem::NewerVersion`]); the store treats it as read-only and
-//! never overwrites it.
+//! never overwrites it. The first line's shape is frozen for every version,
+//! past and future: `srtop-settings`, one space, one to nine ASCII digits,
+//! `\n`. A first line that starts like one but has another shape is
+//! [`Problem::UnknownFormat`], read-only like a newer version
+//! ([`declared_version`]).
 //!
 //! **Bounds (§26).** The whole file is at most [`MAX_SETTINGS_FILE_BYTES`],
 //! [`MAX_LINES`] lines of at most [`MAX_LINE_BYTES`] each, [`MAX_VIEWS`]
@@ -424,8 +428,13 @@ pub enum Problem {
     /// A version this build does not know, newer than it. Never read past
     /// the first line, and never overwritten.
     NewerVersion(u32),
-    /// A version that is not a number, or older than [`OLDEST_VERSION`].
+    /// No version digits, or a version older than [`OLDEST_VERSION`]: a
+    /// damaged settings file.
     BadVersion,
+    /// A first line that starts `srtop-settings ` and a digit, but is not
+    /// the frozen shape ([`declared_version`]): possibly a later srtop's,
+    /// never interpreted and never overwritten.
+    UnknownFormat,
     /// Another application's settings.
     ForeignApp,
     /// A line this version does not allow there.
@@ -454,6 +463,9 @@ impl fmt::Display for Problem {
                 "written by a newer srtop (version {version}; this build reads up to {CURRENT_VERSION})"
             ),
             Self::BadVersion => formatter.write_str("of an unknown version"),
+            Self::UnknownFormat => {
+                formatter.write_str("of a version line this srtop does not know")
+            }
             Self::ForeignApp => formatter.write_str("another application's settings"),
             Self::Malformed { line, what } => write!(formatter, "malformed at line {line}: {what}"),
             Self::Bound(what) => write!(formatter, "over the {what} limit"),
@@ -494,6 +506,17 @@ pub const HEAD_BYTES: usize = MAGIC.len() + 1 + 11;
 ///   file ([`Problem::NotSettings`]).
 /// * A version above [`CURRENT_VERSION`] is [`Problem::NewerVersion`],
 ///   whatever the rest of the file holds or how large it is.
+///
+/// The first line's shape is frozen for every version: the magic, one space,
+/// one to nine ASCII digits and `\n`. Anything else after the magic and the
+/// space is read as follows:
+///
+/// * no digit at all is damage ([`Problem::BadVersion`]);
+/// * ten or more digits, or digits followed by anything but `\n` (`\r\n`, a
+///   space, `.0`), are [`Problem::UnknownFormat`]: not a line this build
+///   writes, so possibly a later one's, and never replaced;
+/// * digits up to the end of the file are a cut-short file, which the rest of
+///   the parser reports.
 pub fn declared_version(bytes: &[u8]) -> Result<u32, Problem> {
     let lead_len = MAGIC.len() + 1;
     let head = &bytes[..bytes.len().min(lead_len)];
@@ -506,19 +529,22 @@ pub fn declared_version(bytes: &[u8]) -> Result<u32, Problem> {
         });
     }
     let rest = &bytes[lead_len..bytes.len().min(HEAD_BYTES)];
-    let digits = rest
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map_or(rest, |end| &rest[..end]);
-    if digits.is_empty() || digits.len() > 9 || !digits.iter().all(u8::is_ascii_digit) {
+    let run = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    if run == 0 {
         return Err(Problem::BadVersion);
     }
-    let version: u32 = std::str::from_utf8(digits)
-        .ok()
-        .and_then(|digits| digits.parse().ok())
-        .ok_or(Problem::BadVersion)?;
+    if run > 9 {
+        return Err(Problem::UnknownFormat);
+    }
+    let version = rest[..run]
+        .iter()
+        .fold(0u32, |value, digit| value * 10 + u32::from(digit - b'0'));
     if version > CURRENT_VERSION {
         return Err(Problem::NewerVersion(version));
+    }
+    match rest.get(run) {
+        Some(b'\n') | None => {}
+        Some(_) => return Err(Problem::UnknownFormat),
     }
     if version < OLDEST_VERSION {
         return Err(Problem::BadVersion);
@@ -931,10 +957,38 @@ mod tests {
         assert_eq!(parse(b""), Err(Problem::Truncated));
         assert_eq!(parse(b"srtop-sett"), Err(Problem::Truncated));
         assert_eq!(parse(b"notes\n"), Err(Problem::NotSettings));
-        assert_eq!(
-            parse(b"srtop-settings 1234567890\n"),
-            Err(Problem::BadVersion)
-        );
+        // The frozen first line (verification round 2, V2-4): another shape
+        // after the magic and a digit is not this build's, and is kept.
+        for unknown in [
+            &b"srtop-settings 1234567890\n"[..],
+            b"srtop-settings 99999999999\n",
+            b"srtop-settings 2\r\n",
+            b"srtop-settings 2 \n",
+            b"srtop-settings 2.0\n",
+            b"srtop-settings 1x\n",
+        ] {
+            assert_eq!(parse(unknown), Err(Problem::UnknownFormat), "{unknown:?}");
+        }
+        for newer in [
+            &b"srtop-settings 3\r\n"[..],
+            b"srtop-settings 3 \n",
+            b"srtop-settings 3.0\n",
+            b"srtop-settings 03\n",
+            b"srtop-settings 999999999\n",
+        ] {
+            assert!(
+                matches!(parse(newer), Err(Problem::NewerVersion(_))),
+                "{newer:?}"
+            );
+        }
+        for damaged in [
+            &b"srtop-settings \n"[..],
+            b"srtop-settings x\n",
+            b"srtop-settings 0\n",
+        ] {
+            assert_eq!(parse(damaged), Err(Problem::BadVersion), "{damaged:?}");
+        }
+        assert_eq!(parse(b"srtop-settings 2"), Err(Problem::Truncated));
         let mut current = b"srtop-settings 2\napp srtop\n".to_vec();
         current.resize(MAX_SETTINGS_FILE_BYTES + 1, b'#');
         assert_eq!(parse(&current), Err(Problem::Oversized));

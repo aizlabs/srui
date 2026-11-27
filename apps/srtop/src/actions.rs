@@ -181,7 +181,8 @@ pub const PANEL_IDS: u64 = 3;
 /// prepared intents, Prepare is refused until srtop restarts.
 pub const DEFAULT_CONFIRMATION_PANELS: u32 = 4096;
 /// The first node ID any confirmation panel can take (PX-030, PX-031):
-/// 2^32, far above every fixed node of the shell (at most 88).
+/// 2^32, far above every fixed node (at most 103, the saved views' status,
+/// PX-069).
 pub const PANEL_RANGE_START: u64 = 1 << 32;
 /// The node IDs one run's panels span: [`DEFAULT_CONFIRMATION_PANELS`]
 /// panels of [`PANEL_IDS`] nodes (PX-031).

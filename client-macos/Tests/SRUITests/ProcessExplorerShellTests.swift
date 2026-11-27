@@ -3192,6 +3192,131 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
+    /// PX-069: the saved views' switcher is a row of standard native buttons and a text field. A
+    /// view saved from the current presentation is applied by its button, a restarted srtop
+    /// recovers it from the server-side settings file and applies it before the first client
+    /// attaches, and renaming or deleting a view leaves the native table's rows, item IDs and
+    /// selection exactly as they were. The settings file lives in a temporary directory.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func savedViewsSwitchSurviveARestartAndRenameOrDeleteKeepsTheSelection() async throws {
+        let settingsDirectory = try TestFixtureDirectory.make(prefix: "px069")
+        defer { TestFixtureDirectory.release(settingsDirectory) }
+        let settingsPath = settingsDirectory.appendingPathComponent("srtop/settings").path
+        let arguments = ["--fake-source", "--settings-path", settingsPath]
+        let byName = [Self.fakeRows[2], Self.fakeRows[0], Self.fakeRows[1]]
+        let slots: [UInt64] = Array(90...97)
+        let (nameFieldID, createID, renameID, deleteID, statusID): (UInt64, UInt64, UInt64, UInt64, UInt64) =
+            (98, 99, 100, 101, 103)
+
+        @MainActor
+        func attach(_ harness: Harness) async throws -> (SessionController, TransactionApplier, AppKitRenderer, NSTableView, NSWindow) {
+            _ = NSApplication.shared
+            let (controller, applier, renderer) = Self.genericClient(SSHTransport(configuration: harness.configuration))
+            renderer.textEditingSession.debounceNanoseconds = 0
+            try await controller.start()
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer with its saved views") {
+                controller.isEventDispatchEnabled
+                    && renderer.registry.handle(for: NodeId(5)) != nil
+                    && renderer.registry.handle(for: NodeId(statusID)) != nil
+            }
+            let window = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+            let scroll = try #require(renderer.registry.handle(for: NodeId(5))?.view as? NSScrollView)
+            let table = try #require(scroll.documentView as? NSTableView)
+            return (controller, applier, renderer, table, window)
+        }
+        @MainActor
+        func button(_ renderer: AppKitRenderer, _ id: UInt64) throws -> NSButton {
+            try #require(renderer.registry.handle(for: NodeId(id))?.view as? NSButton)
+        }
+        @MainActor
+        func type(_ renderer: AppKitRenderer, _ text: String) throws {
+            let handle = try #require(renderer.registry.handle(for: NodeId(nameFieldID)))
+            let field = try #require(handle.view as? NSTextField)
+            let adapter = try #require(handle.textAdapter)
+            #expect(field.isEditable)
+            field.stringValue = text
+            adapter.notifyTextDidChangeForTests()
+            adapter.notifyEndEditingForTests()
+        }
+
+        // First run: nothing saved yet, so the default view is the one view.
+        var harness = try await Self.launch(arguments: arguments)
+        var running = true
+        defer { if running { Self.shutDown(harness) } }
+        var (controller, applier, renderer, table, window) = try await attach(harness)
+        #expect(try button(renderer, slots[0]).title == "View: Default (active)")
+        #expect(try !button(renderer, slots[1]).isEnabled, "an empty slot is disabled")
+        #expect(!FileManager.default.fileExists(atPath: settingsPath), "starting wrote the settings file")
+
+        // Sort by name, then save that as a view through the native field and button.
+        NativeActivation.click(try button(renderer, Self.sortButtonIDs[1]))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the order by name") {
+            Self.nativeRows(table) == byName
+        }
+        try type(renderer, "By name")
+        // The name's TEXT_EDIT precedes the click in this client's event order, so the server
+        // holds the name when it handles the click.
+        NativeActivation.click(try button(renderer, createID))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the saved view's button") {
+            (try? button(renderer, slots[1]).title) == "View: By name (active)"
+        }
+        #expect(FileManager.default.fileExists(atPath: settingsPath))
+        // Switch to the default view and back: the server applies each one.
+        NativeActivation.click(try button(renderer, slots[0]))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the default view applied") {
+            Self.nativeRows(table) == Self.fakeRows && (try? button(renderer, slots[0]).title) == "View: Default (active)"
+        }
+        NativeActivation.click(try button(renderer, slots[1]))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the saved view applied") {
+            Self.nativeRows(table) == byName
+        }
+        let firstWindow = window.windowNumber
+        window.orderOut(nil); window.close()
+        await controller.stop()
+        Self.shutDown(harness)
+        running = false
+
+        // A restart: srtop reads the file and applies the active view before this client attaches.
+        harness = try await Self.launch(arguments: arguments)
+        running = true
+        (controller, applier, renderer, table, window) = try await attach(harness)
+        defer { window.orderOut(nil); window.close() }
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the recovered view") {
+            Self.nativeRows(table) == byName
+        }
+        #expect(try button(renderer, slots[1]).title == "View: By name (active)")
+        #expect(try button(renderer, slots[0]).title == "View: Default")
+
+        // Rename and delete with a process selected natively: nothing of the table changes.
+        table.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
+        let identities = Self.modelItemIDs(applier)
+        let selected = identities[2]
+        func expectTableKept(_ step: String) {
+            #expect(Self.nativeRows(table) == byName, "\(step): the rows changed")
+            #expect(Self.modelItemIDs(applier) == identities, "\(step): an item ID changed")
+            #expect(table.selectedRowIndexes == IndexSet(integer: 2), "\(step): the selection moved")
+            #expect(Self.modelItemIDs(applier)[table.selectedRow] == selected, "\(step)")
+        }
+        try type(renderer, "Names")
+        let rename = try button(renderer, renameID)
+        NativeActivation.click(rename)
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the renamed view") {
+            (try? button(renderer, slots[1]).title) == "View: Names (active)"
+        }
+        expectTableKept("rename")
+        NativeActivation.click(try button(renderer, deleteID))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the deleted view") {
+            (try? button(renderer, slots[1]).isEnabled) == false
+                && (try? button(renderer, slots[0]).title) == "View: Default"
+        }
+        expectTableKept("delete")
+        let status = try #require(renderer.registry.handle(for: NodeId(statusID))?.view as? NSTextField)
+        #expect(status.stringValue.contains("Deleted view “Names”"), "\(status.stringValue)")
+        print("PX-069 native SSH evidence: windows \(firstWindow) then \(window.windowNumber); recovered rows=\(byName); slots=\(slots.prefix(2).compactMap { try? button(renderer, $0).title }); status=\(status.stringValue); selected item \(selected) at row \(table.selectedRow); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
     // PX-068: the catalogued headings, and the short names the chooser's labels may use instead.
     private static let defaultHeadings = ["PID", "Name", "Resident", "CPU (100% = 1 CPU)", "Tag"]
     private static let columnButtonNames = ["PID", "Name", "Resident", "CPU"]

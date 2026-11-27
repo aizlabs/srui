@@ -43,7 +43,10 @@
 //!   `VALUE_CHANGED` (PX-019), or a tag button (`TAG_TOGGLE`,
 //!   `TAG_DESCENDANTS`, `TAGS_CLEAR`) with `ACTIVATE` (PX-020), or an
 //!   action button (`ACTION_PREPARE`, `ACTION_CANCEL`) with `ACTIVATE`
-//!   (PX-028), or, in `src/lib.rs` only, exactly `panel_confirm` with
+//!   (PX-028), or a saved views button (`SAVED_VIEW_SLOT_1`…`_8`,
+//!   `SAVED_VIEW_CREATE`, `SAVED_VIEW_RENAME`, `SAVED_VIEW_DELETE`,
+//!   `SAVED_VIEWS_RESTORE`) with `ACTIVATE` or `SAVED_VIEW_NAME_INPUT` with
+//!   `TEXT_EDIT` (PX-069), or, in `src/lib.rs` only, exactly `panel_confirm` with
 //!   `ACTIVATE`, the confirmation panels' Confirm handlers (PX-030), whose
 //!   gate reaches one of the two production executors pinned below;
 //!   `on_result`, `on_text_edit`, `on_expansion_changed`
@@ -61,6 +64,24 @@
 //!   import of one, a type alias of `File`. A file's write, resize and
 //!   permission methods are refused as methods and as paths
 //!   (`std::io::Write::write_all(&mut f, ..)`).
+//! * **The one file that writes (PX-069).** `src/settings_file.rs`, and no
+//!   other file, may name `OpenOptions`, `OpenOptionsExt`, `DirBuilder`,
+//!   `DirBuilderExt`, `fs::rename` and `fs::remove_file`, and call `.write`
+//!   and `.write_all`: the per-user settings store, which replaces the
+//!   settings file and its backup through fresh temporary files renamed into
+//!   place. Its writes are pinned ([`settings_write_violations`]): exactly
+//!   one `OpenOptions::new()` and one `create_new(true)`, and no `truncate`,
+//!   `append`, `.create(true)`, `custom_flags`, `clone`, `clone_from` or
+//!   `to_owned`. Every other rule holds there as everywhere; no file but it
+//!   may write, and only `src/main.rs` constructs a `SettingsStore`, once,
+//!   from its command line or the per-user default path
+//!   ([`settings_store_constructions`]). Another file may not hold an `impl`
+//!   block for it or a struct literal of it, and the settings module holds
+//!   exactly one literal, in `fn new`, no `Self::new` and no trait `impl`
+//!   for it ([`settings_store_impl_violations`]). These are token rules: a
+//!   construction they do not recognise passes them. By design the module's
+//!   own `fs::rename` and `fs::remove_file` may name any path; that file is
+//!   the one place such a call can be, and it is reviewed with this test.
 //!   The only signal API is receiving SIGINT, SIGTERM and the
 //!   `--smoke-fixture` SIGUSR1.
 //! * **The one raw system-call allowance (PX-029).** `src/handle.rs`, and no
@@ -96,7 +117,7 @@
 //! the token audit does not recognise — among them a write through a `File`
 //! handle by `write!` or a generic writer such as `io::copy`, which tokens cannot
 //! tell from formatting into a `String` (inert while the only open allowed is
-//! read-only); code that procedural macros or the dependencies' own macros
+//! read-only, outside the settings store's fresh temporary files); code that procedural macros or the dependencies' own macros
 //! generate; code inside the allowed dependencies beyond the symbols they
 //! import; the arguments of a raw system call a dependency makes; any binary but
 //! the debug build `cargo test` links; Cargo configuration outside the package
@@ -534,7 +555,8 @@ fn production(level: &[Tok]) -> Vec<Tok> {
 
 /// Every name a grouped import from `fs` brings in must be allowed, never
 /// renamed and never a glob: `use std::fs::{metadata, write}` is refused.
-fn check_fs_group(group: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
+/// `extra` are the names the file's own allowance adds (PX-069).
+fn check_fs_group(group: &[Tok], extra: &[&str], report: &mut dyn FnMut(usize, &str, String)) {
     for (i, tok) in group.iter().enumerate() {
         match tok {
             Tok::Ident(name, _, line) if name == "as" => {
@@ -542,15 +564,309 @@ fn check_fs_group(group: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
             }
             Tok::Ident(name, _, line) => {
                 let renamed_to = ident(i.checked_sub(1).and_then(|p| group.get(p))) == Some("as");
-                if !renamed_to && name != "self" && !FS_ALLOWED.contains(&name.as_str()) {
+                if !renamed_to
+                    && name != "self"
+                    && !FS_ALLOWED.contains(&name.as_str())
+                    && !extra.contains(&name.as_str())
+                {
                     report(*line, "fs-import", format!("fs::{{{name}}} is not a read"));
                 }
             }
             Tok::Punct('*', line) => report(*line, "fs-import", "a glob import from fs".into()),
-            Tok::Group(_, inner, _) => check_fs_group(inner, report),
+            Tok::Group(_, inner, _) => check_fs_group(inner, extra, report),
             _ => {}
         }
     }
+}
+
+/// The one file that may write (PX-069): the per-user settings file's store,
+/// which replaces the settings file and its backup through fresh temporary
+/// files renamed into place.
+const SETTINGS_MODULE: &str = "src/settings_file.rs";
+
+/// The identifiers only [`SETTINGS_MODULE`] may name: the builder that opens
+/// its temporary files and its mode extension.
+const SETTINGS_IDENTS: &[&str] = &["OpenOptions", "OpenOptionsExt"];
+
+/// The methods only [`SETTINGS_MODULE`] may call: `OpenOptions::write`, and
+/// `write_all` of a temporary file it created.
+const SETTINGS_METHODS: &[&str] = &["write", "write_all"];
+
+/// The `std::fs` and `std::os::unix::fs` items only [`SETTINGS_MODULE`] may
+/// name besides the reads: creating its directory (mode 0700), opening a
+/// temporary file, renaming it into place, and removing a temporary file.
+const SETTINGS_FS_ALLOWED: &[&str] = &[
+    "OpenOptions",
+    "OpenOptionsExt",
+    "DirBuilder",
+    "DirBuilderExt",
+    "rename",
+    "remove_file",
+];
+
+/// Whether the token after `level[i]` is a parenthesized group holding
+/// exactly the identifier `true`.
+fn called_with_true(level: &[Tok], i: usize) -> bool {
+    matches!(
+        level.get(i + 1),
+        Some(Tok::Group(Delimiter::Parenthesis, inner, _))
+            if matches!(inner.as_slice(), [Tok::Ident(value, _, _)] if value == "true")
+    )
+}
+
+/// How [`SETTINGS_MODULE`]'s writes are pinned (PX-069): exactly one
+/// `OpenOptions::new()` and exactly one `create_new`, called with exactly
+/// `true` (so every file it opens for writing is a fresh one, never an
+/// existing file or a link); no `truncate`, `append`, `.create(true)` or
+/// `custom_flags` (`O_TRUNC`, `O_APPEND`), which would open an existing file
+/// to rewrite it in place; and no `clone`, `clone_from` or `to_owned` of
+/// anything, so the one pinned builder cannot be copied and reconfigured.
+fn settings_write_violations(source: &str) -> Vec<String> {
+    fn walk(level: &[Tok], counts: &mut (usize, usize), found: &mut Vec<String>) {
+        for (i, tok) in level.iter().enumerate() {
+            let prev = i.checked_sub(1).and_then(|p| level.get(p));
+            match tok {
+                Tok::Ident(name, _, line) => match name.as_str() {
+                    "truncate" | "append" | "custom_flags" => {
+                        found.push(format!("line {line}: `{name}` rewrites a file in place"))
+                    }
+                    "clone" | "clone_from" | "to_owned"
+                        if is_punct(prev, '.') || is_path_sep(prev) =>
+                    {
+                        found.push(format!(
+                            "line {line}: `{name}` could copy the pinned file builder"
+                        ))
+                    }
+                    "Clone" if is_path_sep(level.get(i + 1)) => found.push(format!(
+                        "line {line}: `Clone::` could copy the pinned file builder"
+                    )),
+                    "create_new" if called_with_true(level, i) => counts.1 += 1,
+                    "create_new" => found.push(format!(
+                        "line {line}: `create_new` not called with exactly `true`"
+                    )),
+                    "create" if is_punct(i.checked_sub(1).and_then(|p| level.get(p)), '.') => {
+                        if let Some(Tok::Group(Delimiter::Parenthesis, inner, _)) = level.get(i + 1)
+                        {
+                            if matches!(inner.as_slice(), [Tok::Ident(value, _, _)] if value == "true")
+                            {
+                                found.push(format!(
+                                    "line {line}: `.create(true)` opens an existing file"
+                                ));
+                            }
+                        }
+                    }
+                    "OpenOptions"
+                        if is_path_sep(level.get(i + 1))
+                            && ident(level.get(i + 2)) == Some("new") =>
+                    {
+                        counts.0 += 1
+                    }
+                    _ => {}
+                },
+                Tok::Group(_, inner, _) => walk(inner, counts, found),
+                _ => {}
+            }
+        }
+    }
+    let stream = match TokenStream::from_str(source) {
+        Ok(stream) => stream,
+        Err(error) => return vec![format!("does not tokenize: {error}")],
+    };
+    let tokens = production(&lower(stream));
+    let mut counts = (0, 0);
+    let mut found = Vec::new();
+    walk(&tokens, &mut counts, &mut found);
+    if counts.0 != 1 {
+        found.push(format!(
+            "{} `OpenOptions::new()`, not exactly one",
+            counts.0
+        ));
+    }
+    if counts.1 != 1 {
+        found.push(format!("{} `create_new(true)`, not exactly one", counts.1));
+    }
+    found
+}
+
+/// The one file that may construct a settings store (PX-069): `main`, from
+/// `--settings-path` or the per-user default path, never from client input.
+const SETTINGS_STORE_CONSTRUCTOR: &str = "src/main.rs";
+
+/// Every way production file `file` breaks the constructor pin: a
+/// construction anywhere but [`SETTINGS_STORE_CONSTRUCTOR`], more than one
+/// there, or a renamed or aliased type.
+fn settings_store_violations(file: &str, source: &str) -> Vec<String> {
+    let (constructions, hidden) = settings_store_constructions(source);
+    let mut found: Vec<String> = hidden
+        .into_iter()
+        .map(|violation| format!("{file}: [settings-store] {violation}"))
+        .collect();
+    let allowed = usize::from(file == SETTINGS_STORE_CONSTRUCTOR);
+    if constructions != allowed {
+        found.push(format!(
+            "{file}: [settings-store] {constructions} `SettingsStore::new`, {allowed} allowed"
+        ));
+    }
+    found.extend(
+        settings_store_impl_violations(file == SETTINGS_MODULE, source)
+            .into_iter()
+            .map(|violation| format!("{file}: [settings-store] {violation}")),
+    );
+    found
+}
+
+/// The other ways to make a `SettingsStore` (PX-069 verification round 2,
+/// V2-3): an `impl` block for it in another file, whose `Self::new` the
+/// constructor count cannot see (B1); a struct literal anywhere but the body
+/// of `fn new` in the settings module, which could name any path (B2); a
+/// trait implementation such as `Default`, even there (B3); and `Self::new`
+/// in the settings module. The settings module holds exactly one literal,
+/// in `fn new`, and only the one inherent `impl SettingsStore` block.
+fn settings_store_impl_violations(settings_module: bool, source: &str) -> Vec<String> {
+    struct Walk {
+        settings_module: bool,
+        literals: usize,
+        in_new: usize,
+        found: Vec<String>,
+    }
+    fn walk(level: &[Tok], inside_new: bool, state: &mut Walk) {
+        let mut next_body_is_new = false;
+        // Between `fn` and its body: a return type followed by the body
+        // (`-> Self { .. }`, `-> &SettingsStore { .. }`) is no literal.
+        let mut in_signature = false;
+        // Likewise between `impl` and its block (`impl a::SettingsStore {`).
+        let mut in_impl_header = false;
+        for (i, tok) in level.iter().enumerate() {
+            let prev = i.checked_sub(1).and_then(|p| level.get(p));
+            match tok {
+                Tok::Ident(name, raw, line) if name == "impl" && !*raw => {
+                    in_impl_header = true;
+                    // The header runs to the block it opens.
+                    let end = level[i..]
+                        .iter()
+                        .position(|tok| matches!(tok, Tok::Group(Delimiter::Brace, ..)))
+                        .map_or(level.len(), |offset| i + offset);
+                    let header = &level[i + 1..end];
+                    if contains_ident(header, &["SettingsStore"]) {
+                        let inherent =
+                            matches!(header, [Tok::Ident(only, _, _)] if only == "SettingsStore");
+                        if !state.settings_module {
+                            state.found.push(format!(
+                                "line {line}: an `impl` block for `SettingsStore` outside the settings module"
+                            ));
+                        } else if !inherent {
+                            state.found.push(format!(
+                                "line {line}: a trait implemented for `SettingsStore`"
+                            ));
+                        }
+                    }
+                }
+                Tok::Ident(name, _, _) if name == "fn" => {
+                    next_body_is_new = ident(level.get(i + 1)) == Some("new");
+                    in_signature = true;
+                }
+                Tok::Ident(name, _, line)
+                    if (name == "SettingsStore" || name == "Self")
+                        && matches!(level.get(i + 1), Some(Tok::Group(Delimiter::Brace, ..)))
+                        && !in_signature
+                        && !in_impl_header
+                        && !matches!(ident(prev), Some("struct" | "impl" | "for")) =>
+                {
+                    if name == "SettingsStore" || state.settings_module {
+                        state.literals += 1;
+                        state.in_new += usize::from(inside_new);
+                    }
+                    if !state.settings_module && name == "SettingsStore" {
+                        state.found.push(format!(
+                            "line {line}: a `SettingsStore` literal outside the settings module"
+                        ));
+                    }
+                }
+                Tok::Ident(name, _, line)
+                    if state.settings_module
+                        && name == "Self"
+                        && is_path_sep(level.get(i + 1))
+                        && ident(level.get(i + 2)) == Some("new") =>
+                {
+                    state
+                        .found
+                        .push(format!("line {line}: `Self::new` in the settings module"));
+                }
+                Tok::Group(Delimiter::Brace, inner, _) => {
+                    in_signature = false;
+                    in_impl_header = false;
+                    let body_is_new = std::mem::take(&mut next_body_is_new);
+                    walk(inner, inside_new || body_is_new, state);
+                }
+                Tok::Group(_, inner, _) => walk(inner, inside_new, state),
+                _ => {}
+            }
+        }
+    }
+    let Ok(stream) = TokenStream::from_str(source) else {
+        return vec!["does not tokenize".into()];
+    };
+    let tokens = production(&lower(stream));
+    let mut state = Walk {
+        settings_module,
+        literals: 0,
+        in_new: 0,
+        found: Vec::new(),
+    };
+    walk(&tokens, false, &mut state);
+    if settings_module && (state.literals != 1 || state.in_new != 1) {
+        state.found.push(format!(
+            "{} store literals, {} of them in `fn new`: exactly one, there, is allowed",
+            state.literals, state.in_new
+        ));
+    }
+    state.found
+}
+
+/// How many times a production file constructs a `SettingsStore`
+/// (`SettingsStore::new`, `<SettingsStore>::new`), and every way it could
+/// hide one: the type renamed on import or aliased.
+fn settings_store_constructions(source: &str) -> (usize, Vec<String>) {
+    fn walk(level: &[Tok], count: &mut usize, found: &mut Vec<String>) {
+        for (i, tok) in level.iter().enumerate() {
+            match tok {
+                Tok::Ident(name, _, line) if name == "SettingsStore" => {
+                    let next = level.get(i + 1);
+                    let member = if is_path_sep(next) {
+                        ident(level.get(i + 2))
+                    } else if is_punct(next, '>') && is_path_sep(level.get(i + 2)) {
+                        ident(level.get(i + 3))
+                    } else {
+                        None
+                    };
+                    if member == Some("new") {
+                        *count += 1;
+                    }
+                    if ident(next) == Some("as") {
+                        found.push(format!("line {line}: `SettingsStore` renamed"));
+                    }
+                }
+                Tok::Ident(name, raw, line) if name == "type" && !*raw => {
+                    let end = level[i..]
+                        .iter()
+                        .position(|tok| matches!(tok, Tok::Punct(';', _)))
+                        .map_or(level.len(), |offset| i + offset);
+                    if contains_ident(&level[i + 1..end], &["SettingsStore"]) {
+                        found.push(format!("line {line}: a type alias of `SettingsStore`"));
+                    }
+                }
+                Tok::Group(_, inner, _) => walk(inner, count, found),
+                _ => {}
+            }
+        }
+    }
+    let Ok(stream) = TokenStream::from_str(source) else {
+        return (0, vec!["does not tokenize".into()]);
+    };
+    let tokens = production(&lower(stream));
+    let (mut count, mut found) = (0, Vec::new());
+    walk(&tokens, &mut count, &mut found);
+    (count, found)
 }
 
 fn contains_ident(level: &[Tok], names: &[&str]) -> bool {
@@ -1028,6 +1344,13 @@ fn handle_signal_violations(source: &str) -> Vec<String> {
 fn scan(level: &[Tok], file: &str, report: &mut dyn FnMut(usize, &str, String)) {
     let handle_module = file == HANDLE_MODULE;
     let executor_module = file == EXECUTOR_MODULE;
+    // PX-069: the settings store's writes, in that file alone.
+    let settings_module = file == SETTINGS_MODULE;
+    let fs_extra: &[&str] = if settings_module {
+        SETTINGS_FS_ALLOWED
+    } else {
+        &[]
+    };
     for (i, tok) in level.iter().enumerate() {
         let prev = i.checked_sub(1).and_then(|p| level.get(p));
         let next = level.get(i + 1);
@@ -1036,7 +1359,9 @@ fn scan(level: &[Tok], file: &str, report: &mut dyn FnMut(usize, &str, String)) 
             Tok::Ident(name, raw, line) => {
                 let line = *line;
                 if let Some((_, why)) = FORBIDDEN_IDENTS.iter().find(|(word, _)| word == name) {
-                    if !(handle_module && handle_module_allows(level, i)) {
+                    if !(handle_module && handle_module_allows(level, i))
+                        && !(settings_module && SETTINGS_IDENTS.contains(&name.as_str()))
+                    {
                         report(line, "ident", format!("`{name}`: {why}"));
                     }
                 }
@@ -1068,7 +1393,9 @@ fn scan(level: &[Tok], file: &str, report: &mut dyn FnMut(usize, &str, String)) 
                 // (`std::io::Write::write_all(&mut file, ..)`, or taken as a
                 // value) but a macro (`std::write!`); `fs::` and `File::` paths
                 // have their own rules below
-                if FORBIDDEN_METHODS.contains(&name.as_str()) {
+                if FORBIDDEN_METHODS.contains(&name.as_str())
+                    && !(settings_module && SETTINGS_METHODS.contains(&name.as_str()))
+                {
                     let owner = i.checked_sub(2).and_then(|p| ident(level.get(p)));
                     if is_punct(prev, '.')
                         && (matches!(next, Some(Tok::Group(Delimiter::Parenthesis, ..)))
@@ -1129,12 +1456,13 @@ fn scan(level: &[Tok], file: &str, report: &mut dyn FnMut(usize, &str, String)) 
                         if is_path_sep(next) {
                             match after {
                                 Some(Tok::Ident(member, _, _))
-                                    if !FS_ALLOWED.contains(&member.as_str()) =>
+                                    if !FS_ALLOWED.contains(&member.as_str())
+                                        && !fs_extra.contains(&member.as_str()) =>
                                 {
                                     report(line, "fs", format!("`fs::{member}` is not a read"))
                                 }
                                 Some(Tok::Group(Delimiter::Brace, group, _)) => {
-                                    check_fs_group(group, report)
+                                    check_fs_group(group, fs_extra, report)
                                 }
                                 Some(Tok::Punct('*', _)) => {
                                     report(line, "fs", "a glob import from fs".into())
@@ -1254,9 +1582,30 @@ const SAMPLING_BUTTON_CONSTANTS: &[&str] =
 /// [`PANEL_CONFIRM`]); the generic Confirm `ACTION_CONFIRM` is gone.
 const ACTION_BUTTON_CONSTANTS: &[&str] = &["ACTION_PREPARE", "ACTION_CANCEL"];
 
+/// The saved views' buttons (PX-069), whose `ACTIVATE` handlers apply the
+/// view the server holds in a slot through the presentation paths above,
+/// save the presentation as a view, or rename, delete or restore the saved
+/// views. None signals, opens for control or reconfigures a process; Rename
+/// and Delete never reach the process list or the action gate.
+const SAVED_VIEW_BUTTON_CONSTANTS: &[&str] = &[
+    "SAVED_VIEW_SLOT_1",
+    "SAVED_VIEW_SLOT_2",
+    "SAVED_VIEW_SLOT_3",
+    "SAVED_VIEW_SLOT_4",
+    "SAVED_VIEW_SLOT_5",
+    "SAVED_VIEW_SLOT_6",
+    "SAVED_VIEW_SLOT_7",
+    "SAVED_VIEW_SLOT_8",
+    "SAVED_VIEW_CREATE",
+    "SAVED_VIEW_RENAME",
+    "SAVED_VIEW_DELETE",
+    "SAVED_VIEWS_RESTORE",
+];
+
 /// The text inputs whose `TEXT_EDIT` handlers are allowed: the filter input
 /// (PX-010), the search and PID fields (PX-011), and the user and PID-set
-/// fields (PX-012), and the sampling interval field (PX-015).
+/// fields (PX-012), and the sampling interval field (PX-015), and the saved
+/// views' name field (PX-069).
 const TEXT_INPUT_CONSTANTS: &[&str] = &[
     "FILTER_INPUT",
     "SEARCH_INPUT",
@@ -1264,6 +1613,7 @@ const TEXT_INPUT_CONSTANTS: &[&str] = &[
     "OWNER_INPUT",
     "PID_SET_INPUT",
     "INTERVAL_INPUT",
+    "SAVED_VIEW_NAME_INPUT",
 ];
 
 /// Whether an `on(..)` argument list is one of the sort buttons' `ACTIVATE`
@@ -1304,6 +1654,7 @@ fn is_sort_button_activation(tokens: &[Tok]) -> bool {
             || SAMPLING_BUTTON_CONSTANTS.contains(&name)
             || TAG_BUTTON_CONSTANTS.contains(&name)
             || ACTION_BUTTON_CONSTANTS.contains(&name)
+            || SAVED_VIEW_BUTTON_CONSTANTS.contains(&name)
     ) && event.as_deref() == Some("ACTIVATE")
 }
 
@@ -2664,6 +3015,10 @@ fn no_production_source_can_signal_or_reconfigure_a_process() {
         files.iter().any(|path| path.ends_with(HANDLE_MODULE)),
         "the pinned unsafe blocks are checked against the handle module that holds them"
     );
+    assert!(
+        files.iter().any(|path| path.ends_with(SETTINGS_MODULE)),
+        "the pinned settings writes are checked against the module that holds them"
+    );
     let mut found = Vec::new();
     let mut receivers = 0;
     let mut attributes = BTreeSet::new();
@@ -2675,6 +3030,14 @@ fn no_production_source_can_signal_or_reconfigure_a_process() {
             .display()
             .to_string();
         found.extend(token_violations(&name, &text));
+        if name == SETTINGS_MODULE {
+            found.extend(
+                settings_write_violations(&text)
+                    .into_iter()
+                    .map(|violation| format!("{name}: [settings] {violation}")),
+            );
+        }
+        found.extend(settings_store_violations(&name, &text));
         if name == HANDLE_MODULE {
             found.extend(
                 handle_unsafe_violations(&text)
@@ -2796,6 +3159,258 @@ fn process_actions_implementations(source: &str) -> Vec<String> {
 /// PX-029: the handle module's allowance is exactly its two system calls.
 /// Each construct below is refused in `src/handle.rs` itself, and what the
 /// module really writes passes there and is refused in any other file.
+/// PX-069: the settings store is the one file that may write, only through a
+/// fresh temporary file (`create_new`) renamed into place; the same
+/// constructs anywhere else, and every other rule there, stay refused.
+#[test]
+fn the_settings_allowance_is_exactly_the_settings_modules_atomic_writes() {
+    let writer = "use std::fs::{self, File, OpenOptions};\n\
+                  use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};\n\
+                  fn replace(temporary: &Path, target: &Path, bytes: &[u8]) -> std::io::Result<()> {\n\
+                      fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;\n\
+                      let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(temporary)?;\n\
+                      file.write_all(bytes)?; file.sync_all()?;\n\
+                      let _ = fs::remove_file(temporary);\n\
+                      fs::rename(temporary, target)\n\
+                  }";
+    assert_eq!(
+        token_violations(SETTINGS_MODULE, writer),
+        Vec::<String>::new()
+    );
+    assert_eq!(settings_write_violations(writer), Vec::<String>::new());
+    // The same writer in any other file is refused, rule by rule.
+    let elsewhere = token_violations("src/refresh.rs", writer);
+    for rule in ["[ident]", "[method]", "[fs]", "[fs-import]"] {
+        assert!(
+            elsewhere.iter().any(|violation| violation.contains(rule)),
+            "{rule} not reported outside the settings module: {elsewhere:?}"
+        );
+    }
+    // Inside the settings module, an in-place rewrite and a second open are
+    // refused by the pin, and every other rule still holds.
+    for (name, snippet) in [
+        (
+            "truncate",
+            writer.replace(".create_new(true)", ".create_new(true).truncate(true)"),
+        ),
+        (
+            "append",
+            writer.replace(".create_new(true)", ".create_new(true).append(true)"),
+        ),
+        (
+            "create(true)",
+            writer.replace(".create_new(true)", ".create(true)"),
+        ),
+        (
+            "a second OpenOptions",
+            format!("{writer}\nfn again() {{ let _ = OpenOptions::new().write(true).open(p); }}"),
+        ),
+        // PX-069 verification round 1, F3.
+        (
+            "create_new(false)",
+            writer.replace(".create_new(true)", ".create_new(false)"),
+        ),
+        (
+            "create_new(computed)",
+            writer.replace(".create_new(true)", ".create_new(fresh)"),
+        ),
+        (
+            "a cloned builder with custom_flags(O_TRUNC)",
+            format!(
+                "{writer}\nfn v2(path: &Path, options: &OpenOptions) {{ let mut again = options.clone(); again.custom_flags(0o1000); let _ = again.open(path); }}"
+            ),
+        ),
+        (
+            "custom_flags alone",
+            writer.replace(".mode(0o600)", ".mode(0o600).custom_flags(0o2000)"),
+        ),
+        (
+            "a builder copied by to_owned",
+            format!("{writer}\nfn v2(o: &OpenOptions) {{ let _ = o.to_owned().open(p); }}"),
+        ),
+        (
+            "a builder copied by Clone::clone",
+            format!("{writer}\nfn v2(o: &OpenOptions) {{ let _ = Clone::clone(o).open(p); }}"),
+        ),
+    ] {
+        assert!(
+            !settings_write_violations(&snippet).is_empty(),
+            "{name} passed the settings pin"
+        );
+    }
+    for (name, snippet, rule) in [
+        (
+            "Command",
+            "let _ = std::process::Command::new(\"x\");",
+            "ident",
+        ),
+        ("kill", "kill(1, 9);", "ident"),
+        ("fs::write", "std::fs::write(p, b);", "fs"),
+        ("File::create", "let _ = File::create(p);", "file"),
+        ("set_permissions", "file.set_permissions(mode);", "method"),
+        // V1 of verification round 1: an in-place rewrite through `File::options`.
+        (
+            "File::options",
+            "if let Ok(mut file) = File::options().write(true).open(path) { let _ = file.write_all(b\"x\"); }",
+            "file",
+        ),
+        (
+            "a handler",
+            "session.on(TABLE, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+    ] {
+        let found = token_violations(SETTINGS_MODULE, snippet);
+        assert!(
+            found
+                .iter()
+                .any(|violation| violation.contains(&format!("[{rule}]"))),
+            "{name} was not reported in the settings module: {found:?}"
+        );
+    }
+    // The saved views' registrations are the exact shapes PX-069 installs.
+    for innocent in [
+        "session.on(SAVED_VIEW_SLOT_1, ACTIVATE, slot(0));",
+        "session.on(SAVED_VIEW_SLOT_8, ACTIVATE, slot(7));",
+        "session.on(SAVED_VIEW_RENAME, ACTIVATE, move |session, _| { rename(session); });",
+        "session.on(SAVED_VIEW_NAME_INPUT, TEXT_EDIT, move |session, event| { named(session, event); });",
+    ] {
+        assert_eq!(
+            token_violations("src/lib.rs", innocent),
+            Vec::<String>::new(),
+            "{innocent}"
+        );
+    }
+    // Only `main` constructs a store (F3 of verification round 1, W1): every
+    // form of a construction is counted, and a renamed or aliased type is
+    // reported, so another file cannot write at a path of its choosing.
+    for (snippet, constructions) in [
+        (
+            "let store = crate::settings_file::SettingsStore::new(path_from_client);",
+            1,
+        ),
+        ("let store = <SettingsStore>::new(path);", 1),
+        (
+            "let a = SettingsStore::new(p); let b = SettingsStore::new(q);",
+            2,
+        ),
+        (
+            "fn f(store: &SettingsStore) { store.save(&settings).ok(); }",
+            0,
+        ),
+    ] {
+        assert_eq!(
+            settings_store_constructions(snippet),
+            (constructions, Vec::new()),
+            "{snippet}"
+        );
+    }
+    for hidden in [
+        "use crate::settings_file::SettingsStore as Store;",
+        "type Store = crate::settings_file::SettingsStore;",
+    ] {
+        assert!(
+            !settings_store_constructions(hidden).1.is_empty(),
+            "{hidden}"
+        );
+    }
+    // The per-file policy: one construction in `main`, none elsewhere.
+    let one = "let store = SettingsStore::new(path);";
+    assert_eq!(
+        settings_store_violations(SETTINGS_STORE_CONSTRUCTOR, one),
+        Vec::<String>::new()
+    );
+    assert!(!settings_store_violations("src/zz_verify1_store_bypass.rs", one).is_empty());
+    assert!(!settings_store_violations(SETTINGS_MODULE, one).is_empty());
+    assert!(
+        !settings_store_violations(SETTINGS_STORE_CONSTRUCTOR, &format!("{one}\n{one}")).is_empty()
+    );
+    assert!(!settings_store_violations(SETTINGS_STORE_CONSTRUCTOR, "fn f() {}").is_empty());
+    // Verification round 2, V2-3: the other ways to make a store.
+    let module = "pub struct SettingsStore { path: PathBuf, interrupt: Option<SaveStep> }\n\
+                  impl SettingsStore {\n\
+                      pub fn new(path: impl Into<PathBuf>) -> Self { Self { path: path.into(), interrupt: None } }\n\
+                      pub fn interrupted_at(mut self, step: SaveStep) -> Self { self.interrupt = Some(step); self }\n\
+                  }";
+    assert_eq!(
+        settings_store_violations(SETTINGS_MODULE, module),
+        Vec::<String>::new()
+    );
+    for (name, file, snippet) in [
+        (
+            "B1 an impl block in another file",
+            "src/zz_verify2_b1_impl_block.rs",
+            "impl crate::settings_file::SettingsStore { pub fn verify2_at(path: PathBuf) -> Self { Self::new(path) } }".to_string(),
+        ),
+        (
+            "B1 an impl block alone in another file",
+            "src/zz.rs",
+            "impl SettingsStore { pub fn at(path: PathBuf) -> Self { todo!() } }".to_string(),
+        ),
+        (
+            "B3 a trait impl alone in the settings module",
+            SETTINGS_MODULE,
+            format!("{module}\nimpl Default for SettingsStore {{ fn default() -> Self {{ todo!() }} }}"),
+        ),
+        (
+            "B1 a trait impl in another file",
+            "src/zz.rs",
+            "impl From<PathBuf> for SettingsStore { fn from(p: PathBuf) -> Self { todo!() } }".to_string(),
+        ),
+        (
+            "B2 a second literal in the settings module",
+            SETTINGS_MODULE,
+            format!("{module}\npub fn verify2_put(target: &Path, bytes: &[u8]) -> Result<(), SaveError> {{ let store = SettingsStore {{ path: target.to_path_buf(), interrupt: None }}; store.replace(target, bytes, None) }}"),
+        ),
+        (
+            "B2 a literal outside fn new",
+            SETTINGS_MODULE,
+            module.replace(
+                "pub fn new(path: impl Into<PathBuf>) -> Self { Self { path: path.into(), interrupt: None } }",
+                "pub fn at(path: impl Into<PathBuf>) -> Self { Self { path: path.into(), interrupt: None } }",
+            ),
+        ),
+        (
+            "B3 impl Default",
+            SETTINGS_MODULE,
+            format!("{module}\nimpl Default for SettingsStore {{ fn default() -> Self {{ Self::new(\"/tmp/anything\") }} }}"),
+        ),
+        (
+            "B3 Self::new in the settings module",
+            SETTINGS_MODULE,
+            format!("{module}\nimpl SettingsStore {{ pub fn tmp() -> Self {{ Self::new(\"/tmp/x\") }} }}"),
+        ),
+        (
+            "a literal in another file",
+            "src/zz.rs",
+            "let s = SettingsStore { path, interrupt: None };".to_string(),
+        ),
+        (
+            "B5 the constructor taken as a value",
+            "src/zz.rs",
+            "pub fn f(p: Option<PathBuf>) { let _ = p.map(SettingsStore::new); }".to_string(),
+        ),
+        (
+            "B6 a re-export under the same name",
+            "src/zz.rs",
+            "pub use crate::settings_file::SettingsStore as SettingsStore;".to_string(),
+        ),
+    ] {
+        assert!(
+            !settings_store_violations(file, &snippet).is_empty(),
+            "{name} passed the store pin"
+        );
+    }
+    for bypass in [
+        "session.on(SAVED_VIEW_SLOT_1, VALUE_CHANGED, slot(0));",
+        "session.on(SAVED_VIEW_NAME_INPUT, ACTIVATE, |_, _| {});",
+        "session.on(SAVED_VIEW_SLOTS[0], ACTIVATE, slot(0));",
+        "session.on(slot_node(3), ACTIVATE, slot(3));",
+    ] {
+        assert!(reported(bypass, "handler"), "{bypass}");
+    }
+}
+
 #[test]
 fn the_pidfd_allowance_is_exactly_the_handle_modules_two_system_calls() {
     let in_handle = |snippet: &str| token_violations(HANDLE_MODULE, snippet);

@@ -19,6 +19,14 @@
 //! handler exists, and the package stays read-only. `--protect-pid PID`
 //! (repeatable, at most 64, only with `--actions`) adds a PID no action may
 //! target, besides PID 1 and the support chain the server derives itself.
+//!
+//! Saved views (PX-069) live in this user's settings file on the server:
+//! with `--live-source` it is [`settings_file::default_path`]
+//! (`$XDG_CONFIG_HOME/srtop/settings`, or the platform's configuration
+//! directory), `--settings-path PATH` names another file, and
+//! `--no-settings` keeps none. The fixture sources keep none unless
+//! `--settings-path` is given, so no test run reads or writes the real
+//! user's settings. Without a settings file the view switcher is not created.
 use srui_process_explorer::{
     actions::{
         ActionGate, ActionMode, DryRunExecutor, ProcessActions, DEFAULT_PROTECTED_PIDS,
@@ -26,11 +34,13 @@ use srui_process_explorer::{
     },
     initialize, install_actions, install_column_handlers, install_filter_handlers,
     install_follow_handlers, install_inspector, install_owner_handlers, install_sampling_handlers,
-    install_search_handlers, install_sort_handlers, install_tag_handlers, install_thread_handlers,
-    install_view_handlers,
+    install_saved_views, install_search_handlers, install_sort_handlers, install_tag_handlers,
+    install_thread_handlers, install_view_handlers,
     procfs::ProcFsSource,
     refresh::{poll, ProcessView, DEFAULT_REFRESH_INTERVAL},
     sampling::parse_interval,
+    saved_views::SavedViews,
+    settings_file::{self, SettingsStore},
     source::{
         FakeProcessSource, FollowSource, ProcessSource, RepeatedNamesSource, ScriptedFakeSource,
         SyntheticProcessSource, ThreadsSource, TreeSource,
@@ -84,11 +94,21 @@ struct Actions {
     support: Arc<ServerSupportChain>,
 }
 
+/// Where saved views are kept (PX-069).
+#[derive(Clone, PartialEq, Eq)]
+enum SettingsChoice {
+    /// The default path for the live source; none for a fixture.
+    Default,
+    Path(PathBuf),
+    Disabled,
+}
+
 /// Publishes the first snapshot and starts the refresh loop for one source.
 fn collect<S>(
     session: &Arc<Session>,
     mut source: S,
     interval: Duration,
+    settings: Option<&std::path::Path>,
     actions: Option<&Actions>,
     shutdown: &CancellationToken,
     connections: &mut JoinSet<()>,
@@ -98,7 +118,7 @@ where
 {
     // The sampling controls state the interval the loop polls at from the
     // first transaction (PX-015).
-    let (view, _) = ProcessView::start_with_interval(session, &mut source, interval)?;
+    let (view, snapshot) = ProcessView::start_with_interval(session, &mut source, interval)?;
     // The refresh loop and the sort buttons' handlers share the published view
     // (PX-009). The handlers are installed here, before the socket is served,
     // so a ready instance always answers a click.
@@ -126,6 +146,16 @@ where
     // The inspector reads details through its own reader of the source's
     // records, on its own bounded worker (PX-013).
     install_inspector(session, &view, source.details());
+    // The saved views apply the active view before the socket is served and
+    // before any action control exists (PX-069). Their file is scoped to this
+    // source's identity.
+    if let Some(path) = settings {
+        let saved = Arc::new(Mutex::new(SavedViews::open(
+            SettingsStore::new(path),
+            &snapshot.source.0,
+        )));
+        install_saved_views(session, &view, &saved)?;
+    }
     // The action controls act on the inspector's resolved selection (PX-028),
     // through the dry-run executor, or through the one PID file descriptor
     // terminator of `--actions terminate` (PX-030).
@@ -158,6 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              | --fake-sequence \
              | --live-source | --procfs | --scale-source COUNT] \
              [--refresh-interval-ms MS | --scale-interval-ms MS] [--journal-capacity N] \
+             [--settings-path PATH | --no-settings] \
              [--actions read-only|dry-run|terminate [--protect-pid PID]...]"
             .into());
     }
@@ -167,6 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut interval = None;
     let mut journal_capacity = None;
     let mut actions = None;
+    let mut settings = SettingsChoice::Default;
     let mut protected: Vec<u32> = Vec::new();
     let mut args = args.peekable();
     while let Some(value) = args.next() {
@@ -220,6 +252,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("--journal-capacity N must be a positive integer")?;
                 journal_capacity = Some(capacity);
             }
+            Some("--settings-path") if settings == SettingsChoice::Default => {
+                let path = PathBuf::from(args.next().ok_or("missing --settings-path PATH")?);
+                if path.as_os_str().is_empty() || path.file_name().is_none() {
+                    return Err("--settings-path PATH must name a file".into());
+                }
+                settings = SettingsChoice::Path(path);
+            }
+            Some("--no-settings") if settings == SettingsChoice::Default => {
+                settings = SettingsChoice::Disabled;
+            }
             Some("--actions") if actions.is_none() => {
                 let mode = args
                     .next()
@@ -256,6 +298,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !protected.is_empty() && actions.is_none() {
         return Err("--protect-pid needs --actions".into());
     }
+    if matches!(settings, SettingsChoice::Path(_)) && collection == Collection::None {
+        return Err("--settings-path needs a process source".into());
+    }
+    // Only the live source uses this user's own settings file by default; a
+    // fixture keeps none unless a path is named (PX-069).
+    let settings: Option<PathBuf> = match settings {
+        SettingsChoice::Path(path) => Some(path),
+        SettingsChoice::Disabled => None,
+        // With neither `XDG_CONFIG_HOME` nor `HOME` absolute there is no
+        // per-user directory: saved views are off, and no view control exists.
+        SettingsChoice::Default if collection == Collection::Live => settings_file::default_path(),
+        SettingsChoice::Default => None,
+    };
+    let settings = settings.as_deref();
     // The chain serving this session is derived here, from this process and
     // the transports that connect to it (PX-030); nothing a client sends
     // names a member.
@@ -292,6 +348,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &session,
             FakeProcessSource,
             interval,
+            settings,
             actions,
             &shutdown,
             &mut connections,
@@ -300,6 +357,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &session,
             RepeatedNamesSource,
             interval,
+            settings,
             actions,
             &shutdown,
             &mut connections,
@@ -308,6 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &session,
             FollowSource::default(),
             interval,
+            settings,
             actions,
             &shutdown,
             &mut connections,
@@ -316,6 +375,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &session,
             TreeSource::default(),
             interval,
+            settings,
             actions,
             &shutdown,
             &mut connections,
@@ -324,6 +384,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &session,
             ThreadsSource::default(),
             interval,
+            settings,
             actions,
             &shutdown,
             &mut connections,
@@ -332,6 +393,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &session,
             ScriptedFakeSource::default(),
             interval,
+            settings,
             actions,
             &shutdown,
             &mut connections,
@@ -342,6 +404,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &session,
             ProcFsSource::live(),
             interval,
+            settings,
             actions,
             &shutdown,
             &mut connections,
@@ -350,6 +413,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &session,
             SyntheticProcessSource::new(count),
             interval,
+            settings,
             actions,
             &shutdown,
             &mut connections,

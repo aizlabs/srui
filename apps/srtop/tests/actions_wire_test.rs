@@ -695,6 +695,7 @@ fn a_connected_transport_is_refused_only_while_it_is_connected() {
         &socket,
         &[
             "--live-source",
+            "--no-settings",
             "--refresh-interval-ms",
             "200",
             "--actions",

@@ -278,7 +278,12 @@ fn srtop_collects_the_demo_workers_from_live_proc() {
     };
     let mut memory = DemoWorker::spawn(exe, &spec(Mode::Memory { mib: 96 })).unwrap();
     let mut cpu = DemoWorker::spawn(exe, &spec(Mode::Cpu { threads: 1 })).unwrap();
-    let srtop = Srtop::start(&["--live-source", "--refresh-interval-ms", "250"]);
+    let srtop = Srtop::start(&[
+        "--live-source",
+        "--no-settings",
+        "--refresh-interval-ms",
+        "250",
+    ]);
     let mut replica = Replica::hello(&srtop.socket(), b"px025-live").unwrap();
     let headings = replica.headings();
     let column = |name: &str| {

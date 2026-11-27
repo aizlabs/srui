@@ -4,15 +4,16 @@
 //! column chooser, PX-011 find-next/find-previous and jump to PID, PX-015
 //! sampling interval, Pause view/Resume view and manual refresh, PX-016
 //! keyboard shortcuts, PX-017 follow selected process, PX-018 parent/child
-//! process tree, PX-019 threads, PX-020 tags, PX-021 last-observed records).
+//! process tree, PX-019 threads, PX-020 tags, PX-021 last-observed records,
+//! PX-069 saved views, §§6.3, 26–27).
 //! No process
 //! is ever opened for control: the only client-input handlers are the sort
 //! buttons', the filter input's, the column chooser buttons', the search
 //! controls', the sampling controls', the follow toggle's, the view switch's,
-//! the tree's selection and disclosure reports, the thread checkboxes' and the
-//! tag buttons', which reorder, filter, re-lay out, locate, freeze,
-//! re-sample, follow, re-arrange or mark the published rows and touch no
-//! process. A
+//! the tree's selection and disclosure reports, the thread checkboxes', the
+//! tag buttons' and the saved views controls', which reorder, filter, re-lay
+//! out, locate, freeze, re-sample, follow, re-arrange, mark or save the
+//! presentation of the published rows and touch no process. A
 //! keyboard shortcut (design §§7.4, 7.6, 22.5; PX-016-G01's standard
 //! `shortcut` property) sends the same event its control's click sends, or
 //! only moves local focus; it adds no handler.
@@ -32,7 +33,10 @@ pub mod procfs;
 mod projection;
 pub mod refresh;
 pub mod sampling;
+pub mod saved_views;
 pub mod search;
+pub mod settings;
+pub mod settings_file;
 pub mod sort;
 pub mod source;
 pub mod summary;
@@ -229,6 +233,48 @@ pub const ACTIONS_STATUS: NodeId = NodeId::new(87);
 /// apart from [`ACTIONS_STATUS`]: a signal requested is not a process
 /// exited.
 pub const ACTIONS_OBSERVED: NodeId = NodeId::new(88);
+/// The saved views' switcher and controls (PX-069): a Row under the shell's
+/// column holding one Button per view slot, the view name field, the Save as
+/// new view, Rename active view, Delete active view and Restore default
+/// views buttons, and the views status. Created only when an instance has a
+/// settings store ([`install_saved_views`]), so they are not part of the
+/// shell; the row ceiling charges their reserve whether they exist or not.
+pub const SAVED_VIEWS_ROW: NodeId = NodeId::new(89);
+pub const SAVED_VIEW_SLOT_1: NodeId = NodeId::new(90);
+pub const SAVED_VIEW_SLOT_2: NodeId = NodeId::new(91);
+pub const SAVED_VIEW_SLOT_3: NodeId = NodeId::new(92);
+pub const SAVED_VIEW_SLOT_4: NodeId = NodeId::new(93);
+pub const SAVED_VIEW_SLOT_5: NodeId = NodeId::new(94);
+pub const SAVED_VIEW_SLOT_6: NodeId = NodeId::new(95);
+pub const SAVED_VIEW_SLOT_7: NodeId = NodeId::new(96);
+pub const SAVED_VIEW_SLOT_8: NodeId = NodeId::new(97);
+/// Every view slot's button, in switcher order (PX-069).
+pub const SAVED_VIEW_SLOTS: [NodeId; settings::MAX_VIEWS] = [
+    SAVED_VIEW_SLOT_1,
+    SAVED_VIEW_SLOT_2,
+    SAVED_VIEW_SLOT_3,
+    SAVED_VIEW_SLOT_4,
+    SAVED_VIEW_SLOT_5,
+    SAVED_VIEW_SLOT_6,
+    SAVED_VIEW_SLOT_7,
+    SAVED_VIEW_SLOT_8,
+];
+pub const SAVED_VIEW_NAME_INPUT: NodeId = NodeId::new(98);
+pub const SAVED_VIEW_CREATE: NodeId = NodeId::new(99);
+pub const SAVED_VIEW_RENAME: NodeId = NodeId::new(100);
+pub const SAVED_VIEW_DELETE: NodeId = NodeId::new(101);
+pub const SAVED_VIEWS_RESTORE: NodeId = NodeId::new(102);
+pub const SAVED_VIEWS_STATUS: NodeId = NodeId::new(103);
+/// The nodes the saved views' controls take (PX-069): the row, the slots,
+/// the name field, the four buttons and the status, numbered consecutively
+/// from [`SAVED_VIEWS_ROW`] to [`SAVED_VIEWS_STATUS`], all below the action
+/// panels' range.
+pub const SAVED_VIEWS_NODE_COUNT: usize = 1 + SAVED_VIEW_SLOTS.len() + 1 + 4 + 1;
+const _: () = assert!(
+    SAVED_VIEWS_STATUS.get() - SAVED_VIEWS_ROW.get() + 1 == SAVED_VIEWS_NODE_COUNT as u64
+        && SAVED_VIEWS_ROW.get() == ACTIONS_OBSERVED.get() + 1
+        && SAVED_VIEWS_STATUS.get() < actions::PANEL_RANGE_START
+);
 pub const VIEW_LABEL: &str = "Show process tree";
 pub const VIEW_DESCRIPTION: &str =
     "When on, the same processes are shown as a tree under their parents instead of the table. The server resolves each parent from the latest scan and never guesses one: a process whose parent is not in the scan, unreadable, a newer process reusing its PID, hidden by the filters, or caught in a cycle is shown at the top, and its Parent column says why. Expanding and collapsing are local; sorting orders each parent's children. The selection and follow carry over.";
@@ -714,6 +760,85 @@ pub fn install_actions(
     let cancel_gate = std::sync::Arc::clone(gate);
     session.on(ACTION_CANCEL, ACTIVATE, move |session, _| {
         actions::cancel_requested(&cancel_gate, session);
+    });
+    Ok(())
+}
+
+/// Creates the saved views' controls (PX-069) under the shell's column,
+/// applies the active saved view to `view`, and installs the controls'
+/// handlers: each slot's and each button's `ACTIVATE` and the name field's
+/// `TEXT_EDIT`.
+///
+/// A slot's click names only its slot, fixed here; the view it applies is the
+/// one the server holds there. The name is the text the server kept for the
+/// name field. Rename and Delete are handed the saved views alone, never the
+/// process view or an action gate, so neither can change what the process
+/// list shows, a selection, an identity or an intent. No handler reads a PID,
+/// a row or a path, and none touches a process.
+pub fn install_saved_views(
+    session: &Session,
+    view: &refresh::SharedView,
+    saved: &saved_views::SharedSavedViews,
+) -> Result<(), SessionError> {
+    {
+        let mut views = saved_views::lock_saved_views(saved);
+        views.create_controls(session, COLUMN)?;
+        views.apply_active(session, &mut refresh::lock_view(view))?;
+    }
+    let slot = |index: usize| {
+        let (saved, view) = (std::sync::Arc::clone(saved), std::sync::Arc::clone(view));
+        move |session: &Session, _: &srui_protocol::Event| {
+            let mut views = saved_views::lock_saved_views(&saved);
+            let applied = views.apply_slot(session, &mut refresh::lock_view(&view), index);
+            if let Err(error) = applied {
+                eprintln!("srtop: saved view not applied: {error}");
+            }
+        }
+    };
+    session.on(SAVED_VIEW_SLOT_1, ACTIVATE, slot(0));
+    session.on(SAVED_VIEW_SLOT_2, ACTIVATE, slot(1));
+    session.on(SAVED_VIEW_SLOT_3, ACTIVATE, slot(2));
+    session.on(SAVED_VIEW_SLOT_4, ACTIVATE, slot(3));
+    session.on(SAVED_VIEW_SLOT_5, ACTIVATE, slot(4));
+    session.on(SAVED_VIEW_SLOT_6, ACTIVATE, slot(5));
+    session.on(SAVED_VIEW_SLOT_7, ACTIVATE, slot(6));
+    session.on(SAVED_VIEW_SLOT_8, ACTIVATE, slot(7));
+    let named = std::sync::Arc::clone(saved);
+    session.on(SAVED_VIEW_NAME_INPUT, TEXT_EDIT, move |session, event| {
+        let text = srui_semantic_tree::Event::try_from(event.clone())
+            .ok()
+            .and_then(|event| event.text_arg().map(str::to_string));
+        let mut views = saved_views::lock_saved_views(&named);
+        let text = text.unwrap_or_else(|| views.name_input().to_string());
+        if let Err(error) = views.set_name_input(session, &text) {
+            eprintln!("srtop: view name not published: {error}");
+        }
+    });
+    let (created, read) = (std::sync::Arc::clone(saved), std::sync::Arc::clone(view));
+    session.on(SAVED_VIEW_CREATE, ACTIVATE, move |session, _| {
+        let mut views = saved_views::lock_saved_views(&created);
+        if let Err(error) = views.create(session, &refresh::lock_view(&read)) {
+            eprintln!("srtop: saved view not created: {error}");
+        }
+    });
+    let renamed = std::sync::Arc::clone(saved);
+    session.on(SAVED_VIEW_RENAME, ACTIVATE, move |session, _| {
+        if let Err(error) = saved_views::lock_saved_views(&renamed).rename(session) {
+            eprintln!("srtop: saved view not renamed: {error}");
+        }
+    });
+    let deleted = std::sync::Arc::clone(saved);
+    session.on(SAVED_VIEW_DELETE, ACTIVATE, move |session, _| {
+        if let Err(error) = saved_views::lock_saved_views(&deleted).delete(session) {
+            eprintln!("srtop: saved view not deleted: {error}");
+        }
+    });
+    let (restored, reset) = (std::sync::Arc::clone(saved), std::sync::Arc::clone(view));
+    session.on(SAVED_VIEWS_RESTORE, ACTIVATE, move |session, _| {
+        let mut views = saved_views::lock_saved_views(&restored);
+        if let Err(error) = views.restore_defaults(session, &mut refresh::lock_view(&reset)) {
+            eprintln!("srtop: default views not restored: {error}");
+        }
     });
     Ok(())
 }

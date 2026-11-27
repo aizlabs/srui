@@ -23,6 +23,12 @@
 //!   rule to abandon its retry set) names no node and is rejected; nothing is
 //!   sent to the worker.
 //!
+//! * **Another instance (PX-095).** Two instances serving the same fixture
+//!   (two hosts in effect: the same PIDs, names and item identities) each
+//!   hold a pending request for the same PID in the same panel slot. One
+//!   client's Confirm delivered to the other instance names a node that
+//!   instance never held and is rejected; its own intent stays pending.
+//!
 //! Portable tests use the fixture and the dry-run executor; the Linux test
 //! uses the live `/proc` source, `--actions terminate` and an owned worker.
 
@@ -620,6 +626,76 @@ fn pause_resume(observer: &mut Client) {
     let pause = srui_process_explorer::SAMPLING_PAUSE;
     assert_eq!(observer.click(pause).status, processed());
     assert_eq!(observer.click(pause).status, processed());
+}
+
+/// Portable, PX-095: two concurrent instances, two hosts in effect, serve
+/// the same fixture: the same PIDs, names and item identities. Each client
+/// prepares a request for the same PID in the same panel slot, and one
+/// client's Confirm is then delivered to the other instance, past its
+/// observed revision, as a client that moved a confirmation onto another
+/// session would. It names a node that instance never held: `REJECTED`, its
+/// own intent still pending; the right instance confirms it.
+#[test]
+fn a_confirmation_cannot_be_moved_onto_another_instance_with_identical_processes() {
+    let options = [
+        "--fake-source",
+        "--actions",
+        "dry-run",
+        "--refresh-interval-ms",
+        "300000",
+    ];
+    let (directory_a, directory_b) = (SocketDirectory::new(), SocketDirectory::new());
+    let (socket_a, socket_b) = (directory_a.socket(), directory_b.socket());
+    let _server_a = Server::start(&socket_a, &options);
+    let _server_b = Server::start(&socket_b, &options);
+    let mut a = Client::hello(&socket_a, CLIENT);
+    let mut b = Client::hello(&socket_b, CLIENT);
+    assert_ne!(a.session_id, b.session_id, "two incarnations");
+    assert_eq!(
+        a.item_of(4101),
+        b.item_of(4101),
+        "identical by construction: the same item identity for PID 4101"
+    );
+    let panel_a = prepare(&mut a, 4101);
+    let panel_b = prepare(&mut b, 4101);
+    assert_eq!(a.status(), b.status(), "the same request on both");
+    assert_ne!(
+        panel_a.confirm, panel_b.confirm,
+        "each instance draws its own panel range"
+    );
+    let confirm_a = a.click_event(panel_a.confirm);
+    // Past A's click's observed revision on B, so only the node tells them apart.
+    let mut observer = Client::hello(&socket_b, OBSERVER);
+    while observer.revision() <= confirm_a.observed_revision.get() {
+        pause_resume(&mut observer);
+    }
+    let target = observer.revision();
+    b.until("the observer's commits", |b| {
+        b.revision() >= target && b.enabled(panel_b.confirm)
+    });
+    let pending_b = b.status();
+    assert!(pending_b.starts_with("Prepared #1"), "{pending_b}");
+    let moved = b.deliver(&confirm_a);
+    assert_eq!(moved.status, rejected(), "{moved:?}");
+    assert_eq!(
+        moved.reject_reason,
+        format!(
+            "event target node {} does not exist in store",
+            panel_a.confirm
+        ),
+    );
+    assert_eq!(b.status(), pending_b, "B's intent was not confirmed");
+    assert!(b.enabled(panel_b.confirm), "B's intent is still pending");
+    // Its own instance confirms it; the other is untouched.
+    assert_eq!(a.deliver(&confirm_a).status, processed());
+    assert!(
+        a.status()
+            .starts_with("Dry run #1 requested (terminate PID 4101 · worker)"),
+        "{}",
+        a.status()
+    );
+    b.until("B unchanged", |b| b.revision() >= target);
+    assert_eq!(b.status(), pending_b);
 }
 
 /// Waits until `client`'s instance has passed `event`'s observed revision,

@@ -16,6 +16,8 @@ PX-026-G01, the installable-R1 package gate, has implementation evidence in [its
 
 PX-031 completes the implementation of the safe single-target slice (`delivery_milestones.safe_termination`; the release map's "Confirmed SIGTERM and observed outcome", gate: none): PX-028's authorization, PX-029's process handles, PX-030's confirmed SIGTERM and PX-031's observed outcome, which reports a sent request separately from what srtop's own scans then show (exited after the request, still running, or outcome unknown, never escalated), settles every result through the runtime's event result cache, and abandons every intent on a restart. Its [completion record](docs/process-explorer/completions/PX-031.md) has the evidence; HTOP-R1-001 is `in_progress` until independent verification. The plan defines no separate release record for this slice, and the R1 user evidence above is still outstanding.
 
+PX-095 adds multiple isolated host windows to the generic connection manager: several sessions run at once, each in its own session context and attempt generation, and every window names its host, account and session incarnation in client-owned chrome. Two hosts serving identical PIDs, names and item identities share no selection, event sequence, cached identity or confirmation, and replacing one session leaves the other running. Its [completion record](docs/process-explorer/completions/PX-095.md) has the evidence; `SRUI-PX095-001`..`005` are `in_progress` until independent verification. It was implemented with the R1 user evidence still outstanding. No side-by-side metric comparison view was built.
+
 ## Delivery priorities
 
 1. PX-000–PX-008: real read-only monitor.

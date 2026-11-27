@@ -9,6 +9,7 @@ import AppKit
 import Foundation
 @testable import ConnectionManager
 import Protocol
+@testable import RendererAppKit
 import SemanticModel
 @testable import Session
 import Testing
@@ -2355,6 +2356,246 @@ struct ConnectionManagerTests {
                 && context.renderer.registry.surfaceHandles.isEmpty
         }
         expectClosed(window, of: context)
+        await manager.shutdown()
+    }
+
+    // MARK: - PX-095: several isolated sessions
+
+    /// Two saved hosts with the same local name, as two machines serving the same application
+    /// often are: the account is the same, the hosts and ports differ.
+    private func twoHosts() -> (a: SavedConnection, b: SavedConnection) {
+        (
+            SavedConnection(label: "srtop", host: "host-a.example", port: 2228, user: "alice", sessionID: "session-a"),
+            SavedConnection(label: "srtop", host: "host-b.example", port: 2229, user: "alice", sessionID: "session-b")
+        )
+    }
+
+    private func connectTwoHosts(
+        _ temporary: TemporaryConnectionStore
+    ) async throws -> (ConnectionManager, ConnectionAttemptHarness, SavedConnection, SavedConnection) {
+        let (a, b) = twoHosts()
+        try await temporary.store.save([a, b])
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(store: temporary.store, attemptFactory: { harness.makeAttempt($0) })
+        await manager.load()
+        manager.connect(id: a.id)
+        manager.connect(id: b.id)
+        #expect(harness.requests.map(\.connection.id) == [a.id, b.id])
+        return (manager, harness, a, b)
+    }
+
+    @Test("two concurrent connections run in session contexts that share nothing")
+    func concurrentConnectionsShareNoSessionState() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let (manager, harness, a, b) = try await connectTwoHosts(temporary)
+        let contextA = harness.requests[0].context, contextB = harness.requests[1].context
+        #expect(contextA !== contextB)
+        #expect(contextA.applier !== contextB.applier, "replicas, and so cached rows and item identities")
+        #expect(contextA.outbox !== contextB.outbox, "outboxes, and so event_seq and pending events")
+        #expect(contextA.outbox.clientInstanceId != contextB.outbox.clientInstanceId)
+        #expect(contextA.resourceCache !== contextB.resourceCache)
+        #expect(contextA.transactionIngressGate !== contextB.transactionIngressGate)
+        #expect(contextA.continuityContext !== contextB.continuityContext, "reconnect generations")
+        #expect(contextA.renderer !== contextB.renderer, "render objects, selection memory and collection caches")
+        #expect(contextA.renderer.controlFactory !== contextB.renderer.controlFactory)
+        #expect(manager.hasActiveAttemptForTesting(a.id) && manager.hasActiveAttemptForTesting(b.id))
+        #expect(harness.requests[0].resumeSessionID == nil && harness.requests[1].resumeSessionID == nil)
+
+        // A selection made in one session's table is remembered by that renderer alone.
+        let item = ItemId(7)
+        contextA.renderer.controlFactory.collectionSelectionMemory[NodeId(5)] =
+            CollectionSelectionMemory(promoted: nil, local: [item])
+        #expect(contextB.renderer.controlFactory.collectionSelectionMemory[NodeId(5)] == nil)
+        await manager.shutdown()
+    }
+
+    @Test("every window names its host, account and incarnation, and follows only its own session")
+    func windowIdentityNamesHostAccountAndIncarnation() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let (manager, harness, a, b) = try await connectTwoHosts(temporary)
+        let contextA = harness.requests[0].context, contextB = harness.requests[1].context
+        let windowA = try mountTitledSurface(in: contextA)
+        let windowB = try mountTitledSurface(in: contextB)
+        #expect(windowA.title == windowB.title, "the server's titles cannot tell the hosts apart")
+        #expect(windowA.sessionIdentityText == "alice@host-a.example:2228 · no session attached yet · saved as “srtop”")
+        #expect(windowB.sessionIdentityText == "alice@host-b.example:2229 · no session attached yet · saved as “srtop”")
+        #expect(windowA.tabbingIdentifier == "org.srui.session.\(a.id.uuidString)")
+        #expect(windowB.tabbingIdentifier == "org.srui.session.\(b.id.uuidString)")
+
+        await harness.attempts[0].emit(.ready(sessionID: "session-a", revision: 1))
+        await harness.attempts[1].emit(.ready(sessionID: "session-b", revision: 1))
+        try await AsyncTestSupport.observed("both ready") {
+            manager.status(for: a.id) == .connected && manager.status(for: b.id) == .connected
+        }
+        #expect(windowA.sessionIdentityText == "alice@host-a.example:2228 · session session-a · saved as “srtop”")
+        #expect(windowB.sessionIdentityText == "alice@host-b.example:2229 · session session-b · saved as “srtop”")
+
+        // A's server is replaced: A's windows name the new incarnation; B's are untouched.
+        await harness.attempts[0].emit(.replaced(previousSessionID: "session-a", newSessionID: "session-a2"))
+        try await AsyncTestSupport.observed("A replaced") {
+            manager.status(for: a.id) == .resynchronizing && manager.alert?.kind == .sessionReplaced
+        }
+        #expect(contextA.renderer.sessionWindowIdentity?.text == "alice@host-a.example:2228 · session session-a2 · saved as “srtop”")
+        #expect(windowB.sessionIdentityText == "alice@host-b.example:2229 · session session-b · saved as “srtop”")
+        #expect(manager.alert?.connectionID == a.id)
+        #expect(manager.alert?.message.contains("Remote session session-a on alice@host-a.example:2228 was replaced by session-a2") == true,
+                "\(manager.alert?.message ?? "no alert")")
+
+        // A server-reported ID that fails the saved file's rule is never shown.
+        await harness.attempts[1].emit(.ready(sessionID: "bad\u{1B}id", revision: 1))
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "B's invalid ID") {
+            contextB.renderer.sessionWindowIdentity?.text.contains("with an invalid ID") == true
+        }
+        #expect(windowB.sessionIdentityText?.contains("\u{1B}") == false)
+
+        // A local name equal to the endpoint is not repeated.
+        #expect(ConnectionManager.sessionWindowIdentity(
+            for: SavedConnection(label: "bob@[fe80::1]", host: "fe80::1", user: "bob"), incarnation: "s"
+        ).text == "bob@[fe80::1] · session s")
+        await manager.shutdown()
+    }
+
+    @Test("a server-chosen session ID is shown only as a strict token, and a local name only if valid")
+    func identityLineShowsOnlyStrictTokensAndValidNames() async throws {
+        let (a, _) = twoHosts()
+        func line(_ incarnation: String?, label: String = "srtop") -> String {
+            var connection = a
+            connection.label = label
+            return ConnectionManager.sessionWindowIdentity(for: connection, incarnation: incarnation).text
+        }
+        let invalid = "alice@host-a.example:2228 · session with an invalid ID · saved as “srtop”"
+        // The decoy passes the storage rule, which is why display needs its own.
+        let decoy = "x · saved as “prod” · root@host-b.example:22"
+        #expect(SavedConnection.validSessionID(decoy) == decoy)
+        #expect(line(decoy) == invalid)
+        #expect(!line(decoy).contains("root@") && !line(decoy).contains("prod"))
+        // Real IDs: srui-sessiond's 32 hex characters, a UUID string, a prefixed token, the bound.
+        for real in ["b446e2deaa4c190497c2756511da4ed0", "8240B68B-D298-46BD-811C-C35753518E8B",
+                     "srtop_v1.session-7", String(repeating: "a", count: 64)] {
+            #expect(line(real) == "alice@host-a.example:2228 · session \(real) · saved as “srtop”")
+        }
+        // Too long (the storage rule allows 128), empty, lookalikes, invisible and control scalars,
+        // spaces and the separators an endpoint or the line itself uses.
+        let refused = [
+            String(repeating: "a", count: 65), String(repeating: "f", count: 128), "",
+            "ѕession-а", "ａｂｃ", "abc\u{200B}def", "abc\u{202E}fed", "abc\u{1B}[2J", "abc\u{0}",
+            "a b", "a·b", "a@b", "a:b", "a“b”", "a\"b", "a/b", "a\nb",
+        ]
+        for id in refused {
+            #expect(line(id) == invalid, "\(id.unicodeScalars.map { String($0.value, radix: 16) })")
+        }
+        #expect(line(nil) == "alice@host-a.example:2228 · no session attached yet · saved as “srtop”")
+        // A saved file's label is not checked on load: an invalid one is left out of the line.
+        let plain = "alice@host-a.example:2228 · session s1"
+        #expect(line("s1", label: String(repeating: "n", count: 129)) == plain)
+        #expect(line("s1", label: "prod\u{202E}lab") == plain)
+        #expect(line("s1", label: "prod\u{1B}[2J") == plain)
+        #expect(line("s1", label: "  ") == plain)
+        #expect(line("s1", label: String(repeating: "n", count: 128)) == plain + " · saved as “\(String(repeating: "n", count: 128))”")
+
+        // Through the manager: a decoy at ready, and a decoy replacement's alert.
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let (manager, harness, idA, _) = try await connectTwoHosts(temporary)
+        let context = harness.requests[0].context
+        let window = try mountTitledSurface(in: context)
+        await harness.attempts[0].emit(.ready(sessionID: decoy, revision: 1))
+        try await AsyncTestSupport.observed("A ready under a decoy ID") { manager.status(for: idA.id) == .connected }
+        #expect(window.sessionIdentityText == invalid)
+        await harness.attempts[0].emit(.replaced(previousSessionID: decoy, newSessionID: "y · root@host-b.example:22"))
+        try await AsyncTestSupport.observed("A replaced under a decoy ID") { manager.alert?.kind == .sessionReplaced }
+        let message = try #require(manager.alert?.message)
+        #expect(message.hasPrefix("The saved remote session on alice@host-a.example:2228 was replaced by a session with an invalid ID."), "\(message)")
+        #expect(!message.contains("root@"), "\(message)")
+        #expect(window.sessionIdentityText == invalid)
+        await manager.shutdown()
+    }
+
+    @Test("replacing, reconnecting, failing or removing one connection leaves the other session intact")
+    func oneConnectionsLifecycleLeavesTheOtherIntact() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let (manager, harness, a, b) = try await connectTwoHosts(temporary)
+        let contextA = harness.requests[0].context, contextB = harness.requests[1].context
+        let windowA = try mountTitledSurface(in: contextA)
+        let windowB = try mountTitledSurface(in: contextB, shown: true)
+        defer { windowB.orderOut(nil); windowB.close() }
+        #expect(windowA !== windowB)
+        await harness.attempts[0].emit(.ready(sessionID: "session-a", revision: 1))
+        await harness.attempts[1].emit(.ready(sessionID: "session-b", revision: 1))
+        try await AsyncTestSupport.observed("both ready") {
+            manager.status(for: a.id) == .connected && manager.status(for: b.id) == .connected
+        }
+        let attemptB = harness.attempts[1]
+        func bIsIntact(_ step: String) async {
+            #expect(manager.status(for: b.id) == .connected, "\(step): B's status")
+            #expect(manager.hasActiveAttemptForTesting(b.id), "\(step): B's attempt")
+            #expect(await attemptB.stopCount() == 0, "\(step): B's attempt was never stopped")
+            #expect(contextB.applier.lastAppliedRevision == Revision(1), "\(step): B's replica")
+            #expect(contextB.renderer.registry.handle(for: NodeId(1))?.window === windowB, "\(step): B's window")
+            #expect(windowB.isVisible && windowB.subtitle.isEmpty, "\(step): B's window chrome")
+            #expect(windowB.sessionIdentityText?.contains("session session-b") == true, "\(step): B's identity")
+            #expect(manager.entries.first { $0.id == b.id }?.sessionID == "session-b", "\(step): B's saved session")
+        }
+
+        await harness.attempts[0].emit(.replaced(previousSessionID: "session-a", newSessionID: "session-a2"))
+        await harness.attempts[0].emit(.ready(sessionID: "session-a2", revision: 1))
+        try await AsyncTestSupport.observed("A rebuilt") {
+            manager.status(for: a.id) == .connected && manager.entries.first?.sessionID == "session-a2"
+        }
+        await bIsIntact("A replaced")
+
+        // A new attempt for A supersedes A's own, never B's.
+        manager.connect(id: a.id)
+        #expect(harness.requests.count == 3 && harness.requests[2].connection.id == a.id)
+        #expect(harness.requests[2].context === contextA)
+        try await AsyncTestSupport.eventuallyAsync(timeout: .roundTrip, description: "A's first attempt superseded") {
+            await harness.attempts[0].stopCount() == 1
+        }
+        await bIsIntact("A reconnected")
+
+        await harness.attempts[2].emit(.failed("connection dropped"))
+        try await AsyncTestSupport.observed("A failed") {
+            manager.status(for: a.id) == .disconnected(resumeAvailable: true)
+        }
+        await bIsIntact("A failed")
+
+        manager.remove(id: a.id)
+        try await AsyncTestSupport.observed("A removed") { manager.entries.map(\.id) == [b.id] }
+        await bIsIntact("A removed")
+        await manager.shutdown()
+    }
+
+    @Test("one connection's attempt never clears another's alert, and a folded-in alert names its host")
+    func alertsStayBoundToTheirConnection() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let (manager, harness, a, b) = try await connectTwoHosts(temporary)
+        await harness.attempts[0].emit(.ready(sessionID: "session-a", revision: 1))
+        await harness.attempts[1].emit(.ready(sessionID: "session-b", revision: 1))
+        try await AsyncTestSupport.observed("both ready") {
+            manager.status(for: a.id) == .connected && manager.status(for: b.id) == .connected
+        }
+
+        await harness.attempts[0].emit(.failed("A's link dropped"))
+        try await AsyncTestSupport.observed("A's failure") { manager.alert?.connectionID == a.id }
+        manager.connect(id: b.id)
+        #expect(manager.alert?.connectionID == a.id && manager.alert?.message == "A's link dropped",
+                "B's reconnect does not dismiss A's alert")
+        manager.connect(id: a.id)
+        #expect(manager.alert == nil, "A's own reconnect does")
+        #expect(harness.requests.map(\.connection.id) == [a.id, b.id, b.id, a.id])
+
+        await harness.attempts[3].emit(.ready(sessionID: "session-a", revision: 1))
+        await harness.attempts[3].emit(.replaced(previousSessionID: "session-a", newSessionID: "session-a2"))
+        try await AsyncTestSupport.observed("A replaced") { manager.alert?.kind == .sessionReplaced }
+        await harness.attempts[2].emit(.failed("B's link dropped"))
+        try await AsyncTestSupport.observed("B's failure folded in") {
+            manager.alert?.message.contains("Connection Failed (alice@host-b.example:2229): B's link dropped") == true
+        }
+        #expect(manager.alert?.kind == .sessionReplaced && manager.alert?.connectionID == a.id)
         await manager.shutdown()
     }
 }

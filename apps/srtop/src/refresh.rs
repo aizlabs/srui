@@ -379,6 +379,15 @@ pub const TAGS_RESERVE_BYTES: usize = 4096;
 /// `--actions`, so the controls never change which rows fit.
 pub const ACTIONS_RESERVE_BYTES: usize = 4096;
 
+/// What the saved views' controls are charged in the row ceiling (PX-069):
+/// the row, every slot button with a name at
+/// [`crate::settings::MAX_VIEW_NAME_BYTES`] and its description, the name
+/// field holding [`crate::saved_views::MAX_NAME_INPUT_BYTES`], the four
+/// buttons and the status at [`crate::saved_views::MAX_VIEWS_STATUS_BYTES`].
+/// Charged whether or not the instance has a settings store, so the controls
+/// never change which rows fit.
+pub const SAVED_VIEWS_RESERVE_BYTES: usize = 6144;
+
 /// What every row's tag cell is charged in the row ceiling (PX-020): an
 /// untagged, empty cell, whether the row is tagged or not, so tagging or
 /// untagging a row never changes which rows fit.
@@ -5182,7 +5191,8 @@ fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
             + THREADS_RESERVE_BYTES
             + TAGS_RESERVE_BYTES
             + TAG_CELLS_RESERVE_BYTES
-            + ACTIONS_RESERVE_BYTES,
+            + ACTIONS_RESERVE_BYTES
+            + SAVED_VIEWS_RESERVE_BYTES,
     );
     let mut spent = 0usize;
     let mut kept = 0usize;
@@ -7275,7 +7285,8 @@ mod tests {
                 + THREADS_RESERVE_BYTES
                 + TAGS_RESERVE_BYTES
                 + TAG_CELLS_RESERVE_BYTES
-                + ACTIONS_RESERVE_BYTES);
+                + ACTIONS_RESERVE_BYTES
+                + SAVED_VIEWS_RESERVE_BYTES);
         let mut published = Vec::new();
         for system in [
             SystemSample::not_provided(),

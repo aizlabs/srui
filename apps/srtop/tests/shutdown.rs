@@ -181,7 +181,12 @@ fn an_out_of_range_refresh_interval_is_refused_without_publishing_a_socket() {
         let exit = Command::new(env!("CARGO_BIN_EXE_srtop"))
             .arg("--socket")
             .arg(&socket)
-            .args(["--live-source", "--refresh-interval-ms", interval])
+            .args([
+                "--live-source",
+                "--no-settings",
+                "--refresh-interval-ms",
+                interval,
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

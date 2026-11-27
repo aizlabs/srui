@@ -772,7 +772,12 @@ fn live_procfs_identities_follow_every_continuity_decision() {
     let socket = directory.socket();
     // The default window replays; a one-commit window resynchronizes.
     for capacity in [None, Some("1")] {
-        let mut options = vec!["--live-source", "--refresh-interval-ms", "100"];
+        let mut options = vec![
+            "--live-source",
+            "--no-settings",
+            "--refresh-interval-ms",
+            "100",
+        ];
         if let Some(capacity) = capacity {
             options.extend(["--journal-capacity", capacity]);
         }

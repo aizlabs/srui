@@ -478,7 +478,12 @@ fn delayed_range_requests_converge_under_live_short_lived_process_churn() {
     };
     thread::sleep(Duration::from_millis(800));
     let interval = Duration::from_millis(100);
-    let srtop = Srtop::start(&["--live-source", "--refresh-interval-ms", "100"]);
+    let srtop = Srtop::start(&[
+        "--live-source",
+        "--no-settings",
+        "--refresh-interval-ms",
+        "100",
+    ]);
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         assert_bounded_progress(&srtop, interval, "live", &[100, 300, 600])
     }));

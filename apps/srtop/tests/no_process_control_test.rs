@@ -43,7 +43,10 @@
 //!   `VALUE_CHANGED` (PX-019), or a tag button (`TAG_TOGGLE`,
 //!   `TAG_DESCENDANTS`, `TAGS_CLEAR`) with `ACTIVATE` (PX-020), or an
 //!   action button (`ACTION_PREPARE`, `ACTION_CANCEL`) with `ACTIVATE`
-//!   (PX-028), or, in `src/lib.rs` only, exactly `panel_confirm` with
+//!   (PX-028), or a saved views button (`SAVED_VIEW_SLOT_1`…`_8`,
+//!   `SAVED_VIEW_CREATE`, `SAVED_VIEW_RENAME`, `SAVED_VIEW_DELETE`,
+//!   `SAVED_VIEWS_RESTORE`) with `ACTIVATE` or `SAVED_VIEW_NAME_INPUT` with
+//!   `TEXT_EDIT` (PX-069), or, in `src/lib.rs` only, exactly `panel_confirm` with
 //!   `ACTIVATE`, the confirmation panels' Confirm handlers (PX-030), whose
 //!   gate reaches one of the two production executors pinned below;
 //!   `on_result`, `on_text_edit`, `on_expansion_changed`
@@ -61,6 +64,15 @@
 //!   import of one, a type alias of `File`. A file's write, resize and
 //!   permission methods are refused as methods and as paths
 //!   (`std::io::Write::write_all(&mut f, ..)`).
+//! * **The one file that writes (PX-069).** `src/settings_file.rs`, and no
+//!   other file, may name `OpenOptions`, `OpenOptionsExt`, `DirBuilder`,
+//!   `DirBuilderExt`, `fs::rename` and `fs::remove_file`, and call `.write`
+//!   and `.write_all`: the per-user settings store, which replaces the
+//!   settings file and its backup through fresh temporary files renamed into
+//!   place. Its writes are pinned ([`settings_write_violations`]): exactly
+//!   one `OpenOptions::new()` and one `create_new`, and no `truncate`,
+//!   `append` or `.create(true)`. Every other rule holds there as everywhere;
+//!   no file but it may write, and no client input names its path.
 //!   The only signal API is receiving SIGINT, SIGTERM and the
 //!   `--smoke-fixture` SIGUSR1.
 //! * **The one raw system-call allowance (PX-029).** `src/handle.rs`, and no
@@ -96,7 +108,7 @@
 //! the token audit does not recognise — among them a write through a `File`
 //! handle by `write!` or a generic writer such as `io::copy`, which tokens cannot
 //! tell from formatting into a `String` (inert while the only open allowed is
-//! read-only); code that procedural macros or the dependencies' own macros
+//! read-only, outside the settings store's fresh temporary files); code that procedural macros or the dependencies' own macros
 //! generate; code inside the allowed dependencies beyond the symbols they
 //! import; the arguments of a raw system call a dependency makes; any binary but
 //! the debug build `cargo test` links; Cargo configuration outside the package
@@ -534,7 +546,8 @@ fn production(level: &[Tok]) -> Vec<Tok> {
 
 /// Every name a grouped import from `fs` brings in must be allowed, never
 /// renamed and never a glob: `use std::fs::{metadata, write}` is refused.
-fn check_fs_group(group: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
+/// `extra` are the names the file's own allowance adds (PX-069).
+fn check_fs_group(group: &[Tok], extra: &[&str], report: &mut dyn FnMut(usize, &str, String)) {
     for (i, tok) in group.iter().enumerate() {
         match tok {
             Tok::Ident(name, _, line) if name == "as" => {
@@ -542,15 +555,102 @@ fn check_fs_group(group: &[Tok], report: &mut dyn FnMut(usize, &str, String)) {
             }
             Tok::Ident(name, _, line) => {
                 let renamed_to = ident(i.checked_sub(1).and_then(|p| group.get(p))) == Some("as");
-                if !renamed_to && name != "self" && !FS_ALLOWED.contains(&name.as_str()) {
+                if !renamed_to
+                    && name != "self"
+                    && !FS_ALLOWED.contains(&name.as_str())
+                    && !extra.contains(&name.as_str())
+                {
                     report(*line, "fs-import", format!("fs::{{{name}}} is not a read"));
                 }
             }
             Tok::Punct('*', line) => report(*line, "fs-import", "a glob import from fs".into()),
-            Tok::Group(_, inner, _) => check_fs_group(inner, report),
+            Tok::Group(_, inner, _) => check_fs_group(inner, extra, report),
             _ => {}
         }
     }
+}
+
+/// The one file that may write (PX-069): the per-user settings file's store,
+/// which replaces the settings file and its backup through fresh temporary
+/// files renamed into place.
+const SETTINGS_MODULE: &str = "src/settings_file.rs";
+
+/// The identifiers only [`SETTINGS_MODULE`] may name: the builder that opens
+/// its temporary files and its mode extension.
+const SETTINGS_IDENTS: &[&str] = &["OpenOptions", "OpenOptionsExt"];
+
+/// The methods only [`SETTINGS_MODULE`] may call: `OpenOptions::write`, and
+/// `write_all` of a temporary file it created.
+const SETTINGS_METHODS: &[&str] = &["write", "write_all"];
+
+/// The `std::fs` and `std::os::unix::fs` items only [`SETTINGS_MODULE`] may
+/// name besides the reads: creating its directory (mode 0700), opening a
+/// temporary file, renaming it into place, and removing a temporary file.
+const SETTINGS_FS_ALLOWED: &[&str] = &[
+    "OpenOptions",
+    "OpenOptionsExt",
+    "DirBuilder",
+    "DirBuilderExt",
+    "rename",
+    "remove_file",
+];
+
+/// How [`SETTINGS_MODULE`]'s writes are pinned (PX-069): exactly one
+/// `OpenOptions::new()`, exactly one `create_new` (so every file it opens for
+/// writing is a fresh one, never an existing file or a link), and no
+/// `truncate`, `append` or `.create(true)`, which would open an existing file
+/// to rewrite it in place.
+fn settings_write_violations(source: &str) -> Vec<String> {
+    fn walk(level: &[Tok], counts: &mut (usize, usize), found: &mut Vec<String>) {
+        for (i, tok) in level.iter().enumerate() {
+            match tok {
+                Tok::Ident(name, _, line) => match name.as_str() {
+                    "truncate" | "append" => {
+                        found.push(format!("line {line}: `{name}` rewrites a file in place"))
+                    }
+                    "create_new" => counts.1 += 1,
+                    "create" if is_punct(i.checked_sub(1).and_then(|p| level.get(p)), '.') => {
+                        if let Some(Tok::Group(Delimiter::Parenthesis, inner, _)) = level.get(i + 1)
+                        {
+                            if matches!(inner.as_slice(), [Tok::Ident(value, _, _)] if value == "true")
+                            {
+                                found.push(format!(
+                                    "line {line}: `.create(true)` opens an existing file"
+                                ));
+                            }
+                        }
+                    }
+                    "OpenOptions"
+                        if is_path_sep(level.get(i + 1))
+                            && ident(level.get(i + 2)) == Some("new") =>
+                    {
+                        counts.0 += 1
+                    }
+                    _ => {}
+                },
+                Tok::Group(_, inner, _) => walk(inner, counts, found),
+                _ => {}
+            }
+        }
+    }
+    let stream = match TokenStream::from_str(source) {
+        Ok(stream) => stream,
+        Err(error) => return vec![format!("does not tokenize: {error}")],
+    };
+    let tokens = production(&lower(stream));
+    let mut counts = (0, 0);
+    let mut found = Vec::new();
+    walk(&tokens, &mut counts, &mut found);
+    if counts.0 != 1 {
+        found.push(format!(
+            "{} `OpenOptions::new()`, not exactly one",
+            counts.0
+        ));
+    }
+    if counts.1 != 1 {
+        found.push(format!("{} `create_new`, not exactly one", counts.1));
+    }
+    found
 }
 
 fn contains_ident(level: &[Tok], names: &[&str]) -> bool {
@@ -1028,6 +1128,13 @@ fn handle_signal_violations(source: &str) -> Vec<String> {
 fn scan(level: &[Tok], file: &str, report: &mut dyn FnMut(usize, &str, String)) {
     let handle_module = file == HANDLE_MODULE;
     let executor_module = file == EXECUTOR_MODULE;
+    // PX-069: the settings store's writes, in that file alone.
+    let settings_module = file == SETTINGS_MODULE;
+    let fs_extra: &[&str] = if settings_module {
+        SETTINGS_FS_ALLOWED
+    } else {
+        &[]
+    };
     for (i, tok) in level.iter().enumerate() {
         let prev = i.checked_sub(1).and_then(|p| level.get(p));
         let next = level.get(i + 1);
@@ -1036,7 +1143,9 @@ fn scan(level: &[Tok], file: &str, report: &mut dyn FnMut(usize, &str, String)) 
             Tok::Ident(name, raw, line) => {
                 let line = *line;
                 if let Some((_, why)) = FORBIDDEN_IDENTS.iter().find(|(word, _)| word == name) {
-                    if !(handle_module && handle_module_allows(level, i)) {
+                    if !(handle_module && handle_module_allows(level, i))
+                        && !(settings_module && SETTINGS_IDENTS.contains(&name.as_str()))
+                    {
                         report(line, "ident", format!("`{name}`: {why}"));
                     }
                 }
@@ -1068,7 +1177,9 @@ fn scan(level: &[Tok], file: &str, report: &mut dyn FnMut(usize, &str, String)) 
                 // (`std::io::Write::write_all(&mut file, ..)`, or taken as a
                 // value) but a macro (`std::write!`); `fs::` and `File::` paths
                 // have their own rules below
-                if FORBIDDEN_METHODS.contains(&name.as_str()) {
+                if FORBIDDEN_METHODS.contains(&name.as_str())
+                    && !(settings_module && SETTINGS_METHODS.contains(&name.as_str()))
+                {
                     let owner = i.checked_sub(2).and_then(|p| ident(level.get(p)));
                     if is_punct(prev, '.')
                         && (matches!(next, Some(Tok::Group(Delimiter::Parenthesis, ..)))
@@ -1129,12 +1240,13 @@ fn scan(level: &[Tok], file: &str, report: &mut dyn FnMut(usize, &str, String)) 
                         if is_path_sep(next) {
                             match after {
                                 Some(Tok::Ident(member, _, _))
-                                    if !FS_ALLOWED.contains(&member.as_str()) =>
+                                    if !FS_ALLOWED.contains(&member.as_str())
+                                        && !fs_extra.contains(&member.as_str()) =>
                                 {
                                     report(line, "fs", format!("`fs::{member}` is not a read"))
                                 }
                                 Some(Tok::Group(Delimiter::Brace, group, _)) => {
-                                    check_fs_group(group, report)
+                                    check_fs_group(group, fs_extra, report)
                                 }
                                 Some(Tok::Punct('*', _)) => {
                                     report(line, "fs", "a glob import from fs".into())
@@ -1254,9 +1366,30 @@ const SAMPLING_BUTTON_CONSTANTS: &[&str] =
 /// [`PANEL_CONFIRM`]); the generic Confirm `ACTION_CONFIRM` is gone.
 const ACTION_BUTTON_CONSTANTS: &[&str] = &["ACTION_PREPARE", "ACTION_CANCEL"];
 
+/// The saved views' buttons (PX-069), whose `ACTIVATE` handlers apply the
+/// view the server holds in a slot through the presentation paths above,
+/// save the presentation as a view, or rename, delete or restore the saved
+/// views. None signals, opens for control or reconfigures a process; Rename
+/// and Delete never reach the process list or the action gate.
+const SAVED_VIEW_BUTTON_CONSTANTS: &[&str] = &[
+    "SAVED_VIEW_SLOT_1",
+    "SAVED_VIEW_SLOT_2",
+    "SAVED_VIEW_SLOT_3",
+    "SAVED_VIEW_SLOT_4",
+    "SAVED_VIEW_SLOT_5",
+    "SAVED_VIEW_SLOT_6",
+    "SAVED_VIEW_SLOT_7",
+    "SAVED_VIEW_SLOT_8",
+    "SAVED_VIEW_CREATE",
+    "SAVED_VIEW_RENAME",
+    "SAVED_VIEW_DELETE",
+    "SAVED_VIEWS_RESTORE",
+];
+
 /// The text inputs whose `TEXT_EDIT` handlers are allowed: the filter input
 /// (PX-010), the search and PID fields (PX-011), and the user and PID-set
-/// fields (PX-012), and the sampling interval field (PX-015).
+/// fields (PX-012), and the sampling interval field (PX-015), and the saved
+/// views' name field (PX-069).
 const TEXT_INPUT_CONSTANTS: &[&str] = &[
     "FILTER_INPUT",
     "SEARCH_INPUT",
@@ -1264,6 +1397,7 @@ const TEXT_INPUT_CONSTANTS: &[&str] = &[
     "OWNER_INPUT",
     "PID_SET_INPUT",
     "INTERVAL_INPUT",
+    "SAVED_VIEW_NAME_INPUT",
 ];
 
 /// Whether an `on(..)` argument list is one of the sort buttons' `ACTIVATE`
@@ -1304,6 +1438,7 @@ fn is_sort_button_activation(tokens: &[Tok]) -> bool {
             || SAMPLING_BUTTON_CONSTANTS.contains(&name)
             || TAG_BUTTON_CONSTANTS.contains(&name)
             || ACTION_BUTTON_CONSTANTS.contains(&name)
+            || SAVED_VIEW_BUTTON_CONSTANTS.contains(&name)
     ) && event.as_deref() == Some("ACTIVATE")
 }
 
@@ -2664,6 +2799,10 @@ fn no_production_source_can_signal_or_reconfigure_a_process() {
         files.iter().any(|path| path.ends_with(HANDLE_MODULE)),
         "the pinned unsafe blocks are checked against the handle module that holds them"
     );
+    assert!(
+        files.iter().any(|path| path.ends_with(SETTINGS_MODULE)),
+        "the pinned settings writes are checked against the module that holds them"
+    );
     let mut found = Vec::new();
     let mut receivers = 0;
     let mut attributes = BTreeSet::new();
@@ -2675,6 +2814,13 @@ fn no_production_source_can_signal_or_reconfigure_a_process() {
             .display()
             .to_string();
         found.extend(token_violations(&name, &text));
+        if name == SETTINGS_MODULE {
+            found.extend(
+                settings_write_violations(&text)
+                    .into_iter()
+                    .map(|violation| format!("{name}: [settings] {violation}")),
+            );
+        }
         if name == HANDLE_MODULE {
             found.extend(
                 handle_unsafe_violations(&text)
@@ -2796,6 +2942,105 @@ fn process_actions_implementations(source: &str) -> Vec<String> {
 /// PX-029: the handle module's allowance is exactly its two system calls.
 /// Each construct below is refused in `src/handle.rs` itself, and what the
 /// module really writes passes there and is refused in any other file.
+/// PX-069: the settings store is the one file that may write, only through a
+/// fresh temporary file (`create_new`) renamed into place; the same
+/// constructs anywhere else, and every other rule there, stay refused.
+#[test]
+fn the_settings_allowance_is_exactly_the_settings_modules_atomic_writes() {
+    let writer = "use std::fs::{self, File, OpenOptions};\n\
+                  use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};\n\
+                  fn replace(temporary: &Path, target: &Path, bytes: &[u8]) -> std::io::Result<()> {\n\
+                      fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;\n\
+                      let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(temporary)?;\n\
+                      file.write_all(bytes)?; file.sync_all()?;\n\
+                      let _ = fs::remove_file(temporary);\n\
+                      fs::rename(temporary, target)\n\
+                  }";
+    assert_eq!(
+        token_violations(SETTINGS_MODULE, writer),
+        Vec::<String>::new()
+    );
+    assert_eq!(settings_write_violations(writer), Vec::<String>::new());
+    // The same writer in any other file is refused, rule by rule.
+    let elsewhere = token_violations("src/refresh.rs", writer);
+    for rule in ["[ident]", "[method]", "[fs]", "[fs-import]"] {
+        assert!(
+            elsewhere.iter().any(|violation| violation.contains(rule)),
+            "{rule} not reported outside the settings module: {elsewhere:?}"
+        );
+    }
+    // Inside the settings module, an in-place rewrite and a second open are
+    // refused by the pin, and every other rule still holds.
+    for (name, snippet) in [
+        (
+            "truncate",
+            writer.replace(".create_new(true)", ".create_new(true).truncate(true)"),
+        ),
+        (
+            "append",
+            writer.replace(".create_new(true)", ".create_new(true).append(true)"),
+        ),
+        (
+            "create(true)",
+            writer.replace(".create_new(true)", ".create(true)"),
+        ),
+        (
+            "a second OpenOptions",
+            format!("{writer}\nfn again() {{ let _ = OpenOptions::new().write(true).open(p); }}"),
+        ),
+    ] {
+        assert!(
+            !settings_write_violations(&snippet).is_empty(),
+            "{name} passed the settings pin"
+        );
+    }
+    for (name, snippet, rule) in [
+        (
+            "Command",
+            "let _ = std::process::Command::new(\"x\");",
+            "ident",
+        ),
+        ("kill", "kill(1, 9);", "ident"),
+        ("fs::write", "std::fs::write(p, b);", "fs"),
+        ("File::create", "let _ = File::create(p);", "file"),
+        ("set_permissions", "file.set_permissions(mode);", "method"),
+        (
+            "a handler",
+            "session.on(TABLE, ACTIVATE, |_, _| {});",
+            "handler",
+        ),
+    ] {
+        let found = token_violations(SETTINGS_MODULE, snippet);
+        assert!(
+            found
+                .iter()
+                .any(|violation| violation.contains(&format!("[{rule}]"))),
+            "{name} was not reported in the settings module: {found:?}"
+        );
+    }
+    // The saved views' registrations are the exact shapes PX-069 installs.
+    for innocent in [
+        "session.on(SAVED_VIEW_SLOT_1, ACTIVATE, slot(0));",
+        "session.on(SAVED_VIEW_SLOT_8, ACTIVATE, slot(7));",
+        "session.on(SAVED_VIEW_RENAME, ACTIVATE, move |session, _| { rename(session); });",
+        "session.on(SAVED_VIEW_NAME_INPUT, TEXT_EDIT, move |session, event| { named(session, event); });",
+    ] {
+        assert_eq!(
+            token_violations("src/lib.rs", innocent),
+            Vec::<String>::new(),
+            "{innocent}"
+        );
+    }
+    for bypass in [
+        "session.on(SAVED_VIEW_SLOT_1, VALUE_CHANGED, slot(0));",
+        "session.on(SAVED_VIEW_NAME_INPUT, ACTIVATE, |_, _| {});",
+        "session.on(SAVED_VIEW_SLOTS[0], ACTIVATE, slot(0));",
+        "session.on(slot_node(3), ACTIVATE, slot(3));",
+    ] {
+        assert!(reported(bypass, "handler"), "{bypass}");
+    }
+}
+
 #[test]
 fn the_pidfd_allowance_is_exactly_the_handle_modules_two_system_calls() {
     let in_handle = |snippet: &str| token_violations(HANDLE_MODULE, snippet);

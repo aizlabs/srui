@@ -726,6 +726,7 @@ fn live_replay_sends_one_sigterm_and_a_restart_retries_nothing() {
     let pid = u64::from(worker.0.id());
     let options = [
         "--live-source",
+        "--no-settings",
         "--refresh-interval-ms",
         "200",
         "--actions",

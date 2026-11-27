@@ -18,6 +18,8 @@ PX-031 completes the implementation of the safe single-target slice (`delivery_m
 
 PX-095 adds multiple isolated host windows to the generic connection manager: several sessions run at once, each in its own session context and attempt generation, and every window names its host, account and session incarnation in client-owned chrome. Two hosts serving identical PIDs, names and item identities share no selection, event sequence, cached identity or confirmation, and replacing one session leaves the other running. Its [completion record](docs/process-explorer/completions/PX-095.md) has the evidence; `SRUI-PX095-001`..`005` are `in_progress` until independent verification. It was implemented with the R1 user evidence still outstanding. No side-by-side metric comparison view was built.
 
+PX-070-G01 specifies the later btop-inspired dashboard before any of it is built: btop++ `v1.4.8` (commit `cf1da590`, Apache-2.0) is the pinned reference, htop 3.5.3 stays the process-management baseline, and [the specification](docs/process-explorer/design/dashboard.md) gives every core panel (CPU, memory/swap, disk, network) a collector owner, renderer owner, unit and freshness policy, finite budget and accessible fallback, and defines the evaluation tasks and pass/fail criteria PX-073-G02 runs. The missing standard `Split` container becomes PX-070-G02, a new prerequisite of PX-073-G01. Neither R1 nor safe termination depends on any dashboard ticket. Its [completion record](docs/process-explorer/completions/PX-070-G01.md) has the evidence; `SRUI-PX070G01-001`..`005` are `in_progress` until independent verification. No product code changed.
+
 ## Delivery priorities
 
 1. PX-000–PX-008: real read-only monitor.

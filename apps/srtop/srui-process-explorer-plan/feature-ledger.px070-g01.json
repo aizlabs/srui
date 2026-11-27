@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-070-G01",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Dashboard-design gate (D1 §§6–8, 12, 18, 22, 25–26, 31–32; BT1): a specification-only record of the btop-inspired native dashboard written before implementation — pinned btop++ reference, selected workflows, four core panels with owners, units, freshness, budgets and accessible fallbacks, generic widget/profile review with one new prerequisite (PX-070-G02 Split), and an objective evaluation protocol; no product, protocol, registry, SDK or client change; no btop parity commitment; R1 and safe termination independent of it",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "BT1": "https://github.com/aristocratos/btop/tree/cf1da5900b1e9eaa1c20fd7148dd812b43340b8a",
+      "H1": "https://github.com/htop-dev/htop/releases"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX070G01-001",
+      "feature": "The dashboard's reference is pinned: btop++ tag v1.4.8, commit cf1da5900b1e9eaa1c20fd7148dd812b43340b8a (annotated tag object 842fa7fbeabe4704b56d66e7aa31d173e628abec), Apache-2.0, release binary digests for aarch64 and x86_64 musl, verified on 27 November 2026 with git ls-remote and the GitHub releases, commits and license APIs; htop 3.5.3 stays the process-management baseline; no btop code or asset is copied; no btop parity or general superiority is committed; rebaselining is an explicit plan change",
+      "scope": "PX-070-G01/docs/process-explorer/design/dashboard.md sections 1–3; SOURCES.md BT1; task-index.json dashboard_inspiration; feature-ledger.seed.json X05 upstream_version",
+      "source_refs": ["BT1", "H1"],
+      "owner": "PX-070-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-070-G01.md",
+        "docs/process-explorer/design/dashboard.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX070G01-002",
+      "feature": "The dashboard composition is specified: four core panels (CPU aggregate, memory/swap, disk, network) in at most two semantic groups above the unchanged searchable process table and inspector, divided by a standard Split; compact, expanded and hidden presentations as saved semantic choices with moves-only layout changes and scalar-only samples; compact CPU and memory/swap reuse the PX-070 meters; bounded panel and device-expansion controls; local window, divider and graph resizing that sends nothing; keyboard focus order and PX-016-G01 focus shortcuts; host/account/incarnation only in PX-095 client chrome; disconnected presentation through PX-022-G01/PX-022-G02 and paused presentation through PX-015; later per-CPU, temperature and GPU panels never block the core four",
+      "scope": "PX-070-G01/docs/process-explorer/design/dashboard.md sections 4, 8, 9",
+      "source_refs": ["D1", "BT1"],
+      "owner": "PX-070-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-070-G01.md",
+        "docs/process-explorer/design/dashboard.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX070G01-003",
+      "feature": "Every required panel has a collector owner (existing procfs/summary for CPU and memory/swap, PX-054, PX-055, PX-056, PX-090), a renderer owner (existing Text, Progress, Row/Column and model-backed Table; PX-073 over PX-071/PX-072 for graphs; PX-070-G02 for Split), a unit policy (one-decimal shares with denominators, IEC bytes, IEC bytes per second, never bits), a freshness policy (own sample time and interval per panel, no implied atomic host snapshot, warming-up/unavailable/denied/not-provided/none-configured/collector-error/stale/paused states that never become zero, labelled gaps), a finite budget (nodes, rows, series, 900 samples or 15 minutes per series, a 1 MiB snapshot reserve, a 4 KiB/s steady-state payload bound) and a sentence-level accessible fallback with a numeric series table",
+      "scope": "PX-070-G01/docs/process-explorer/design/dashboard.md sections 5–7",
+      "source_refs": ["D1"],
+      "owner": "PX-070-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-070-G01.md",
+        "docs/process-explorer/design/dashboard.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX070G01-004",
+      "feature": "Generic widget and profile support was reviewed against the checkout (registry.yaml node types and properties, server-rust/sdk widgets, ControlFactory.makeHandle, ExtensionMountResolver, capability.rs): graphs are missing and already owned by PX-071-PX-073; the standard Split container is in the registry but has no SDK builder, no renderer and no axis property, so it becomes the new prerequisite PX-070-G02 (ticket file, task-index entry, master plan, queue and catalogue, execution order after PX-070-G01) and PX-073-G01 now depends on it; Tabs are not needed; accessibility grouping of labelled containers is left for PX-073-G01 to verify",
+      "scope": "PX-070-G01/docs/process-explorer/design/dashboard.md section 10; tickets/PX-070-G02-split.md; task-index.json; IMPLEMENTATION_PLAN.md; TASK_INDEX.md; tickets/PX-073-G01-dashboard-compose.md",
+      "source_refs": ["D1"],
+      "owner": "PX-070-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-070-G01.md",
+        "tickets/PX-070-G02-split.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX070G01-005",
+      "feature": "An objective evaluation protocol is fixed before implementation: one matched Linux environment, the pinned btop binary checked against its digest, the same SSH relay at 0/100/300/600 ms, identical explicit 1 s and 2 s intervals, only fields both tools show with normalized units, owned bounded workloads with harness reference values, and four tasks (locate a busy process, inspect a trend, inspect disk/network activity, recover after disconnect) with numeric pass/fail criteria for the dashboard run by automation, keyboard-only and VoiceOver without graphs; btop is observed, never scored; no conclusion from screenshots; R1 (PX-027) and safe termination (PX-031) have no dashboard ticket in their transitive dependencies",
+      "scope": "PX-070-G01/docs/process-explorer/design/dashboard.md section 11 and section 1 (R1 independence)",
+      "source_refs": ["D1", "BT1"],
+      "owner": "PX-070-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-070-G01.md",
+        "docs/process-explorer/design/dashboard.md"
+      ]
+    }
+  ]
+}

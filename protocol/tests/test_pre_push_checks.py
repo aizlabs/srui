@@ -344,8 +344,12 @@ class GitFixture(unittest.TestCase):
         self.write("scripts/check-test-process-stdio.sh", "#!/bin/sh\nexit 0\n")
         # PX-026: test.sh runs the isolated endpoint check and the client listener gate; the
         # stubs record that the srtop profile reaches them.
+        # PX-026-G01: test.sh also sweeps leaked fixture servers first and runs the R1 package
+        # self-tests; stub both so the fixture carries every script test.sh invokes.
         for script in ("scripts/run-px026-isolated-endpoint-check.sh",
-                       "scripts/check-client-no-listener-api.sh"):
+                       "scripts/check-client-no-listener-api.sh",
+                       "scripts/reap-test-servers.sh",
+                       "apps/srtop/r1/selftest.sh"):
             self.write(script, "#!/bin/sh\nprintf '%s\\n' \"$0\" >> \"$SRUI_HOOK_TEST_LOG\"\n")
         self.write(".githooks/pre-push-full", "#!/bin/sh\nexit 99\n")
         self.write("apps/srtop/src/main.rs", "// base\n")

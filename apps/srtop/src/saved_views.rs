@@ -57,7 +57,7 @@ pub const RENAME_LABEL: &str = "Rename active view";
 pub const DELETE_LABEL: &str = "Delete active view";
 pub const RESTORE_LABEL: &str = "Restore default views";
 pub const SLOT_DESCRIPTION: &str =
-    "Applies this saved view: its columns, sort, filters, table or tree, and thread controls. It changes no process.";
+    "Applies this saved view: its columns, sort, filters, table or tree, thread controls and meter layout. It changes no process.";
 pub const ROW_DESCRIPTION: &str =
     "Saved views, kept in this user's srtop settings on the server. Views hold presentation only: no process, selection or action.";
 
@@ -90,6 +90,7 @@ pub fn capture(view: &ProcessView, name: ViewName) -> SavedView {
         owner,
         tree: view.view_mode() == ViewMode::Tree,
         threads: view.thread_settings(),
+        meters: view.meter_layout().clone(),
     }
 }
 
@@ -103,6 +104,9 @@ pub fn apply(
     if view.column_layout() != &saved.columns {
         view.set_columns(session, saved.columns.fields())?;
     }
+    // The meter layout (PX-070): structure only, and nothing when it is
+    // already the one shown.
+    view.set_meter_layout(session, saved.meters.clone())?;
     if let Some(order) = saved.sort.filter(|order| view.sort() != Some(*order)) {
         view.set_sort(session, order)?;
     }

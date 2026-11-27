@@ -33,9 +33,9 @@ use srui_process_explorer::{
         MAX_CONFIGURED_PROTECTED_PIDS,
     },
     initialize, install_actions, install_column_handlers, install_filter_handlers,
-    install_follow_handlers, install_inspector, install_owner_handlers, install_sampling_handlers,
-    install_saved_views, install_search_handlers, install_sort_handlers, install_tag_handlers,
-    install_thread_handlers, install_view_handlers,
+    install_follow_handlers, install_inspector, install_meter_handlers, install_owner_handlers,
+    install_sampling_handlers, install_saved_views, install_search_handlers, install_sort_handlers,
+    install_tag_handlers, install_thread_handlers, install_view_handlers,
     procfs::ProcFsSource,
     refresh::{poll, ProcessView, DEFAULT_REFRESH_INTERVAL},
     sampling::parse_interval,
@@ -126,6 +126,8 @@ where
     install_sort_handlers(session, &view);
     install_filter_handlers(session, &view);
     install_column_handlers(session, &view);
+    // The meter layout buttons re-arrange the summary's structure (PX-070).
+    install_meter_handlers(session, &view);
     install_search_handlers(session, &view);
     install_owner_handlers(session, &view);
     // The sampling controls record requests on the view and wake the one

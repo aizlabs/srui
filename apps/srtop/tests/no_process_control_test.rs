@@ -46,7 +46,9 @@
 //!   (PX-028), or a saved views button (`SAVED_VIEW_SLOT_1`…`_8`,
 //!   `SAVED_VIEW_CREATE`, `SAVED_VIEW_RENAME`, `SAVED_VIEW_DELETE`,
 //!   `SAVED_VIEWS_RESTORE`) with `ACTIVATE` or `SAVED_VIEW_NAME_INPUT` with
-//!   `TEXT_EDIT` (PX-069), or, in `src/lib.rs` only, exactly `panel_confirm` with
+//!   `TEXT_EDIT` (PX-069), or a meter layout button (`METER_TOGGLE_*`,
+//!   `METER_EARLIER_*`, `METER_LATER_*`, `METER_MODE_*`, `METERS_HEADER`,
+//!   `METERS_RESTORE`) with `ACTIVATE` (PX-070), or, in `src/lib.rs` only, exactly `panel_confirm` with
 //!   `ACTIVATE`, the confirmation panels' Confirm handlers (PX-030), whose
 //!   gate reaches one of the two production executors pinned below;
 //!   `on_result`, `on_text_edit`, `on_expansion_changed`
@@ -1602,6 +1604,35 @@ const SAVED_VIEW_BUTTON_CONSTANTS: &[&str] = &[
     "SAVED_VIEWS_RESTORE",
 ];
 
+/// The meter layout buttons (PX-070), whose `ACTIVATE` handlers re-arrange
+/// the system summary's structure and, like the column chooser's, touch no
+/// row and no process.
+const METER_BUTTON_CONSTANTS: &[&str] = &[
+    "METER_TOGGLE_CPU",
+    "METER_EARLIER_CPU",
+    "METER_LATER_CPU",
+    "METER_MODE_CPU",
+    "METER_TOGGLE_MEMORY",
+    "METER_EARLIER_MEMORY",
+    "METER_LATER_MEMORY",
+    "METER_MODE_MEMORY",
+    "METER_TOGGLE_SWAP",
+    "METER_EARLIER_SWAP",
+    "METER_LATER_SWAP",
+    "METER_MODE_SWAP",
+    "METER_TOGGLE_LOAD",
+    "METER_EARLIER_LOAD",
+    "METER_LATER_LOAD",
+    "METER_TOGGLE_UPTIME",
+    "METER_EARLIER_UPTIME",
+    "METER_LATER_UPTIME",
+    "METER_TOGGLE_PROCESSES",
+    "METER_EARLIER_PROCESSES",
+    "METER_LATER_PROCESSES",
+    "METERS_HEADER",
+    "METERS_RESTORE",
+];
+
 /// The text inputs whose `TEXT_EDIT` handlers are allowed: the filter input
 /// (PX-010), the search and PID fields (PX-011), and the user and PID-set
 /// fields (PX-012), and the sampling interval field (PX-015), and the saved
@@ -1655,6 +1686,7 @@ fn is_sort_button_activation(tokens: &[Tok]) -> bool {
             || TAG_BUTTON_CONSTANTS.contains(&name)
             || ACTION_BUTTON_CONSTANTS.contains(&name)
             || SAVED_VIEW_BUTTON_CONSTANTS.contains(&name)
+            || METER_BUTTON_CONSTANTS.contains(&name)
     ) && event.as_deref() == Some("ACTIVATE")
 }
 

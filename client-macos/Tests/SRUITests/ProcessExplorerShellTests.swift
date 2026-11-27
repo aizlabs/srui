@@ -3192,6 +3192,150 @@ struct ProcessExplorerShellTests {
         await controller.stop()
     }
 
+    /// PX-070: the meter layout is semantic structure the server owns, shown by the unchanged generic
+    /// client. Samples only update the native meters in place (every handle survives them); a layout
+    /// click moves the native meter views into the other group or the collapsed container in one
+    /// structural revision; and a native resize or appearance change sends nothing to the server and
+    /// needs no server geometry, because none exists.
+    @Test(.timeLimit(.minutes(2)))
+    @MainActor
+    func meterLayoutChangesNativeStructureOnlyOnALayoutChangeAndResizeOrThemeSendsNothing() async throws {
+        let harness = try await Self.launch(arguments: ["--fake-sequence", "--refresh-interval-ms", "300"])
+        defer { Self.shutDown(harness) }
+        _ = NSApplication.shared
+        let renderer = AppKitRenderer()
+        let applier = TransactionApplier()
+        let outbox = EventOutbox()
+        let controller = SessionController(transport: SSHTransport(configuration: harness.configuration),
+                                           applier: applier, outbox: outbox, renderer: renderer)
+        controller.attachRenderer(renderer)
+        try await controller.start()
+        func handle(_ id: UInt64) -> RenderHandle? { renderer.registry.handle(for: NodeId(id)) }
+        func text(_ id: UInt64) -> String { (handle(id)?.view as? NSTextField)?.stringValue ?? "" }
+        /// What a group's stack holds for a node: a Row inside a Column sits in its scroll wrapper.
+        func placed(_ id: UInt64) -> NSView? {
+            guard let view = handle(id)?.view else { return nil }
+            if let scroll = view.enclosingScrollView, scroll.documentView === view { return scroll }
+            return view
+        }
+        func arranged(_ id: UInt64) -> [NSView] { (handle(id)?.view as? NSStackView)?.arrangedSubviews ?? [] }
+        func shows(_ group: UInt64, _ ids: [UInt64]) -> Bool {
+            let views = ids.compactMap(placed)
+            return views.count == ids.count && arranged(group).count == ids.count
+                && zip(arranged(group), views).allSatisfy { $0 === $1 }
+        }
+        func button(_ title: String) throws -> NSButton {
+            let buttons = Self.meterButtonIDs.compactMap { handle($0)?.view as? NSButton }
+            return try #require(buttons.first { $0.title == title }, "meter button \(title); buttons: \(buttons.map(\.title))")
+        }
+        func summaryHandles() -> [RenderHandle?] { Self.meterLayoutNodeIDs.map(handle) }
+        func sameHandles(_ before: [RenderHandle?]) -> Bool {
+            zip(before, summaryHandles()).allSatisfy { $0 != nil && $0 === $1 }
+        }
+        func samples(_ count: UInt64, _ step: String) async throws {
+            let start = applier.lastAppliedRevision.value
+            try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "\(count) samples: \(step)") {
+                applier.lastAppliedRevision.value >= start + count
+            }
+        }
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "the explorer over SSH") {
+            applier.lastAppliedRevision.value >= 1 && controller.isEventDispatchEnabled
+                && handle(Self.meterStatusID) != nil && handle(5) != nil
+        }
+        let window = try #require(handle(1)?.window)
+        defer { handle(1)?.window?.orderOut(nil); handle(1)?.window?.close() }
+        SurfacePresentation.forHostApplication().present(window)
+
+        // The default layout: every meter in group 1, in order; group 2 and the hidden container
+        // collapsed; every bar beside its line.
+        let defaultGroup = Self.meterRootIDs
+        #expect(shows(Self.meterGroup1ID, defaultGroup))
+        #expect(arranged(Self.meterGroup2ID).isEmpty && handle(Self.meterGroup2ID)?.view.isHidden == true)
+        #expect(handle(Self.meterHiddenID)?.view.isHidden == true)
+        #expect(arranged(7).count == 2 && arranged(7).first === handle(8)?.view, "the CPU bar precedes its line")
+        #expect(text(Self.meterStatusID).hasPrefix("Meters shown · group 1: CPU (bar)"))
+
+        // Samples update the meters in place: the same native views, a new freshness line.
+        var before = summaryHandles()
+        var freshness = text(19)
+        try await samples(2, "default layout")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "a new freshness line") {
+            text(19) != freshness
+        }
+        #expect(sameHandles(before), "a sample rebuilt a meter view")
+
+        // Processes into group 2: one structural revision moves the native view there.
+        NativeActivation.click(try button("Move Processes meter later"))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "Processes in group 2") {
+            shows(Self.meterGroup2ID, [18]) && handle(Self.meterGroup2ID)?.view.isHidden == false
+                && shows(Self.meterGroup1ID, Array(defaultGroup.dropLast()))
+        }
+        #expect(text(Self.meterStatusID).contains("group 2: Processes (text)"))
+        before = summaryHandles()
+        freshness = text(19)
+        try await samples(2, "processes in group 2")
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "a new freshness line") {
+            text(19) != freshness
+        }
+        #expect(sameHandles(before), "a sample after the layout change rebuilt a meter view")
+
+        // CPU as text: its bar goes into the collapsed container; the line stays and still states
+        // the figure as text.
+        NativeActivation.click(try button("Show CPU meter as text"))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "CPU as text") {
+            arranged(7).count == 1 && arranged(7).first === handle(9)?.view
+                && arranged(Self.meterHiddenID).contains { $0 === handle(8)?.view }
+        }
+        #expect(text(9).hasPrefix("Overall CPU (100% = all 4 logical CPUs): 30.0%"))
+        #expect(try button("Show CPU meter as bar").isEnabled)
+
+        // A native resize and an appearance change are the client's own: no event is sent, no
+        // meter view is rebuilt, and the next sample still lands in the same views.
+        let window2 = try #require(handle(1)?.window)
+        let sentBefore = await outbox.eventSeq
+        before = summaryHandles()
+        let frame = window2.frame
+        window2.setFrame(NSRect(x: frame.minX, y: frame.minY, width: frame.width * 0.6, height: frame.height * 0.8),
+                         display: true)
+        window2.contentView?.layoutSubtreeIfNeeded()
+        window2.appearance = NSAppearance(named: .darkAqua)
+        window2.contentView?.layoutSubtreeIfNeeded()
+        try await samples(2, "after resize and appearance")
+        window2.setFrame(frame, display: true)
+        window2.appearance = NSAppearance(named: .aqua)
+        window2.contentView?.layoutSubtreeIfNeeded()
+        try await samples(1, "after restoring the frame")
+        let sentAfter = await outbox.eventSeq
+        #expect(sentAfter == sentBefore, "a resize or appearance change sent \(sentAfter - sentBefore) events")
+        #expect(sameHandles(before), "a resize or appearance change rebuilt a meter view")
+        #expect(handle(1)?.window === window2)
+
+        // Hiding every meter collapses both groups; the freshness line stays.
+        NativeActivation.click(try button("Hide meters"))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "meters hidden") {
+            handle(Self.meterGroup1ID)?.view.isHidden == true && handle(Self.meterGroup2ID)?.view.isHidden == true
+                && text(Self.meterStatusID).hasPrefix("Meters hidden")
+        }
+        #expect(handle(19)?.view.isHidden == false)
+        NativeActivation.click(try button("Restore default meters"))
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "default meters") {
+            shows(Self.meterGroup1ID, defaultGroup) && handle(Self.meterGroup1ID)?.view.isHidden == false
+                && arranged(7).count == 2
+        }
+        print("PX-070 native SSH evidence: window \(handle(1)?.window?.windowNumber ?? -1); status=\(text(Self.meterStatusID)); events sent by resize/appearance=\(sentAfter - sentBefore); revision=\(applier.lastAppliedRevision.value)")
+        await controller.stop()
+    }
+
+    // PX-070: the summary's meter group, hidden-container and meter nodes, and the layout controls.
+    fileprivate static let meterGroup1ID: UInt64 = 105
+    fileprivate static let meterGroup2ID: UInt64 = 106
+    fileprivate static let meterHiddenID: UInt64 = 107
+    fileprivate static let meterButtonIDs: [UInt64] = Array(109...131)
+    fileprivate static let meterStatusID: UInt64 = 132
+    /// CPU, memory and swap rows, then the load, uptime and processes lines.
+    fileprivate static let meterRootIDs: [UInt64] = [7, 10, 13, 16, 17, 18]
+    fileprivate static let meterLayoutNodeIDs: [UInt64] = Array(6...19) + Array(104...107)
+
     /// PX-069: the saved views' switcher is a row of standard native buttons and a text field. A
     /// view saved from the current presentation is applied by its button, a restarted srtop
     /// recovers it from the server-side settings file and applies it before the first client
@@ -3325,7 +3469,9 @@ struct ProcessExplorerShellTests {
     @MainActor
     private static func enabledNonSortButtons(_ renderer: AppKitRenderer) -> [NSButton] {
         renderer.registry.allHandles.compactMap { $0.view as? NSButton }.filter { button in
-            button.isEnabled && !button.title.lowercased().contains("sort")
+            // PX-070: a meter layout button names CPU too.
+            let title = button.title.lowercased()
+            return button.isEnabled && !title.contains("sort") && !title.contains("meter")
         }
     }
 

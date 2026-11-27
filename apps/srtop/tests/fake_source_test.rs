@@ -103,8 +103,8 @@ fn injected_source_is_called_once_and_three_rows_are_model_data() {
         assert!(rows
             .iter()
             .all(|row| row.item_id.get() != 4101 && row.item_id.get() != 4102));
-        for id in 1..=SHELL_NODE_COUNT as u64 {
-            let node = store.get_node(srui_sdk::NodeId::new(id)).unwrap();
+        for id in srui_process_explorer::shell_node_ids() {
+            let node = store.get_node(id).unwrap();
             assert!(!node.has_property(ACTIONS));
             assert!(!node.has_property(ACTION_KEY));
         }

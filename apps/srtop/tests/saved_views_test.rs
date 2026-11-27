@@ -391,6 +391,7 @@ fn view(name: &str, columns: &[ProcessField]) -> SavedView {
         owner: SavedOwner::Mine,
         tree: false,
         threads: ThreadSettings::default(),
+        meters: srui_process_explorer::meters::MeterLayout::default(),
     }
 }
 
@@ -1027,9 +1028,10 @@ fn an_unknown_first_line_shape_is_never_replaced() {
     let dir = TempDir::new("shape");
     let (store, old, _) = two_saves(&dir);
     for (head, reason) in [
-        ("srtop-settings 3\r\n", ReadOnly::NewerVersion(3)),
-        ("srtop-settings 3 \n", ReadOnly::NewerVersion(3)),
-        ("srtop-settings 3.0\n", ReadOnly::NewerVersion(3)),
+        ("srtop-settings 4\r\n", ReadOnly::NewerVersion(4)),
+        ("srtop-settings 4 \n", ReadOnly::NewerVersion(4)),
+        ("srtop-settings 4.0\n", ReadOnly::NewerVersion(4)),
+        ("srtop-settings 3\r\n", ReadOnly::UnknownFormat),
         ("srtop-settings 2\r\n", ReadOnly::UnknownFormat),
         ("srtop-settings 2.1\n", ReadOnly::UnknownFormat),
         ("srtop-settings 1234567890\n", ReadOnly::UnknownFormat),
@@ -1388,7 +1390,9 @@ fn a_version_1_file_is_migrated_and_written_back_as_the_current_version() {
     );
     assert_eq!(read(store.path()), v1.as_bytes(), "reading never writes");
     explorer.processed(SAVED_VIEW_SLOTS[1]);
-    assert!(read(store.path()).starts_with(b"srtop-settings 2\n"));
+    assert!(
+        read(store.path()).starts_with(format!("srtop-settings {CURRENT_VERSION}\n").as_bytes())
+    );
     assert_eq!(read(&store.backup_path()), v1.as_bytes());
     assert_eq!(store.load(SOURCE).settings.active, Some(1));
 }
@@ -1611,6 +1615,9 @@ fn no_intent_confirmation_selection_or_process_identity_is_ever_saved() {
             "end-view",
             "filter",
             "kernel-threads",
+            // PX-070: the meter layout, never a figure.
+            "meter-group",
+            "meters",
             "owner",
             "source",
             "sort",

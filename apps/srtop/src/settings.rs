@@ -15,9 +15,9 @@
 //! * no process identity, selection, tag, search, PID set, pending action
 //!   intent or confirmation. A [`SavedView`] has no field that could hold
 //!   one, so none can be persisted as a preference (§§7.7, 27).
-//! * no meter definitions: srtop has no meters yet (PX-070 adds them). A
-//!   later version adds them through [`CURRENT_VERSION`] and a migration, not
-//!   through a speculative field now.
+//! * no meter definition or figure: a view stores its meter *layout* (PX-070)
+//!   — which meters, in which group and order, bar or text, and whether the
+//!   meters are shown — never a value, a position, a size or a colour.
 //!
 //! **The format.** UTF-8 text, one `key value` per line, every value escaped
 //! ([`escape`]) so no byte outside printable ASCII, no space and no line break
@@ -31,11 +31,17 @@
 //! is an integrity check against accidents, not a signature: the file is the
 //! user's own.
 //!
-//! **Versions and migration.** [`CURRENT_VERSION`] is 2. Version 1 is the
+//! **Versions and migration.** [`CURRENT_VERSION`] is 3. Version 1 is the
 //! minimal layout record (columns and sort per view, no active view), kept
 //! readable so the migration path is exercised from the first release: a
 //! version 1 file is read, migrated in memory ([`Parsed::version`] says
-//! from which version), and written back as version 2 only by the next save.
+//! from which version), and written back as the current version only by the
+//! next save. Version 2 (PX-069) holds everything but the meter layout;
+//! version 3 (PX-070) adds three lines to each view, after the thread
+//! controls: `meters on|off` and one `meter-group` line per group
+//! ([`MAX_METER_GROUPS`]), each a comma-separated list of
+//! `<meter key>:<bar|text>` or `-` for an empty group. A version 1 or 2
+//! view migrates to the default meter layout.
 //! A version above [`CURRENT_VERSION`] is never interpreted past its first
 //! line ([`Problem::NewerVersion`]); the store treats it as read-only and
 //! never overwrites it. The first line's shape is frozen for every version,
@@ -55,12 +61,15 @@
 //! **Compatibility.** Structure is strict: an unknown key, a missing key or a
 //! malformed value refuses the file. Values that are well formed but that this
 //! build cannot honour are dropped and explained ([`Parsed::notes`]): a column
-//! or sort key the catalogue does not hold, a duplicate column. A view with no
-//! recognised column gets the default layout. Nothing a file says can crash
+//! or sort key the catalogue does not hold, a duplicate column, a meter this
+//! build does not have, a meter placed twice, or a presentation this build
+//! cannot show (that meter is shown as text, which every meter supports). A
+//! view with no recognised column gets the default layout. Nothing a file says can crash
 //! the parser: every path returns a [`Problem`].
 
 use crate::catalogue::{ColumnLayout, ProcessField, SortDirection, PROCESS_LIST};
 use crate::filter::MAX_FILTER_QUERY_BYTES;
+use crate::meters::{Meter, MeterLayout, Placement, Presentation, MAX_METER_GROUPS, METERS};
 use crate::owner::MAX_OWNER_INPUT_BYTES;
 use crate::sort::SortOrder;
 use crate::source::DisplayName;
@@ -72,7 +81,7 @@ pub const MAGIC: &str = "srtop-settings";
 /// The application a settings file belongs to.
 pub const APP: &str = "srtop";
 /// The version this build writes.
-pub const CURRENT_VERSION: u32 = 2;
+pub const CURRENT_VERSION: u32 = 3;
 /// The oldest version this build reads (and migrates).
 pub const OLDEST_VERSION: u32 = 1;
 /// The most bytes a settings file may hold. Bounded reads stop one byte past
@@ -90,8 +99,11 @@ pub const MAX_VIEW_NAME_BYTES: usize = 64;
 pub const MAX_SOURCE_BYTES: usize = 512;
 /// The most column entries one view may list, recognised or not.
 pub const MAX_COLUMN_ENTRIES: usize = 32;
-/// The most bytes of one column or sort key.
+/// The most bytes of one column, sort or meter key.
 pub const MAX_KEY_BYTES: usize = 64;
+/// The most meter entries one `meter-group` line may list, recognised or
+/// not (PX-070).
+pub const MAX_METER_ENTRIES: usize = 32;
 /// The most compatibility notes kept from one read.
 pub const MAX_NOTES: usize = 8;
 /// The name of the one view of the default settings.
@@ -175,6 +187,8 @@ pub struct SavedView {
     /// The process tree instead of the table (PX-018).
     pub tree: bool,
     pub threads: ThreadSettings,
+    /// The meter layout (PX-070).
+    pub meters: MeterLayout,
 }
 
 impl SavedView {
@@ -193,6 +207,7 @@ impl SavedView {
             owner: SavedOwner::AllVisible,
             tree: false,
             threads: ThreadSettings::default(),
+            meters: MeterLayout::default(),
         }
     }
 }
@@ -318,6 +333,10 @@ impl Settings {
             line("tree", on_off(view.tree));
             line("user-threads", on_off(view.threads.user));
             line("kernel-threads", on_off(view.threads.kernel));
+            line("meters", on_off(view.meters.header()));
+            for group in view.meters.groups() {
+                line("meter-group", &meter_group_value(group));
+            }
             line("end-view", "-");
         }
         let checksum = fnv1a64(body.as_bytes());
@@ -339,6 +358,18 @@ fn field_of(key: &str) -> Option<ProcessField> {
     PROCESS_LIST
         .into_iter()
         .find(|field| field_key(*field) == key)
+}
+
+/// One `meter-group` value: `key:presentation` entries, or `-` for none.
+fn meter_group_value(group: &[Placement]) -> String {
+    if group.is_empty() {
+        return "-".to_string();
+    }
+    group
+        .iter()
+        .map(|placement| format!("{}:{}", placement.meter.key(), placement.presentation.key()))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn on_off(on: bool) -> &'static str {
@@ -734,6 +765,7 @@ impl<'a> Body<'a> {
             owner: SavedOwner::AllVisible,
             tree: false,
             threads: ThreadSettings::default(),
+            meters: MeterLayout::default(),
         };
         if self.version >= 2 {
             view.filter = self.text("filter")?;
@@ -746,6 +778,9 @@ impl<'a> Body<'a> {
                 user: self.on_off("user-threads")?,
                 kernel: self.on_off("kernel-threads")?,
             };
+        }
+        if self.version >= 3 {
+            view.meters = self.meters(&view.name)?;
         }
         let line = self.line_number();
         if self.value("end-view")? != "-" {
@@ -812,6 +847,66 @@ impl<'a> Body<'a> {
         }
     }
 
+    /// A view's meter layout (version 3, PX-070): `meters`, then exactly
+    /// [`MAX_METER_GROUPS`] `meter-group` lines. Each entry is
+    /// `<key>:<presentation>`, both key-shaped; more than
+    /// [`MAX_METER_ENTRIES`] on one line refuses the file. A meter this build
+    /// does not have, or one already placed, is dropped and explained; a
+    /// presentation it cannot show for that meter becomes text, which every
+    /// meter has, and is explained.
+    fn meters(&mut self, name: &ViewName) -> Result<MeterLayout, Problem> {
+        let header = self.on_off("meters")?;
+        let mut placed: Vec<Meter> = Vec::new();
+        let mut groups: [Vec<Placement>; MAX_METER_GROUPS] = Default::default();
+        for group in &mut groups {
+            let line = self.line_number();
+            let value = self.value("meter-group")?;
+            if value == "-" {
+                continue;
+            }
+            let entries: Vec<&str> = value.split(',').collect();
+            if entries.len() > MAX_METER_ENTRIES {
+                return Err(Problem::Bound("meters"));
+            }
+            for entry in entries {
+                let (key, mode) = entry
+                    .split_once(':')
+                    .filter(|(key, mode)| is_key(key) && is_key(mode))
+                    .ok_or(malformed(line, "meter-group"))?;
+                let Some(meter) = Meter::of_key(key) else {
+                    self.note(format!(
+                        "view “{name}”: meter {key} is not in this srtop and was dropped"
+                    ));
+                    continue;
+                };
+                if placed.contains(&meter) {
+                    self.note(format!(
+                        "view “{name}”: meter {key} placed twice; kept once"
+                    ));
+                    continue;
+                }
+                let presentation = match Presentation::of_key(mode) {
+                    Some(Presentation::Bar) if !meter.supports_bar() => None,
+                    other => other,
+                };
+                let presentation = presentation.unwrap_or_else(|| {
+                    self.note(format!(
+                        "view “{name}”: meter {key} cannot be shown as {mode}; it is shown as text"
+                    ));
+                    Presentation::Text
+                });
+                placed.push(meter);
+                group.push(Placement {
+                    meter,
+                    presentation,
+                });
+            }
+        }
+        debug_assert!(placed.len() <= METERS.len());
+        // Every entry kept names a distinct meter in a presentation it has.
+        MeterLayout::new(header, groups).map_err(|_| malformed(0, "meters"))
+    }
+
     fn owner(&mut self) -> Result<SavedOwner, Problem> {
         let line = self.line_number();
         let value = self.value("owner")?;
@@ -862,6 +957,14 @@ mod tests {
                 user: true,
                 kernel: false,
             },
+            // PX-070: a non-default meter layout in both groups, with a
+            // text-only presentation of a bar-capable meter.
+            meters: MeterLayout::default()
+                .moving_later(Meter::Processes)
+                .moving_later(Meter::Uptime)
+                .switching(Meter::Memory)
+                .toggling(Meter::Swap)
+                .toggling_header(),
         });
         settings.active = Some(1);
         settings
@@ -871,7 +974,15 @@ mod tests {
     fn settings_round_trip_through_the_current_format() {
         let settings = sample();
         let text = settings.encode().unwrap();
-        assert!(text.starts_with("srtop-settings 2\napp srtop\n"));
+        assert!(text.starts_with("srtop-settings 3\napp srtop\n"));
+        assert!(
+            text.contains(
+                "\nmeters off\nmeter-group system.cpu_busy:bar,system.memory_used:text,\
+                           system.load_average:text\nmeter-group system.uptime:text,\
+                           system.process_count:text\nend-view -\n"
+            ),
+            "{text}"
+        );
         assert!(text.is_ascii(), "every value is escaped: {text}");
         let parsed = parse(text.as_bytes()).unwrap();
         assert_eq!(parsed.settings, settings);
@@ -970,10 +1081,10 @@ mod tests {
             assert_eq!(parse(unknown), Err(Problem::UnknownFormat), "{unknown:?}");
         }
         for newer in [
-            &b"srtop-settings 3\r\n"[..],
-            b"srtop-settings 3 \n",
-            b"srtop-settings 3.0\n",
-            b"srtop-settings 03\n",
+            &b"srtop-settings 4\r\n"[..],
+            b"srtop-settings 4 \n",
+            b"srtop-settings 4.0\n",
+            b"srtop-settings 04\n",
             b"srtop-settings 999999999\n",
         ] {
             assert!(
@@ -1026,6 +1137,131 @@ mod tests {
         assert_eq!(unescape("%4"), None);
         assert_eq!(unescape("%zz"), None);
         assert_eq!(unescape("%FF"), None, "not UTF-8");
+    }
+
+    /// A version 2 file (PX-069) holds no meter layout: each view migrates to
+    /// the default one, and the next save writes version 3 (PX-070).
+    #[test]
+    fn a_version_2_view_migrates_to_the_default_meter_layout() {
+        let body = "srtop-settings 2\napp srtop\nsource s\nactive 0\nview V\n\
+                    columns process.pid\nsort none\nfilter -\nowner all\ntree off\n\
+                    user-threads off\nkernel-threads on\nend-view -\n";
+        let file = format!("{body}checksum {:016x}\n", fnv1a64(body.as_bytes()));
+        let parsed = parse(file.as_bytes()).unwrap();
+        assert_eq!(parsed.version, 2);
+        assert_eq!(parsed.settings.views[0].meters, MeterLayout::default());
+        let rewritten = parsed.settings.encode().unwrap();
+        assert!(rewritten.starts_with("srtop-settings 3\n"));
+        assert_eq!(
+            parse(rewritten.as_bytes()).unwrap().settings,
+            parsed.settings
+        );
+        // A version 2 file that already holds meter lines is not version 2.
+        let ahead = body.replace(
+            "kernel-threads on\n",
+            "kernel-threads on\nmeters on\nmeter-group -\nmeter-group -\n",
+        );
+        let file = format!("{ahead}checksum {:016x}\n", fnv1a64(ahead.as_bytes()));
+        assert!(matches!(
+            parse(file.as_bytes()),
+            Err(Problem::Malformed { .. })
+        ));
+    }
+
+    fn version_3(meter_lines: &str) -> Vec<u8> {
+        let body = format!(
+            "srtop-settings 3\napp srtop\nsource s\nactive 0\nview V\ncolumns process.pid\n\
+             sort none\nfilter -\nowner all\ntree off\nuser-threads off\nkernel-threads on\n\
+             {meter_lines}end-view -\n"
+        );
+        format!("{body}checksum {:016x}\n", fnv1a64(body.as_bytes())).into_bytes()
+    }
+
+    /// Unknown meters, duplicates and presentations this build cannot show
+    /// are dropped or shown as text and explained; the structure stays strict
+    /// and the entry count is bounded (PX-070).
+    #[test]
+    fn meter_values_this_build_cannot_honour_are_explained_while_structure_stays_strict() {
+        let parsed = parse(&version_3(
+            "meters on\nmeter-group system.gpu_busy:bar,system.cpu_busy:graph,\
+             system.load_average:bar\nmeter-group system.cpu_busy:text,system.swap_used:bar\n",
+        ))
+        .unwrap();
+        let meters = &parsed.settings.views[0].meters;
+        assert_eq!(
+            meters.groups()[0],
+            vec![
+                Placement {
+                    meter: Meter::Cpu,
+                    presentation: Presentation::Text
+                },
+                Placement {
+                    meter: Meter::Load,
+                    presentation: Presentation::Text
+                },
+            ]
+        );
+        assert_eq!(
+            meters.groups()[1],
+            vec![Placement {
+                meter: Meter::Swap,
+                presentation: Presentation::Bar
+            }]
+        );
+        assert_eq!(parsed.notes.len(), 4, "{:?}", parsed.notes);
+        // No meter at all is a layout: the groups are empty.
+        let empty = parse(&version_3("meters on\nmeter-group -\nmeter-group -\n")).unwrap();
+        assert!(empty.settings.views[0]
+            .meters
+            .groups()
+            .iter()
+            .all(Vec::is_empty));
+        for malformed in [
+            "meters on\nmeter-group -\n",
+            "meters on\nmeter-group -\nmeter-group -\nmeter-group -\n",
+            "meters yes\nmeter-group -\nmeter-group -\n",
+            "meters on\nmeter-group system.cpu_busy\nmeter-group -\n",
+            "meters on\nmeter-group System.CPU:bar\nmeter-group -\n",
+            "meters on\nmeter-group system.cpu_busy:bar,\nmeter-group -\n",
+            "meters on\nmeter-group \nmeter-group -\n",
+            "meter-group -\nmeter-group -\n",
+            "",
+        ] {
+            assert!(
+                matches!(parse(&version_3(malformed)), Err(Problem::Malformed { .. })),
+                "{malformed:?}"
+            );
+        }
+        let many = vec!["system.x:bar"; MAX_METER_ENTRIES + 1].join(",");
+        assert_eq!(
+            parse(&version_3(&format!(
+                "meters on\nmeter-group {many}\nmeter-group -\n"
+            ))),
+            Err(Problem::Bound("meters"))
+        );
+        let most = vec!["system.x:bar"; MAX_METER_ENTRIES].join(",");
+        assert!(parse(&version_3(&format!(
+            "meters on\nmeter-group {most}\nmeter-group -\n"
+        )))
+        .is_ok());
+    }
+
+    /// Eight views with every meter line at its widest still fit the
+    /// format's bounds, so a saved layout can always be read back.
+    #[test]
+    fn the_widest_settings_with_meters_fit_the_format() {
+        let mut settings = Settings::defaults(&"s".repeat(MAX_SOURCE_BYTES));
+        settings.views.clear();
+        for index in 0..MAX_VIEWS {
+            let mut view = sample().views[1].clone();
+            view.name = ViewName::parse(&format!("{index}{}", "ü".repeat(31))).unwrap();
+            view.filter = "\u{20000}".repeat(MAX_FILTER_QUERY_BYTES / 4);
+            view.columns = ColumnLayout::default();
+            view.meters = MeterLayout::default().moving_later(Meter::Processes);
+            settings.views.push(view);
+        }
+        let text = settings.encode().unwrap();
+        assert_eq!(parse(text.as_bytes()).unwrap().settings, settings);
     }
 
     #[test]

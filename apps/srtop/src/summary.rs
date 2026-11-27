@@ -20,6 +20,9 @@
 //!   "Collector error", and is set in the warning role. Transport loss is
 //!   reported by the generic client's own connection indicator, and nothing here
 //!   imitates it: a server cannot publish while it is disconnected.
+//! * Which meters are shown, where, and as a bar or as text is the meter layout
+//!   (PX-070, [`crate::meters`]): a refresh computes every node's properties
+//!   here and publishes only those of the meters the layout shows.
 //! * Nothing reaches the wire unless what a client sees changed. The published
 //!   properties are kept per node and per property, and a refresh sets only the
 //!   ones that differ, as scalar `SET_PROPERTY` operations inside its own
@@ -36,9 +39,7 @@ use crate::source::{
     SwapFigures, SystemCpu, SystemSample,
 };
 use crate::{bounded, ScanReport, COLUMN, MAX_SOURCE_STATUS_BYTES};
-use srui_sdk::{
-    EnumToken, NodeId, Operation, PropertyRef, SpacingRole, TextRole, TypeRef, Value, Visibility,
-};
+use srui_sdk::{EnumToken, NodeId, PropertyRef, SpacingRole, TextRole, TypeRef, Value, Visibility};
 use std::collections::BTreeMap;
 
 /// The summary's own column, between the status line and the process table.
@@ -62,27 +63,50 @@ pub const PROCESSES_TEXT: NodeId = NodeId::new(18);
 /// or the collector error that kept it from being replaced.
 pub const FRESHNESS_TEXT: NodeId = NodeId::new(19);
 
-/// Every summary node in creation order, with its type and its parent. Each
-/// bar comes before its line in its row, so the bars line up whatever the lines
-/// say.
-pub const LAYOUT: [(NodeId, TypeRef, NodeId); 14] = [
+/// The summary's row of meter groups (PX-070): the first child of the
+/// summary column, before the freshness line. Collapsed while the meters are
+/// hidden.
+pub const METER_GROUPS: NodeId = NodeId::new(104);
+/// The two meter group columns inside [`METER_GROUPS`] (PX-070). A group
+/// with no meter is collapsed.
+pub const METER_GROUP_1: NodeId = NodeId::new(105);
+pub const METER_GROUP_2: NodeId = NodeId::new(106);
+/// The collapsed container of every meter that is not shown and every bar of
+/// a meter shown as text (PX-070): the last child of the summary column. A
+/// node ID is never reused in a session (§6.2), so a meter is never
+/// deleted and created again; hiding it moves it here, and a sample does not
+/// update it while it is here.
+pub const METER_HIDDEN: NodeId = NodeId::new(107);
+
+/// Every summary node of the default meter layout (PX-070) in creation
+/// order, with its type and its parent: the summary column, its row of meter
+/// groups and the two group columns, every meter in the first group, and the
+/// freshness line, then the empty, collapsed container of hidden meters.
+/// Each bar comes before its line in its row, so the bars line up whatever
+/// the lines say. Every layout has exactly these nodes, under other parents
+/// and in another order ([`crate::meters::MeterLayout::nodes`]).
+pub const LAYOUT: [(NodeId, TypeRef, NodeId); 18] = [
     (SUMMARY, TypeRef::COLUMN, COLUMN),
-    (CPU_ROW, TypeRef::ROW, SUMMARY),
+    (METER_GROUPS, TypeRef::ROW, SUMMARY),
+    (METER_GROUP_1, TypeRef::COLUMN, METER_GROUPS),
+    (METER_GROUP_2, TypeRef::COLUMN, METER_GROUPS),
+    (CPU_ROW, TypeRef::ROW, METER_GROUP_1),
     (CPU_BAR, TypeRef::PROGRESS, CPU_ROW),
     (CPU_TEXT, TypeRef::TEXT, CPU_ROW),
-    (MEMORY_ROW, TypeRef::ROW, SUMMARY),
+    (MEMORY_ROW, TypeRef::ROW, METER_GROUP_1),
     (MEMORY_BAR, TypeRef::PROGRESS, MEMORY_ROW),
     (MEMORY_TEXT, TypeRef::TEXT, MEMORY_ROW),
-    (SWAP_ROW, TypeRef::ROW, SUMMARY),
+    (SWAP_ROW, TypeRef::ROW, METER_GROUP_1),
     (SWAP_BAR, TypeRef::PROGRESS, SWAP_ROW),
     (SWAP_TEXT, TypeRef::TEXT, SWAP_ROW),
-    (LOAD_TEXT, TypeRef::TEXT, SUMMARY),
-    (UPTIME_TEXT, TypeRef::TEXT, SUMMARY),
-    (PROCESSES_TEXT, TypeRef::TEXT, SUMMARY),
+    (LOAD_TEXT, TypeRef::TEXT, METER_GROUP_1),
+    (UPTIME_TEXT, TypeRef::TEXT, METER_GROUP_1),
+    (PROCESSES_TEXT, TypeRef::TEXT, METER_GROUP_1),
     (FRESHNESS_TEXT, TypeRef::TEXT, SUMMARY),
+    (METER_HIDDEN, TypeRef::COLUMN, SUMMARY),
 ];
 
-/// How many nodes the summary adds to the shell.
+/// How many nodes the summary adds to the shell, in every meter layout.
 pub const NODE_COUNT: usize = LAYOUT.len();
 
 /// The longest text one summary line may publish, in encoded bytes.
@@ -620,10 +644,10 @@ pub fn properties(summary: &Summary) -> Properties {
     properties
 }
 
-/// The properties a summary node is created with and keeps for the life of the
-/// shell: the summary's accessibility label and spacing, each row's spacing, and
-/// each bar's label.
-fn fixed(id: NodeId) -> Vec<(PropertyRef, Value)> {
+/// The properties a summary node is created with and keeps for as long as it
+/// exists: the summary's and each meter group's accessibility label and
+/// spacing, each row's spacing, and each bar's label.
+pub(crate) fn fixed(id: NodeId) -> Vec<(PropertyRef, Value)> {
     let spacing = |role: SpacingRole| {
         (
             PropertyRef::SPACING_ROLE,
@@ -633,31 +657,16 @@ fn fixed(id: NodeId) -> Vec<(PropertyRef, Value)> {
     let label = |text: &str| (PropertyRef::LABEL, Value::from(text));
     match id {
         SUMMARY => vec![label("System summary"), spacing(SpacingRole::Tight)],
+        METER_GROUPS => vec![label("Meters"), spacing(SpacingRole::Relaxed)],
+        METER_GROUP_1 => vec![label("Meter group 1"), spacing(SpacingRole::Tight)],
+        METER_GROUP_2 => vec![label("Meter group 2"), spacing(SpacingRole::Tight)],
+        METER_HIDDEN => vec![label("Hidden meters")],
         CPU_ROW | MEMORY_ROW | SWAP_ROW => vec![spacing(SpacingRole::Normal)],
         CPU_BAR => vec![label("Overall CPU")],
         MEMORY_BAR => vec![label("Memory used")],
         SWAP_BAR => vec![label("Swap used")],
         _ => Vec::new(),
     }
-}
-
-/// The operations that create the summary under the shell's column, each node
-/// carrying its fixed properties and its share of `properties` — the same
-/// single `CREATE_NODE` per node a catch-up snapshot carries (§13, §18).
-pub fn create_operations(properties: &Properties) -> Vec<Operation> {
-    LAYOUT
-        .iter()
-        .map(|&(id, node_type, parent)| {
-            let mut node = fixed(id);
-            node.extend(
-                properties
-                    .iter()
-                    .filter(|((owner, _), _)| *owner == id)
-                    .map(|((_, property), value)| (*property, value.clone())),
-            );
-            Operation::create_node(id, node_type, Some(parent), None, node)
-        })
-        .collect()
 }
 
 /// One property a refresh sets, or clears where `value` is `None`.
@@ -1356,8 +1365,15 @@ mod tests {
     /// and Row layout and nothing else: no image, no resource, no drawing.
     #[test]
     fn the_summary_is_text_and_progress_in_rows_and_a_column() {
-        let operations =
-            create_operations(&properties(&healthy(&sample(FakeProcessSource::system()))));
+        let layout = crate::meters::MeterLayout::default();
+        let operations = crate::meters::create_operations(
+            &layout,
+            &layout.properties(
+                &properties(&healthy(&sample(FakeProcessSource::system()))),
+                &Properties::new(),
+            ),
+        );
+        use srui_sdk::Operation;
         assert_eq!(operations.len(), NODE_COUNT);
         for (operation, (id, node_type, parent)) in operations.iter().zip(LAYOUT) {
             let Operation::CreateNode {

@@ -137,6 +137,7 @@ use crate::inspector::{
     Inspector, InspectorView,
 };
 use crate::lastseen::{Departure, Evidence, Exit, LastSeen, ReadThreads, Tombstone, Unobserved};
+use crate::meters::{MeterAction, MeterLayout};
 use crate::owner::{OwnerChoice, OwnerFilter, OwnerView};
 use crate::procfs::{MonotonicClock, SystemMonotonicClock};
 use crate::projection::{Row, SessionItemIds};
@@ -388,6 +389,17 @@ pub const ACTIONS_RESERVE_BYTES: usize = 4096;
 /// never change which rows fit.
 pub const SAVED_VIEWS_RESERVE_BYTES: usize = 6144;
 
+/// Bytes reserved for the meter layout controls in a catch-up snapshot
+/// (PX-070): their row, the twenty-three buttons with their widest labels and
+/// descriptions, and the layout status at
+/// [`crate::meters::MAX_METERS_STATUS_BYTES`]. Charged at this fixed reserve
+/// whatever the layout is, so a layout change never moves the row ceiling;
+/// `the_shell_status_and_summary_fit_their_snapshot_allowances` measures it.
+/// The summary's own nodes, in any layout, stay inside
+/// [`SUMMARY_RESERVE_BYTES`]: no layout publishes more of them than the
+/// default does.
+pub const METERS_RESERVE_BYTES: usize = 6144;
+
 /// What every row's tag cell is charged in the row ceiling (PX-020): an
 /// untagged, empty cell, whether the row is tagged or not, so tagging or
 /// untagging a row never changes which rows fit.
@@ -540,8 +552,15 @@ pub struct ProcessView {
     rows: Vec<Row>,
     status: String,
     filter_status: String,
-    /// The summary's properties as the client holds them (PX-007).
+    /// The summary's properties as the client holds them (PX-007): only the
+    /// nodes the meter layout publishes (PX-070).
     summary: summary::Properties,
+    /// The latest summary for every summary node, whatever the meter layout
+    /// shows (PX-070): what a meter that is shown again is created with.
+    /// Server-side memory only.
+    summary_full: summary::Properties,
+    /// The published meter layout (PX-070).
+    meters: MeterLayout,
     /// The last successful sample, which the summary shows until another
     /// replaces it. Server-side memory only: what reaches the wire is
     /// `summary`.
@@ -862,12 +881,16 @@ impl ProcessView {
             Ok(sample) => (Some(sample), None),
             Err(error) => (None, Some(error)),
         };
-        let summary = summary::properties(&summary::summarize(&summary::State::Collecting {
+        let summary_full = summary::properties(&summary::summarize(&summary::State::Collecting {
             last: sample.as_ref(),
             error,
             source: &snapshot.source,
             filter_matches: None,
         }));
+        // The shell starts in the default meter layout (PX-070); a saved view
+        // may change it once the first snapshot is published.
+        let meters = MeterLayout::default();
+        let summary = meters.properties(&summary_full, &summary::Properties::new());
         let owner_published = {
             let scope = owner.scope(&unfiltered_rows, &committed_filter);
             let shown = rows.iter().filter(|row| !row.key.is_thread()).count();
@@ -919,6 +942,8 @@ impl ProcessView {
                 status,
                 filter_status,
                 summary,
+                summary_full,
+                meters,
                 sample,
                 published_limit,
                 sort: None,
@@ -1903,8 +1928,8 @@ impl ProcessView {
     }
 
     /// Re-evaluates the summary using the last sample and updated filter match count.
-    fn summarize_with_matches(&self, filter_matches: Option<usize>) -> summary::Properties {
-        match &self.sample {
+    fn summarize_with_matches(&mut self, filter_matches: Option<usize>) -> summary::Properties {
+        let full = match &self.sample {
             Some(sample) => summary::properties(&summary::summarize(&summary::State::Collecting {
                 last: Some(sample),
                 error: None,
@@ -1912,7 +1937,8 @@ impl ProcessView {
                 filter_matches,
             })),
             None => summary::properties(&summary::summarize(&summary::State::NotStarted)),
-        }
+        };
+        self.laid_out(full)
     }
 
     /// The summary this refresh publishes (PX-007): this scan's sample if it is
@@ -1936,12 +1962,71 @@ impl ProcessView {
                 Err(error) => Some(error),
             }
         };
-        summary::properties(&summary::summarize(&summary::State::Collecting {
+        let full = summary::properties(&summary::summarize(&summary::State::Collecting {
             last: self.sample.as_ref(),
             error,
             source: &snapshot.source,
             filter_matches,
-        }))
+        }));
+        self.laid_out(full)
+    }
+
+    /// `full`, the summary of every node, kept for a meter shown later, and
+    /// what the published meter layout sends of it (PX-070): a sample only
+    /// ever sets properties on the nodes that exist.
+    fn laid_out(&mut self, full: summary::Properties) -> summary::Properties {
+        let target = self.meters.properties(&full, &self.summary);
+        self.summary_full = full;
+        target
+    }
+
+    /// The published meter layout (PX-070).
+    pub fn meter_layout(&self) -> &MeterLayout {
+        &self.meters
+    }
+
+    /// Applies one click on a meter layout button (§7.6, PX-070), resolved
+    /// against the layout this view holds when the click is applied.
+    pub fn click_meter(
+        &mut self,
+        session: &Session,
+        action: MeterAction,
+    ) -> Result<bool, SessionError> {
+        let layout = action.apply(&self.meters);
+        self.set_meter_layout(session, layout)
+    }
+
+    /// Makes `layout` the published meter layout (PX-070), in one transaction,
+    /// and says whether anything was committed.
+    ///
+    /// The same layout commits nothing. Another one commits only structure —
+    /// the deletions, moves and creations [`crate::meters::transition`] plans
+    /// — with the group visibility and the controls whose label, enablement
+    /// or status changes: no figure a client already holds is re-sent, and
+    /// no row, sort, filter or selection changes. A paused view (PX-015)
+    /// shows a meter again with the frozen sample's figures, which are the
+    /// last ones this view computed. A failed transaction leaves the view
+    /// holding what the store holds.
+    pub fn set_meter_layout(
+        &mut self,
+        session: &Session,
+        layout: MeterLayout,
+    ) -> Result<bool, SessionError> {
+        if layout == self.meters {
+            return Ok(false);
+        }
+        let (mut operations, published) =
+            crate::meters::transition(&self.meters, &layout, &self.summary, &self.summary_full);
+        operations.extend(crate::meters::control_operations(&self.meters, &layout));
+        session.transaction(|ui| {
+            for operation in &operations {
+                ui.apply_op(operation)?;
+            }
+            Ok(())
+        })?;
+        self.summary = published;
+        self.meters = layout;
+        Ok(true)
     }
 
     /// Publishes an error over the last-known rows and mutates no row.
@@ -2374,7 +2459,8 @@ impl ProcessView {
         let filter_matches = visible.restricted.then_some(visible.matched_processes);
         // A paused view re-projects its frozen rows, and its freshness line
         // keeps saying it is paused (PX-015).
-        let summary = self.labelled(self.summarize_with_matches(filter_matches));
+        let summary = self.summarize_with_matches(filter_matches);
+        let summary = self.labelled(summary);
         let filter_status = self.filter_status_for(
             target.len(),
             visible.matched,
@@ -5192,7 +5278,8 @@ fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
             + TAGS_RESERVE_BYTES
             + TAG_CELLS_RESERVE_BYTES
             + ACTIONS_RESERVE_BYTES
-            + SAVED_VIEWS_RESERVE_BYTES,
+            + SAVED_VIEWS_RESERVE_BYTES
+            + METERS_RESERVE_BYTES,
     );
     let mut spent = 0usize;
     let mut kept = 0usize;
@@ -7286,7 +7373,8 @@ mod tests {
                 + TAGS_RESERVE_BYTES
                 + TAG_CELLS_RESERVE_BYTES
                 + ACTIONS_RESERVE_BYTES
-                + SAVED_VIEWS_RESERVE_BYTES);
+                + SAVED_VIEWS_RESERVE_BYTES
+                + METERS_RESERVE_BYTES);
         let mut published = Vec::new();
         for system in [
             SystemSample::not_provided(),
@@ -7525,7 +7613,9 @@ mod tests {
                 Value::from(srui_sdk::EnumToken::from(srui_sdk::Visibility::Visible)),
             );
         }
-        widest
+        // In the default meter layout (PX-070), which shows every meter and
+        // bar: no layout publishes more of the summary.
+        crate::meters::MeterLayout::default().properties(&widest, &summary::Properties::new())
     }
 
     /// PX-007: the summary is charged a fixed reserve against the catch-up
@@ -7543,7 +7633,8 @@ mod tests {
                 assert_eq!(text.len(), summary::MAX_SUMMARY_TEXT_BYTES);
             }
         }
-        let operations = summary::create_operations(&widest);
+        let operations =
+            crate::meters::create_operations(&crate::meters::MeterLayout::default(), &widest);
         let planned: usize = operations.iter().map(create_node_bytes).sum();
         assert!(
             planned <= SUMMARY_RESERVE_BYTES,
@@ -7704,6 +7795,36 @@ mod tests {
                     VALUE,
                     "\u{20000}".repeat(crate::filter::MAX_FILTER_QUERY_BYTES / 4),
                 )?;
+                // PX-070: every meter layout button at its widest label, and
+                // the layout status at its bound, cut mark included.
+                let default = MeterLayout::default();
+                let layouts = [
+                    default.clone(),
+                    default.toggling_header(),
+                    crate::meters::METERS
+                        .into_iter()
+                        .fold(default.clone(), |layout, meter| layout.toggling(meter)),
+                    crate::meters::METERS
+                        .into_iter()
+                        .fold(default, |layout, meter| layout.switching(meter)),
+                ];
+                for (button, action) in crate::meters::METER_BUTTONS {
+                    let widest = layouts
+                        .iter()
+                        .map(|layout| action.label(layout))
+                        .max_by_key(String::len)
+                        .unwrap();
+                    ui.set(button, LABEL, widest)?;
+                    ui.set(button, ENABLED, true)?;
+                }
+                ui.set(
+                    crate::METERS_STATUS,
+                    TEXT,
+                    crate::bounded(
+                        &"\u{20000}".repeat(crate::meters::MAX_METERS_STATUS_BYTES / 4 + 1),
+                        crate::meters::MAX_METERS_STATUS_BYTES,
+                    ),
+                )?;
                 Ok(())
             })
             .unwrap();
@@ -7737,6 +7858,26 @@ mod tests {
                     .sum::<usize>()
             })
         };
+        // PX-070: the meter layout controls at their widest, against their
+        // own reserve.
+        let mut meter_controls = vec![crate::METER_CONTROLS_ROW];
+        meter_controls.extend(crate::meters::METER_BUTTONS.map(|(button, _)| button));
+        meter_controls.push(crate::METERS_STATUS);
+        let meter_controls = encoded(&meter_controls);
+        assert!(
+            meter_controls <= METERS_RESERVE_BYTES,
+            "the widest meter controls encode to {meter_controls} bytes, above their \
+             {METERS_RESERVE_BYTES} byte reserve"
+        );
+        assert!(
+            meter_controls > METERS_RESERVE_BYTES / 2,
+            "the reserve must be measured against meter controls that really are wide: \
+             {meter_controls}"
+        );
+        println!(
+            "PX-070 meter controls at their widest: encoded={meter_controls} \
+             reserve={METERS_RESERVE_BYTES}"
+        );
         let inspector = encoded(&[
             crate::INSPECTOR,
             INSPECTOR_STATUS,
@@ -7986,6 +8127,7 @@ mod tests {
                     + VIEW_RESERVE_BYTES
                     + THREADS_RESERVE_BYTES
                     + TAGS_RESERVE_BYTES
+                    + METERS_RESERVE_BYTES
                     + TRANSACTION_ENVELOPE_BYTES,
             "a snapshot with no row is {frame} bytes, above the allowances the row budget \
              leaves for it"
@@ -8005,6 +8147,7 @@ mod tests {
                 + VIEW_RESERVE_BYTES
                 + THREADS_RESERVE_BYTES
                 + TAGS_RESERVE_BYTES
+                + METERS_RESERVE_BYTES
         );
         println!(
             "PX-018 view switch and tree at their widest: encoded={view} reserve={VIEW_RESERVE_BYTES}"

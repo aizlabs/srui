@@ -33,6 +33,17 @@
 // the window shows the complete current state; a WELCOME naming another session is reported as
 // the saved session's replacement. Removing an entry forgets it locally and sends nothing.
 //
+// PX-095: several connections run at once, each in its own `ConnectionSessionContext` (replica,
+// outbox and so its `client_instance_id` and `event_seq`, resource cache, ingress gate, continuity
+// context, renderer and so its selection memory and collection caches) and its own attempt
+// generation (`activeTokens`, keyed by the saved entry). Nothing is shared between two contexts,
+// so two hosts that serve the same node IDs, process IDs and names cannot share a selection, an
+// event or a cached identity, and a confirmation can only be sent through the session whose window
+// shows it. Every window of a session carries a client-owned identity line naming the host, the
+// account and the incarnation (`session_id`, §17) its replica came from, apart from the server's
+// title and the status subtitle. An alert about one connection is never cleared by an attempt of
+// another, and one merged into another connection's alert names its own endpoint.
+//
 
 import Foundation
 import Observation
@@ -470,6 +481,18 @@ final class ConnectionSessionContext {
     /// snapshot is applied before ready, as for any fresh attach.
     private(set) var hasBeenReady = false
 
+    /// The saved entry whose session this context holds, for its windows' identity line (PX-095).
+    /// Its label and endpoint never change for one entry; its session ID is not read from here.
+    var identifiedConnection: SavedConnection?
+    /// The session incarnation (`session_id`, §17) whose replica this context holds, as the
+    /// transport reported it at ready or at a REPLACED decision, validated; `nil` before either.
+    var incarnation: String?
+
+    /// The identity line every window of this context shows (PX-095), or `nil` without an entry.
+    var windowIdentity: SessionWindowIdentity? {
+        identifiedConnection.map { ConnectionManager.sessionWindowIdentity(for: $0, incarnation: incarnation) }
+    }
+
     /// A session has been ready here and its replica still holds a committed revision: the
     /// process-local continuity checkpoint a `CLIENT_RESUME` stands on (§18, PX-024 round 3).
     var hasCommittedReplica: Bool {
@@ -740,6 +763,11 @@ public final class ConnectionManager {
         if candidate.kind == .connectionFailed,
            candidate.connectionID == current.connectionID {
             detail = "The replacement connection then failed: \(candidate.message)"
+        } else if let other = candidate.connectionID,
+                  other != current.connectionID,
+                  let name = endpointName(for: other) {
+            // PX-095: another connection's alert, folded into this one, says whose it is.
+            detail = "\(candidate.title) (\(name)): \(candidate.message)"
         } else {
             detail = "\(candidate.title): \(candidate.message)"
         }
@@ -965,6 +993,9 @@ public final class ConnectionManager {
             contexts[connection.id] = created
             context = created
         }
+        // PX-095: the context's windows name this entry's host, account and incarnation.
+        context.identifiedConnection = connection
+        context.renderer.setSessionWindowIdentity(context.windowIdentity)
 
         let configuration = Self.sshConfiguration(for: connection)
         let request = ConnectionAttemptRequest(
@@ -982,7 +1013,10 @@ public final class ConnectionManager {
         }
         attemptsByToken[token] = attempt
         setStatus(.connecting, for: connection.id)
-        if alert?.kind != .sessionReplaced {
+        // PX-095: a new attempt dismisses only its own connection's alert (or one that names no
+        // connection), never another host's; a replacement disclosure stays until dismissed.
+        if let current = alert, current.kind != .sessionReplaced,
+           current.connectionID == nil || current.connectionID == connection.id {
             alert = nil
         }
 
@@ -1090,10 +1124,12 @@ public final class ConnectionManager {
             case .resynchronizing:
                 showWindowStatus(.resynchronizing, for: connectionID)
                 return false
-            case .replaced:
+            case .replaced(_, let newSessionID):
+                showIncarnation(newSessionID, for: connectionID)
                 showWindowStatus(.resynchronizing, for: connectionID, replaced: true)
                 return false
-            case .ready:
+            case .ready(let sessionID, _):
+                showIncarnation(sessionID, for: connectionID)
                 showWindowStatus(.connected, for: connectionID)
                 return false
             }
@@ -1115,16 +1151,22 @@ public final class ConnectionManager {
             let replacement = SavedConnection.validSessionID(newSessionID)
             entries[index].sessionID = replacement
             entries[index].lastKnownRevision = 0
+            showIncarnation(newSessionID, for: connectionID)
             setStatus(.resynchronizing, for: connectionID, replaced: true)
+            let endpoint = ConnectionEndpoint.displayString(
+                host: entries[index].host,
+                port: entries[index].port,
+                user: entries[index].user
+            )
             let persistenceError = await save(entries)
             guard activeTokens[connectionID] == token else { return true }
 
             let newName = replacement ?? "a session with an invalid ID"
             var message: String
             if let previous = previousSessionID.flatMap(SavedConnection.validSessionID) {
-                message = "Remote session \(previous) was replaced by \(newName). "
+                message = "Remote session \(previous) on \(endpoint) was replaced by \(newName). "
             } else {
-                message = "The saved remote session was replaced by \(newName). "
+                message = "The saved remote session on \(endpoint) was replaced by \(newName). "
             }
             message += "SRUI is rebuilding from authoritative state."
             if let persistenceError {
@@ -1144,6 +1186,7 @@ public final class ConnectionManager {
             entries[index].lastKnownRevision = stored == nil ? 0 : revision
             contexts[connectionID]?.markPersistableRevisionReady(for: sessionID)
             pendingFirstSuccess.remove(connectionID)
+            showIncarnation(sessionID, for: connectionID)
             setStatus(.connected, for: connectionID)
             let persistenceError = await save(entries)
             guard activeTokens[connectionID] == token else { return true }
@@ -1314,6 +1357,57 @@ public final class ConnectionManager {
                 : status.sessionWindowStatus(
                     lastAppliedRevision: context.applier.lastAppliedRevision.value
                 )
+        )
+    }
+
+    /// Records the incarnation whose replica the connection's context now holds (the transport's
+    /// ready, or a REPLACED decision) and puts it on every window's identity line (PX-095). Callers
+    /// speak for the current attempt generation, as for `setStatus`.
+    private func showIncarnation(_ sessionID: String, for connectionID: SavedConnection.ID) {
+        guard let context = contexts[connectionID] else { return }
+        context.incarnation = SavedConnection.validSessionID(sessionID) ?? Self.invalidIncarnation
+        context.renderer.setSessionWindowIdentity(context.windowIdentity)
+    }
+
+    /// Shown in place of a server-reported session ID that fails `SavedConnection.validSessionID`.
+    nonisolated static let invalidIncarnation = "with an invalid ID"
+
+    /// The identity line of a session's windows (PX-095): the endpoint the client itself connected
+    /// to (account and host, and the port when one is set), the incarnation (`session_id`, §17)
+    /// whose replica the windows show, and the entry's local name when it differs from the
+    /// endpoint. The endpoint comes first: a local name is the user's free text and can look like
+    /// another endpoint. Nothing in it comes from a server property; the session ID is the one the
+    /// handshake attached to, validated by `SavedConnection.validSessionID`. `groupIdentifier` is
+    /// unique per saved entry, so no window tab group spans two connections.
+    nonisolated static func sessionWindowIdentity(
+        for connection: SavedConnection,
+        incarnation: String?
+    ) -> SessionWindowIdentity {
+        let endpoint = ConnectionEndpoint.displayString(
+            host: connection.host,
+            port: connection.port,
+            user: connection.user
+        )
+        var text = endpoint + " · " + (incarnation.map { "session \($0)" } ?? "no session attached yet")
+        if connection.label != endpoint {
+            text += " · saved as “\(connection.label)”"
+        }
+        return SessionWindowIdentity(
+            text: text,
+            groupIdentifier: "org.srui.session.\(connection.id.uuidString)"
+        )
+    }
+
+    /// The endpoint of a connection, for an alert that names it (PX-095), or `nil` if unknown.
+    private func endpointName(for connectionID: SavedConnection.ID) -> String? {
+        guard let connection = entries.first(where: { $0.id == connectionID })
+            ?? contexts[connectionID]?.identifiedConnection else {
+            return nil
+        }
+        return ConnectionEndpoint.displayString(
+            host: connection.host,
+            port: connection.port,
+            user: connection.user
         )
     }
 

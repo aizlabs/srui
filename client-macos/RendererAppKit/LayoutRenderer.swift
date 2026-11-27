@@ -43,6 +43,16 @@ public final class LayoutRenderer {
     /// else the window caches stays readable and scrollable.
     public private(set) var sessionWindowStatus: String?
 
+    /// Client-owned identity line on every Surface window of this session (PX-095), or `nil`.
+    ///
+    /// The connection manager sets it from its own saved endpoint and the session ID its transport
+    /// attached to, so windows of two hosts that serve the same application, node IDs, process IDs
+    /// and names still say which host, account and incarnation each belongs to. Like the status, it
+    /// lives as long as this renderer and reaches every window `mount(nodeID:from:)` creates. It is
+    /// drawn by a titlebar accessory (`SessionWindowIdentity`), so neither the server's title nor
+    /// the status subtitle is touched.
+    public private(set) var sessionWindowIdentity: SessionWindowIdentity?
+
     /// Local dispatch of the standard `shortcut` property for this renderer's surfaces.
     public let shortcutRouter: ShortcutRouter
 
@@ -332,6 +342,19 @@ public final class LayoutRenderer {
         window.setAccessibilityHelp(sessionWindowStatus)
     }
 
+    /// Sets or, with `nil`, removes the client-owned identity line on every Surface window, now and
+    /// for every window mounted later (PX-095).
+    public func setSessionWindowIdentity(_ identity: SessionWindowIdentity?) {
+        sessionWindowIdentity = identity
+        for handle in registry.surfaceHandles {
+            handle.window?.applySessionWindowIdentity(identity)
+        }
+        RendererDiagnostics.log(
+            // Whether, not what: the line names a host and an account.
+            "sessionWindowIdentity=\(identity == nil ? "<none>" : "set") surfaces=\(registry.surfaceHandles.count)"
+        )
+    }
+
     /// Validates extension negotiation and fallback structure without mutating AppKit state.
     public func validateExtensionMounts(in store: SemanticStore) throws {
         try controlFactory.extensionMountResolver.validateMountableExtensions(in: store)
@@ -350,6 +373,9 @@ public final class LayoutRenderer {
         try registry.register(handle)
         if let window = handle.window {
             applySessionWindowStatus(to: window)
+            if let sessionWindowIdentity {
+                window.applySessionWindowIdentity(sessionWindowIdentity)
+            }
         }
         RendererDiagnostics.log(
             "mounted node=\(node.id) type=\(node.nodeType) parent=\(node.parentID?.description ?? "root")"

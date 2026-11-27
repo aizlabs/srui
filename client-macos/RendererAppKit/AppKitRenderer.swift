@@ -101,6 +101,18 @@ public final class AppKitRenderer {
         layoutRenderer.setSessionWindowStatus(status)
     }
 
+    /// The client-owned identity line (host, account, incarnation) on every Surface window of this
+    /// session, or `nil` (PX-095; see `LayoutRenderer.sessionWindowIdentity`).
+    public var sessionWindowIdentity: SessionWindowIdentity? {
+        layoutRenderer.sessionWindowIdentity
+    }
+
+    /// Sets or removes the identity line on every Surface window of this session, now and for every
+    /// window mounted later. Only the client's connection manager may drive it (PX-095).
+    public func setSessionWindowIdentity(_ identity: SessionWindowIdentity?) {
+        layoutRenderer.setSessionWindowIdentity(identity)
+    }
+
     /// Drops in-flight coverage without emitting. Used by `stop()` so a torn-down
     /// pump cannot record phantom pending windows (§8, §22.7).
     public func clearCollectionRangeTrackers() {

@@ -2311,30 +2311,30 @@ struct ProcessExplorerShellTests {
     }
 
     // PX-028: the action controls, present only with `--actions`.
-    fileprivate static let actionPrepareID: UInt64 = 84
-    fileprivate static let actionCancelID: UInt64 = 86
-    fileprivate static let actionsStatusID: UInt64 = 87
+    static let actionPrepareID: UInt64 = 84
+    static let actionCancelID: UInt64 = 86
+    static let actionsStatusID: UInt64 = 87
     // PX-031: what was observed of the process after a sent request, apart from the request.
     fileprivate static let actionsObservedID: UInt64 = 88
     // PX-030: confirmation panel `slot`'s nodes, fresh for every intent: base + 3·slot is its row,
     // + 1 its question and + 2 its Confirm (`actions::PanelIds`). PX-031: every run of srtop draws
     // its own base, 2^32 + k·12288, so the native handle is found by its offset within the run's
     // range rather than by a fixed ID.
-    fileprivate static let panelRangeStart: UInt64 = 1 << 32
-    fileprivate static let panelRunSpan: UInt64 = 3 * 4096
+    static let panelRangeStart: UInt64 = 1 << 32
+    static let panelRunSpan: UInt64 = 3 * 4096
     @MainActor
-    fileprivate static func panelHandle(_ registry: RenderRegistry, slot: UInt64, offset: UInt64) -> RenderHandle? {
+    static func panelHandle(_ registry: RenderRegistry, slot: UInt64, offset: UInt64) -> RenderHandle? {
         registry.allHandles.first { handle in
             let id = handle.nodeID.value
             return id >= panelRangeStart && (id - panelRangeStart) % panelRunSpan == 3 * slot + offset
         }
     }
     @MainActor
-    fileprivate static func panelConfirm(_ registry: RenderRegistry, _ slot: UInt64) -> NSButton? {
+    static func panelConfirm(_ registry: RenderRegistry, _ slot: UInt64) -> NSButton? {
         panelHandle(registry, slot: slot, offset: 2)?.view as? NSButton
     }
     @MainActor
-    fileprivate static func panelQuestion(_ registry: RenderRegistry, _ slot: UInt64) -> String {
+    static func panelQuestion(_ registry: RenderRegistry, _ slot: UInt64) -> String {
         (panelHandle(registry, slot: slot, offset: 1)?.view as? NSTextField)?.stringValue ?? ""
     }
 
@@ -2455,11 +2455,11 @@ struct ProcessExplorerShellTests {
     }
 
     // PX-015: the sampling controls.
-    fileprivate static let samplingPauseID: UInt64 = 62
+    static let samplingPauseID: UInt64 = 62
     fileprivate static let samplingRefreshID: UInt64 = 63
     fileprivate static let intervalInputID: UInt64 = 64
     fileprivate static let intervalApplyID: UInt64 = 65
-    fileprivate static let samplingStatusID: UInt64 = 66
+    static let samplingStatusID: UInt64 = 66
 
     /// The string `id` holds as its `VALUE` on the client.
     @MainActor
@@ -3051,7 +3051,7 @@ struct ProcessExplorerShellTests {
 
     // PX-013: the inspector's four lines.
     fileprivate static let inspectorMetricsID: UInt64 = 59
-    fileprivate static let inspectorLineIDs: [UInt64] = [56, 57, 58, 59]
+    static let inspectorLineIDs: [UInt64] = [56, 57, 58, 59]
 
     /// The inspector lines the client holds (PX-013).
     @MainActor
@@ -3524,7 +3524,7 @@ struct ProcessExplorerShellTests {
     /// Starts a new srtop on the harness's socket after the previous one stopped: the same
     /// endpoint, a new incarnation.
     @MainActor
-    private static func relaunchServer(in harness: Harness, arguments: [String]) async throws -> Process {
+    static func relaunchServer(in harness: Harness, arguments: [String]) async throws -> Process {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
@@ -3615,7 +3615,7 @@ struct ProcessExplorerShellTests {
 
     // PX-009: the sort row's four buttons, in column order.
     fileprivate static let sortButtonIDs: [UInt64] = [21, 22, 23, 24]
-    private static let fakeRows = [
+    static let fakeRows = [
         ["4101", "worker", "1.1 MiB", "250.0%", ""],
         ["4102", "worker", "0 B", "0.0%", ""],
         ["Unavailable", "helper", "Denied", "Warming up", ""],
@@ -3741,7 +3741,7 @@ struct ProcessExplorerShellTests {
     }
 
     @MainActor
-    fileprivate static func nativeRows(_ table: NSTableView) -> [[String]] {
+    static func nativeRows(_ table: NSTableView) -> [[String]] {
         (0..<table.numberOfRows).map { row in
             (0..<table.tableColumns.count).map { column in
                 (table.view(atColumn: column, row: row, makeIfNecessary: true) as? NSTextField)?
@@ -3752,14 +3752,14 @@ struct ProcessExplorerShellTests {
 
     /// Stable item identities held by the client, in published order.
     @MainActor
-    fileprivate static func modelItemIDs(_ applier: TransactionApplier) -> [UInt64] {
+    static func modelItemIDs(_ applier: TransactionApplier) -> [UInt64] {
         guard let model = applier.store.getModel(ModelId(1)) else { return [] }
         return model.items.sorted { $0.key < $1.key }.map { $0.value.itemID.value }
     }
 
     /// The row cells the client holds, in published order.
     @MainActor
-    fileprivate static func modelRows(_ applier: TransactionApplier) -> [[String]] {
+    static func modelRows(_ applier: TransactionApplier) -> [[String]] {
         guard let model = applier.store.getModel(ModelId(1)) else { return [] }
         return model.items.sorted { $0.key < $1.key }.map { item in
             guard case .list(let cells) = item.value.value else { return [] }

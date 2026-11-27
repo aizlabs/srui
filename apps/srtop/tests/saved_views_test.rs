@@ -919,9 +919,15 @@ fn each_read_only_status_names_the_protected_file_and_what_is_shown() {
         store.path().display().to_string(),
         store.backup_path().display().to_string(),
     );
+    let theirs = Settings {
+        source: "procfs:/proc".into(),
+        ..settings_with(&["Live"])
+    };
     // A valid settings file and a protected backup: the file's views are
     // shown and applied; the backup is the one named.
     for (backup_bytes, reason) in [
+        // PX-069 verification round 3, V3-1: another source's valid backup.
+        (theirs.encode().unwrap().into_bytes(), ReadOnly::OtherSource),
         (
             format!("srtop-settings {}\n", CURRENT_VERSION + 1).into_bytes(),
             ReadOnly::NewerVersion(CURRENT_VERSION + 1),
@@ -969,16 +975,48 @@ fn each_read_only_status_names_the_protected_file_and_what_is_shown() {
         "{status}"
     );
     // A settings file of another source: the defaults, the file named.
-    let theirs = Settings {
-        source: "procfs:/proc".into(),
-        ..settings_with(&["Live"])
-    };
     std::fs::write(store.path(), theirs.encode().unwrap()).unwrap();
     let status = SavedViews::open(store.clone(), SOURCE).status();
     assert!(
         status.contains(&format!("Not saving: the settings file {path} was saved for another process source; it is left unchanged and the default view is shown")),
         "{status}"
     );
+}
+
+/// PX-069 verification round 3, V3-1: a valid backup saved for another
+/// process source is never replaced, also when the settings file was moved
+/// away and the first save creates a new one.
+#[test]
+fn another_sources_backup_is_never_replaced() {
+    let dir = TempDir::new("other-source-bak");
+    let (store, old, new) = two_saves(&dir);
+    let theirs = Settings {
+        source: "procfs:/proc".into(),
+        ..settings_with(&["Live"])
+    };
+    let theirs_bytes = theirs.encode().unwrap().into_bytes();
+    std::fs::write(store.backup_path(), &theirs_bytes).unwrap();
+    std::fs::remove_file(store.path()).unwrap();
+    // No settings file: the first save writes one and leaves the backup.
+    assert_eq!(store.load(SOURCE).read_only, None);
+    store.save(&old).unwrap();
+    assert_eq!(read(&store.backup_path()), theirs_bytes);
+    // The next save would replace the backup: refused, both files kept.
+    let loaded = store.load(SOURCE);
+    assert_eq!(
+        loaded.read_only,
+        Some(ReadOnly::Backup(Box::new(ReadOnly::OtherSource)))
+    );
+    assert_eq!(loaded.settings, old);
+    let primary = read(store.path());
+    assert_eq!(
+        store.save(&new),
+        Err(SaveError::Refused(ReadOnly::Backup(Box::new(
+            ReadOnly::OtherSource
+        ))))
+    );
+    assert_eq!(read(&store.backup_path()), theirs_bytes);
+    assert_eq!(read(store.path()), primary);
 }
 
 /// PX-069 verification round 2, V2-4: the first line's shape is frozen, so a

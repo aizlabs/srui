@@ -352,7 +352,7 @@ impl SettingsStore {
                             .then_some(parsed.version),
                     },
                     settings: parsed.settings,
-                    read_only: self.protected_backup(),
+                    read_only: self.protected_backup(source),
                     notes: parsed.notes,
                 };
             }
@@ -401,7 +401,7 @@ impl SettingsStore {
                 return Err(SaveError::Refused(ReadOnly::OtherSource));
             }
             Found::Valid { bytes, .. } => {
-                if let Some(reason) = self.protected_backup() {
+                if let Some(reason) = self.protected_backup(&settings.source) {
                     return Err(SaveError::Refused(reason));
                 }
                 self.replace(&self.backup_path(), &bytes, None)?;
@@ -429,14 +429,18 @@ impl SettingsStore {
     }
 
     /// Why the backup must not be replaced, if it must not: a file whose
-    /// head names a newer version or another application, a file that is not
-    /// settings at all, or one that cannot be read. A damaged backup, a
-    /// missing one or a link (renamed over, never followed) may be replaced.
-    fn protected_backup(&self) -> Option<ReadOnly> {
+    /// head names a newer version or another application, a valid file saved
+    /// for another process source than `source`, a file that is not settings
+    /// at all, or one that cannot be read. A damaged backup, a missing one or
+    /// a link (renamed over, never followed) may be replaced.
+    fn protected_backup(&self, source: &str) -> Option<ReadOnly> {
         match classify(&self.backup_path()) {
             Found::Refused(Problem::NotAFile) => None,
             Found::Refused(problem) => {
                 read_only(&problem).map(|reason| ReadOnly::Backup(Box::new(reason)))
+            }
+            Found::Valid { parsed, .. } if parsed.settings.source != source => {
+                Some(ReadOnly::Backup(Box::new(ReadOnly::OtherSource)))
             }
             Found::Missing | Found::Valid { .. } => None,
         }

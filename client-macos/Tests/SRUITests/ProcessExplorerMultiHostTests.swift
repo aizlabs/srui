@@ -156,12 +156,38 @@ extension ProcessExplorerShellTests {
         try await Task.sleep(for: .milliseconds(300))
         #expect(b.selectedPIDs().isEmpty && b.inspector() == "Selected process: none · select a row to inspect it")
         #expect(await b.eventSeq() == seqB0, "A's selection allocated nothing in B's outbox")
+        // Verification round 1 (W3): B rebuilds every view while A holds its local selection, once
+        // by a remount (as a resynchronization's snapshot does) and once by a warm reconnect. A
+        // renderer restores a collection's selection from its own memory on every remount, so a
+        // memory shared between sessions would put A's 4101 (the same ItemId) into B's table.
+        let remountedB = try #require(b.context)
+        try remountedB.renderer.attach(store: remountedB.applier.store)
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(b.selectedPIDs().isEmpty && b.inspector() == "Selected process: none · select a row to inspect it",
+                "B's remount kept B's own selection: \(b.describe())")
+        manager.connect(id: idB)
+        try await waitFor("B warm-reconnected") {
+            manager.status(for: idB) == .connected && b.rows() == Self.fakeRows
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(b.selectedPIDs().isEmpty && b.inspector() == "Selected process: none · select a row to inspect it",
+                "B's warm reconnect kept B's own selection: \(b.describe())")
+        #expect(session(idB) == sessionB, "the same incarnation, resumed")
+        #expect(a.selectedPIDs() == ["4101"])
+        record("B remounted and reconnected while A held 4101")
         let seqA1 = await a.eventSeq()
         try b.select("4102")
         try await waitFor("B's inspector on 4102") { b.inspector() == "Selected process: PID 4102 · worker" }
         try await Task.sleep(for: .milliseconds(300))
         #expect(a.selectedPIDs() == ["4101"] && a.inspector() == "Selected process: PID 4101 · worker")
         #expect(await a.eventSeq() == seqA1, "B's selection allocated nothing in A's outbox")
+        // And the other way round: A remounts while B holds 4102; A keeps 4101.
+        let remountedA = try #require(a.context)
+        try remountedA.renderer.attach(store: remountedA.applier.store)
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(a.selectedPIDs() == ["4101"] && a.inspector() == "Selected process: PID 4101 · worker",
+                "A's remount kept A's own selection: \(a.describe())")
+        #expect(b.selectedPIDs() == ["4102"])
         record("selected apart")
 
         // An action and its confirmation belong to one session. A prepares 4101: A's window shows

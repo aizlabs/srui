@@ -485,7 +485,9 @@ final class ConnectionSessionContext {
     /// Its label and endpoint never change for one entry; its session ID is not read from here.
     var identifiedConnection: SavedConnection?
     /// The session incarnation (`session_id`, §17) whose replica this context holds, as the
-    /// transport reported it at ready or at a REPLACED decision, validated; `nil` before either.
+    /// transport reported it at ready or at a REPLACED decision, `nil` before either. Held as
+    /// reported (cut to one scalar past `maximumShownSessionIDLength`, so an over-long ID stays
+    /// over-long and bounded); `ConnectionManager.shownSessionID` decides whether it is shown.
     var incarnation: String?
 
     /// The identity line every window of this context shows (PX-095), or `nil` without an entry.
@@ -1161,9 +1163,11 @@ public final class ConnectionManager {
             let persistenceError = await save(entries)
             guard activeTokens[connectionID] == token else { return true }
 
-            let newName = replacement ?? "a session with an invalid ID"
+            // Shown only as a strict token (PX-095 round 1): the message names the endpoint, and
+            // a server-chosen ID must not be able to name another one after it.
+            let newName = Self.shownSessionID(newSessionID) ?? "a session with an invalid ID"
             var message: String
-            if let previous = previousSessionID.flatMap(SavedConnection.validSessionID) {
+            if let previous = previousSessionID.flatMap(Self.shownSessionID) {
                 message = "Remote session \(previous) on \(endpoint) was replaced by \(newName). "
             } else {
                 message = "The saved remote session on \(endpoint) was replaced by \(newName). "
@@ -1365,20 +1369,44 @@ public final class ConnectionManager {
     /// speak for the current attempt generation, as for `setStatus`.
     private func showIncarnation(_ sessionID: String, for connectionID: SavedConnection.ID) {
         guard let context = contexts[connectionID] else { return }
-        context.incarnation = SavedConnection.validSessionID(sessionID) ?? Self.invalidIncarnation
+        context.incarnation = String(sessionID.unicodeScalars.prefix(Self.maximumShownSessionIDLength + 1))
         context.renderer.setSessionWindowIdentity(context.windowIdentity)
     }
 
-    /// Shown in place of a server-reported session ID that fails `SavedConnection.validSessionID`.
-    nonisolated static let invalidIncarnation = "with an invalid ID"
+    /// The longest session ID a window or alert shows (PX-095 round 1). `srui-sessiond` (and so
+    /// srtop) mints 32 lowercase hex characters (`mint_session_id`); 64 leaves room for another
+    /// server's UUID string or prefixed token.
+    nonisolated static let maximumShownSessionIDLength = 64
+
+    /// `id` if it may be shown next to an endpoint, else `nil` (PX-095 round 1): 1 to
+    /// `maximumShownSessionIDLength` ASCII letters, digits, `.`, `_` or `-`. The session ID is
+    /// server-chosen and `SavedConnection.validSessionID` admits spaces, `·`, quotes and `@`, so
+    /// an ID such as `x · saved as “prod” · root@host-b:22` could make the rest of the line read
+    /// as another host; this charset can name no endpoint, label or separator, and has no
+    /// lookalike or invisible scalar. Storage keeps the looser rule; only display is strict.
+    nonisolated static func shownSessionID(_ id: String) -> String? {
+        guard (1...maximumShownSessionIDLength).contains(id.unicodeScalars.count),
+              id.unicodeScalars.allSatisfy({ scalar in
+                  switch scalar {
+                  case "a"..."z", "A"..."Z", "0"..."9", ".", "_", "-": return true
+                  default: return false
+                  }
+              }) else {
+            return nil
+        }
+        return id
+    }
 
     /// The identity line of a session's windows (PX-095): the endpoint the client itself connected
     /// to (account and host, and the port when one is set), the incarnation (`session_id`, §17)
     /// whose replica the windows show, and the entry's local name when it differs from the
     /// endpoint. The endpoint comes first: a local name is the user's free text and can look like
     /// another endpoint. Nothing in it comes from a server property; the session ID is the one the
-    /// handshake attached to, validated by `SavedConnection.validSessionID`. `groupIdentifier` is
-    /// unique per saved entry, so no window tab group spans two connections.
+    /// handshake attached to, shown only if `shownSessionID` admits it (otherwise `session with an
+    /// invalid ID`). The local name is shown only if it passes the Connect form's rule
+    /// (`ConnectionEndpoint.validate(label:)`: at most 128 scalars, no control, format or
+    /// separator scalar), since the saved file is not checked for it on load. `groupIdentifier`
+    /// is unique per saved entry, so no window tab group spans two connections.
     nonisolated static func sessionWindowIdentity(
         for connection: SavedConnection,
         incarnation: String?
@@ -1388,9 +1416,13 @@ public final class ConnectionManager {
             port: connection.port,
             user: connection.user
         )
-        var text = endpoint + " · " + (incarnation.map { "session \($0)" } ?? "no session attached yet")
-        if connection.label != endpoint {
-            text += " · saved as “\(connection.label)”"
+        let session = incarnation.map { reported in
+            shownSessionID(reported).map { "session \($0)" } ?? "session with an invalid ID"
+        } ?? "no session attached yet"
+        var text = endpoint + " · " + session
+        let label = ConnectionEndpoint.trimmed(connection.label)
+        if label != endpoint, !label.isEmpty, ConnectionEndpoint.validate(label: label) == nil {
+            text += " · saved as “\(label)”"
         }
         return SessionWindowIdentity(
             text: text,

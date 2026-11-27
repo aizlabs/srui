@@ -2457,6 +2457,62 @@ struct ConnectionManagerTests {
         await manager.shutdown()
     }
 
+    @Test("a server-chosen session ID is shown only as a strict token, and a local name only if valid")
+    func identityLineShowsOnlyStrictTokensAndValidNames() async throws {
+        let (a, _) = twoHosts()
+        func line(_ incarnation: String?, label: String = "srtop") -> String {
+            var connection = a
+            connection.label = label
+            return ConnectionManager.sessionWindowIdentity(for: connection, incarnation: incarnation).text
+        }
+        let invalid = "alice@host-a.example:2228 · session with an invalid ID · saved as “srtop”"
+        // The decoy passes the storage rule, which is why display needs its own.
+        let decoy = "x · saved as “prod” · root@host-b.example:22"
+        #expect(SavedConnection.validSessionID(decoy) == decoy)
+        #expect(line(decoy) == invalid)
+        #expect(!line(decoy).contains("root@") && !line(decoy).contains("prod"))
+        // Real IDs: srui-sessiond's 32 hex characters, a UUID string, a prefixed token, the bound.
+        for real in ["b446e2deaa4c190497c2756511da4ed0", "8240B68B-D298-46BD-811C-C35753518E8B",
+                     "srtop_v1.session-7", String(repeating: "a", count: 64)] {
+            #expect(line(real) == "alice@host-a.example:2228 · session \(real) · saved as “srtop”")
+        }
+        // Too long (the storage rule allows 128), empty, lookalikes, invisible and control scalars,
+        // spaces and the separators an endpoint or the line itself uses.
+        let refused = [
+            String(repeating: "a", count: 65), String(repeating: "f", count: 128), "",
+            "ѕession-а", "ａｂｃ", "abc\u{200B}def", "abc\u{202E}fed", "abc\u{1B}[2J", "abc\u{0}",
+            "a b", "a·b", "a@b", "a:b", "a“b”", "a\"b", "a/b", "a\nb",
+        ]
+        for id in refused {
+            #expect(line(id) == invalid, "\(id.unicodeScalars.map { String($0.value, radix: 16) })")
+        }
+        #expect(line(nil) == "alice@host-a.example:2228 · no session attached yet · saved as “srtop”")
+        // A saved file's label is not checked on load: an invalid one is left out of the line.
+        let plain = "alice@host-a.example:2228 · session s1"
+        #expect(line("s1", label: String(repeating: "n", count: 129)) == plain)
+        #expect(line("s1", label: "prod\u{202E}lab") == plain)
+        #expect(line("s1", label: "prod\u{1B}[2J") == plain)
+        #expect(line("s1", label: "  ") == plain)
+        #expect(line("s1", label: String(repeating: "n", count: 128)) == plain + " · saved as “\(String(repeating: "n", count: 128))”")
+
+        // Through the manager: a decoy at ready, and a decoy replacement's alert.
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let (manager, harness, idA, _) = try await connectTwoHosts(temporary)
+        let context = harness.requests[0].context
+        let window = try mountTitledSurface(in: context)
+        await harness.attempts[0].emit(.ready(sessionID: decoy, revision: 1))
+        try await AsyncTestSupport.observed("A ready under a decoy ID") { manager.status(for: idA.id) == .connected }
+        #expect(window.sessionIdentityText == invalid)
+        await harness.attempts[0].emit(.replaced(previousSessionID: decoy, newSessionID: "y · root@host-b.example:22"))
+        try await AsyncTestSupport.observed("A replaced under a decoy ID") { manager.alert?.kind == .sessionReplaced }
+        let message = try #require(manager.alert?.message)
+        #expect(message.hasPrefix("The saved remote session on alice@host-a.example:2228 was replaced by a session with an invalid ID."), "\(message)")
+        #expect(!message.contains("root@"), "\(message)")
+        #expect(window.sessionIdentityText == invalid)
+        await manager.shutdown()
+    }
+
     @Test("replacing, reconnecting, failing or removing one connection leaves the other session intact")
     func oneConnectionsLifecycleLeavesTheOtherIntact() async throws {
         let temporary = TemporaryConnectionStore()

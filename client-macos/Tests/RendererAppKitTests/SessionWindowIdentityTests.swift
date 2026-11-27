@@ -97,6 +97,31 @@ struct SessionWindowIdentityTests {
         #expect(window.title == "Renamed" && window.sessionIdentityText == hostA.text)
     }
 
+    @Test("a server title or text that copies another host's identity line cannot replace or join it")
+    func serverTextCannotStandInForTheIdentity() throws {
+        let decoy = hostB.text
+        let store = try makeStore([
+            .createNode(id: 1, nodeType: .surface, properties: [(.label, .string(decoy))]),
+            .createNode(id: 2, nodeType: .text, parentID: 1, properties: [(.text, .string(decoy))]),
+        ])
+        let renderer = AppKitRenderer()
+        try renderer.attach(store: store)
+        renderer.setSessionWindowIdentity(hostA)
+        let window = try #require(renderer.registry.handle(for: 1)?.window)
+        #expect(window.title == decoy, "the server owns the title, whatever it says")
+        #expect(window.subtitle.isEmpty, "the subtitle is the client's status, never a server property")
+        // The identity is the one line in the titlebar accessory, which no server node is mounted into.
+        #expect(window.sessionIdentityText == hostA.text)
+        #expect(identityFields(of: window).map(\.stringValue) == [hostA.text])
+        let content = try #require(window.contentView)
+        func identified(_ view: NSView) -> [NSView] {
+            (view.identifier == SessionWindowIdentity.accessoryIdentifier ? [view] : []) + view.subviews.flatMap(identified)
+        }
+        #expect(identified(content).isEmpty, "nothing in the server's content carries the identity's identifier")
+        let field = try #require(identityFields(of: window).first)
+        #expect(!field.isDescendant(of: content), "the line is drawn outside the server's content view")
+    }
+
     @Test("two renderers with the same node IDs and title keep their own identity and tab group")
     func twoSessionsWithIdenticalTreesAreToldApart() throws {
         let operations: [SemanticModel.Operation] = [

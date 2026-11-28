@@ -1,0 +1,153 @@
+{
+  "name": "split_move_ninth_pane_rejected",
+  "description": "MOVE_NODE into a Split that already holds eight panes is refused and the transaction rolled back; reordering a pane within its own full Split earlier in the same transaction adds no pane (§12.1, §13, §26).",
+  "spec_sections": [
+    "§12.1",
+    "§13",
+    "§26"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Host"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Split",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "label": "Dashboard"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 10,
+          "node_type": "Text",
+          "parent_id": 2,
+          "child_index": null,
+          "properties": {
+            "text": "pane 10"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 11,
+          "node_type": "Text",
+          "parent_id": 2,
+          "child_index": null,
+          "properties": {
+            "text": "pane 11"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 12,
+          "node_type": "Text",
+          "parent_id": 2,
+          "child_index": null,
+          "properties": {
+            "text": "pane 12"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 13,
+          "node_type": "Text",
+          "parent_id": 2,
+          "child_index": null,
+          "properties": {
+            "text": "pane 13"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 14,
+          "node_type": "Text",
+          "parent_id": 2,
+          "child_index": null,
+          "properties": {
+            "text": "pane 14"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 15,
+          "node_type": "Text",
+          "parent_id": 2,
+          "child_index": null,
+          "properties": {
+            "text": "pane 15"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 16,
+          "node_type": "Text",
+          "parent_id": 2,
+          "child_index": null,
+          "properties": {
+            "text": "pane 16"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 17,
+          "node_type": "Text",
+          "parent_id": 2,
+          "child_index": null,
+          "properties": {
+            "text": "pane 17"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 30,
+          "node_type": "Text",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "text": "outside"
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "MOVE_NODE",
+        "node_id": 17,
+        "new_parent_id": 2,
+        "new_child_index": 0
+      },
+      {
+        "type": "MOVE_NODE",
+        "node_id": 30,
+        "new_parent_id": 2,
+        "new_child_index": null
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "max_split_panes_exceeded",
+    "failed_op_index": 1,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

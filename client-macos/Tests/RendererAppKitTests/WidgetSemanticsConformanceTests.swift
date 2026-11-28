@@ -29,8 +29,9 @@ import Testing
 @MainActor
 struct WidgetSemanticsConformanceTests {
 
-    /// §7.3: exactly the 18 required-tier node types construct; everything else is refused
-    /// outright rather than silently substituted (§4 inv. 13).
+    /// §7.3: exactly the 18 required-tier node types construct, plus the SHOULD-tier types this
+    /// renderer implements (`Split`, PX-070-G02); everything else is refused outright rather than
+    /// silently substituted (§4 inv. 13).
     @Test
     func rendererImplementsExactlyTheRequiredTier() throws {
         // Tier comes from `standardNodeTypesTable`, which generate_swift_registry.py emits from
@@ -42,13 +43,19 @@ struct WidgetSemanticsConformanceTests {
                 .filter { $0.tier == "required" }
                 .map { TypeRef.standard($0.id) })
         #expect(requiredTier.count == 18, "§7.3 defines 18 required-tier node types")
+        // SHOULD-tier types implemented here, each named with its ticket. The tier itself still
+        // comes from the registry table: a type listed here must really be SHOULD tier.
+        let implementedShouldTier: Set<TypeRef> = [.split]
+        for nodeType in implementedShouldTier {
+            #expect(standardNodeTypesTable.first { TypeRef.standard($0.id) == nodeType }?.tier == "should")
+        }
 
         let factory = ControlFactory()
         for entry in standardNodeTypesTable {
             let nodeType = TypeRef.standard(entry.id)
             let node = Node(id: 1, nodeType: nodeType)
 
-            if requiredTier.contains(nodeType) {
+            if requiredTier.contains(nodeType) || implementedShouldTier.contains(nodeType) {
                 let handle = try factory.makeHandle(for: node)
                 #expect(
                     handle.nodeType == nodeType,
@@ -59,6 +66,37 @@ struct WidgetSemanticsConformanceTests {
                 }
             }
         }
+    }
+
+    /// §7.6 `Split`: "resize locally". A divider moved through the split view or its
+    /// accessibility splitter originates no interaction, so the optional VALUE_CHANGED is never
+    /// sent (PX-070-G02, §22.5).
+    @Test
+    func splitDividerMovesOriginateNoInteraction() throws {
+        let factory = ControlFactory()
+        var emitted: [SemanticInteraction] = []
+        factory.onInteraction = { emitted.append($0) }
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let split = try #require(try factory.makeHandle(for: Node(id: 30, nodeType: .split)).view as? SemanticSplitView)
+        for id in [31, 32] as [NodeId] {
+            let pane = try factory.makeHandle(for: Node(id: id, nodeType: .text, parentID: 30))
+            factory.attachSplitPane(pane, node: Node(id: id, nodeType: .text, parentID: 30), to: split)
+        }
+        split.translatesAutoresizingMaskIntoConstraints = true
+        split.frame = window.contentLayoutRect
+        window.contentView = split
+        window.layoutIfNeeded()
+        split.setPosition(150, ofDividerAt: 0)
+        let splitter = try #require((split.accessibilityChildren() ?? []).compactMap { $0 as? SplitDividerAccessibilityElement }.first)
+        #expect(splitter.accessibilityPerformIncrement())
+        #expect(splitter.accessibilityPerformDecrement())
+        splitter.setAccessibilityValue(NSNumber(value: 320))
+        #expect(emitted.isEmpty, "divider moves are local interaction state: \(emitted)")
     }
 
     /// §7.6: a Button press means ACTIVATE and nothing else — no value, no coordinates.
@@ -239,6 +277,9 @@ struct WidgetSemanticsConformanceTests {
 
         // §7.6 emissions with no case to carry them. Update the suite 2 manifest gap if this
         // set changes. Tree.EXPANSION_CHANGED is carried by `.expansionChanged` (PX-018-G01).
+        // Split's optional VALUE_CHANGED (§7.6 "optional VALUE_CHANGED / layout event") is
+        // deliberately not originated: divider positions are local (PX-070-G02, §22.5); see
+        // `splitDividerMovesOriginateNoInteraction`.
         let unroutableRequiredEmissions = ["Surface.VIEWPORT_CHANGED"]
         #expect(
             unroutableRequiredEmissions.count == 1,

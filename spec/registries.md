@@ -83,12 +83,12 @@ Design-doc tier groupings for reference:
 > **Admission Rule for Standard Widgets (§7.2)**: A widget belongs in the Standard Profile only if its meaning and state machine are stable across multiple major desktop toolkit families (AppKit, WinUI, GTK, SWT), its behavior is specified without reference to a particular drawing API, and it supports accessibility mapping.
 
 ### 4.2 Common Properties (§7.4, §8)
-The canonical registry defines 34 standard properties in five categories:
+The canonical registry defines 35 standard properties in five categories:
 1. **Identity & Accessibility** (§7.4)
 2. **Common State** (§7.4)
 3. **Content** (§7.4)
 4. **Layout Intent** (§7.4)
-5. **Control-Specific & Semantic Metadata** (§7.7, §8): `presentation_hint`, `action_key`, `columns`, `selection_mode`, `shortcut`, `keep_visible`, and the model item properties `tree_depth`, `descendant_count`
+5. **Control-Specific & Semantic Metadata** (§7.7, §8): `presentation_hint`, `action_key`, `columns`, `selection_mode`, `shortcut`, `keep_visible`, `split_axis`, and the model item properties `tree_depth`, `descendant_count`
 
 Each property entry includes `value_type` metadata validated by the registry tool.
 
@@ -135,8 +135,16 @@ Each property entry includes `value_type` metadata validated by the registry too
 - **Rendering:** setting, changing or clearing it never selects, deselects or replaces a local selection, posts no selection notification and emits no event. When a commit sets it (even to the same item) or changes the row index at which the item is shown, the client scrolls the minimum needed to make that row visible; a commit that leaves the row index unchanged never scrolls, so a local pan persists until the item moves. An uncached item (or one without a displayed row) is not scrolled to and nothing is requested for it; it is revealed when it arrives through range data. A newly mounted collection view has no local viewport to keep, so it starts with the hinted row revealed. On a hierarchical `Tree` the displayed row comes from the hidden-interval mapping: an item under a collapsed ancestor has no row, so nothing scrolls and nothing is expanded for it. A local expand or collapse never scrolls, even when it expands the hinted item's own ancestor or shifts its row; it only re-baselines the last revealed row to the item's new displayed row (or to not shown), and the next commit that sets the hint or moves the item relative to that baseline reveals it. Local selection, scrolling and keyboard navigation never clear or override the hint.
 - **Fallback (§4 inv. 13 optional semantics):** a client without support ignores it and keeps its viewport where the user put it.
 
+**`Split` and `split_axis` — user-resizable panes (node type 25, property 35, enum 13 `SplitAxis`; §4 inv. 13, §7.3, §7.6, §10, §22.4, §22.5, §26; PX-070-G02).** `Split` is a SHOULD-tier container whose children are its panes:
+
+- **Panes:** each child is one pane, in child order. A `Split` holds at most 8 panes (`MAX_SPLIT_PANES`); a `CREATE_NODE` or `MOVE_NODE` that would give it a ninth is refused with `max_split_panes_exceeded` and the whole transaction is discarded. Moving or reordering a pane within its own `Split` adds none. Nested `Split`s count toward the existing `max_tree_depth` limit like any container.
+- **Axis:** `split_axis` is a `SplitAxis` enum value, `side_by_side` (panes left to right, vertical dividers; the default when absent) or `stacked` (panes top to bottom, horizontal dividers). It is admitted only on a `Split`; any other node type is refused with `split_axis_not_admitted`. A value outside `SplitAxis` (another enum's token, an undefined value id, a non-enum) is refused with `invalid_split_axis` on every decode path (node records, `SET_PROPERTY`, `BATCH_PROPERTY_SET`; vector `malformed_split_axis_unknown_value.bin`) and again at apply, before admission is checked, as for `shortcut`. Changing it is structure-affecting for that `Split`. Row and Column keep expressing their axis by node type.
+- **Sizing:** panes are sized from each child's existing layout hints (`minimum_size`, `maximum_size`, `preferred_size`, `grow`) as hints, never pixel mandates (§10). A child whose `visibility` is `collapsed` collapses its pane; `hidden` keeps the pane's space.
+- **Divider positions are local interaction state (§7.6 "resize locally", §22.5):** no property carries one, the server never sets one, and the client sends no geometry and no event when the user drags a divider or adjusts it through accessibility. The optional `VALUE_CHANGED` the registry lists for `Split` is not originated by any client in this repository. A commit that keeps a `Split`'s panes keeps the user's divider positions; adding or removing a pane keeps the remaining panes' proportions; a remount restores the proportions when the pane set is unchanged.
+- **Compatibility:** no capability is negotiated per node type. A client built before this change refuses a `Split` (unsupported node type) and an unknown `split_axis` property id, explicitly (§4 inv. 13).
+
 ### 4.3 Standard Enums (§7.5, §7.2, §7.4, §8)
-The canonical registry defines 12 standard enum types with monotonic type IDs ($1 \ldots 12$) and contiguous value IDs within each enum.
+The canonical registry defines 13 standard enum types with monotonic type IDs ($1 \ldots 13$) and contiguous value IDs within each enum.
 On the wire, enum values are represented by `EnumValue(enum_id, value_id)` where `enum_id` references the `StandardEnum` type ID (e.g. `ActionRole = 2`) and `value_id` references the value within that enum (e.g. `destructive = 3`).
 
 Standard enum types:
@@ -152,6 +160,7 @@ Standard enum types:
 10. `VerticalAlignment` (ID 10)
 11. `SelectionMode` (ID 11)
 12. `ValidationState` (ID 12)
+13. `SplitAxis` (ID 13)
 
 ### 4.4 Standard Events (§7.6, §7.7)
 Semantic and coordinate pointer events are defined with `kind` metadata (`semantic` or `coordinate`) with monotonic IDs ($1 \ldots 11$).

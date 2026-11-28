@@ -24,8 +24,8 @@ pub use srui_semantic_tree::{
     StandardActionRole as ActionRole, StandardHorizontalAlignment as HorizontalAlignment,
     StandardImportance as Importance, StandardInputRole as InputRole,
     StandardPaddingRole as PaddingRole, StandardSelectionMode as SelectionMode,
-    StandardSpacingRole as SpacingRole, StandardTextRole as TextRole,
-    StandardTogglePresentationHint as TogglePresentationHint,
+    StandardSpacingRole as SpacingRole, StandardSplitAxis as SplitAxis,
+    StandardTextRole as TextRole, StandardTogglePresentationHint as TogglePresentationHint,
     StandardValidationState as ValidationState, StandardVerticalAlignment as VerticalAlignment,
     StandardVisibility as Visibility,
 };

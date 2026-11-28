@@ -27,6 +27,12 @@
 //! `List`, `Table` or `Tree` that has a `model_ref`, so clearing `model_ref` while it is held is
 //! refused. As with a promoted selection, item presence is checked only against the
 //! authoritative store, by the SDK.
+//!
+//! The standard `Split` container (§4 inv. 13, §7.3, §10, §26; [`crate::split`]): its
+//! `split_axis` must be `SplitAxis` `side_by_side` or `stacked` and is admitted on no other node
+//! type (checked on `CREATE_NODE`, `SET_PROPERTY` and `BATCH_PROPERTY_SET`), and a `CREATE_NODE`
+//! or `MOVE_NODE` that would give a `Split` more than [`crate::MAX_SPLIT_PANES`] children is
+//! refused.
 
 pub mod error;
 pub mod limits;
@@ -42,6 +48,7 @@ pub use node::Node;
 use crate::ids::{ItemId, ModelId, NodeId, PropertyRef, StandardSelectionMode, TypeRef};
 use crate::model::{Model, ModelItem};
 use crate::shortcut::{shortcut_behavior, Shortcut, ShortcutError};
+use crate::split::{is_split, parse_split_axis, MAX_SPLIT_PANES};
 use crate::transaction::{Operation, Revision};
 use crate::value::Value;
 use std::collections::{HashMap, HashSet};
@@ -140,6 +147,24 @@ fn validate_shortcut_value(
     })?;
     if shortcut_behavior(node_type).is_none() {
         return Err(StoreError::ShortcutNotAdmitted { node_id, node_type });
+    }
+    Ok(())
+}
+
+/// Validates one `split_axis` value, then the node type's admission (§4 inv. 13, §7.3).
+///
+/// Same order as the `shortcut` check, and as the Swift replica: the value first, then the type.
+fn validate_split_axis_value(
+    node_id: NodeId,
+    node_type: TypeRef,
+    value: &Value,
+) -> Result<(), StoreError> {
+    parse_split_axis(value).map_err(|e| StoreError::InvalidSplitAxis {
+        node_id,
+        reason: e.to_string(),
+    })?;
+    if !is_split(node_type) {
+        return Err(StoreError::SplitAxisNotAdmitted { node_id, node_type });
     }
     Ok(())
 }
@@ -532,6 +557,11 @@ impl SemanticStore {
             last_assigned(&prop_list, PropertyRef::MODEL_REF),
         )?;
         for (prop, val) in &prop_list {
+            if *prop == PropertyRef::SPLIT_AXIS {
+                validate_split_axis_value(id, node_type, val)?;
+            }
+        }
+        for (prop, val) in &prop_list {
             if *prop == PropertyRef::SHORTCUT {
                 validate_shortcut_value(id, node_type, val)?;
             }
@@ -551,6 +581,13 @@ impl SemanticStore {
                 .get(&pid)
                 .expect("parent existence verified above");
             let child_count = parent_node.ordered_children.len();
+            // §26: a Split holds at most MAX_SPLIT_PANES panes.
+            if is_split(parent_node.node_type) && child_count >= MAX_SPLIT_PANES {
+                return Err(StoreError::MaxSplitPanesExceeded {
+                    split_id: pid,
+                    limit: MAX_SPLIT_PANES,
+                });
+            }
             if let Some(idx) = child_index {
                 if idx > child_count {
                     return Err(StoreError::ChildIndexOutOfBounds {
@@ -668,6 +705,14 @@ impl SemanticStore {
             validate_shortcut_value(id, node_type, &val)?;
             self.check_shortcut_unique(id, self.shortcut_scope(id), &val)?;
         }
+        if prop == PropertyRef::SPLIT_AXIS {
+            let node_type = self
+                .nodes
+                .get(&id)
+                .ok_or(StoreError::NodeNotFound(id))?
+                .node_type;
+            validate_split_axis_value(id, node_type, &val)?;
+        }
         let node = self
             .nodes
             .get_mut(&id)
@@ -727,6 +772,11 @@ impl SemanticStore {
             let model_ref = last_assigned(&prop_list, PropertyRef::MODEL_REF)
                 .or_else(|| node.get_property(PropertyRef::MODEL_REF));
             validate_keep_visible(id, node.node_type, keep_visible, model_ref)?;
+            for (prop, val) in &prop_list {
+                if *prop == PropertyRef::SPLIT_AXIS {
+                    validate_split_axis_value(id, node.node_type, val)?;
+                }
+            }
             for (prop, val) in &prop_list {
                 if *prop == PropertyRef::SHORTCUT {
                     validate_shortcut_value(id, node.node_type, val)?;
@@ -820,6 +870,21 @@ impl SemanticStore {
                 return Err(StoreError::ChildIndexOutOfBounds {
                     index: idx,
                     count: current_dest_len,
+                });
+            }
+        }
+
+        // §26: a Split gains a pane only while it holds fewer than MAX_SPLIT_PANES. Moving a
+        // pane within its own Split adds none.
+        if let Some(pid) = new_parent_id {
+            let parent_node = self.nodes.get(&pid).expect("parent existence verified");
+            if is_split(parent_node.node_type)
+                && old_parent_id != Some(pid)
+                && current_dest_len >= MAX_SPLIT_PANES
+            {
+                return Err(StoreError::MaxSplitPanesExceeded {
+                    split_id: pid,
+                    limit: MAX_SPLIT_PANES,
                 });
             }
         }

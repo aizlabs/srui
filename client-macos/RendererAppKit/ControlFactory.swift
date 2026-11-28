@@ -67,6 +67,11 @@ public final class ControlFactory {
     /// with `pruneCollectionSelectionMemory(keeping:)`; an empty set removes the entry.
     var collectionDisclosureMemory: [NodeId: (modelID: ModelId?, collapsed: Set<ItemId>)] = [:]
 
+    /// Local pane proportions per Split node (pane id → fraction of the panes' length), kept
+    /// across remounts and never sent (PX-070-G02; §7.6, §22.5). At most `maxSplitPanes` entries
+    /// per Split; pruned with `pruneSplitProportionMemory(keeping:)` when the Split is gone.
+    var splitProportionMemory: [NodeId: [NodeId: Double]] = [:]
+
     /// Whether users may change collection selections (PX-022-G02). `LayoutRenderer` clears it while
     /// its session windows carry a client-owned status, that is, while the session cannot carry a
     /// new selection report; every List/Table/Tree adapter consults it before a user change.
@@ -336,6 +341,9 @@ public final class ControlFactory {
             let outline = makeOutline(for: node, store: store)
             result = (outline.0, outline.1, outline.2, nil)
 
+        case .split:
+            result = (makeSplitView(for: node), nil, nil, nil)
+
         default:
             throw ControlFactoryError.unsupportedNodeType(node.nodeType)
         }
@@ -449,6 +457,10 @@ public final class ControlFactory {
             default:
                 handle.view.isHidden = false
                 handle.view.alphaValue = 1
+            }
+            // A collapsed child collapses its Split pane; `hidden` keeps the pane's space.
+            if let pane = handle.view.superview as? SplitPaneView {
+                pane.owner?.setPane(pane, collapsed: handle.view.isHidden)
             }
 
         case .enabled:
@@ -575,6 +587,8 @@ public final class ControlFactory {
                 (numericValue(value) ?? 0) > 0 ? Self.flexibleHuggingPriority : Self.rigidHuggingPriority
             handle.view.setContentHuggingPriority(priority, for: .horizontal)
             handle.view.setContentHuggingPriority(priority, for: .vertical)
+            // In a Split pane, `grow` weighs the pane's first share of the length (a hint).
+            (handle.view.superview as? SplitPaneView)?.growWeight = numericValue(value)
 
         case .shrink:
             let priority: NSLayoutConstraint.Priority =
@@ -585,6 +599,7 @@ public final class ControlFactory {
         case .minimumSize:
             handle.layoutMetadata.minimumSize = value?.asSize
             replaceSizeConstraints(for: property, size: value?.asSize, relation: .minimum, handle: handle)
+            (handle.view.superview as? SplitPaneView)?.minimumSize = value?.asSize
 
         case .maximumSize:
             handle.layoutMetadata.maximumSize = value?.asSize
@@ -593,6 +608,11 @@ public final class ControlFactory {
         case .preferredSize:
             handle.layoutMetadata.preferredSize = value?.asSize
             replaceSizeConstraints(for: property, size: value?.asSize, relation: .preferred, handle: handle)
+            (handle.view.superview as? SplitPaneView)?.preferredSize = value?.asSize
+
+        case .splitAxis:
+            // Only a Split admits it (the store refuses it elsewhere); a change is structural.
+            (handle.view as? SemanticSplitView)?.apply(axis: effectiveSplitAxis(value) ?? .sideBySide)
 
         case .spacingRole:
             let spacing = spacing(for: value?.asEnumToken)
@@ -1094,6 +1114,45 @@ public final class ControlFactory {
     private static let rigidHuggingPriority = NSLayoutConstraint.Priority(
         rawValue: NSLayoutConstraint.Priority.windowSizeStayPut.rawValue - 1
     )
+
+    /// A standard Split as `NSSplitView` (§22.4; `SplitRendering.swift`). Its pane proportions
+    /// live in `splitProportionMemory`, so a remount that rebuilds this view restores them.
+    private func makeSplitView(for node: Node) -> SemanticSplitView {
+        let split = SemanticSplitView(nodeID: node.id)
+        let id = node.id
+        split.loadProportions = { [weak self] in self?.splitProportionMemory[id] ?? [:] }
+        split.storeProportions = { [weak self] proportions in
+            self?.splitProportionMemory[id] = proportions.isEmpty ? nil : proportions
+        }
+        // A split container takes the space its parent offers unless `grow` says otherwise.
+        split.setContentHuggingPriority(Self.flexibleHuggingPriority, for: .horizontal)
+        split.setContentHuggingPriority(Self.flexibleHuggingPriority, for: .vertical)
+        return split
+    }
+
+    /// Mounts `child` as the next pane of the Split rendered by `split` (§10, §22.4).
+    ///
+    /// The pane takes the child's collapsed state, `grow` and `preferred_size`; later property
+    /// commits update them in place through `apply(property:value:to:store:)`.
+    func attachSplitPane(_ child: RenderHandle, node: Node, to split: SemanticSplitView) {
+        // A Row/Column pane fills its pane: its stack hugs below the pane's fill priority.
+        if let stack = child.view as? NSStackView {
+            stack.setHuggingPriority(Self.flexibleHuggingPriority, for: .horizontal)
+            stack.setHuggingPriority(Self.flexibleHuggingPriority, for: .vertical)
+        }
+        let pane = split.addPane(content: child.view, nodeID: child.nodeID)
+        pane.preferredSize = child.layoutMetadata.preferredSize
+        pane.minimumSize = child.layoutMetadata.minimumSize
+        pane.growWeight = numericValue(node.getProperty(.grow))
+        if child.view.isHidden {
+            split.setPane(pane, collapsed: true)
+        }
+    }
+
+    /// Drops remembered pane proportions of Splits that are no longer mounted.
+    func pruneSplitProportionMemory(keeping present: Set<NodeId>) {
+        splitProportionMemory = splitProportionMemory.filter { present.contains($0.key) }
+    }
 
     private func makeTerminalView(for node: Node) -> TerminalView {
         let view = TerminalView(nodeID: node.id)

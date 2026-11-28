@@ -72,6 +72,21 @@ final class SemanticNotPaintConformanceTests: XCTestCase {
         }
     }
 
+    /// §7.6 `Split` "resize locally", §22.5 (PX-070-G02): the registry has no divider position or
+    /// pane geometry property; the only Split-specific property is its axis.
+    func testSplitCarriesNoDividerPositionOrPaneGeometry() {
+        for entry in standardPropertiesTable {
+            let name = entry.name.lowercased()
+            for forbidden in ["divider", "position", "pane_", "split_"] where name.contains(forbidden) {
+                XCTAssertEqual(
+                    entry.name, "split_axis",
+                    "Standard property '\(entry.name)' would carry Split geometry; divider positions are local (§7.6, §22.5)"
+                )
+            }
+        }
+        XCTAssertEqual(standardPropertyValueType(.splitAxis), .enumToken)
+    }
+
     /// §7.6 / §7.7: standard events route semantic intent, not raw pointer streams.
     func testStandardEventsRouteSemanticIntentNotRawPointerStreams() {
         for entry in standardEventsTable {

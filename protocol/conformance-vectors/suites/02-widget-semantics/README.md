@@ -17,6 +17,8 @@ Shortcut admission (PX-016-G01): `shortcut_test` and `ShortcutStoreTests` accept
 
 Tree disclosure (PX-018-G01): `Tree` now originates `EXPANSION_CHANGED` (§7.6) through `SemanticInteraction.expansionChanged`. `HierarchicalTreeTests` collapses and expands locally — with no range request and exactly one event each, sent without awaiting a reply — and `WidgetSemanticsConformanceTests` carries the new case; `tree_model_test` covers `Tree::on_expansion_changed`, which delivers `(item, expanded)` and never a malformed report. The remaining open gap is Surface `VIEWPORT_CHANGED` only.
 
+Split (PX-070-G02): `split_test` and `SplitStoreTests` accept a `Split` with 1 to 8 panes on either axis, refuse a ninth pane with the transaction rolled back, accept `split_axis` on `Split` and refuse it on every other registry node type, and refuse an unknown `SplitAxis` value; `widgets_test` covers the SDK `Split` builder with its axis and panes. §7.6 gives `Split` an optional `VALUE_CHANGED`; it is deliberately not originated, because divider positions are local (§22.5): `WidgetSemanticsConformanceTests.splitDividerMovesOriginateNoInteraction` and `SplitRenderingTests` assert that neither a divider move nor an accessibility adjustment originates any interaction. `Split` is the one SHOULD-tier type the renderer constructs; the others stay refused.
+
 ## Runners
 
 **Rust**
@@ -25,6 +27,7 @@ Tree disclosure (PX-018-G01): `Tree` now originates `EXPANSION_CHANGED` (§7.6) 
 cargo test --manifest-path server-rust/Cargo.toml -p srui-sdk --test widgets_test
 cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test shortcut_test
 cargo test --manifest-path server-rust/Cargo.toml -p srui-sdk --test tree_model_test
+cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test split_test
 ```
 
 **Swift**
@@ -36,6 +39,8 @@ swift test --package-path client-macos --filter ControlFactoryPropertyTests
 swift test --package-path client-macos --filter ShortcutStoreTests
 swift test --package-path client-macos --filter ShortcutRoutingTests
 swift test --package-path client-macos --filter HierarchicalTreeTests
+swift test --package-path client-macos --filter SplitStoreTests
+swift test --package-path client-macos --filter SplitRenderingTests
 ```
 
 ## Open gaps

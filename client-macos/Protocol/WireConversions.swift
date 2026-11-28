@@ -138,6 +138,21 @@ func validateDecodedShortcut(_ property: PropertyRef, _ value: Value) throws {
     }
 }
 
+/// Refuses a standard `split_axis` value outside `SplitAxis` on these wire conversions, as
+/// `ProtocolDecoder` and the Rust `validate_decoded_split_axis` do (§4 inv. 13).
+func validateDecodedSplitAxis(_ property: PropertyRef, _ value: Value) throws {
+    guard property == .splitAxis else { return }
+    if case .failure(let error) = parseSplitAxis(value) {
+        throw ValueConversionError.invalidSplitAxis(error.description)
+    }
+}
+
+/// Every decode-time standard-property check: `shortcut` and `split_axis`.
+func validateDecodedStandardProperty(_ property: PropertyRef, _ value: Value) throws {
+    try validateDecodedShortcut(property, value)
+    try validateDecodedSplitAxis(property, value)
+}
+
 // MARK: - Property <-> SRUIProperty
 
 extension Property {
@@ -152,7 +167,7 @@ extension Property {
         } else {
             val = .null
         }
-        try validateDecodedShortcut(prop, val)
+        try validateDecodedStandardProperty(prop, val)
         self.init(property: prop, value: val)
     }
 
@@ -386,7 +401,7 @@ extension StoreOperation {
             let id = NodeId(set.nodeID)
             let propRef = PropertyRef(wire: set.property)
             let val = set.hasValue ? try Value(wire: set.value) : .null
-            try validateDecodedShortcut(propRef, val)
+            try validateDecodedStandardProperty(propRef, val)
             self = .setProperty(id: id, property: propRef, value: val)
 
         case .clearProperty_p(let clear):

@@ -87,6 +87,20 @@ fn test_semantic_not_paint_architectural_invariants() {
         );
     }
 
+    // 2b. §7.6 `Split` "resize locally", §22.5 (PX-070-G02): no divider position or pane geometry
+    // property exists; the only Split-specific property is its axis.
+    for &(id, name) in STANDARD_PROPERTIES {
+        for forbidden in ["divider", "position", "pane_", "split_"] {
+            if name.contains(forbidden) {
+                assert_eq!(
+                    name, "split_axis",
+                    "Standard property {} ({}) would carry Split geometry; divider positions are local (§7.6, §22.5)",
+                    id, name
+                );
+            }
+        }
+    }
+
     // 3. Verify Standard Operations
     for &(id, name) in STANDARD_OPERATIONS {
         let name_lower = name.to_lowercase();

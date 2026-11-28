@@ -18,6 +18,10 @@ public enum LayoutRendererError: Error, Equatable, Sendable {
 /// A List/Table/Tree `keep_visible` is a server hint, never selection (§6.3, §22.7): after the
 /// model refresh (and after any promotion) each refreshed or hinted collection reveals the hinted
 /// row when the commit set the property or moved the item (`CollectionKeepVisibleRendering.swift`).
+///
+/// A Split's children are mounted as its panes (`SplitRendering.swift`, PX-070-G02). Its divider
+/// positions are local: a non-structural commit leaves the split view and its dividers alone, and
+/// a remount restores the remembered pane proportions (§7.6, §22.5).
 @MainActor
 public final class LayoutRenderer {
     public let registry: RenderRegistry
@@ -107,6 +111,7 @@ public final class LayoutRenderer {
         applyPromotedSelections(store: store, explicit: promotedNodeIDs, only: nil)
         applyKeepVisible(store: store, explicit: keepVisibleNodeIDs, only: nil)
         controlFactory.pruneCollectionSelectionMemory(keeping: present)
+        controlFactory.pruneSplitProportionMemory(keeping: present)
         controlFactory.textEditingSession.syncPresentNodes(present)
         Task {
             await controlFactory.terminalSession.syncPresentNodes(present)
@@ -385,7 +390,7 @@ public final class LayoutRenderer {
             guard let parentHandle = registry.handle(for: parentID) else {
                 throw LayoutRendererError.missingParentHandle(parentID)
             }
-            attach(handle.view, to: parentHandle)
+            attach(handle, node: node, to: parentHandle)
         }
         if case .native = mountDecision {
             return
@@ -396,8 +401,27 @@ public final class LayoutRenderer {
         configureCollectionScrolling(for: handle)
     }
 
-    private func attach(_ child: NSView, to parent: RenderHandle) {
+    private func attach(_ childHandle: RenderHandle, node: Node, to parent: RenderHandle) {
+        let child = childHandle.view
+        if let split = parent.view as? SemanticSplitView {
+            controlFactory.attachSplitPane(childHandle, node: node, to: split)
+            return
+        }
         if let stack = parent.view as? NSStackView {
+            if child is SemanticSplitView {
+                stack.addArrangedSubview(child)
+                reconcileFillConstraints(for: parent)
+                // A Split fills its stack's cross axis, below the explicit fill constraints (999).
+                let inset = stack.orientation == .vertical
+                    ? stack.edgeInsets.left + stack.edgeInsets.right
+                    : stack.edgeInsets.top + stack.edgeInsets.bottom
+                let fill = stack.orientation == .vertical
+                    ? child.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -inset)
+                    : child.heightAnchor.constraint(equalTo: stack.heightAnchor, constant: -inset)
+                fill.priority = .defaultHigh
+                fill.isActive = true
+                return
+            }
             if stack.orientation == .vertical,
                let rowStack = child as? NSStackView,
                rowStack.orientation == .horizontal {

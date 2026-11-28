@@ -251,6 +251,22 @@ STATE_MACHINE_VECTORS_ADDED_AFTER_SPLIT = (
     "93_keep_visible_clear_model_ref_while_held_rejected.json",
     # PX-017-G01 verification O3: BATCH_PROPERTY_SET relies on the node's existing model_ref.
     "94_keep_visible_batch_uses_existing_model_ref_success.json",
+    # PX-070-G02: the standard Split container, `split_axis` and the 8-pane limit (§7.3, §10, §26).
+    "95_split_one_pane_default_axis_success.json",
+    "96_split_eight_panes_stacked_success.json",
+    "97_split_ninth_pane_rejected.json",
+    "98_split_move_ninth_pane_rejected.json",
+    "99_split_axis_on_split_success.json",
+    "100_split_axis_on_row_rejected.json",
+    "101_split_axis_on_table_set_rejected.json",
+    "102_split_axis_unknown_value_rejected.json",
+    "103_split_axis_wrong_enum_rejected.json",
+)
+
+# Suite 3 vectors added after the split; the original suite 3 vector is one of the 49.
+SEMANTIC_NOT_PAINT_VECTORS_ADDED_AFTER_SPLIT = (
+    # PX-070-G02: a Split dashboard expressed with layout hints only, no divider position.
+    "12_split_panes_without_geometry.json",
 )
 
 
@@ -261,10 +277,14 @@ def test_the_49_original_state_machine_vectors_are_all_still_present(manifest: d
     suite_one_dir = VECTORS_DIR / suite_one["vectors"]["dir"]
     for name in STATE_MACHINE_VECTORS_ADDED_AFTER_SPLIT:
         assert (suite_one_dir / name).is_file(), f"declared post-split vector {name} is missing"
+    suite_three_dir = VECTORS_DIR / suite_three["vectors"]["dir"]
+    for name in SEMANTIC_NOT_PAINT_VECTORS_ADDED_AFTER_SPLIT:
+        assert (suite_three_dir / name).is_file(), f"declared post-split vector {name} is missing"
     total = (
         suite_one["vectors"]["count"]
         + suite_three["vectors"]["count"]
         - len(STATE_MACHINE_VECTORS_ADDED_AFTER_SPLIT)
+        - len(SEMANTIC_NOT_PAINT_VECTORS_ADDED_AFTER_SPLIT)
     )
     assert total == 49, f"the core state-machine corpus is 49 vectors, manifest accounts for {total}"
 

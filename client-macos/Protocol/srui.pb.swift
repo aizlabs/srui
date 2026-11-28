@@ -220,6 +220,7 @@ public nonisolated enum Srui_Protocol_StandardProperty: SwiftProtobuf.Enum, Swif
   case propertyTreeDepth // = 32
   case propertyDescendantCount // = 33
   case propertyKeepVisible // = 34
+  case propertySplitAxis // = 35
   case UNRECOGNIZED(Int)
 
   public init() {
@@ -263,6 +264,7 @@ public nonisolated enum Srui_Protocol_StandardProperty: SwiftProtobuf.Enum, Swif
     case 32: self = .propertyTreeDepth
     case 33: self = .propertyDescendantCount
     case 34: self = .propertyKeepVisible
+    case 35: self = .propertySplitAxis
     default: self = .UNRECOGNIZED(rawValue)
     }
   }
@@ -304,6 +306,7 @@ public nonisolated enum Srui_Protocol_StandardProperty: SwiftProtobuf.Enum, Swif
     case .propertyTreeDepth: return 32
     case .propertyDescendantCount: return 33
     case .propertyKeepVisible: return 34
+    case .propertySplitAxis: return 35
     case .UNRECOGNIZED(let i): return i
     }
   }
@@ -345,6 +348,7 @@ public nonisolated enum Srui_Protocol_StandardProperty: SwiftProtobuf.Enum, Swif
     .propertyTreeDepth,
     .propertyDescendantCount,
     .propertyKeepVisible,
+    .propertySplitAxis,
   ]
 
 }
@@ -897,6 +901,44 @@ public nonisolated enum Srui_Protocol_ValidationState: SwiftProtobuf.Enum, Swift
 
 }
 
+public nonisolated enum Srui_Protocol_SplitAxis: SwiftProtobuf.Enum, Swift.CaseIterable {
+  public typealias RawValue = Int
+  case unspecified // = 0
+  case sideBySide // = 1
+  case stacked // = 2
+  case UNRECOGNIZED(Int)
+
+  public init() {
+    self = .unspecified
+  }
+
+  public init?(rawValue: Int) {
+    switch rawValue {
+    case 0: self = .unspecified
+    case 1: self = .sideBySide
+    case 2: self = .stacked
+    default: self = .UNRECOGNIZED(rawValue)
+    }
+  }
+
+  public var rawValue: Int {
+    switch self {
+    case .unspecified: return 0
+    case .sideBySide: return 1
+    case .stacked: return 2
+    case .UNRECOGNIZED(let i): return i
+    }
+  }
+
+  // The compiler won't synthesize support with the UNRECOGNIZED case.
+  public static let allCases: [Srui_Protocol_SplitAxis] = [
+    .unspecified,
+    .sideBySide,
+    .stacked,
+  ]
+
+}
+
 public nonisolated enum Srui_Protocol_StandardEvent: SwiftProtobuf.Enum, Swift.CaseIterable {
   public typealias RawValue = Int
   case eventUnspecified // = 0
@@ -990,6 +1032,7 @@ public nonisolated enum Srui_Protocol_StandardEnum: SwiftProtobuf.Enum, Swift.Ca
   case enumVerticalAlignment // = 10
   case enumSelectionMode // = 11
   case enumValidationState // = 12
+  case enumSplitAxis // = 13
   case UNRECOGNIZED(Int)
 
   public init() {
@@ -1011,6 +1054,7 @@ public nonisolated enum Srui_Protocol_StandardEnum: SwiftProtobuf.Enum, Swift.Ca
     case 10: self = .enumVerticalAlignment
     case 11: self = .enumSelectionMode
     case 12: self = .enumValidationState
+    case 13: self = .enumSplitAxis
     default: self = .UNRECOGNIZED(rawValue)
     }
   }
@@ -1030,6 +1074,7 @@ public nonisolated enum Srui_Protocol_StandardEnum: SwiftProtobuf.Enum, Swift.Ca
     case .enumVerticalAlignment: return 10
     case .enumSelectionMode: return 11
     case .enumValidationState: return 12
+    case .enumSplitAxis: return 13
     case .UNRECOGNIZED(let i): return i
     }
   }
@@ -1049,6 +1094,7 @@ public nonisolated enum Srui_Protocol_StandardEnum: SwiftProtobuf.Enum, Swift.Ca
     .enumVerticalAlignment,
     .enumSelectionMode,
     .enumValidationState,
+    .enumSplitAxis,
   ]
 
 }
@@ -2865,7 +2911,7 @@ nonisolated extension Srui_Protocol_StandardNodeType: SwiftProtobuf._ProtoNamePr
 }
 
 nonisolated extension Srui_Protocol_StandardProperty: SwiftProtobuf._ProtoNameProviding {
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0PROPERTY_UNSPECIFIED\0\u{1}PROPERTY_LABEL\0\u{1}PROPERTY_ACCESSIBLE_DESCRIPTION\0\u{1}PROPERTY_ROLE\0\u{1}PROPERTY_VALUE_DESCRIPTION\0\u{1}PROPERTY_ACTIONS\0\u{1}PROPERTY_VISIBILITY\0\u{1}PROPERTY_ENABLED\0\u{1}PROPERTY_READ_ONLY\0\u{1}PROPERTY_BUSY\0\u{1}PROPERTY_SELECTED\0\u{1}PROPERTY_VALIDATION_STATE\0\u{1}PROPERTY_TEXT\0\u{1}PROPERTY_VALUE\0\u{1}PROPERTY_PLACEHOLDER\0\u{1}PROPERTY_RESOURCE\0\u{1}PROPERTY_ITEMS\0\u{1}PROPERTY_MODEL_REF\0\u{1}PROPERTY_HORIZONTAL_ALIGNMENT\0\u{1}PROPERTY_VERTICAL_ALIGNMENT\0\u{1}PROPERTY_GROW\0\u{1}PROPERTY_SHRINK\0\u{1}PROPERTY_MINIMUM_SIZE\0\u{1}PROPERTY_MAXIMUM_SIZE\0\u{1}PROPERTY_PREFERRED_SIZE\0\u{1}PROPERTY_SPACING_ROLE\0\u{1}PROPERTY_PADDING_ROLE\0\u{1}PROPERTY_PRESENTATION_HINT\0\u{1}PROPERTY_ACTION_KEY\0\u{1}PROPERTY_COLUMNS\0\u{1}PROPERTY_SELECTION_MODE\0\u{1}PROPERTY_SHORTCUT\0\u{1}PROPERTY_TREE_DEPTH\0\u{1}PROPERTY_DESCENDANT_COUNT\0\u{1}PROPERTY_KEEP_VISIBLE\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0PROPERTY_UNSPECIFIED\0\u{1}PROPERTY_LABEL\0\u{1}PROPERTY_ACCESSIBLE_DESCRIPTION\0\u{1}PROPERTY_ROLE\0\u{1}PROPERTY_VALUE_DESCRIPTION\0\u{1}PROPERTY_ACTIONS\0\u{1}PROPERTY_VISIBILITY\0\u{1}PROPERTY_ENABLED\0\u{1}PROPERTY_READ_ONLY\0\u{1}PROPERTY_BUSY\0\u{1}PROPERTY_SELECTED\0\u{1}PROPERTY_VALIDATION_STATE\0\u{1}PROPERTY_TEXT\0\u{1}PROPERTY_VALUE\0\u{1}PROPERTY_PLACEHOLDER\0\u{1}PROPERTY_RESOURCE\0\u{1}PROPERTY_ITEMS\0\u{1}PROPERTY_MODEL_REF\0\u{1}PROPERTY_HORIZONTAL_ALIGNMENT\0\u{1}PROPERTY_VERTICAL_ALIGNMENT\0\u{1}PROPERTY_GROW\0\u{1}PROPERTY_SHRINK\0\u{1}PROPERTY_MINIMUM_SIZE\0\u{1}PROPERTY_MAXIMUM_SIZE\0\u{1}PROPERTY_PREFERRED_SIZE\0\u{1}PROPERTY_SPACING_ROLE\0\u{1}PROPERTY_PADDING_ROLE\0\u{1}PROPERTY_PRESENTATION_HINT\0\u{1}PROPERTY_ACTION_KEY\0\u{1}PROPERTY_COLUMNS\0\u{1}PROPERTY_SELECTION_MODE\0\u{1}PROPERTY_SHORTCUT\0\u{1}PROPERTY_TREE_DEPTH\0\u{1}PROPERTY_DESCENDANT_COUNT\0\u{1}PROPERTY_KEEP_VISIBLE\0\u{1}PROPERTY_SPLIT_AXIS\0")
 }
 
 nonisolated extension Srui_Protocol_TextRole: SwiftProtobuf._ProtoNameProviding {
@@ -2916,12 +2962,16 @@ nonisolated extension Srui_Protocol_ValidationState: SwiftProtobuf._ProtoNamePro
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0VALIDATION_UNSPECIFIED\0\u{1}VALIDATION_VALID\0\u{1}VALIDATION_WARNING\0\u{1}VALIDATION_ERROR\0")
 }
 
+nonisolated extension Srui_Protocol_SplitAxis: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0SPLIT_AXIS_UNSPECIFIED\0\u{1}SPLIT_AXIS_SIDE_BY_SIDE\0\u{1}SPLIT_AXIS_STACKED\0")
+}
+
 nonisolated extension Srui_Protocol_StandardEvent: SwiftProtobuf._ProtoNameProviding {
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0EVENT_UNSPECIFIED\0\u{1}EVENT_ACTIVATE\0\u{1}EVENT_VALUE_CHANGED\0\u{1}EVENT_SELECTION_CHANGED\0\u{1}EVENT_EXPANSION_CHANGED\0\u{1}EVENT_TEXT_EDIT\0\u{1}EVENT_VIEWPORT_CHANGED\0\u{1}EVENT_POINTER_DOWN\0\u{1}EVENT_POINTER_UP\0\u{1}EVENT_POINTER_MOVE\0\u{1}EVENT_POINTER_CANCEL\0\u{1}EVENT_POINTER_SCROLL\0")
 }
 
 nonisolated extension Srui_Protocol_StandardEnum: SwiftProtobuf._ProtoNameProviding {
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0ENUM_UNSPECIFIED\0\u{1}ENUM_TEXT_ROLE\0\u{1}ENUM_ACTION_ROLE\0\u{1}ENUM_INPUT_ROLE\0\u{1}ENUM_IMPORTANCE\0\u{1}ENUM_TOGGLE_PRESENTATION_HINT\0\u{1}ENUM_VISIBILITY\0\u{1}ENUM_SPACING_ROLE\0\u{1}ENUM_PADDING_ROLE\0\u{1}ENUM_HORIZONTAL_ALIGNMENT\0\u{1}ENUM_VERTICAL_ALIGNMENT\0\u{1}ENUM_SELECTION_MODE\0\u{1}ENUM_VALIDATION_STATE\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0ENUM_UNSPECIFIED\0\u{1}ENUM_TEXT_ROLE\0\u{1}ENUM_ACTION_ROLE\0\u{1}ENUM_INPUT_ROLE\0\u{1}ENUM_IMPORTANCE\0\u{1}ENUM_TOGGLE_PRESENTATION_HINT\0\u{1}ENUM_VISIBILITY\0\u{1}ENUM_SPACING_ROLE\0\u{1}ENUM_PADDING_ROLE\0\u{1}ENUM_HORIZONTAL_ALIGNMENT\0\u{1}ENUM_VERTICAL_ALIGNMENT\0\u{1}ENUM_SELECTION_MODE\0\u{1}ENUM_VALIDATION_STATE\0\u{1}ENUM_SPLIT_AXIS\0")
 }
 
 nonisolated extension Srui_Protocol_StandardOperation: SwiftProtobuf._ProtoNameProviding {

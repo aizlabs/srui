@@ -70,10 +70,10 @@ exactly what the initial graph instantiates — no more, no less.
 
 ### Deliberately absent
 
-`Dialog`, `Select`, `ChoiceGroup`, `Slider`, `NumberInput`, `Tabs`, `Split`, `Toolbar`, `Menu`.
+`Dialog`, `Select`, `ChoiceGroup`, `Slider`, `NumberInput`, `Tabs`, `Toolbar`, `Menu`.
 
 These exist in `protocol/registry.yaml` but `ControlFactory` throws `unsupportedNodeType` for
-them. Creating any listed type would put a node in the authoritative tree that no client can render — exactly
+them. `Split` is renderable since PX-070-G02 but this gallery does not show it yet. Creating any listed type would put a node in the authoritative tree that no client can render — exactly
 the silent degradation §4 inv. 13 forbids. `unsupported_node_types_are_not_advertised` fails the
 build if one ever appears.
 

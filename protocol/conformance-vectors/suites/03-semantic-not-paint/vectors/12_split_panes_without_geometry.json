@@ -1,0 +1,125 @@
+{
+  "name": "split_panes_without_geometry",
+  "description": "A stacked Split dividing host panels from a process table is expressed with semantic layout intent only: the axis, each pane's minimum/preferred size hints and grow weight, and a collapsed pane. No fixture field names a pixel position, a frame or a divider position: divider positions are local interaction state (§4.17, §7.6, §10, §22.5).",
+  "spec_sections": [
+    "§4.7",
+    "§4.16",
+    "§4.17",
+    "§7.6",
+    "§10",
+    "§22.5",
+    "§32.3"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [],
+  "transaction": {
+    "base_revision": 0,
+    "new_revision": 1,
+    "operations": [
+      {
+        "type": "CREATE_NODE",
+        "node_id": 1,
+        "node_type": "Surface",
+        "parent_id": null,
+        "child_index": null,
+        "properties": {
+          "label": "Host dashboard"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 2,
+        "node_type": "Split",
+        "parent_id": 1,
+        "child_index": null,
+        "properties": {
+          "label": "Dashboard",
+          "split_axis": {
+            "enum": "SplitAxis",
+            "value": "stacked"
+          },
+          "grow": 1.5
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 3,
+        "node_type": "Column",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {
+          "label": "Host panels",
+          "minimum_size": {
+            "width": 0.0,
+            "height": 96.0
+          },
+          "preferred_size": {
+            "width": 0.0,
+            "height": 160.0
+          }
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 4,
+        "node_type": "Table",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {
+          "label": "Processes",
+          "grow": 1.5,
+          "minimum_size": {
+            "width": 0.0,
+            "height": 120.0
+          }
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 5,
+        "node_type": "Text",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {
+          "text": "Inspector",
+          "visibility": {
+            "enum": "Visibility",
+            "value": "collapsed"
+          }
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "success",
+    "committed_revision": 1,
+    "store_state": {
+      "node_count": 5,
+      "roots": [
+        1
+      ],
+      "nodes": {
+        "2": {
+          "node_id": 2,
+          "node_type": "Split",
+          "parent_id": 1,
+          "ordered_children": [
+            3,
+            4,
+            5
+          ],
+          "properties": {
+            "label": "Dashboard",
+            "split_axis": {
+              "enum": "SplitAxis",
+              "value": "stacked"
+            },
+            "grow": 1.5
+          }
+        }
+      },
+      "model_count": 0,
+      "models": {}
+    }
+  }
+}

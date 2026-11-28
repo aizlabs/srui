@@ -116,14 +116,14 @@ fn main() {
     );
     assert_eq!(
         registry.properties.len(),
-        34,
-        "Expected 34 standard properties, parsed {}",
+        35,
+        "Expected 35 standard properties, parsed {}",
         registry.properties.len()
     );
     assert_eq!(
         registry.enums.len(),
-        12,
-        "Expected 12 standard enums, parsed {}",
+        13,
+        "Expected 13 standard enums, parsed {}",
         registry.enums.len()
     );
     assert_eq!(

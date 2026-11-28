@@ -432,6 +432,14 @@ properties:
     value_type: value
     description: "Server-hinted keep-in-view item of a model-backed List, Table or Tree (§6.3, §8, §22.7): an ItemId the client keeps in view. Presentation guidance, never selection state: setting, changing or clearing it never selects, deselects or replaces a local selection, posts no selection notification and emits no event. When a commit sets it, or changes the row index at which the named item is shown, the client scrolls the minimum needed to make that row visible; a commit that leaves the row index unchanged never scrolls, so a local pan persists until the item moves. An uncached item is revealed when it arrives through range data; the client requests nothing for it. Valid only as an ItemId on a List, Table or Tree that has a model_ref (clearing model_ref while it is held is refused). Authoritative sessions refuse an ItemId the collection's model does not hold and clear the property in the commit that removes the item. Fallback: a client without support keeps its viewport where the user put it (§4 inv. 13, §22.5)."
 
+  # Split pane axis (§7.3, §7.6, §10, §22.4, §22.5)
+  - id: 35
+    name: split_axis
+    category: control_specific
+    value_type: enum
+    enum_types: [SplitAxis]
+    description: "Pane axis of a Split (§7.3, §10, §22.4): side_by_side lays its panes out left to right with vertical dividers, stacked lays them out top to bottom with horizontal dividers. Absent means side_by_side. Admitted only on Split and refused on every other node type; a value outside SplitAxis is refused at decode and apply (§4 inv. 13). Changing it rebuilds that Split's panes. Each child of a Split is one pane, in child order, at most 8 panes per Split (§26); pane sizing uses each child's existing layout hints, never pixel geometry. Divider positions are local interaction state: never sent, never set by the server (§7.6, §22.5)."
+
 enums:
   - id: 1
     name: TextRole
@@ -633,6 +641,17 @@ enums:
       - id: 3
         name: error
         description: "Value failed validation checks"
+
+  - id: 13
+    name: SplitAxis
+    description: "Pane axis of a Split container (§7.3, §10, §22.4)"
+    values:
+      - id: 1
+        name: side_by_side
+        description: "Panes left to right, separated by vertical dividers (the default)"
+      - id: 2
+        name: stacked
+        description: "Panes top to bottom, separated by horizontal dividers"
 
 events:
   # Semantic Events (§7.6)

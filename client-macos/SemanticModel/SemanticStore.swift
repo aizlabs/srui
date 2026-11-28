@@ -25,6 +25,11 @@
 // Tree that has a model_ref (clearing model_ref while it is held is refused). Item presence is
 // not checked, because this sparse replica may not cache the item.
 //
+// The standard Split container (§4 inv. 13, §7.3, §10, §26; `Split.swift`): its `split_axis` must
+// be SplitAxis side_by_side or stacked and is admitted on no other node type (CREATE_NODE,
+// SET_PROPERTY, BATCH_PROPERTY_SET), and a CREATE_NODE or MOVE_NODE that would give a Split more
+// than `maxSplitPanes` children is refused. Same rules, order and codes as the Rust store.
+//
 // Architectural Invariants (§4):
 // - Invariant 2: The client retains a non-authoritative replica of committed semantic UI state
 //   plus local presentation state. The replica exists only to render, interact, inspect, cache,
@@ -449,6 +454,12 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
     case shortcutNotAdmitted(nodeID: NodeId, nodeType: TypeRef)
     /// Another node in the same Surface already holds this `shortcut` (§7.4).
     case duplicateShortcut(nodeID: NodeId, existing: NodeId, shortcut: String)
+    /// A `split_axis` value is not SplitAxis side_by_side or stacked (§4 inv. 13).
+    case invalidSplitAxis(nodeID: NodeId, reason: String)
+    /// A `split_axis` was set on a node type other than Split (§4 inv. 13, §7.3).
+    case splitAxisNotAdmitted(nodeID: NodeId, nodeType: TypeRef)
+    /// A Split already holds `maxSplitPanes` panes, so it cannot gain another (§26).
+    case maxSplitPanesExceeded(splitID: NodeId, limit: Int)
     /// A model item's `tree_depth` reaches the configured `maxModelTreeDepth`, which counts
     /// levels, so `tree_depth` must stay below it (§8, §26).
     case maxModelTreeDepthExceeded(modelID: ModelId, index: UInt64, limit: Int, treeDepth: UInt64)
@@ -516,6 +527,12 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
             return "node \(nodeID) of type \(nodeType) does not admit a shortcut"
         case .duplicateShortcut(let nodeID, let existing, let shortcut):
             return "shortcut \"\(shortcut)\" on node \(nodeID) is already held by node \(existing) in the same Surface"
+        case .invalidSplitAxis(let nodeID, let reason):
+            return "invalid split_axis on node \(nodeID): \(reason)"
+        case .splitAxisNotAdmitted(let nodeID, let nodeType):
+            return "node \(nodeID) of type \(nodeType) does not admit split_axis; only a Split does"
+        case .maxSplitPanesExceeded(let splitID, let limit):
+            return "split \(splitID) already holds \(limit) panes, the most a Split admits (§26)"
         case .maxModelTreeDepthExceeded(let modelID, let index, let limit, let treeDepth):
             return "model tree depth limit exceeded: item at index \(index) of model \(modelID) has tree_depth \(treeDepth), but max_model_tree_depth is \(limit) levels"
         case .invalidModelTree(let modelID, let index, let violation):
@@ -556,6 +573,9 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
         case .invalidShortcut: return "invalid_shortcut"
         case .shortcutNotAdmitted: return "shortcut_not_admitted"
         case .duplicateShortcut: return "duplicate_shortcut"
+        case .invalidSplitAxis: return "invalid_split_axis"
+        case .splitAxisNotAdmitted: return "split_axis_not_admitted"
+        case .maxSplitPanesExceeded: return "max_split_panes_exceeded"
         case .maxModelTreeDepthExceeded: return "max_model_tree_depth_exceeded"
         case .invalidModelTree(_, _, let violation): return violation.conformanceCode
         case .operationError: return "operation_error"
@@ -1047,9 +1067,10 @@ public struct SemanticStore: Equatable, Sendable {
     ///
     /// Extension properties remain registry-defined and are validated by their negotiated handler.
     private func validatePropertyValueType(property: PropertyRef, value: Value) throws {
-        // `shortcut` has its own validator, which also requires a string, so it reports
-        // `invalid_shortcut` exactly as the Rust store does (§4 inv. 13).
-        guard property != .shortcut,
+        // `shortcut` and `split_axis` have their own validators, which also check the value
+        // kind, so they report `invalid_shortcut` / `invalid_split_axis` exactly as the Rust store
+        // does (§4 inv. 13).
+        guard property != .shortcut, property != .splitAxis,
               let expected = standardPropertyValueType(property), expected != .any else {
             return
         }
@@ -1125,6 +1146,17 @@ public struct SemanticStore: Equatable, Sendable {
             return
         }
         throw StoreError.invalidKeepVisible(nodeID: nodeID, reason: reason)
+    }
+
+    /// Validates one `split_axis` value, then the node type's admission (§4 inv. 13, §7.3).
+    /// Same order as the `shortcut` check and as the Rust store: the value first, then the type.
+    private func validateSplitAxisValue(nodeID: NodeId, nodeType: TypeRef, value: Value) throws {
+        if case .failure(let error) = parseSplitAxis(value) {
+            throw StoreError.invalidSplitAxis(nodeID: nodeID, reason: error.description)
+        }
+        guard isSplit(nodeType) else {
+            throw StoreError.splitAxisNotAdmitted(nodeID: nodeID, nodeType: nodeType)
+        }
     }
 
     /// The node that scopes shortcut uniqueness for `id`: the root of its tree. In the standard
@@ -1273,6 +1305,9 @@ public struct SemanticStore: Equatable, Sendable {
             keepVisible: properties.last(where: { $0.0 == .keepVisible })?.1,
             modelRef: properties.last(where: { $0.0 == .modelRef })?.1
         )
+        for (prop, val) in properties where prop == .splitAxis {
+            try validateSplitAxisValue(nodeID: id, nodeType: nodeType, value: val)
+        }
         for (prop, val) in properties where prop == .shortcut {
             try validateShortcutValue(nodeID: id, nodeType: nodeType, value: val)
         }
@@ -1287,6 +1322,10 @@ public struct SemanticStore: Equatable, Sendable {
                 throw StoreError.parentNotFound(pid)
             }
             let childCount = parentNode.orderedChildren.count
+            // §26: a Split holds at most maxSplitPanes panes.
+            if isSplit(parentNode.nodeType), childCount >= maxSplitPanes {
+                throw StoreError.maxSplitPanesExceeded(splitID: pid, limit: maxSplitPanes)
+            }
             if let idx = childIndex, idx < 0 || idx > childCount {
                 throw StoreError.childIndexOutOfBounds(index: idx, count: childCount)
             }
@@ -1403,6 +1442,9 @@ public struct SemanticStore: Equatable, Sendable {
             try validateShortcutValue(nodeID: nodeID, nodeType: node.nodeType, value: value)
             try checkShortcutUnique(nodeID: nodeID, scope: shortcutScope(nodeID), value: value)
         }
+        if property == .splitAxis {
+            try validateSplitAxisValue(nodeID: nodeID, nodeType: node.nodeType, value: value)
+        }
         if property == .value {
             try validateCollectionSelection(
                 nodeID: nodeID,
@@ -1484,6 +1526,9 @@ public struct SemanticStore: Equatable, Sendable {
                 ?? node.properties[.keepVisible],
             modelRef: properties.last(where: { $0.0 == .modelRef })?.1 ?? node.properties[.modelRef]
         )
+        for (prop, val) in properties where prop == .splitAxis {
+            try validateSplitAxisValue(nodeID: nodeID, nodeType: node.nodeType, value: val)
+        }
         for (prop, val) in properties where prop == .shortcut {
             try validateShortcutValue(nodeID: nodeID, nodeType: node.nodeType, value: val)
         }
@@ -1574,6 +1619,13 @@ public struct SemanticStore: Equatable, Sendable {
 
         if let idx = newChildIndex, idx < 0 || idx > currentDestLen {
             throw StoreError.childIndexOutOfBounds(index: idx, count: currentDestLen)
+        }
+
+        // §26: a Split gains a pane only while it holds fewer than maxSplitPanes. Moving a pane
+        // within its own Split adds none.
+        if let pid = newParentID, let parentNode = nodes[pid], isSplit(parentNode.nodeType),
+           oldParentID != pid, currentDestLen >= maxSplitPanes {
+            throw StoreError.maxSplitPanesExceeded(splitID: pid, limit: maxSplitPanes)
         }
 
         // Shortcut uniqueness within the destination Surface (§7.4).

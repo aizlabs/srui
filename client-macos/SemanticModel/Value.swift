@@ -147,6 +147,8 @@ public enum ValueConversionError: Error, Hashable, Equatable, Sendable, CustomSt
     case invalidNestedStructure(String)
     /// A standard `shortcut` value outside the closed canonical grammar (§4 inv. 13, §26).
     case invalidShortcut(String)
+    /// A standard `split_axis` value outside the `SplitAxis` enum (§4 inv. 13).
+    case invalidSplitAxis(String)
 
     public var description: String {
         switch self {
@@ -158,6 +160,8 @@ public enum ValueConversionError: Error, Hashable, Equatable, Sendable, CustomSt
             return "invalid nested structure: \(msg)"
         case .invalidShortcut(let reason):
             return "invalid shortcut: \(reason)"
+        case .invalidSplitAxis(let reason):
+            return "invalid split_axis: \(reason)"
         }
     }
 }

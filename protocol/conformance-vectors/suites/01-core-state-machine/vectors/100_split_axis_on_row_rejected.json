@@ -1,0 +1,62 @@
+{
+  "name": "split_axis_on_row_rejected",
+  "description": "split_axis is admitted only on a Split; a Row created with it is refused with split_axis_not_admitted and the transaction discarded (§4 inv. 13, §12.1). Row and Column express their axis by node type.",
+  "spec_sections": [
+    "§4 inv. 13",
+    "§7.3",
+    "§12.1"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Host"
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "CREATE_NODE",
+        "node_id": 2,
+        "node_type": "Column",
+        "parent_id": 1,
+        "child_index": null,
+        "properties": {}
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 3,
+        "node_type": "Row",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {
+          "split_axis": {
+            "enum": "SplitAxis",
+            "value": "side_by_side"
+          }
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "split_axis_not_admitted",
+    "failed_op_index": 1,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

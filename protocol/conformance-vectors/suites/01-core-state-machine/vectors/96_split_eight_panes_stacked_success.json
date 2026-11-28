@@ -1,0 +1,241 @@
+{
+  "name": "split_eight_panes_stacked_success",
+  "description": "A stacked Split with exactly eight panes, the most a Split admits, is accepted in one transaction (§7.3, §26).",
+  "spec_sections": [
+    "§7.3",
+    "§10",
+    "§12.1",
+    "§26"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [],
+  "transaction": {
+    "base_revision": 0,
+    "new_revision": 1,
+    "operations": [
+      {
+        "type": "CREATE_NODE",
+        "node_id": 1,
+        "node_type": "Surface",
+        "parent_id": null,
+        "child_index": null,
+        "properties": {
+          "label": "Host"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 2,
+        "node_type": "Split",
+        "parent_id": 1,
+        "child_index": null,
+        "properties": {
+          "label": "Dashboard",
+          "split_axis": {
+            "enum": "SplitAxis",
+            "value": "stacked"
+          }
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 10,
+        "node_type": "Text",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {
+          "text": "pane 10"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 11,
+        "node_type": "Text",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {
+          "text": "pane 11"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 12,
+        "node_type": "Text",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {
+          "text": "pane 12"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 13,
+        "node_type": "Text",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {
+          "text": "pane 13"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 14,
+        "node_type": "Text",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {
+          "text": "pane 14"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 15,
+        "node_type": "Text",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {
+          "text": "pane 15"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 16,
+        "node_type": "Text",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {
+          "text": "pane 16"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 17,
+        "node_type": "Text",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {
+          "text": "pane 17"
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "success",
+    "committed_revision": 1,
+    "store_state": {
+      "node_count": 10,
+      "roots": [
+        1
+      ],
+      "nodes": {
+        "1": {
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "ordered_children": [
+            2
+          ],
+          "properties": {
+            "label": "Host"
+          }
+        },
+        "2": {
+          "node_id": 2,
+          "node_type": "Split",
+          "parent_id": 1,
+          "ordered_children": [
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17
+          ],
+          "properties": {
+            "label": "Dashboard",
+            "split_axis": {
+              "enum": "SplitAxis",
+              "value": "stacked"
+            }
+          }
+        },
+        "10": {
+          "node_id": 10,
+          "node_type": "Text",
+          "parent_id": 2,
+          "ordered_children": [],
+          "properties": {
+            "text": "pane 10"
+          }
+        },
+        "11": {
+          "node_id": 11,
+          "node_type": "Text",
+          "parent_id": 2,
+          "ordered_children": [],
+          "properties": {
+            "text": "pane 11"
+          }
+        },
+        "12": {
+          "node_id": 12,
+          "node_type": "Text",
+          "parent_id": 2,
+          "ordered_children": [],
+          "properties": {
+            "text": "pane 12"
+          }
+        },
+        "13": {
+          "node_id": 13,
+          "node_type": "Text",
+          "parent_id": 2,
+          "ordered_children": [],
+          "properties": {
+            "text": "pane 13"
+          }
+        },
+        "14": {
+          "node_id": 14,
+          "node_type": "Text",
+          "parent_id": 2,
+          "ordered_children": [],
+          "properties": {
+            "text": "pane 14"
+          }
+        },
+        "15": {
+          "node_id": 15,
+          "node_type": "Text",
+          "parent_id": 2,
+          "ordered_children": [],
+          "properties": {
+            "text": "pane 15"
+          }
+        },
+        "16": {
+          "node_id": 16,
+          "node_type": "Text",
+          "parent_id": 2,
+          "ordered_children": [],
+          "properties": {
+            "text": "pane 16"
+          }
+        },
+        "17": {
+          "node_id": 17,
+          "node_type": "Text",
+          "parent_id": 2,
+          "ordered_children": [],
+          "properties": {
+            "text": "pane 17"
+          }
+        }
+      },
+      "model_count": 0,
+      "models": {}
+    }
+  }
+}

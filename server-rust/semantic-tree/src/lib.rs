@@ -23,12 +23,16 @@
 //! - §14: Resource model (large blobs are resources, not properties)
 //! - §15: Capability negotiation ([`CapabilitySet`], [`Profile`], [`ServerCapabilities`])
 //! - §26: Mandatory limits ([`StoreLimits`], including [`DEFAULT_MAX_MODEL_TREE_DEPTH`])
+//! - §7.3, §10, §22.4: the standard `Split` container: its `split_axis` property
+//!   ([`StandardSplitAxis`], [`parse_split_axis`]), checked at decode and apply, and at most
+//!   [`MAX_SPLIT_PANES`] panes (§4 inv. 13, §26)
 
 pub mod capability;
 pub mod event;
 pub mod ids;
 pub mod model;
 pub mod shortcut;
+pub mod split;
 pub mod store;
 pub mod transaction;
 pub mod value;
@@ -52,10 +56,10 @@ pub use ids::{
     standard_node_type_name, standard_operation_name, standard_property_name, ItemId, ModelId,
     NodeId, ParseResourceHashError, PropertyRef, RegistryLookupError, ResourceHash,
     StandardActionRole, StandardHorizontalAlignment, StandardImportance, StandardInputRole,
-    StandardPaddingRole, StandardSelectionMode, StandardSpacingRole, StandardTextRole,
-    StandardTogglePresentationHint, StandardValidationState, StandardVerticalAlignment,
-    StandardVisibility, TypeRef, STANDARD_ENUMS, STANDARD_EVENTS, STANDARD_NAMESPACE_ID,
-    STANDARD_NODE_TYPES, STANDARD_OPERATIONS, STANDARD_PROPERTIES,
+    StandardPaddingRole, StandardSelectionMode, StandardSpacingRole, StandardSplitAxis,
+    StandardTextRole, StandardTogglePresentationHint, StandardValidationState,
+    StandardVerticalAlignment, StandardVisibility, TypeRef, STANDARD_ENUMS, STANDARD_EVENTS,
+    STANDARD_NAMESPACE_ID, STANDARD_NODE_TYPES, STANDARD_OPERATIONS, STANDARD_PROPERTIES,
 };
 
 pub use model::{Model, ModelItem};
@@ -63,6 +67,11 @@ pub use model::{Model, ModelItem};
 pub use shortcut::{
     escape_token, shortcut_behavior, NamedKey, Shortcut, ShortcutBehavior, ShortcutError,
     ShortcutKey, MAX_SHORTCUT_BYTES,
+};
+
+pub use split::{
+    effective_split_axis, is_split, parse_split_axis, SplitAxisError, MAX_SPLIT_PANES,
+    SPLIT_AXIS_ENUM_ID,
 };
 
 pub use store::{

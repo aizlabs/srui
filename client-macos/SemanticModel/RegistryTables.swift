@@ -95,6 +95,7 @@ public let standardPropertiesTable: [(id: UInt32, name: String)] = [
     (32, "tree_depth"),
     (33, "descendant_count"),
     (34, "keep_visible"),
+    (35, "split_axis"),
 ]
 
 /// Runtime value kinds declared by the standard property registry.
@@ -148,6 +149,7 @@ public func standardPropertyValueType(_ property: PropertyRef) -> StandardProper
     case 32: return .unsignedInt
     case 33: return .unsignedInt
     case 34: return .any
+    case 35: return .enumToken
     default: return nil
     }
 }
@@ -195,6 +197,7 @@ public let standardEnumsTable: [(id: UInt32, name: String)] = [
     (10, "VerticalAlignment"),
     (11, "SelectionMode"),
     (12, "ValidationState"),
+    (13, "SplitAxis"),
 ]
 
 // MARK: - Lookup Functions
@@ -305,6 +308,7 @@ public func lookupStandardProperty(_ name: String) -> UInt32? {
     case "tree_depth": return 32
     case "descendant_count": return 33
     case "keep_visible": return 34
+    case "split_axis": return 35
     default: return nil
     }
 }
@@ -345,6 +349,7 @@ public func lookupStandardPropertyName(_ id: UInt32) -> String? {
     case 32: return "tree_depth"
     case 33: return "descendant_count"
     case 34: return "keep_visible"
+    case 35: return "split_axis"
     default: return nil
     }
 }
@@ -447,6 +452,7 @@ public func lookupStandardEnum(_ name: String) -> UInt32? {
     case "VerticalAlignment": return 10
     case "SelectionMode": return 11
     case "ValidationState": return 12
+    case "SplitAxis": return 13
     default: return nil
     }
 }
@@ -465,6 +471,7 @@ public func lookupStandardEnumName(_ id: UInt32) -> String? {
     case 10: return "VerticalAlignment"
     case 11: return "SelectionMode"
     case 12: return "ValidationState"
+    case 13: return "SplitAxis"
     default: return nil
     }
 }
@@ -570,6 +577,12 @@ public func lookupStandardEnumValue(enumID: UInt32, valueName: String) -> UInt32
         case "error": return 3
         default: return nil
         }
+    case 13:
+        switch valueName {
+        case "side_by_side": return 1
+        case "stacked": return 2
+        default: return nil
+        }
     default: return nil
     }
 }
@@ -623,6 +636,8 @@ public func lookupStandardEnumValueName(enumID: UInt32, valueID: UInt32) -> Stri
     case (12, 1): return "valid"
     case (12, 2): return "warning"
     case (12, 3): return "error"
+    case (13, 1): return "side_by_side"
+    case (13, 2): return "stacked"
     default: return nil
     }
 }
@@ -726,6 +741,12 @@ public func resolveStandardEnumValue(enumName: String, valueName: String) -> Enu
         case "valid": return EnumToken(enumID: 12, valueID: 1)
         case "warning": return EnumToken(enumID: 12, valueID: 2)
         case "error": return EnumToken(enumID: 12, valueID: 3)
+        default: return nil
+        }
+    case "SplitAxis", "EnumSplitAxis":
+        switch valueName {
+        case "side_by_side": return EnumToken(enumID: 13, valueID: 1)
+        case "stacked": return EnumToken(enumID: 13, valueID: 2)
         default: return nil
         }
     default: return nil
@@ -885,6 +906,8 @@ extension PropertyRef {
     public static let DESCENDANT_COUNT = PropertyRef.standard(33)
     public static let keepVisible = PropertyRef.standard(34)
     public static let KEEP_VISIBLE = PropertyRef.standard(34)
+    public static let splitAxis = PropertyRef.standard(35)
+    public static let SPLIT_AXIS = PropertyRef.standard(35)
 }
 
 // MARK: - Standard EnumToken Constants
@@ -984,6 +1007,10 @@ extension EnumToken {
     public static let VALIDATION_STATE_WARNING = EnumToken(enumID: 12, valueID: 2)
     public static let validationStateError = EnumToken(enumID: 12, valueID: 3)
     public static let VALIDATION_STATE_ERROR = EnumToken(enumID: 12, valueID: 3)
+    public static let splitAxisSideBySide = EnumToken(enumID: 13, valueID: 1)
+    public static let SPLIT_AXIS_SIDE_BY_SIDE = EnumToken(enumID: 13, valueID: 1)
+    public static let splitAxisStacked = EnumToken(enumID: 13, valueID: 2)
+    public static let SPLIT_AXIS_STACKED = EnumToken(enumID: 13, valueID: 2)
 }
 
 // MARK: - Typed Standard Enums
@@ -1199,6 +1226,22 @@ public enum StandardValidationState: UInt32, CaseIterable, Sendable {
 
     public init?(enumToken: EnumToken) {
         guard enumToken.enumID == 12 else { return nil }
+        self.init(rawValue: enumToken.valueID)
+    }
+}
+
+public enum StandardSplitAxis: UInt32, CaseIterable, Sendable {
+    case sideBySide = 1
+    case stacked = 2
+
+    public static let standardEnumID: UInt32 = 13
+
+    public var enumToken: EnumToken {
+        EnumToken(enumID: 13, valueID: self.rawValue)
+    }
+
+    public init?(enumToken: EnumToken) {
+        guard enumToken.enumID == 13 else { return nil }
         self.init(rawValue: enumToken.valueID)
     }
 }

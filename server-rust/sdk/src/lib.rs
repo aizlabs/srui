@@ -11,6 +11,8 @@
 //! [`tree_model`] flattens a server-side forest into a hierarchical `Tree` model (preorder items
 //! with `tree_depth`/`descendant_count`, bounded by `max_model_tree_depth`, §8, §26); `Tree` reads
 //! `columns` and reports local disclosure through [`Tree::on_expansion_changed`] (§7.6, §22.5).
+//! [`Split`] builds the standard user-resizable pane container with its `split_axis`
+//! ([`SplitAxis`]); each child is a pane, at most [`MAX_SPLIT_PANES`] (§7.3, §10, §22.4, §26).
 
 pub mod keep_visible;
 pub mod selection;
@@ -37,6 +39,9 @@ pub use srui_semantic_tree::{
     shortcut_behavior, NamedKey, Shortcut, ShortcutBehavior, ShortcutError, ShortcutKey,
     MAX_SHORTCUT_BYTES,
 };
+
+// The standard Split container (§7.3, §10, §22.4, §26)
+pub use srui_semantic_tree::MAX_SPLIT_PANES;
 
 // Resource CAS API (§14)
 pub use srui_resources::{
@@ -92,6 +97,8 @@ pub const PRESENTATION_HINT: PropertyRef = PropertyRef::PRESENTATION_HINT;
 pub const SELECTION_MODE: PropertyRef = PropertyRef::SELECTION_MODE;
 /// Property reference for `keep_visible` (§6.3, §8, §22.7).
 pub const KEEP_VISIBLE: PropertyRef = PropertyRef::KEEP_VISIBLE;
+/// Property reference for `split_axis`, the pane axis of a `Split` (§10, §22.4).
+pub const SPLIT_AXIS: PropertyRef = PropertyRef::SPLIT_AXIS;
 /// Property reference for `horizontal_alignment` (§7.4).
 pub const HORIZONTAL_ALIGNMENT: PropertyRef = PropertyRef::HORIZONTAL_ALIGNMENT;
 /// Property reference for `vertical_alignment` (§7.4).

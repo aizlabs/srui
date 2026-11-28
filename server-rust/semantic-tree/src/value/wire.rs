@@ -11,6 +11,8 @@ pub enum ValueConversionError {
     InvalidNestedStructure(String),
     /// A standard `shortcut` property value outside the closed canonical grammar (§4 inv. 13, §26).
     InvalidShortcut(String),
+    /// A standard `split_axis` property value outside the `SplitAxis` enum (§4 inv. 13).
+    InvalidSplitAxis(String),
 }
 
 impl fmt::Display for ValueConversionError {
@@ -24,6 +26,7 @@ impl fmt::Display for ValueConversionError {
             }
             Self::InvalidNestedStructure(msg) => write!(f, "invalid nested structure: {}", msg),
             Self::InvalidShortcut(msg) => write!(f, "invalid shortcut: {}", msg),
+            Self::InvalidSplitAxis(msg) => write!(f, "invalid split_axis: {}", msg),
         }
     }
 }
@@ -47,6 +50,31 @@ pub fn validate_decoded_shortcut(
         _ => Err(crate::shortcut::ShortcutError::NotAString),
     };
     result.map_err(|e| ValueConversionError::InvalidShortcut(e.to_string()))
+}
+
+/// Decode-time check of the standard `split_axis` property (§4 inv. 13).
+///
+/// Called on the same wire paths as [`validate_decoded_shortcut`], so a value outside
+/// `SplitAxis` never reaches a store. The store repeats it, plus node-type admission, at apply.
+pub fn validate_decoded_split_axis(
+    property: PropertyRef,
+    value: &Value,
+) -> Result<(), ValueConversionError> {
+    if property != PropertyRef::SPLIT_AXIS {
+        return Ok(());
+    }
+    crate::split::parse_split_axis(value)
+        .map(|_| ())
+        .map_err(|e| ValueConversionError::InvalidSplitAxis(e.to_string()))
+}
+
+/// Every decode-time standard-property check: `shortcut` and `split_axis` (§4 inv. 13, §26).
+pub fn validate_decoded_property(
+    property: PropertyRef,
+    value: &Value,
+) -> Result<(), ValueConversionError> {
+    validate_decoded_shortcut(property, value)?;
+    validate_decoded_split_axis(property, value)
 }
 
 // In-Memory -> Wire Proto (borrowed: avoids cloning the full domain Value tree)
@@ -203,7 +231,7 @@ impl TryFrom<srui_protocol::Property> for Property {
             .map(Value::try_from)
             .transpose()?
             .unwrap_or(Value::Null);
-        validate_decoded_shortcut(property, &value)?;
+        validate_decoded_property(property, &value)?;
 
         Ok(Self { property, value })
     }

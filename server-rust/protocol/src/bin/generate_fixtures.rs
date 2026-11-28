@@ -470,6 +470,85 @@ fn main() {
         fs::write(out_dir.join(name), &bytes).expect("write malformed shortcut vector");
         println!("Wrote {name} ({} bytes)", bytes.len());
     }
+
+    // 24–25. The standard Split container (PX-070-G02; §4 inv. 13, §26).
+    for (name, message) in malformed_split_vectors() {
+        let bytes = encode_framed(&message).expect("encode framed malformed split vector");
+        fs::write(out_dir.join(name), &bytes).expect("write malformed split vector");
+        println!("Wrote {name} ({} bytes)", bytes.len());
+    }
+}
+
+fn standard_property(id: StandardProperty) -> Option<PropertyRef> {
+    Some(PropertyRef {
+        namespace_id: STANDARD_NAMESPACE_ID,
+        local_id: id as u32,
+    })
+}
+
+fn create_node_op(node_id: u64, node_type: StandardNodeType, parent_id: u64) -> Operation {
+    Operation {
+        op: Some(operation::Op::CreateNode(CreateNodeOp {
+            node: Some(NodeRecord {
+                node_id,
+                r#type: Some(TypeRef {
+                    namespace_id: STANDARD_NAMESPACE_ID,
+                    local_id: node_type as u32,
+                }),
+                parent_id,
+                // u32::MAX means "append" (no explicit child index).
+                child_index: u32::MAX,
+                properties: Vec::new(),
+            }),
+        })),
+    }
+}
+
+/// Malformed `Split` vectors (PX-070-G02):
+///
+/// - `malformed_split_axis_unknown_value.bin` sets `split_axis` to `SplitAxis` value 3, which the
+///   enum does not define; every decode path refuses it.
+/// - `malformed_split_ninth_pane.bin` creates a Surface, a Split under it and nine Text panes.
+///   It is protobuf-valid and decodes (a stateless decoder cannot know a parent's type); applying
+///   it refuses the ninth pane (operation 10) with `max_split_panes_exceeded`, committing nothing.
+fn malformed_split_vectors() -> [(&'static str, SruiMessage); 2] {
+    let unknown_axis = SruiMessage {
+        msg: Some(srui_message::Msg::Transaction(Transaction {
+            base_revision: 7,
+            new_revision: 8,
+            priority: 0,
+            operations: vec![Operation {
+                op: Some(operation::Op::SetProperty(SetPropertyOp {
+                    node_id: 2,
+                    property: standard_property(StandardProperty::PropertySplitAxis),
+                    value: Some(Value {
+                        value: Some(value::Value::EnumValue(EnumValue {
+                            enum_id: StandardEnum::EnumSplitAxis as u32,
+                            value_id: 3,
+                        })),
+                    }),
+                })),
+            }],
+        })),
+    };
+    // NodeRecord parent_id 0 means "no parent" (a root).
+    let mut operations = vec![
+        create_node_op(1, StandardNodeType::NodeTypeSurface, 0),
+        create_node_op(2, StandardNodeType::NodeTypeSplit, 1),
+    ];
+    operations.extend((3..=11).map(|id| create_node_op(id, StandardNodeType::NodeTypeText, 2)));
+    let ninth_pane = SruiMessage {
+        msg: Some(srui_message::Msg::Transaction(Transaction {
+            base_revision: 0,
+            new_revision: 1,
+            priority: 0,
+            operations,
+        })),
+    };
+    [
+        ("malformed_split_axis_unknown_value.bin", unknown_axis),
+        ("malformed_split_ninth_pane.bin", ninth_pane),
+    ]
 }
 
 /// Malformed `shortcut` values: over-length (33 bytes), an unknown token, a duplicate modifier.

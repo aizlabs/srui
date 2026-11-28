@@ -90,6 +90,7 @@ enum StandardProperty {
   PROPERTY_TREE_DEPTH = 32;
   PROPERTY_DESCENDANT_COUNT = 33;
   PROPERTY_KEEP_VISIBLE = 34;
+  PROPERTY_SPLIT_AXIS = 35;
 }
 
 enum TextRole {
@@ -187,6 +188,12 @@ enum ValidationState {
   VALIDATION_ERROR = 3;
 }
 
+enum SplitAxis {
+  SPLIT_AXIS_UNSPECIFIED = 0;
+  SPLIT_AXIS_SIDE_BY_SIDE = 1;
+  SPLIT_AXIS_STACKED = 2;
+}
+
 enum StandardEvent {
   EVENT_UNSPECIFIED = 0;
   // Semantic Events (§7.6)
@@ -218,6 +225,7 @@ enum StandardEnum {
   ENUM_VERTICAL_ALIGNMENT = 10;
   ENUM_SELECTION_MODE = 11;
   ENUM_VALIDATION_STATE = 12;
+  ENUM_SPLIT_AXIS = 13;
 }
 
 enum StandardOperation {

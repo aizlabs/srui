@@ -18,7 +18,7 @@
       "status": "active",
       "vectors": {
         "dir": "suites/01-core-state-machine/vectors",
-        "count": 93
+        "count": 102
       },
       "rust": [
         [
@@ -30,6 +30,16 @@
           "srui-semantic-tree",
           "--test",
           "state_machine_conformance_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-semantic-tree",
+          "--test",
+          "split_test"
         ]
       ],
       "swift": [
@@ -40,6 +50,14 @@
           "client-macos",
           "--filter",
           "StateMachineConformanceTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SplitStoreTests"
         ]
       ]
     },
@@ -84,6 +102,16 @@
           "srui-sdk",
           "--test",
           "tree_model_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-semantic-tree",
+          "--test",
+          "split_test"
         ]
       ],
       "swift": [
@@ -134,6 +162,22 @@
           "client-macos",
           "--filter",
           "HierarchicalTreeTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SplitStoreTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SplitRenderingTests"
         ]
       ],
       "gaps": [
@@ -167,7 +211,7 @@
       "status": "active",
       "vectors": {
         "dir": "suites/03-semantic-not-paint/vectors",
-        "count": 1
+        "count": 2
       },
       "rust": [
         [
@@ -226,6 +270,22 @@
           "client-macos",
           "--filter",
           "FrameIndependenceConformanceTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SplitFrameIndependenceTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SplitRenderingTests"
         ]
       ]
     },
@@ -662,6 +722,16 @@
           "srui-sdk",
           "--test",
           "tree_model_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-semantic-tree",
+          "--test",
+          "split_test"
         ]
       ],
       "swift": [
@@ -720,6 +790,14 @@
           "client-macos",
           "--filter",
           "ModelTreeStoreTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SplitStoreTests"
         ]
       ]
     },
@@ -790,6 +868,14 @@
           "client-macos",
           "--filter",
           "HierarchicalTreeTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SplitRenderingTests"
         ]
       ],
       "not_applicable": {
@@ -880,6 +966,14 @@
           "client-macos",
           "--filter",
           "HierarchicalTreeTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SplitRenderingTests"
         ]
       ],
       "not_applicable": {

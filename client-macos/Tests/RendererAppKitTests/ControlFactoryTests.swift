@@ -44,7 +44,7 @@ private let controlFactoryRequiredTierTypes: [TypeRef] = [
 
 private let controlFactoryUnsupportedTypes: [TypeRef] = [
     .dialog, .select, .choiceGroup, .slider, .numberInput,
-    .tabs, .split, .menu, .toolbar,
+    .tabs, .menu, .toolbar,
 ]
 
 @MainActor
@@ -811,6 +811,27 @@ struct ControlFactoryTests {
         default:
             break
         }
+    }
+
+    /// PX-070-G02 (suite 12, §22.4): the SHOULD-tier Split maps to `NSSplitView`; side_by_side
+    /// (also the default) gives vertical dividers, stacked horizontal ones.
+    @Test
+    func splitMapsToNSSplitViewWithTheAxisAsDividerOrientation() throws {
+        let factory = ControlFactory()
+        let plain = try #require(try factory.makeHandle(for: Node(id: 1, nodeType: .split)).view as? SemanticSplitView)
+        #expect(plain.isVertical)
+        #expect(plain.axis == .sideBySide)
+        #expect(plain.dividerStyle == .thin)
+        #expect(plain.accessibilityRole() == .splitGroup)
+        let stacked = try #require(try factory.makeHandle(for: Node(
+            id: 2, nodeType: .split, properties: [(.splitAxis, .enumToken(.splitAxisStacked))]
+        )).view as? SemanticSplitView)
+        #expect(!stacked.isVertical)
+        #expect(stacked.axis == .stacked)
+        let sideBySide = try #require(try factory.makeHandle(for: Node(
+            id: 3, nodeType: .split, properties: [(.splitAxis, .enumToken(.splitAxisSideBySide))]
+        )).view as? SemanticSplitView)
+        #expect(sideBySide.isVertical)
     }
 
     @Test(arguments: controlFactoryUnsupportedTypes)

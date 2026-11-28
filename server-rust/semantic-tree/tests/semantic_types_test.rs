@@ -394,7 +394,13 @@ fn test_standard_registry_lookups() {
     );
     assert_eq!(PropertyRef::DESCENDANT_COUNT, PropertyRef::standard(33));
     assert_eq!(PropertyRef::KEEP_VISIBLE, PropertyRef::standard(34));
-    assert_eq!(STANDARD_PROPERTIES.len(), 34);
+    assert_eq!(
+        resolve_standard_property("split_axis").unwrap(),
+        PropertyRef::SPLIT_AXIS
+    );
+    assert_eq!(PropertyRef::SPLIT_AXIS, PropertyRef::standard(35));
+    assert_eq!(STANDARD_PROPERTIES.len(), 35);
+    assert_eq!(STANDARD_ENUMS.len(), 13);
 
     // Check all 27 standard node types round-trip with their names
     for (id, name) in STANDARD_NODE_TYPES {
@@ -403,7 +409,7 @@ fn test_standard_registry_lookups() {
         assert_eq!(TypeRef::resolve_standard(name).unwrap(), type_ref);
     }
 
-    // Check all 33 standard properties round-trip with their names
+    // Check all 35 standard properties round-trip with their names
     for (id, name) in STANDARD_PROPERTIES {
         let prop_ref = PropertyRef::standard(*id);
         assert_eq!(prop_ref.standard_name(), Some(*name));
@@ -428,6 +434,8 @@ fn test_standard_registry_lookups() {
     assert_eq!(EnumToken::VERTICAL_ALIGNMENT_TOP, EnumToken::new(10, 1));
     assert_eq!(EnumToken::SELECTION_MODE_MULTIPLE, EnumToken::new(11, 3));
     assert_eq!(EnumToken::VALIDATION_STATE_ERROR, EnumToken::new(12, 3));
+    assert_eq!(EnumToken::SPLIT_AXIS_SIDE_BY_SIDE, EnumToken::new(13, 1));
+    assert_eq!(EnumToken::SPLIT_AXIS_STACKED, EnumToken::new(13, 2));
 
     // Check typed standard enum conversions
     let action_role = StandardActionRole::Destructive;

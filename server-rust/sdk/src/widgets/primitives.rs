@@ -1,4 +1,5 @@
-//! Layout and container widget handles and builders (§7.2, §7.3 Required Tier).
+//! Layout and container widget handles and builders (§7.2, §7.3 Required Tier), plus the
+//! SHOULD-tier [`Split`] container (§7.3, §10, §22.4).
 
 use crate::widgets::*;
 use crate::StoreMut;
@@ -252,3 +253,90 @@ impl_string_prop!(
     PropertyRef::ACCESSIBLE_DESCRIPTION,
     "Secondary accessibility description (§7.4)."
 );
+
+// =============================================================================
+// 8. Split (§7.2, §7.3 SHOULD Tier, TypeRef::SPLIT / id 25)
+// =============================================================================
+
+impl_widget_boilerplate!(
+    Split,
+    SplitBuilder,
+    TypeRef::SPLIT,
+    "User-resizable pane division container (§7.2, §7.3 SHOULD Tier, §10, §22.4).\n\n\
+     Each child is one pane, in child order, at most [`Split::MAX_PANES`]: create a pane with \
+     any widget builder's `parent(split_id)`. `axis` is the standard `split_axis` property \
+     (absent means [`SplitAxis::SideBySide`]). Pane sizes come from each pane's own layout \
+     hints (`minimum_size`, `maximum_size`, `preferred_size`, `grow`), never from pixel \
+     geometry; a pane whose `visibility` is `collapsed` collapses. Divider positions are local \
+     to the client and never reach the server (§7.6, §22.5), so this SDK offers no divider \
+     position and no `VALUE_CHANGED` handler for a Split."
+);
+impl_enum_prop!(
+    Split,
+    SplitBuilder,
+    SplitAxis,
+    axis,
+    axis_of,
+    get_axis,
+    set_axis,
+    set_axis_for,
+    op_set_axis,
+    op_set_axis_for,
+    clear_axis,
+    clear_axis_for,
+    op_clear_axis,
+    op_clear_axis_for,
+    PropertyRef::SPLIT_AXIS,
+    "Pane axis (`split_axis`): side by side or stacked; absent means side by side (§10, §22.4)."
+);
+impl_string_prop!(
+    Split,
+    SplitBuilder,
+    label,
+    label_of,
+    get_label,
+    set_label,
+    set_label_for,
+    op_set_label,
+    op_set_label_for,
+    clear_label,
+    clear_label_for,
+    op_clear_label,
+    op_clear_label_for,
+    PropertyRef::LABEL,
+    "Accessibility label of the split group (§22.8)."
+);
+impl_string_prop!(
+    Split,
+    SplitBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description (§7.4)."
+);
+impl_common_state_props!(Split, SplitBuilder);
+impl_common_layout_props!(Split, SplitBuilder);
+
+impl Split {
+    /// Most panes one Split holds; a ninth child is refused (§26).
+    pub const MAX_PANES: usize = srui_semantic_tree::MAX_SPLIT_PANES;
+
+    /// The panes (children) of this Split in `store`, in pane order. Empty if the node is absent.
+    pub fn panes<'a>(&self, store: &'a SemanticStore) -> &'a [NodeId] {
+        store.children_of(self.id).unwrap_or(&[])
+    }
+
+    /// The axis the panes are laid out on: `axis`, or [`SplitAxis::SideBySide`] when absent.
+    pub fn effective_axis(&self, store: &SemanticStore) -> SplitAxis {
+        self.axis(store).unwrap_or(SplitAxis::SideBySide)
+    }
+}

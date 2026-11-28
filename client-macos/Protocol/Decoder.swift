@@ -57,6 +57,8 @@ public enum ProtocolDecodeError: Error, Equatable, Sendable, CustomStringConvert
     case invalidOperation(String)
     /// A standard `shortcut` value is outside the closed canonical grammar (§4 inv. 13, §26).
     case invalidShortcut(String)
+    /// A standard `split_axis` value is outside the `SplitAxis` enum (§4 inv. 13).
+    case invalidSplitAxis(String)
     /// General protocol decoding error.
     case custom(String)
 
@@ -92,6 +94,8 @@ public enum ProtocolDecodeError: Error, Equatable, Sendable, CustomStringConvert
             return "Invalid operation: \(msg)"
         case .invalidShortcut(let reason):
             return "invalid shortcut: \(reason)"
+        case .invalidSplitAxis(let reason):
+            return "invalid split_axis: \(reason)"
         case .custom(let msg):
             return "Protocol error: \(msg)"
         }
@@ -115,6 +119,7 @@ public enum ProtocolDecodeError: Error, Equatable, Sendable, CustomStringConvert
         case .invalidResourceHashLength: return "invalid_resource_hash_length"
         case .invalidOperation: return "invalid_operation"
         case .invalidShortcut: return "invalid_shortcut"
+        case .invalidSplitAxis: return "invalid_split_axis"
         case .custom: return "custom_error"
         }
     }
@@ -306,7 +311,7 @@ public struct ProtocolDecoder: Sendable {
             let id = NodeId(set.nodeID)
             let propRef = PropertyRef(wire: set.property)
             let val = set.hasValue ? try validateAndConvertValue(wire: set.value, depth: 1) : .null
-            try Self.checkDecodedShortcut(propRef, val)
+            try Self.checkDecodedStandardProperty(propRef, val)
             return .setProperty(id: id, property: propRef, value: val)
 
         case .clearProperty_p(let clear):
@@ -336,7 +341,7 @@ public struct ProtocolDecoder: Sendable {
                 }
                 let propRef = PropertyRef(wire: p.property)
                 let val = p.hasValue ? try validateAndConvertValue(wire: p.value, depth: 1) : .null
-                try Self.checkDecodedShortcut(propRef, val)
+                try Self.checkDecodedStandardProperty(propRef, val)
                 props.append(Property(property: propRef, value: val))
             }
             return .batchPropertySet(id: id, properties: props)
@@ -431,7 +436,7 @@ public struct ProtocolDecoder: Sendable {
             }
             let propRef = PropertyRef(wire: p.property)
             let val = p.hasValue ? try validateAndConvertValue(wire: p.value, depth: 1) : .null
-            try Self.checkDecodedShortcut(propRef, val)
+            try Self.checkDecodedStandardProperty(propRef, val)
             props.append(Property(property: propRef, value: val))
         }
 
@@ -456,7 +461,7 @@ public struct ProtocolDecoder: Sendable {
             }
             let propRef = PropertyRef(wire: p.property)
             let propVal = p.hasValue ? try validateAndConvertValue(wire: p.value, depth: 1) : .null
-            try Self.checkDecodedShortcut(propRef, propVal)
+            try Self.checkDecodedStandardProperty(propRef, propVal)
             props[propRef] = propVal
         }
 
@@ -480,7 +485,7 @@ public struct ProtocolDecoder: Sendable {
             }
             let propRef = PropertyRef(wire: p.property)
             let val = p.hasValue ? try validateAndConvertValue(wire: p.value, depth: 1) : .null
-            try Self.checkDecodedShortcut(propRef, val)
+            try Self.checkDecodedStandardProperty(propRef, val)
             args[propRef] = val
         }
 
@@ -574,7 +579,7 @@ public struct ProtocolDecoder: Sendable {
                 }
                 let propRef = PropertyRef(wire: p.property)
                 let val = p.hasValue ? try validateAndConvertValue(wire: p.value, depth: depth + 1) : .null
-                try Self.checkDecodedShortcut(propRef, val)
+                try Self.checkDecodedStandardProperty(propRef, val)
                 props.append(Property(property: propRef, value: val))
             }
             return .record(SmallRecord(typeRef: typeRef, properties: props))
@@ -594,6 +599,22 @@ public struct ProtocolDecoder: Sendable {
         } catch let error as ShortcutError {
             throw ProtocolDecodeError.invalidShortcut(error.description)
         }
+    }
+
+    /// Decode-time check of the standard `split_axis` property (§4 inv. 13), on the same paths
+    /// as `checkDecodedShortcut` and mirroring the Rust `validate_decoded_split_axis`. The store
+    /// repeats it and adds node-type admission at apply.
+    static func checkDecodedSplitAxis(_ property: PropertyRef, _ value: Value) throws {
+        guard property == .splitAxis else { return }
+        if case .failure(let error) = parseSplitAxis(value) {
+            throw ProtocolDecodeError.invalidSplitAxis(error.description)
+        }
+    }
+
+    /// Every decode-time standard-property check: `shortcut` and `split_axis`.
+    static func checkDecodedStandardProperty(_ property: PropertyRef, _ value: Value) throws {
+        try checkDecodedShortcut(property, value)
+        try checkDecodedSplitAxis(property, value)
     }
 
     // MARK: - Encode Operations (§16)

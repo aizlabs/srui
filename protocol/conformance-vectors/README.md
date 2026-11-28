@@ -33,6 +33,8 @@ Fixed binary wire fixtures for cross-language Protobuf conformance checks (§16,
 | `shortcut_grammar_cases.json` | Shared Rust/Swift parser parity table for the `shortcut` grammar: outcome category, offending token and exact message for 50 inputs, including combining marks after `+` and control characters (PX-016-G01 round 1; §4 inv. 13, §26) |
 | `model_tree_shape_cases.json` | Shared Rust/Swift/Python parity table for hierarchical model shapes: 323 sparse caches of `[index, tree_depth, descendant_count]` with `item_count`, `max_model_tree_depth` and the expected first violation (or acceptance), 23 hand-written edge cases plus 300 seeded random forests with injected faults; every verdict agrees with a true-forest oracle (PX-018-G01; §8, §26) |
 | `malformed_shortcut_duplicate_modifier.bin` | Protobuf-valid framed `Transaction` setting `shortcut = "primary+primary+r"`, a duplicate modifier; refused during semantic conversion (PX-016-G01; §4 inv. 13, §26) |
+| `malformed_split_axis_unknown_value.bin` | Protobuf-valid framed `Transaction` setting `split_axis` to `SplitAxis` value 3, which the enum does not define; refused during semantic conversion (PX-070-G02; §4 inv. 13) |
+| `malformed_split_ninth_pane.bin` | Protobuf-valid framed `Transaction` creating a `Surface`, a `Split` and nine `Text` panes; it decodes (a stateless decoder cannot know a parent's type) and applying it refuses operation 10 with `max_split_panes_exceeded`, committing nothing (PX-070-G02; §26) |
 
 See `expected.json` for canonical hex and field declarations.
 

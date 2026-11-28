@@ -242,6 +242,88 @@ fn test_row_and_column_layout_widgets() {
     assert_eq!(col_node.parent_id, Some(NodeId::new(201)));
 }
 
+/// PX-070-G02: the SHOULD-tier Split builds with its axis and panes; pane hints stay on the
+/// panes, the axis on the Split only, and a ninth pane is refused by the store (§7.3, §10, §26).
+#[test]
+fn test_split_widget_axis_and_panes() {
+    let mut store = SemanticStore::new();
+    let surface = Surface::builder(700).create(&mut store).unwrap();
+    let split = Split::builder(701)
+        .parent(surface.id())
+        .axis(SplitAxis::Stacked)
+        .label("Dashboard")
+        .grow(1.0)
+        .create(&mut store)
+        .expect("Failed to create Split");
+    assert_eq!(Split::NODE_TYPE, TypeRef::SPLIT);
+    assert_eq!(Split::NODE_TYPE, TypeRef::standard(25));
+    assert_eq!(split.axis(&store), Some(SplitAxis::Stacked));
+    assert_eq!(split.effective_axis(&store), SplitAxis::Stacked);
+    assert_eq!(split.label(&store), Some("Dashboard"));
+    assert_eq!(
+        store
+            .get_node(split.id())
+            .unwrap()
+            .get_property(PropertyRef::SPLIT_AXIS),
+        Some(&Value::EnumToken(EnumToken::SPLIT_AXIS_STACKED))
+    );
+
+    // Panes are ordinary children with their own layout hints.
+    let panels = Column::builder(702)
+        .parent(split.id())
+        .minimum_size(Size::new(0.0, 120.0))
+        .preferred_size(Size::new(0.0, 200.0))
+        .create(&mut store)
+        .unwrap();
+    let table = Table::builder(703)
+        .parent(split.id())
+        .grow(1.0)
+        .create(&mut store)
+        .unwrap();
+    assert_eq!(split.panes(&store), &[panels.id(), table.id()]);
+
+    // The axis can be changed and cleared; absent means side by side.
+    split.set_axis(&mut store, SplitAxis::SideBySide).unwrap();
+    assert_eq!(split.effective_axis(&store), SplitAxis::SideBySide);
+    split.clear_axis(&mut store).unwrap();
+    assert_eq!(split.axis(&store), None);
+    assert_eq!(split.effective_axis(&store), SplitAxis::SideBySide);
+    assert_eq!(
+        Split::op_set_axis_for(split.id(), SplitAxis::Stacked),
+        Operation::set_property(
+            split.id(),
+            PropertyRef::SPLIT_AXIS,
+            Value::EnumToken(EnumToken::SPLIT_AXIS_STACKED)
+        )
+    );
+
+    // At most MAX_PANES panes.
+    assert_eq!(Split::MAX_PANES, 8);
+    assert_eq!(MAX_SPLIT_PANES, 8);
+    for id in 704..710 {
+        Text::builder(id)
+            .parent(split.id())
+            .create(&mut store)
+            .unwrap();
+    }
+    assert_eq!(split.panes(&store).len(), Split::MAX_PANES);
+    let ninth = Text::builder(710).parent(split.id()).create(&mut store);
+    assert_eq!(
+        ninth.unwrap_err().conformance_code(),
+        "max_split_panes_exceeded"
+    );
+
+    // split_axis is a Split property only: the generic path refuses it elsewhere.
+    let err = store
+        .set_property(
+            panels.id(),
+            PropertyRef::SPLIT_AXIS,
+            Value::EnumToken(EnumToken::SPLIT_AXIS_STACKED),
+        )
+        .unwrap_err();
+    assert_eq!(err.conformance_code(), "split_axis_not_admitted");
+}
+
 #[test]
 fn test_grid_widget() {
     let mut store = SemanticStore::new();

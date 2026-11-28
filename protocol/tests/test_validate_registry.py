@@ -322,6 +322,9 @@ def test_expected_json_matches_fixtures_and_registry() -> None:
         "malformed_shortcut_over_length",
         "malformed_shortcut_unknown_token",
         "malformed_shortcut_duplicate_modifier",
+        # PX-070-G02: an unknown `split_axis` value (decode) and a ninth Split pane (apply).
+        "malformed_split_axis_unknown_value",
+        "malformed_split_ninth_pane",
     }
     assert required_malformed <= malformed.keys()
 

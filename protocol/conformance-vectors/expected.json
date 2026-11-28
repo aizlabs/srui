@@ -403,6 +403,23 @@
       "hex": "253223080710081a1d1a1b08021202101f1a1332117072696d6172792b7072696d6172792b72",
       "byte_length": 38,
       "expected_error": "wire transaction error: invalid shortcut: modifier \"primary\" appears more than once"
+    },
+    "malformed_split_axis_unknown_value": {
+      "file": "malformed_split_axis_unknown_value.bin",
+      "sha256": "54cb6b2d585624dca779ca7bec298abc24c75c1cd6ebe74fa5d6feef65f5e84f",
+      "hex": "183216080710081a101a0e0802120210231a065204080d1003",
+      "byte_length": 25,
+      "expected_error": "wire transaction error: invalid split_axis: split_axis must be SplitAxis side_by_side (13:1) or stacked (13:2), got enum 13 value 3"
+    },
+    "malformed_split_ninth_pane": {
+      "file": "malformed_split_ninth_pane.bin",
+      "sha256": "eff87839004ab54f55321d21e58c71b8244720767fe45ab28ef021645db3bfa8",
+      "hex": "df0132dc0110011a100a0e0a0c08011202100120ffffffff0f1a120a100a0e080212021019180120ffffffff0f1a120a100a0e080312021009180220ffffffff0f1a120a100a0e080412021009180220ffffffff0f1a120a100a0e080512021009180220ffffffff0f1a120a100a0e080612021009180220ffffffff0f1a120a100a0e080712021009180220ffffffff0f1a120a100a0e080812021009180220ffffffff0f1a120a100a0e080912021009180220ffffffff0f1a120a100a0e080a12021009180220ffffffff0f1a120a100a0e080b12021009180220ffffffff0f",
+      "byte_length": 225,
+      "expected_error": "operation at index 10 failed: split NodeId(2) already holds 8 panes, the most a Split admits (\u00a726)",
+      "expected_error_code": "max_split_panes_exceeded",
+      "failed_op_index": 10,
+      "refused_at": "apply"
     }
   }
 }

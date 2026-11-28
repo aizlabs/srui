@@ -17,6 +17,8 @@ Shortcuts (PX-016-G01): `ShortcutRoutingTests` maps every grammar class to `keyE
 
 Hierarchical Tree (PX-018-G01): a model-backed `Tree` maps to `NSOutlineView` with a flat data source over the preorder; `tree_depth` becomes the indentation level of the outline column cell, a cached item with descendants gets a disclosure button, and `columns` maps to `NSTableColumn`s exactly as for `Table`, with the first declared column as the outline column and a visible header. The informative positive model fixtures are suite 1 vectors 70–75 (nested tree; insert, delete and reset inside a subtree).
 
+Split (PX-070-G02): `Split` maps to `NSSplitView` (`SemanticSplitView`): `side_by_side` (and an absent axis) to a vertical-divider split view, `stacked` to a horizontal-divider one (`ControlFactoryTests`, `SplitRenderingTests`). The accessibility tree exposes an `AXSplitGroup` labelled from the `Split`'s `label` whose splitters (`AXSplitter`) carry the divider position as their value and support increment and decrement; AppKit's own splitters, which expose a value but no working increment, are replaced rather than duplicated.
+
 ## Runners
 
 **Swift**
@@ -25,6 +27,7 @@ Hierarchical Tree (PX-018-G01): a model-backed `Tree` maps to `NSOutlineView` wi
 swift test --package-path client-macos --filter ControlFactoryTests
 swift test --package-path client-macos --filter ShortcutRoutingTests
 swift test --package-path client-macos --filter HierarchicalTreeTests
+swift test --package-path client-macos --filter SplitRenderingTests
 ```
 
 **Rust** — `N/A`: Native toolkit mapping is renderer-side and informative (§22.4); the server has no half.

@@ -1,0 +1,119 @@
+{
+  "name": "split_axis_on_split_success",
+  "description": "split_axis is admitted on a Split: SET_PROPERTY to stacked, BATCH_PROPERTY_SET back to side_by_side with a label, then CLEAR_PROPERTY restores the side_by_side default; the panes are unchanged (§7.3, §10, §13).",
+  "spec_sections": [
+    "§7.3",
+    "§10",
+    "§13"
+  ],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Host"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Split",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {}
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 3,
+          "node_type": "Column",
+          "parent_id": 2,
+          "child_index": null,
+          "properties": {}
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 4,
+          "node_type": "Table",
+          "parent_id": 2,
+          "child_index": null,
+          "properties": {
+            "label": "Processes"
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "SET_PROPERTY",
+        "node_id": 2,
+        "property": "split_axis",
+        "value": {
+          "enum": "SplitAxis",
+          "value": "stacked"
+        }
+      },
+      {
+        "type": "BATCH_PROPERTY_SET",
+        "node_id": 2,
+        "properties": {
+          "label": "Dashboard",
+          "split_axis": {
+            "enum": "SplitAxis",
+            "value": "side_by_side"
+          }
+        }
+      },
+      {
+        "type": "SET_PROPERTY",
+        "node_id": 2,
+        "property": "split_axis",
+        "value": {
+          "enum": "SplitAxis",
+          "value": "stacked"
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "success",
+    "committed_revision": 2,
+    "store_state": {
+      "node_count": 4,
+      "roots": [
+        1
+      ],
+      "nodes": {
+        "2": {
+          "node_id": 2,
+          "node_type": "Split",
+          "parent_id": 1,
+          "ordered_children": [
+            3,
+            4
+          ],
+          "properties": {
+            "label": "Dashboard",
+            "split_axis": {
+              "enum": "SplitAxis",
+              "value": "stacked"
+            }
+          }
+        }
+      },
+      "model_count": 0,
+      "models": {}
+    }
+  }
+}

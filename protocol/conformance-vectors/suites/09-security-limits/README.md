@@ -17,6 +17,8 @@ Malformed shortcuts (PX-016-G01): `malformed_shortcut_over_length.bin`, `malform
 
 Hierarchical model limits (PX-018-G01): `max_model_tree_depth` (default 256 levels) and the shape rules for `tree_depth` / `descendant_count` are refused identically by the Rust store and the Swift replica. Negative vectors live with suite 1 and replay through both decode/apply paths: `76_model_tree_depth_over_limit_rejected.json` and `77_model_tree_depth_over_default_limit_rejected.json` (depth over the limit), `78_model_tree_descendant_count_past_item_count_rejected.json` (`descendant_count` past `item_count`), `79_model_tree_depth_jump_rejected.json` (a depth jump over one) `80_model_tree_child_outside_parent_span_rejected.json` (a child outside its parent's span), `85_model_tree_deeper_item_after_leaf_rejected.json` (a child under a leaf), `86_model_tree_unreachable_depth_across_gap_rejected.json` (a depth no forest reaches across an uncached gap) and `88_model_tree_descendants_below_the_deepest_level_rejected.json` (descendants below the deepest level). `model_tree_test` / `ModelTreeStoreTests` assert the limit at and past its bound and the shared table `model_tree_shape_cases.json` (323 rows) row for row, every verdict confirmed by the true-forest oracle in `protocol/tests/test_model_tree_shape_cases.py`; `conformance_security_limits_test` pins the boundary on its own.
 
+Split (PX-070-G02): at most 8 panes per `Split` (`MAX_SPLIT_PANES`) and a closed `SplitAxis` value set. `malformed_split_axis_unknown_value.bin` (`SplitAxis` value 3) is refused on decode by Rust and by both Swift decode paths with the same reason (`invalid split_axis: …`). `malformed_split_ninth_pane.bin` creates a `Surface`, a `Split` and nine panes: it is protobuf-valid and decodes on every path, because a stateless decoder cannot know a parent's type, and applying it refuses operation 10 with `max_split_panes_exceeded`, committing nothing (`split_test`, `SplitStoreTests`). Nested `Split`s count toward `max_tree_depth`.
+
 ## Runners
 
 **Rust**
@@ -28,6 +30,7 @@ cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test c
 cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test shortcut_test
 cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test model_tree_test
 cargo test --manifest-path server-rust/Cargo.toml -p srui-sdk --test tree_model_test
+cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test split_test
 ```
 
 **Swift**
@@ -40,4 +43,5 @@ swift test --package-path client-macos --filter TransactionRateLimiterTests
 swift test --package-path client-macos --filter SecurityLimitsConformanceTests
 swift test --package-path client-macos --filter ShortcutStoreTests
 swift test --package-path client-macos --filter ModelTreeStoreTests
+swift test --package-path client-macos --filter SplitStoreTests
 ```

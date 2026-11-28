@@ -146,6 +146,12 @@ pub enum StoreError {
         existing: NodeId,
         shortcut: String,
     },
+    /// A `split_axis` value is not `SplitAxis` `side_by_side` or `stacked` (§4 inv. 13).
+    InvalidSplitAxis { node_id: NodeId, reason: String },
+    /// A `split_axis` was set on a node type other than `Split` (§4 inv. 13, §7.3).
+    SplitAxisNotAdmitted { node_id: NodeId, node_type: TypeRef },
+    /// A `Split` already holds [`crate::MAX_SPLIT_PANES`] panes, so it cannot gain another (§26).
+    MaxSplitPanesExceeded { split_id: NodeId, limit: usize },
     /// A model item's `tree_depth` reaches the configured `max_model_tree_depth`, which counts
     /// levels, so `tree_depth` must stay below it (§8, §26).
     MaxModelTreeDepthExceeded {
@@ -287,6 +293,19 @@ impl fmt::Display for StoreError {
                 "shortcut {:?} on node {} is already held by node {} in the same Surface",
                 shortcut, node_id, existing
             ),
+            Self::InvalidSplitAxis { node_id, reason } => {
+                write!(f, "invalid split_axis on node {}: {}", node_id, reason)
+            }
+            Self::SplitAxisNotAdmitted { node_id, node_type } => write!(
+                f,
+                "node {} of type {} does not admit split_axis; only a Split does",
+                node_id, node_type
+            ),
+            Self::MaxSplitPanesExceeded { split_id, limit } => write!(
+                f,
+                "split {} already holds {} panes, the most a Split admits (§26)",
+                split_id, limit
+            ),
             Self::MaxModelTreeDepthExceeded {
                 model_id,
                 index,
@@ -345,6 +364,9 @@ impl StoreError {
             Self::InvalidShortcut { .. } => "invalid_shortcut",
             Self::ShortcutNotAdmitted { .. } => "shortcut_not_admitted",
             Self::DuplicateShortcut { .. } => "duplicate_shortcut",
+            Self::InvalidSplitAxis { .. } => "invalid_split_axis",
+            Self::SplitAxisNotAdmitted { .. } => "split_axis_not_admitted",
+            Self::MaxSplitPanesExceeded { .. } => "max_split_panes_exceeded",
             Self::MaxModelTreeDepthExceeded { .. } => "max_model_tree_depth_exceeded",
             Self::InvalidModelTree { violation, .. } => violation.conformance_code(),
             Self::OperationError(_) => "operation_error",

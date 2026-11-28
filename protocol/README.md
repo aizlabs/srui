@@ -67,7 +67,7 @@ invariant.
 
 ## Standard Registry & Operation Wire Tags
 
-- **Standard Enums**: `StandardEnum` type IDs $1 \ldots 12$ match `registry.yaml` enums $1 \ldots 12$. On the wire, `EnumValue` carries `(enum_id, value_id)`.
+- **Standard Enums**: `StandardEnum` type IDs $1 \ldots 13$ match `registry.yaml` enums $1 \ldots 13$. On the wire, `EnumValue` carries `(enum_id, value_id)`. Enum 13 `SplitAxis` (`side_by_side`, `stacked`) is the value of property 35 `split_axis`, admitted only on a `Split`; a value outside it is refused on every decode path (`malformed_split_axis_unknown_value.bin`, PX-070-G02).
 - **Operations & Commit**: `Operation` oneof field tags $1 \ldots 13$ map 1:1 with numeric operation IDs in `StandardOperation` and `registry.yaml`, including `CommitOp commit = 5`.
 - **Transactions**: The `Transaction` envelope (`base_revision` → `new_revision`) defines atomic commit boundaries.
 

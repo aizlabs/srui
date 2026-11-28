@@ -94,8 +94,8 @@ pub const BASELINE_TREE_ITEMS: [&str; 6] = [
     "    sessiond/",
 ];
 
-/// Every node type this gallery instantiates, matching the AppKit `ControlFactory` support set:
-/// Every node type this gallery instantiates, matching the AppKit ControlFactory support set.
+/// Every node type this gallery instantiates: the AppKit `ControlFactory` support set, except the
+/// SHOULD-tier `Split` (PX-070-G02), which the renderer builds but this gallery does not show.
 pub fn supported_node_types() -> Vec<TypeRef> {
     vec![
         Surface::NODE_TYPE,
@@ -128,7 +128,6 @@ pub fn unsupported_node_type_names() -> Vec<&'static str> {
         "Slider",
         "NumberInput",
         "Tabs",
-        "Split",
         "Toolbar",
         "Menu",
     ]

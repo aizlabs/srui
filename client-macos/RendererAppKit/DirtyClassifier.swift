@@ -22,11 +22,18 @@ public enum DirtyClassifier {
         switch operation {
         case .setProperty(let nodeID, let property, _),
              .clearProperty(let nodeID, let property):
+            // A Split's `split_axis` re-lays out its panes on the other axis (PX-070-G02, §22.4).
+            // The store admits it only on a Split, so this names that Split's operation alone.
+            if property == .splitAxis {
+                return [.structureAffecting(operation: operation)]
+            }
             return [classify(nodeID: nodeID, property: property)]
 
         case .batchPropertySet(let nodeID, let properties):
             return properties.map {
-                classify(nodeID: nodeID, property: $0.property)
+                $0.property == .splitAxis
+                    ? .structureAffecting(operation: operation)
+                    : classify(nodeID: nodeID, property: $0.property)
             }
 
         case .modelInsert(let id, _, _),

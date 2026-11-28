@@ -5,7 +5,7 @@ Edition 1.2 · 12 September 2026. Use the authoritative SRUI v0.6 design and the
 ## PX-073-G01 — Compose the native host dashboard and process-history drill-down
 
 **Phase:** G · **Scope size:** M · **Status:** planned · **Gate:** none
-**Dependencies:** PX-070-G01, PX-070-G02, PX-073, PX-054, PX-055, PX-056, PX-090
+**Dependencies:** PX-070-G01, PX-070-G02, PX-073, PX-054, PX-055, PX-056, PX-090, PX-095
 **Read:** D1 §§6–8, 12, 18, 22, 25–26, 31–32; PX-070–PX-073, PX-090; sources BT1
 
 ### Standing execution contract

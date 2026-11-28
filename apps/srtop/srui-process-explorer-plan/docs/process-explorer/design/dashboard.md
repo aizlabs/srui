@@ -47,7 +47,7 @@ The two regions are panes of one standard `Split` (stacked axis), so the user ca
 **Panel presentations** (a saved semantic choice per panel, never geometry):
 
 - **Compact**: one line per figure in words plus a native bar where the figure is a share. For CPU and Memory/swap this is exactly the PX-070 meter (`apps/srtop/src/meters.rs`, `apps/srtop/src/summary.rs`), reused, not duplicated: the same nodes, the same `Sample`, the same never-zero rules. Disk and Network compact forms are one line each for the aggregate read/write and receive/transmit rates.
-- **Expanded**: compact content plus the aggregate series graph (PX-073) and, for Disk and Network, a model-backed device/interface `Table` (§8) with at most `MAX_DASHBOARD_DEVICE_ROWS` rows; at most `MAX_EXPANDED_DEVICES` devices or interfaces may additionally show their own series.
+- **Expanded**: compact content plus one series graph node (PX-073) and its fallback, and, for Disk and Network, a model-backed device/interface `Table` (§8) with at most `MAX_DASHBOARD_DEVICE_ROWS` rows; at most `MAX_EXPANDED_DEVICES` devices or interfaces may additionally show their own series. A panel's aggregate series and every device series it shows are carried by that one graph node (a PX-071 requirement, section 5), so showing a device's series adds series data, never nodes.
 - **Hidden**: the panel is moved into a collapsed container (the PX-070 `METER_HIDDEN` pattern), so no node is created or deleted after the shell and node IDs are never reused (§6.2).
 
 **Default layout.** All four panels shown, CPU and Memory/swap expanded, Disk and Network compact, no per-device expansion. Load, uptime and the process count stay PX-070 meters. A client without the metrics profile shows the Standard Widget fallback (section 5) in every presentation.
@@ -58,7 +58,7 @@ The two regions are panes of one standard `Split` (stacked axis), so the user ca
 
 **Keyboard focus.** The AppKit key-view loop reaches, in order: filter, search, process table, inspector controls, action controls, then each panel's controls in panel order and each expanded device `Table`. Focus shortcuts use only PX-016-G01's admitted types and grammar (`primary+` required for printable keys): at least one for the process table and one per expanded device table; their exact keys are PX-073-G01's choice and must be listed in its completion note. Graph keyboard reachability is PX-073's ("VoiceOver or the accessibility API can obtain units, current values, series names, and unavailable state"); if a graph is not focusable, its numeric fallback is.
 
-**Host and account labels.** The trusted host/account/session-incarnation label is PX-095's client-owned window chrome (`client-macos/RendererAppKit/SessionWindowIdentity.swift`, set by `ConnectionManager` through `setSessionWindowIdentity`); no server text may imitate it. Server text names only the collection source (the PX-007 freshness line already does) and each panel's scope ("host", a device or interface name).
+**Host and account labels.** PX-073-G01 depends on PX-095 for them. The trusted host/account/session-incarnation label is PX-095's client-owned window chrome (`client-macos/RendererAppKit/SessionWindowIdentity.swift`, set by `ConnectionManager` through `setSessionWindowIdentity`); no server text may imitate it. Server text names only the collection source (the PX-007 freshness line already does) and each panel's scope ("host", a device or interface name).
 
 **Disconnected presentation.** Transport state is PX-022-G01's client-owned subtitle (`connecting|disconnected|resynchronizing — showing data from revision N (stale)`, `session replaced — rebuilding`); a server cannot publish while disconnected, so panels never claim to be live or disconnected themselves. While stale the window keeps the last applied revision: values, sample times and graphs stay as applied, nothing is extrapolated, and user selection changes are refused locally (PX-022-G02). After `RESUME_OK` the replayed commits bring the panels forward; after a snapshot resynchronization the panels and series are rebuilt from the snapshot. A `REPLACED` session is a new recording: PX-095 labels the new incarnation and history restarts (PX-090).
 
@@ -70,8 +70,9 @@ The two regions are panes of one standard `Split` (stacked axis), so the user ca
 - **Sample interval.** Host panels sample on srtop's one refresh loop (`apps/srtop/src/sampling.rs`; `DEFAULT_REFRESH_INTERVAL` 1 s, `MIN_REFRESH_INTERVAL` 50 ms, `MAX_REFRESH_INTERVAL` 300 s in `apps/srtop/src/refresh.rs`). PX-042's collection-cost policy may give a panel a longer interval, never a shorter one. Each panel's freshness line states its interval.
 - **Independent timestamps.** Every panel carries its own last-successful-sample time. CPU and Memory/swap come from the same scan as the process table (`Sample::of`, `summary.rs`) and therefore share that scan's time; Disk and Network have their own reads and their own times. No panel, row or graph implies an atomic host snapshot across panels (PX-071).
 - **States, never zero.** A figure the collector could not state is never shown as `0` in text, bar or graph: `warming up` (a rate needs a second sample, or a counter reset or device reappearance started a new baseline), `unavailable` with the reason, `denied` naming the file and errno class, `not provided` by this source, `none configured` (no swap, no disks, no non-loopback interface), `collector error` (the last good sample is kept and the line is in the warning role), `stale` (server-side: no successful sample for 3 intervals, detected by the refresh loop's own timer, the PX-031 deadline pattern), `paused`. The PX-007/PX-070 tests already enforce this for CPU, memory and swap (`unavailable_and_stale_figures_never_become_zero_in_any_presentation`, `apps/srtop/tests/meters_test.rs`); PX-073-G01 extends them to every panel and presentation.
+- **One graph node per panel (PX-071 requirement).** The PX-071 profile must let one graph node carry several series, at least `MAX_SERIES_PER_GRAPH` = 18 (the Disk and Network maximum: 2 aggregate + 2 × 8 devices), each with its own stable series identity (host, device or interface, direction), unit and gaps, and must define that node's Standard Widget fallback as the single bounded `Table` above. PX-071 now depends on PX-070-G01 so it reads this requirement. Node counts in section 6 therefore do not grow with device expansion.
 - **Gaps.** A missing sample is a gap in the series and in its numeric fallback, labelled with its start and duration; graphs never interpolate across it (PX-072, PX-073).
-- **Accessible alternative.** Each panel has a heading `Text` naming it; its current values are complete sentences in `Text` (unit, denominator, scope, sample time and interval), readable alone; and its series has a nonvisual numeric alternative (the PX-071 Standard Widget fallback: recent samples with times in a bounded `Table` or `Text`). Every evaluation task (section 11) must be completable with graphs absent. Whether a labelled `Row`/`Column` is exposed as a native accessibility group was not verified in this checkout (`ControlFactory.apply(property:value:to:store:)` sets the label on the `NSStackView`, which AppKit may not expose as an element); the per-panel sentences do not depend on grouping, and PX-073-G01 must verify grouping on a real window and append a renderer prerequisite if it is missing.
+- **Accessible alternative.** Each panel has a heading `Text` naming it; its current values are complete sentences in `Text` (unit, denominator, scope, sample time and interval), readable alone; and its series history has a nonvisual numeric alternative: the PX-071 Standard Widget fallback, one model-backed `Table` per graph node whose rows are the most recent `MAX_FALLBACK_SAMPLES` (60) samples of every series the graph shows, aggregate and per-device alike, each row naming the series (device or interface and direction), the sample time, and the value with its unit or the gap and its duration, at most `MAX_FALLBACK_ROW_BYTES` (64) bytes on the wire per row. The device table gives current rates; the fallback table gives the history, so a per-device series is never graph-only. Every evaluation task (section 11) must be completable with graphs absent. Whether a labelled `Row`/`Column` is exposed as a native accessibility group was not verified in this checkout (`ControlFactory.apply(property:value:to:store:)` sets the label on the `NSStackView`, which AppKit may not expose as an element); the per-panel sentences do not depend on grouping, and PX-073-G01 must verify grouping on a real window and append a renderer prerequisite if it is missing.
 - **Scope honesty.** Host disk and network activity never names a process as responsible; per-process I/O is PX-047's and per-process network attribution is out of scope (PX-073-G01 out of scope).
 
 ## 6. Panel specifications
@@ -86,8 +87,8 @@ Budget constants are maxima PX-073-G01 must define as named constants and assert
 | Collector owner | Existing: `apps/srtop/src/procfs.rs` (`/proc/stat`, `SystemCpuInterval` in `apps/srtop/src/source.rs`), PX-006/PX-007; per-CPU classes later PX-052 |
 | Renderer owner | Compact: existing `Text` + `Progress` (PX-070 meter). Expanded graph: PX-073 over the PX-071 profile, series published by PX-072. Layout: existing `Row`/`Column`, `Split` from PX-070-G02 |
 | Units / freshness | `%` of N logical CPUs, one decimal; shares the scan's sample time; `warming up` until two scans; `stale` after 3 intervals without a scan |
-| Budget | ≤ 12 nodes (including the PX-070 meter's nodes and the graph node with its fallback); 1 series; ≤ `MAX_SERIES_SAMPLES` (900) samples; each line ≤ 512 bytes (`MAX_SUMMARY_TEXT_BYTES`) |
-| Accessible fallback | `CPU: 37.4% busy of 8 logical CPUs, sampled 14:02:07, every 1 s` plus the numeric series table |
+| Budget | ≤ 12 nodes (including the PX-070 meter's nodes, the graph node and its fallback `Table`); 1 series; ≤ `MAX_SERIES_SAMPLES` (900) samples; fallback ≤ 60 rows; each line ≤ 512 bytes (`MAX_SUMMARY_TEXT_BYTES`) |
+| Accessible fallback | `CPU: 37.4% busy of 8 logical CPUs, sampled 14:02:07, every 1 s` plus the fallback sample table |
 
 ### 6.2 Memory and swap
 
@@ -97,8 +98,8 @@ Budget constants are maxima PX-073-G01 must define as named constants and assert
 | Collector owner | Existing: `procfs.rs` `meminfo` (`MemoryFigures`, `SwapFigures`), PX-007; breakdown PX-054 |
 | Renderer owner | Compact: existing PX-070 meters (memory and swap bars). Expanded: PX-073 graph of the two series; breakdown as standard `Text`/`Progress` or a small `Table` (PX-054) |
 | Units / freshness | IEC bytes and `%` of total; shares the scan's time; `none configured` for no swap (never 0% of 0); `available` is labelled as available, not free (PX-054 verify) |
-| Budget | ≤ 16 nodes; 2 series; ≤ 900 samples each; lines ≤ 512 bytes |
-| Accessible fallback | `Memory: 5.2 GiB used of 15.5 GiB (33.5% of total)` and `Swap: none configured`, plus the numeric series tables |
+| Budget | ≤ 16 nodes (one graph node and one fallback `Table` for both series); 2 series; ≤ 900 samples each; fallback ≤ 120 rows; lines ≤ 512 bytes |
+| Accessible fallback | `Memory: 5.2 GiB used of 15.5 GiB (33.5% of total)` and `Swap: none configured`, plus the fallback sample table |
 
 ### 6.3 Disk
 
@@ -106,10 +107,10 @@ Budget constants are maxima PX-073-G01 must define as named constants and assert
 | --- | --- |
 | Fields | Aggregate read and write bytes/s; per device read/write bytes/s and operations/s, plus busy share where the source provides it. Aggregation excludes partitions and stacked devices so nothing is double counted; the rule is PX-055's and is stated in the panel's scope line |
 | Collector owner | **PX-055** (none exists in this checkout: no `diskstats` reader in `apps/srtop/src/`) |
-| Renderer owner | Compact: existing `Text`. Expanded: model-backed `Table` (existing, §8, virtualized) for devices and PX-073 graphs for the aggregate and ≤ `MAX_EXPANDED_DEVICES` devices |
+| Renderer owner | Compact: existing `Text`. Expanded: model-backed `Table` (existing, §8, virtualized) for devices, and one PX-073 graph node carrying the aggregate and ≤ `MAX_EXPANDED_DEVICES` devices' series |
 | Units / freshness | IEC bytes/s and `ops/s`; own sample time; `warming up` on the first sample, on a counter decrease and on device (re)appearance; a device that disappears releases its series and baseline |
-| Budget | ≤ 16 nodes; device table ≤ `MAX_DASHBOARD_DEVICE_ROWS` (64) rows, each ≤ 512 bytes, with a `N more devices not shown` line beyond; series: 2 aggregate + 2 × `MAX_EXPANDED_DEVICES` (8); ≤ 900 samples each |
-| Accessible fallback | `Disk (host, physical devices): read 12.0 MiB/s, write 3.4 MiB/s, sampled 14:02:07, every 1 s`; the device table is itself the per-device alternative |
+| Budget | ≤ 16 nodes whatever the expansion (one graph node, one fallback `Table`, one device `Table`); device table ≤ `MAX_DASHBOARD_DEVICE_ROWS` (64) rows, each ≤ 512 bytes, with a `N more devices not shown` line beyond; series: 2 aggregate + 2 × `MAX_EXPANDED_DEVICES` (8) = 18 in the one graph node; ≤ 900 samples each; fallback ≤ 18 × 60 = 1,080 rows |
+| Accessible fallback | `Disk (host, physical devices): read 12.0 MiB/s, write 3.4 MiB/s, sampled 14:02:07, every 1 s`; the device table for current per-device rates; the fallback sample table for the history of the aggregate and of every expanded device |
 
 ### 6.4 Network
 
@@ -117,10 +118,10 @@ Budget constants are maxima PX-073-G01 must define as named constants and assert
 | --- | --- |
 | Fields | Aggregate receive and transmit bytes/s and packets/s; per interface the same. The aggregate excludes loopback and states how virtual interfaces are treated (PX-056's rule); counters are passive reads only |
 | Collector owner | **PX-056** (none exists in this checkout: no `/proc/net/dev` reader in `apps/srtop/src/`) |
-| Renderer owner | As Disk: existing `Text` and model-backed `Table`, PX-073 graphs |
+| Renderer owner | As Disk: existing `Text` and model-backed `Table`, one PX-073 graph node for the aggregate and expanded interfaces |
 | Units / freshness | IEC bytes/s and `packets/s`, never bits; own sample time; `warming up` on first sample, counter decrease, rename or recreation; `none configured` when only loopback exists |
-| Budget | ≤ 16 nodes; interface table ≤ 64 rows of ≤ 512 bytes; series 2 aggregate + 2 × 8; ≤ 900 samples each |
-| Accessible fallback | `Network (host, non-loopback interfaces): receive 1.2 MiB/s, transmit 85.0 KiB/s, sampled 14:02:07, every 1 s`; the interface table |
+| Budget | ≤ 16 nodes whatever the expansion; interface table ≤ 64 rows of ≤ 512 bytes; series 2 aggregate + 2 × 8 = 18 in the one graph node; ≤ 900 samples each; fallback ≤ 1,080 rows |
+| Accessible fallback | `Network (host, non-loopback interfaces): receive 1.2 MiB/s, transmit 85.0 KiB/s, sampled 14:02:07, every 1 s`; the interface table for current rates; the fallback sample table for the history of the aggregate and every expanded interface |
 
 ### 6.5 Process table, inspector and sampled history
 
@@ -129,8 +130,8 @@ Budget constants are maxima PX-073-G01 must define as named constants and assert
 | Table | Existing and unchanged: model-backed `Table`, CPU sort, filter, search, follow, tree (PX-009–PX-018). Selection, filter and viewport survive every panel update and every layout change (asserted by PX-073-G01) |
 | Inspector | Existing `apps/srtop/src/inspector.rs` (PX-013): selection resolves only against published rows to a `ProcessKey`, never a PID |
 | History | **PX-090**'s opt-in bounded store for selected/watched processes, rendered with the same PX-073 renderer; only samples actually collected for that `ProcessKey`, with a labelled recording start; an exited process's history stays viewable and non-actionable; a new daemon starts a new recording. Historical browsing with a Live/History switch is PX-091 (later, not a core dependency) |
-| Budget | PX-090's caps: count, byte and age limits with a 15-minute maximum; at most `MAX_HISTORY_PROCESSES` (4) processes × their series, ≤ 900 samples each |
-| Fallback | The inspector's existing text lines plus the history's numeric table |
+| Budget | PX-090's caps: count, byte and age limits with a 15-minute maximum; at most `MAX_HISTORY_PROCESSES` (4) processes × `MAX_HISTORY_SERIES_PER_PROCESS` (4: CPU share and resident memory now, room for PX-047's read/write rates) series, ≤ 900 samples each; charged to `HISTORY_RESERVE_BYTES` (section 7) |
+| Fallback | The inspector's existing text lines plus the history's fallback sample table (≤ 60 rows per series, ≤ 64 bytes each) |
 
 ## 7. Dashboard budget summary
 
@@ -139,11 +140,28 @@ Budget constants are maxima PX-073-G01 must define as named constants and assert
 | Dashboard nodes beyond today's shell | ≤ 96 (panels 12 + 16 + 16 + 16, ≤ 18 panel controls, ≤ 8 layout and `Split` nodes, rounded up) | constant after the shell, like PX-070's constant 111-node shell |
 | Host series | ≤ 39 (1 + 2 + 2 + 16 + 2 + 16) | section 6 |
 | Samples per series | `MAX_SERIES_SAMPLES` = 900 and an age cap of 15 minutes, whichever is reached first (15 minutes at 1 s; 45 s at the 50 ms minimum interval) | PX-090's 15-minute maximum |
-| Series bytes in a catch-up snapshot | ≤ 39 × 900 × 24 bytes ≈ 823 KiB, assuming PX-071 encodes a sample as at most a timestamp, a sequence number and a float64 | PX-071 fixes the real encoding; PX-073-G01 recomputes this bound from it |
-| Snapshot allowance | `DASHBOARD_RESERVE_BYTES` ≤ 1 MiB charged against the row ceiling of the one 16 MiB catch-up frame, exactly as `METERS_RESERVE_BYTES` and the other reserves in `apps/srtop/src/refresh.rs` are | PX-004-G01, PX-070 |
 | Device/interface rows | ≤ 64 per panel, ≤ 512 bytes each | section 6 |
+| Fallback sample rows | ≤ `MAX_FALLBACK_SAMPLES` (60) per series, ≤ `MAX_FALLBACK_ROW_BYTES` (64) bytes each on the wire | section 5 |
+| History series | ≤ 16 (4 processes × 4 series), ≤ 900 samples each | section 6.5 |
+| Snapshot allowance | Two reserves charged against the row ceiling of the one 16 MiB catch-up frame, exactly as `METERS_RESERVE_BYTES` and the other reserves in `apps/srtop/src/refresh.rs` are: `DASHBOARD_RESERVE_BYTES` = 1,179,648 (1,152 KiB) and `HISTORY_RESERVE_BYTES` = 458,752 (448 KiB), 1,638,400 bytes (1,600 KiB) together; the arithmetic follows the table. Because a semantic tree carries an extension node's fallback subtree with it (§11.1), both the profile series and their fallback rows are charged, whichever the client renders | PX-004-G01, PX-070 |
 | Steady-state panel payload | ≤ 4 KiB/s at the 1 s default with every panel expanded and 8 devices and 8 interfaces showing series, measured as SRUI payload apart from SSH overhead (the PX-027 method) | pass/fail threshold for PX-073-G02 |
-| Server memory for host series | ≤ 4 MiB | PX-072's bounded store |
+| Server memory for host and history series | ≤ 4 MiB | PX-072's and PX-090's bounded stores |
+
+**Snapshot arithmetic.** A sample is assumed to cost at most 24 bytes in the PX-071 encoding (a timestamp, a sequence number and a float64); PX-071 fixes the real encoding and PX-073-G01 recomputes every line below from it, keeping each reserve at or above its sum.
+
+| Charged to | Item | Bytes |
+| --- | --- | --- |
+| `DASHBOARD_RESERVE_BYTES` | host series: 39 × 900 × 24 | 842,400 |
+| | host fallback rows: 39 × 60 × 64 | 149,760 |
+| | device and interface rows: 2 × 64 × 512 | 65,536 |
+| | dashboard nodes: 96 × 640 (≤ 512 bytes of text plus node and property framing) | 61,440 |
+| | **sum** (reserve 1,179,648; margin 60,512) | **1,119,136** |
+| `HISTORY_RESERVE_BYTES` | history series: 4 × 4 × 900 × 24 | 345,600 |
+| | history fallback rows: 4 × 4 × 60 × 64 | 61,440 |
+| | **sum** (reserve 458,752; margin 51,712) | **407,040** |
+| Both | **total reserve** | **1,638,400** |
+
+**Effect on the row ceiling.** The reserves come out of the rows a catch-up snapshot can hold. PX-070's widest-row fixture (`a_high_core_count_host_stays_bounded_in_every_layout`, `apps/srtop/tests/meters_test.rs`) publishes 25,564 rows at `de1edd69`; with `METERS_RESERVE_BYTES` raised by 1,638,400 bytes in a scratch copy of the same commit, it publishes **23,055** rows (2,509 fewer, the snapshot 13,075,303–13,075,315 bytes instead of 14,500,426–14,500,438), the same for every CPU count. PX-073-G01 must re-baseline every row-ceiling assertion (that test, `the_rows_at_the_ceiling_are_the_frame_less_the_fixed_allowances_whatever_the_summary` in `apps/srtop/src/refresh.rs`, and the PX-010-G01 scale tests) to its real reserves, and the R-Dashboard envelope states the lower ceiling.
 
 ## 8. Authority and safety
 
@@ -153,7 +171,7 @@ Budget constants are maxima PX-073-G01 must define as named constants and assert
 
 ## 9. Relationship to the existing plan tickets
 
-PX-070 (meters, merged) provides compact CPU/memory/swap and the moves-only layout pattern; PX-071 specifies the metrics profile; PX-072 publishes series; PX-073 renders them; PX-054/PX-055/PX-056 provide the detailed memory, disk and network collectors; PX-090 provides process history; PX-070-G02 (new, section 10) provides `Split`; PX-073-G01 composes all of them to this specification; PX-073-G02 runs section 11 against the pinned btop and gates R-Dashboard. PX-095 (merged) supplies host-isolated windows and chrome; PX-022-G01/PX-022-G02 supply stale-window status and selection freeze; PX-015 supplies pause.
+PX-070 (meters, merged) provides compact CPU/memory/swap and the moves-only layout pattern; PX-071 specifies the metrics profile (and now depends on PX-070-G01 for the one-graph-node-per-panel requirement of section 5); PX-072 publishes series; PX-073 renders them; PX-054/PX-055/PX-056 provide the detailed memory, disk and network collectors; PX-090 provides process history; PX-070-G02 (new, section 10) provides `Split`; PX-073-G01 composes all of them to this specification; PX-073-G02 runs section 11 against the pinned btop and gates R-Dashboard. PX-095 (merged) supplies host-isolated windows and chrome and is now an explicit dependency of PX-073-G01 (A8); PX-022-G01/PX-022-G02 supply stale-window status and selection freeze; PX-015 supplies pause.
 
 ## 10. Generic widget and profile support in this checkout
 
@@ -177,7 +195,7 @@ Reviewed at `de1edd69`.
 | Selected-process sampled history | no | — | already planned: PX-090 |
 | VectorScene (`org.srui.vector-scene`) | constant only | `capability.rs` `PROFILE_VECTOR_SCENE`; no renderer | not used: PX-071 explains why graphs are a domain profile, not T36 VectorScene |
 
-**PX-070-G02 — Render the standard Split container with locally resized panes** (phase G, size M, gate none, depends on PX-070-G01; ticket `tickets/PX-070-G02-split.md`). Generic: an SDK builder, one registry-owned pane-axis property (`split_axis`, enum `SplitAxis`: `side_by_side` default, `stacked`), the AppKit `NSSplitView` mapping (§22.4), local divider positions with no event and no geometry on the wire, at most 8 panes, codegen and conformance vectors (suites 1, 2, 3, 4, 9, 10, 12), native AppKit and accessibility tests. Its full build, out-of-scope and acceptance text are in the ticket. It changes the registry and therefore regenerates the committed Swift tables and updates the `semantic-tree` build.rs count asserts in its own commit, like PX-016-G01, PX-017-G01 and PX-018-G01 did.
+**PX-070-G02 — Render the standard Split container with locally resized panes** (phase G, size M, gate none, depends on PX-070-G01; ticket `tickets/PX-070-G02-split.md`). Generic: an SDK builder, one registry-owned pane-axis property (`split_axis`, enum `SplitAxis`: `side_by_side` default, `stacked`), the AppKit `NSSplitView` mapping (§22.4), local divider positions with no event and no geometry on the wire, at most 8 panes, codegen and conformance vectors (suites 1, 2, 3, 4, 9, 10, 12), native AppKit and accessibility tests. Its full build, out-of-scope and acceptance text are in the ticket. It changes the registry and therefore regenerates the committed Swift tables and updates the `semantic-tree` build.rs count asserts in its own commit, like PX-016-G01, PX-017-G01 and PX-018-G01 did. The user decided on 2026-11-27 that it is a required prerequisite of PX-073-G01 (A2) and that it plans `split_axis`/`SplitAxis` (A3); the registry change itself still needs recorded user approval when PX-070-G02 is implemented.
 
 ## 11. Evaluation protocol (defined before implementation)
 
@@ -218,11 +236,14 @@ Task completion time and success; user actions per task; collection overhead (CP
 - Differences in field definitions (for example btop's memory "used" versus `MemTotal − MemAvailable`) are named; non-matching fields are not compared.
 - Passing does not certify htop or btop parity (PX-073-G02 verify).
 
-## 12. Assumptions and decisions recorded for sign-off
+## 12. Assumptions and decisions
+
+A2 and A3 were decided by the user on 2026-11-27, answering the orchestrator's question; the answers are quoted. The rest are defaults within this ticket's scope.
 
 - **A1 — btop v1.4.8 is the reference.** Latest release on 27 November 2026. Rebaselining is an explicit plan change (section 2).
-- **A2 — `Split` is a prerequisite of the core dashboard.** Local resizing could instead be limited to window resize, graph reflow and compact/expanded presentations, which need no new widget; this specification chooses a user-draggable panel/table divider because btop's fixed boxes are the main layout limitation a native client can lift, and `Split` is already a D1 standard widget. Alternative: drop PX-070-G02 from PX-073-G01's dependencies and keep it optional.
-- **A3 — `Split` gets one new registry property for its axis.** D1 defines `Split` but no orientation, and no existing property expresses it. Alternatives inside PX-070-G02: a fixed axis per node (no registry change, but a stacked dashboard and a side-by-side split could not both be expressed), or two node types (contradicts D1's single `Split`).
+- **A2 — `Split` is a required prerequisite of the core dashboard. Decided: "Draggable divider (Recommended)".** PX-070-G02 stays in PX-073-G01's `depends_on`, so the user can drag the panel/table divider. The rejected alternative limited local resizing to window resize, graph reflow and compact/expanded presentations and kept `Split` optional.
+- **A3 — `Split` gets one new registry property for its axis. Decided: "Plan split_axis (Recommended)".** PX-070-G02 plans the registry property `split_axis` with enum `SplitAxis` (`side_by_side`, `stacked`). D1 defines `Split` but no orientation, and no existing property expresses it. The rejected alternatives were a fixed axis per node (no registry change, but a stacked dashboard and a side-by-side split could not both be expressed) and two node types (contradicts D1's single `Split`). This decision approves the plan only: the protocol/registry change itself still needs recorded user approval when PX-070-G02 is implemented, before it is merged.
+- **A8 — PX-073-G01 depends on PX-095.** The host/account/incarnation labels the dashboard relies on are PX-095's client chrome, so PX-095 is an explicit dependency of PX-073-G01 (it was already one of PX-073-G02's).
 - **A4 — Compact CPU and Memory/swap reuse the PX-070 meters** rather than adding parallel panel nodes, so the same figure never appears twice with different freshness.
 - **A5 — Bytes per second, never bits**, across the dashboard; the evaluation normalizes btop's units.
 - **A6 — Budgets and thresholds in sections 7 and 11 are design maxima** chosen from existing srtop bounds and PX-027/PX-010-G01 measurements, not measured for the dashboard; PX-073-G01/PX-073-G02 measure them.

@@ -288,10 +288,10 @@ This priority order keeps R1 and safe termination first, then the later dashboar
 | [PX-070](tickets/PX-070-meterlayout.md) | Configure meter layout and non-graph display modes | PX-069 | none |
 | [PX-070-G01](tickets/PX-070-G01-dashboard-design.md) | Specify the btop-inspired native dashboard and evaluation scope | PX-031, PX-070 | Dashboard-design |
 | [PX-070-G02](tickets/PX-070-G02-split.md) | Render the standard Split container with locally resized panes | PX-070-G01 | none |
-| [PX-071](tickets/PX-071-metricprofile.md) | Specify a small retained metrics-visualization profile | PX-070 | none |
+| [PX-071](tickets/PX-071-metricprofile.md) | Specify a small retained metrics-visualization profile | PX-070, PX-070-G01 | none |
 | [PX-072](tickets/PX-072-metricserver.md) | Publish retained metric-series data from the server | PX-071 | none |
 | [PX-073](tickets/PX-073-metricclient.md) | Render native retained gauges and history graphs | PX-072 | none |
-| [PX-073-G01](tickets/PX-073-G01-dashboard-compose.md) | Compose the native host dashboard and process-history drill-down | PX-070-G01, PX-070-G02, PX-073, PX-054, PX-055, PX-056, PX-090 | none |
+| [PX-073-G01](tickets/PX-073-G01-dashboard-compose.md) | Compose the native host dashboard and process-history drill-down | PX-070-G01, PX-070-G02, PX-073, PX-054, PX-055, PX-056, PX-090, PX-095 | none |
 | [PX-073-G02](tickets/PX-073-G02-dashboard-gate.md) | Release gate for the measured native dashboard | PX-073-G01, PX-095, PX-010-G01, PX-026-G01 | R-Dashboard |
 | [PX-074](tickets/PX-074-displayprefs.md) | Add display preferences and remaining navigation modes | PX-073 | none |
 | [PX-075](tickets/PX-075-startup.md) | Add validated startup options and configuration import | PX-074 | none |

@@ -126,18 +126,18 @@
       "name": "offset-not-increasing",
       "ops": [
         {"op": "model_delete", "model": 101, "index": 0, "count": 1},
-        {"op": "model_insert", "model": 101, "index": 899, "items": [{"id": 900000, "value": {"float": 1.0}}]}
+        {"op": "model_insert", "model": 101, "index": 899, "items": [{"id": 899500, "value": {"float": 1.0}}]}
       ],
       "expect": {
         "capable": "refuse:T1",
-        "base": "generic:duplicate item id"
+        "base": "accept"
       }
     },
     {
       "name": "offset-at-2^40",
       "ops": [
-        {"op": "model_delete", "model": 101, "index": 0, "count": 1},
-        {"op": "model_insert", "model": 101, "index": 899, "items": [{"id": 1099511627776, "value": {"float": 1.0}}]}
+        {"op": "model_delete", "model": 101, "index": 0, "count": 900},
+        {"op": "model_insert", "model": 101, "index": 0, "items": [{"id": 1099511627776, "value": {"float": 1.0}}]}
       ],
       "expect": {
         "capable": "refuse:T1",
@@ -212,7 +212,7 @@
     {
       "name": "window-below-1-second",
       "ops": [
-        {"op": "set_property", "node": 10, "prop": "m:window_ms", "value": {"uint": 999}}
+        {"op": "set_property", "node": 20, "prop": "m:window_ms", "value": {"uint": 999}}
       ],
       "expect": {
         "capable": "refuse:G1",
@@ -286,7 +286,7 @@
     {
       "name": "sample-models-are-immutable",
       "ops": [
-        {"op": "clear_property", "node": 10, "prop": "m:sample_models"}
+        {"op": "set_property", "node": 10, "prop": "m:sample_models", "value": {"uint_range": [101, 118]}}
       ],
       "expect": {
         "capable": "refuse:S3",
@@ -294,26 +294,156 @@
       }
     },
     {
+      "name": "sixteenth-graph-in-a-session",
+      "ops": [
+        {"op": "create_model", "model": 3000, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3001, 3018], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3019, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2000, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 0"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3000}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3001, 3018]}}},
+        {"op": "create_node", "id": 2001, "parent": 2000, "type": "std:Table", "props": {"std:label": {"string": "Graph 0 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3019}}},
+        {"op": "create_model", "model": 3020, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3021, 3038], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3039, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2002, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 1"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3020}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3021, 3038]}}},
+        {"op": "create_node", "id": 2003, "parent": 2002, "type": "std:Table", "props": {"std:label": {"string": "Graph 1 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3039}}},
+        {"op": "create_model", "model": 3040, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3041, 3058], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3059, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2004, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 2"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3040}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3041, 3058]}}},
+        {"op": "create_node", "id": 2005, "parent": 2004, "type": "std:Table", "props": {"std:label": {"string": "Graph 2 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3059}}},
+        {"op": "create_model", "model": 3060, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3061, 3078], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3079, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2006, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 3"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3060}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3061, 3078]}}},
+        {"op": "create_node", "id": 2007, "parent": 2006, "type": "std:Table", "props": {"std:label": {"string": "Graph 3 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3079}}},
+        {"op": "create_model", "model": 3080, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3081, 3098], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3099, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2008, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 4"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3080}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3081, 3098]}}},
+        {"op": "create_node", "id": 2009, "parent": 2008, "type": "std:Table", "props": {"std:label": {"string": "Graph 4 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3099}}},
+        {"op": "create_model", "model": 3100, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3101, 3118], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3119, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2010, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 5"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3100}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3101, 3118]}}},
+        {"op": "create_node", "id": 2011, "parent": 2010, "type": "std:Table", "props": {"std:label": {"string": "Graph 5 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3119}}},
+        {"op": "create_model", "model": 3120, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3121, 3138], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3139, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2012, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 6"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3120}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3121, 3138]}}},
+        {"op": "create_node", "id": 2013, "parent": 2012, "type": "std:Table", "props": {"std:label": {"string": "Graph 6 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3139}}},
+        {"op": "create_model", "model": 3140, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3141, 3158], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3159, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2014, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 7"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3140}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3141, 3158]}}},
+        {"op": "create_node", "id": 2015, "parent": 2014, "type": "std:Table", "props": {"std:label": {"string": "Graph 7 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3159}}},
+        {"op": "create_model", "model": 3160, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3161, 3178], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3179, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2016, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 8"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3160}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3161, 3178]}}},
+        {"op": "create_node", "id": 2017, "parent": 2016, "type": "std:Table", "props": {"std:label": {"string": "Graph 8 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3179}}},
+        {"op": "create_model", "model": 3180, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3181, 3198], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3199, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2018, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 9"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3180}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3181, 3198]}}},
+        {"op": "create_node", "id": 2019, "parent": 2018, "type": "std:Table", "props": {"std:label": {"string": "Graph 9 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3199}}},
+        {"op": "create_model", "model": 3200, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3201, 3218], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3219, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2020, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 10"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3200}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3201, 3218]}}},
+        {"op": "create_node", "id": 2021, "parent": 2020, "type": "std:Table", "props": {"std:label": {"string": "Graph 10 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3219}}},
+        {"op": "create_model", "model": 3220, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3221, 3238], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3239, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2022, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 11"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3220}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3221, 3238]}}},
+        {"op": "create_node", "id": 2023, "parent": 2022, "type": "std:Table", "props": {"std:label": {"string": "Graph 11 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3239}}},
+        {"op": "create_model", "model": 3240, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3241, 3258], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3259, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2024, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 12"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3240}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3241, 3258]}}},
+        {"op": "create_node", "id": 2025, "parent": 2024, "type": "std:Table", "props": {"std:label": {"string": "Graph 12 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3259}}}
+      ],
+      "expect": {
+        "capable": "accept",
+        "base": "accept"
+      }
+    },
+    {
       "name": "seventeenth-graph-in-a-session",
       "ops": [
-        {"op": "create_node", "id": 1000, "parent": 1, "type": "m:SeriesGraph", "props": {}},
-        {"op": "create_node", "id": 1001, "parent": 1, "type": "m:SeriesGraph", "props": {}},
-        {"op": "create_node", "id": 1002, "parent": 1, "type": "m:SeriesGraph", "props": {}},
-        {"op": "create_node", "id": 1003, "parent": 1, "type": "m:SeriesGraph", "props": {}},
-        {"op": "create_node", "id": 1004, "parent": 1, "type": "m:SeriesGraph", "props": {}},
-        {"op": "create_node", "id": 1005, "parent": 1, "type": "m:SeriesGraph", "props": {}},
-        {"op": "create_node", "id": 1006, "parent": 1, "type": "m:SeriesGraph", "props": {}},
-        {"op": "create_node", "id": 1007, "parent": 1, "type": "m:SeriesGraph", "props": {}},
-        {"op": "create_node", "id": 1008, "parent": 1, "type": "m:SeriesGraph", "props": {}},
-        {"op": "create_node", "id": 1009, "parent": 1, "type": "m:SeriesGraph", "props": {}},
-        {"op": "create_node", "id": 1010, "parent": 1, "type": "m:SeriesGraph", "props": {}},
-        {"op": "create_node", "id": 1011, "parent": 1, "type": "m:SeriesGraph", "props": {}},
-        {"op": "create_node", "id": 1012, "parent": 1, "type": "m:SeriesGraph", "props": {}},
-        {"op": "create_node", "id": 1013, "parent": 1, "type": "m:SeriesGraph", "props": {}}
+        {"op": "create_model", "model": 3000, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3001, 3018], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3019, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2000, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 0"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3000}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3001, 3018]}}},
+        {"op": "create_node", "id": 2001, "parent": 2000, "type": "std:Table", "props": {"std:label": {"string": "Graph 0 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3019}}},
+        {"op": "create_model", "model": 3020, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3021, 3038], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3039, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2002, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 1"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3020}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3021, 3038]}}},
+        {"op": "create_node", "id": 2003, "parent": 2002, "type": "std:Table", "props": {"std:label": {"string": "Graph 1 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3039}}},
+        {"op": "create_model", "model": 3040, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3041, 3058], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3059, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2004, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 2"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3040}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3041, 3058]}}},
+        {"op": "create_node", "id": 2005, "parent": 2004, "type": "std:Table", "props": {"std:label": {"string": "Graph 2 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3059}}},
+        {"op": "create_model", "model": 3060, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3061, 3078], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3079, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2006, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 3"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3060}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3061, 3078]}}},
+        {"op": "create_node", "id": 2007, "parent": 2006, "type": "std:Table", "props": {"std:label": {"string": "Graph 3 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3079}}},
+        {"op": "create_model", "model": 3080, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3081, 3098], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3099, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2008, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 4"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3080}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3081, 3098]}}},
+        {"op": "create_node", "id": 2009, "parent": 2008, "type": "std:Table", "props": {"std:label": {"string": "Graph 4 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3099}}},
+        {"op": "create_model", "model": 3100, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3101, 3118], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3119, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2010, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 5"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3100}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3101, 3118]}}},
+        {"op": "create_node", "id": 2011, "parent": 2010, "type": "std:Table", "props": {"std:label": {"string": "Graph 5 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3119}}},
+        {"op": "create_model", "model": 3120, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3121, 3138], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3139, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2012, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 6"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3120}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3121, 3138]}}},
+        {"op": "create_node", "id": 2013, "parent": 2012, "type": "std:Table", "props": {"std:label": {"string": "Graph 6 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3139}}},
+        {"op": "create_model", "model": 3140, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3141, 3158], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3159, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2014, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 7"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3140}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3141, 3158]}}},
+        {"op": "create_node", "id": 2015, "parent": 2014, "type": "std:Table", "props": {"std:label": {"string": "Graph 7 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3159}}},
+        {"op": "create_model", "model": 3160, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3161, 3178], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3179, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2016, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 8"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3160}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3161, 3178]}}},
+        {"op": "create_node", "id": 2017, "parent": 2016, "type": "std:Table", "props": {"std:label": {"string": "Graph 8 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3179}}},
+        {"op": "create_model", "model": 3180, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3181, 3198], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3199, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2018, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 9"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3180}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3181, 3198]}}},
+        {"op": "create_node", "id": 2019, "parent": 2018, "type": "std:Table", "props": {"std:label": {"string": "Graph 9 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3199}}},
+        {"op": "create_model", "model": 3200, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3201, 3218], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3219, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2020, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 10"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3200}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3201, 3218]}}},
+        {"op": "create_node", "id": 2021, "parent": 2020, "type": "std:Table", "props": {"std:label": {"string": "Graph 10 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3219}}},
+        {"op": "create_model", "model": 3220, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3221, 3238], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3239, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2022, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 11"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3220}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3221, 3238]}}},
+        {"op": "create_node", "id": 2023, "parent": 2022, "type": "std:Table", "props": {"std:label": {"string": "Graph 11 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3239}}},
+        {"op": "create_model", "model": 3240, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3241, 3258], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3259, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2024, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 12"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3240}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3241, 3258]}}},
+        {"op": "create_node", "id": 2025, "parent": 2024, "type": "std:Table", "props": {"std:label": {"string": "Graph 12 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3259}}},
+        {"op": "create_model", "model": 3260, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [3261, 3278], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 3279, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 2026, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Graph 13"}, "std:value_description": {"string": "No series"}, "std:model_ref": {"uint": 3260}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "count"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [3261, 3278]}}},
+        {"op": "create_node", "id": 2027, "parent": 2026, "type": "std:Table", "props": {"std:label": {"string": "Graph 13 samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 3279}}}
       ],
       "expect": {
         "capable": "refuse:S4",
-        "base": "generic:unsupported_extension_without_fallback"
+        "base": "accept"
       }
     }
   ]

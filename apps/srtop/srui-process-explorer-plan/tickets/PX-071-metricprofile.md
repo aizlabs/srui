@@ -5,7 +5,7 @@ Edition 1.2 · 12 September 2026. Use the authoritative SRUI v0.6 design and the
 ## PX-071 — Specify a small retained metrics-visualization profile
 
 **Phase:** G · **Scope size:** S · **Status:** planned · **Gate:** none
-**Dependencies:** PX-070
+**Dependencies:** PX-070, PX-070-G01
 **Read:** D1 §§6.4, 11, 15, 26; D2 T20, T31; T36 is NOT assumed
 
 ### Standing execution contract
@@ -38,7 +38,7 @@ Run the repository commands recorded by PX-000, plus the ticket's verification. 
 
 Write a separately versioned optional profile for numeric gauges and bounded time series, with units, source timestamps, series identity, append/replace/evict semantics, axis intent, limits, and accessibility summaries. Use a project-owned canonical namespace, assigned through the normal negotiation mechanism; do not assume org.srui ownership.
 Provide Standard Widget fallbacks and golden fixtures. No arbitrary paths, shaders, drawing scripts, or downloaded expressions. Explain why this is a domain-specific extension rather than implementing T36 VectorScene or stuffing graphs into Image resources.
-Support independent panel timestamps, explicit gaps/staleness, units/denominators, bounded graph windows, and stable host/device identity. Independently sampled panels must not imply an atomic host snapshot.
+Support independent panel timestamps, explicit gaps/staleness, units/denominators, bounded graph windows, and stable host/device identity. Independently sampled panels must not imply an atomic host snapshot. Let one graph node carry several series (at least 18, each with its own stable identity, unit and gaps) and define that node's Standard Widget fallback as one bounded model-backed Table of recent samples, as PX-070-G01's dashboard specification (`docs/process-explorer/design/dashboard.md`, sections 5 and 7) requires.
 
 ### Out of scope
 

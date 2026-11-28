@@ -744,7 +744,7 @@
       ],
       "source": "BT1",
       "status": "planned",
-      "upstream_version": "Reference tag/commit to be pinned at PX-070-G01; no btop parity target",
+      "upstream_version": "btop++ v1.4.8, commit cf1da5900b1e9eaa1c20fd7148dd812b43340b8a, pinned at PX-070-G01; no btop parity target",
       "individual_entries": [],
       "evidence": [],
       "notes": "Selected workflow inspiration only; core CPU/memory/disk/network panels, optional GPU/per-CPU additions, measured native UX and overhead. htop remains the separate process-management baseline."

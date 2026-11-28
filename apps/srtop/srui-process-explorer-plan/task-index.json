@@ -1861,14 +1861,36 @@
       ]
     },
     {
+      "id": "PX-070-G02",
+      "key": "split",
+      "title": "Render the standard Split container with locally resized panes",
+      "depends_on": [
+        "PX-070-G01"
+      ],
+      "gate": "none",
+      "build": "`Split` (registry node type 25, SHOULD tier in §7.3, `NSSplitView` in §22.4, a core layout container in §10) is in `protocol/registry.yaml` but nothing builds or renders it: the SDK has no Split builder (`server-rust/sdk/src/widgets/` builds Surface, Row, Column, Grid and Scroll, not Split), and `ControlFactory.makeHandle` (`client-macos/RendererAppKit/ControlFactory.swift`) has no `.split` case and throws `ControlFactoryError.unsupportedNodeType`. PX-070-G01's dashboard specification (`docs/process-explorer/design/dashboard.md`) needs it for a user-resizable divider between the host panels and the process table. Add it as a generic standard container. Each child is one pane, in child order. D1 names no pane axis and no existing property expresses one (Row and Column express their axis by node type), so add one registry-owned property `split_axis` with a new enum `SplitAxis` (`side_by_side`, `stacked`); absent means `side_by_side`; it is admitted only on Split and refused on every other node type at apply in Rust and Swift (§4 inv. 13). Pane sizing reuses the existing layout hints on each child (`minimum_size`, `maximum_size`, `preferred_size`, `grow`) as hints, never pixel mandates (§10); a child whose `visibility` is `collapsed` collapses its pane, and `hidden` keeps its space. At most 8 panes per Split: a ninth child fails the transaction explicitly, and nesting counts toward the existing tree-depth limit (§26). Divider positions are local interaction state (§7.6 `Split`: resize locally; §22.5): the user drags a divider or adjusts it through accessibility, the client sends no geometry and this ticket emits no `VALUE_CHANGED` (Split's optional event stays unimplemented and is documented as such). A commit that keeps a Split's panes keeps the user's divider positions; adding or removing a pane keeps the remaining panes' proportions; a remount restores the proportions when the pane set is unchanged. SDK builder with the axis and panes. Registry, `spec/registries.md`, the `server-rust/semantic-tree/build.rs` count asserts and the committed generated Swift tables updated through `./protocol/generate_proto.sh`; `DirtyClassifier` classifies `split_axis` as structure-affecting for that Split only and pane hints as layout. No per-node-type capability negotiation is added: a client older than this ticket still refuses Split explicitly, which the completion note records as a compatibility limit. No application-specific client path. The user approved planning `split_axis` and `SplitAxis` on 2026-11-27 (recorded in PX-070-G01's completion note); the protocol/registry change itself still needs recorded user approval before this ticket's branch merges.",
+      "verify": "Each new test fails with its behaviour reverted, and the mutants are recorded in the completion note. Rust and Swift tests plus conformance vectors with the manifest counts updated exactly: suites 1 and 2 (a Split with 1 to 8 panes is accepted; a ninth child is refused with the whole transaction rolled back; `split_axis` is accepted on Split and refused on every other node type; an unknown `SplitAxis` value is refused), suite 3 (Split fixtures carry no pixel geometry and no divider position), suite 4 (dragging a divider changes no protocol traffic: byte-identical streams with and without local resizing), suite 9 (negative malformed vectors for an unknown axis value and an over-limit pane count on both the Rust and Swift decode paths), and suites 10 and 12 (`side_by_side` maps to a vertical-divider `NSSplitView` and `stacked` to a horizontal one; a collapsed child collapses its pane; the accessibility tree exposes a split group whose splitters carry a value and an increment/decrement action). Native AppKit tests on a real `NSWindow`: setting a divider position emits no event and no outgoing frame; a commit updating a pane's `Text` keeps the divider where the user put it; inserting a third pane keeps the first divider's proportion; a remount with the same panes restores the proportions; a pane's `minimum_size` is honoured while dragging. `./protocol/generate_proto.sh` leaves no diff, `uv run python protocol/validate_registry.py`, `cargo test --manifest-path server-rust/Cargo.toml`, `cargo clippy` for each changed crate with `-D warnings`, `scripts/run-conformance`, `bash scripts/run-swift-tests.sh`, `scripts/check-test-process-stdio.sh` and `scripts/parse-changed-swift.sh` pass.",
+      "out": "No Tabs, Menu, Toolbar or Overlay. No divider-position event, server-set divider position or persisted geometry. No per-node-type capability negotiation. No srtop change (PX-073-G01 adopts Split). No edit of the read-only design document.",
+      "phase": "G",
+      "size": "M",
+      "status": "planned",
+      "refs": "D1 §§4 inv. 13, 7.2, 7.3, 7.6, 10, 22.4, 22.5, 22.8, 26, 32; registry Split (25)",
+      "sources": "",
+      "file": "tickets/PX-070-G02-split.md",
+      "deps": [
+        "dashboard-design"
+      ]
+    },
+    {
       "key": "metricprofile",
       "phase": "G",
       "title": "Specify a small retained metrics-visualization profile",
-      "build": "Write a separately versioned optional profile for numeric gauges and bounded time series, with units, source timestamps, series identity, append/replace/evict semantics, axis intent, limits, and accessibility summaries. Use a project-owned canonical namespace, assigned through the normal negotiation mechanism; do not assume org.srui ownership.\nProvide Standard Widget fallbacks and golden fixtures. No arbitrary paths, shaders, drawing scripts, or downloaded expressions. Explain why this is a domain-specific extension rather than implementing T36 VectorScene or stuffing graphs into Image resources.\nSupport independent panel timestamps, explicit gaps/staleness, units/denominators, bounded graph windows, and stable host/device identity. Independently sampled panels must not imply an atomic host snapshot.",
+      "build": "Write a separately versioned optional profile for numeric gauges and bounded time series, with units, source timestamps, series identity, append/replace/evict semantics, axis intent, limits, and accessibility summaries. Use a project-owned canonical namespace, assigned through the normal negotiation mechanism; do not assume org.srui ownership.\nProvide Standard Widget fallbacks and golden fixtures. No arbitrary paths, shaders, drawing scripts, or downloaded expressions. Explain why this is a domain-specific extension rather than implementing T36 VectorScene or stuffing graphs into Image resources.\nSupport independent panel timestamps, explicit gaps/staleness, units/denominators, bounded graph windows, and stable host/device identity. Independently sampled panels must not imply an atomic host snapshot. Let one graph node carry several series (at least 18, each with its own stable identity, unit and gaps) and define that node's Standard Widget fallback as one bounded model-backed Table of recent samples, as PX-070-G01's dashboard specification (`docs/process-explorer/design/dashboard.md`, sections 5 and 7) requires.",
       "verify": "A schema review checks units, negative values, missing samples/gaps, window bounds, profile-version mismatch, and unsupported-client fallback. Both sides can implement the meaning without AppKit types. No production graph is enabled in this specification-only ticket.",
       "out": "No downloaded client logic, CSS/HTML engine, arbitrary immediate-mode drawing, or modifications to upstream htop settings.",
       "deps": [
-        "meterlayout"
+        "meterlayout",
+        "dashboard-design"
       ],
       "refs": "D1 §§6.4, 11, 15, 26; D2 T20, T31; T36 is NOT assumed",
       "sources": "",
@@ -1876,7 +1898,8 @@
       "size": "S",
       "id": "PX-071",
       "depends_on": [
-        "PX-070"
+        "PX-070",
+        "PX-070-G01"
       ],
       "file": "tickets/PX-071-metricprofile.md",
       "status": "planned"
@@ -1929,11 +1952,13 @@
       "title": "Compose the native host dashboard and process-history drill-down",
       "depends_on": [
         "PX-070-G01",
+        "PX-070-G02",
         "PX-073",
         "PX-054",
         "PX-055",
         "PX-056",
-        "PX-090"
+        "PX-090",
+        "PX-095"
       ],
       "gate": "none",
       "build": "Compose CPU, memory/swap, disk, and network panels with the existing table/inspector through SDK semantics and the generic metrics renderer. Reuse collectors, PX-072 bounded host series, and PX-090 selected-process history; do not create a second sampling/history subsystem.\nShow units, sample intervals, independent timestamps, gaps, and current values. Use a modest default layout with configurable panel visibility/order and bounded device expansion. Preserve table selection/filter/viewport while panels update. Process drill-down shows only samples actually collected for that ProcessKey, with a clear recording start; exited tasks stay non-actionable.\nKeep data and intent scoped to host/source/incarnation. Paused, historical, disconnected, or invalid-intent contexts cannot authorize process changes. Keep numeric/Standard Widget fallbacks usable without graphs. Host disk/network activity does not identify the responsible process.\nGPU, temperature, and detailed per-CPU panels are optional later integrations through PX-052/PX-053/PX-060/PX-061 with their own live evidence.",
@@ -1947,11 +1972,13 @@
       "file": "tickets/PX-073-G01-dashboard-compose.md",
       "deps": [
         "dashboard-design",
+        "split",
         "metricclient",
         "hostmemory",
         "disk",
         "network",
-        "history"
+        "history",
+        "multihost"
       ]
     },
     {
@@ -3563,6 +3590,7 @@
     "PX-069",
     "PX-070",
     "PX-070-G01",
+    "PX-070-G02",
     "PX-071",
     "PX-072",
     "PX-073",
@@ -3683,6 +3711,11 @@
   "dashboard_inspiration": {
     "project": "btop++",
     "url": "https://github.com/aristocratos/btop",
-    "scope": "Selected workflows; no full parity claim. Pin a version at PX-070-G01."
+    "scope": "Selected workflows; no full parity claim. Pinned at PX-070-G01.",
+    "pinned_tag": "v1.4.8",
+    "pinned_commit": "cf1da5900b1e9eaa1c20fd7148dd812b43340b8a",
+    "license": "Apache-2.0",
+    "checked": "2026-11-27",
+    "specification": "docs/process-explorer/design/dashboard.md"
   }
 }

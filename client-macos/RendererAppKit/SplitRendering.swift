@@ -291,14 +291,15 @@ public final class SemanticSplitView: NSSplitView, NSSplitViewDelegate {
     /// that would consume the axis are scaled down rather than squeezing those panes to nothing.
     private func targetFractions(for visible: [SplitPaneView], available: CGFloat) -> [Double] {
         let remembered = loadProportions()
-        let known = visible.compactMap { remembered[$0.nodeID] }.filter { $0 > 0 }
+        // A remembered 0 is a pane the user closed to nothing, not a new pane: it stays at 0.
+        let known = visible.compactMap { remembered[$0.nodeID] }.filter { $0 >= 0 }
+        let knownTotal = known.reduce(0, +)
         let count = Double(visible.count)
-        guard known.isEmpty else {
-            let newCount = Double(visible.filter { (remembered[$0.nodeID] ?? 0) <= 0 }.count)
+        guard known.isEmpty || knownTotal <= 0 else {
+            let newCount = Double(visible.filter { remembered[$0.nodeID] == nil }.count)
             let knownShare = 1 - newCount / count
-            let knownTotal = known.reduce(0, +)
             return visible.map { pane in
-                if let fraction = remembered[pane.nodeID], fraction > 0 {
+                if let fraction = remembered[pane.nodeID], fraction >= 0 {
                     return fraction / knownTotal * knownShare
                 }
                 return 1 / count

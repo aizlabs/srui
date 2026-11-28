@@ -338,6 +338,23 @@ struct SplitRenderingTests {
     }
 
     @Test
+    func aPaneTheUserClosedToNothingStaysClosedAcrossResizeAndRemount() throws {
+        let h = try Harness(Self.base(panes: [Self.text(Self.paneA), Self.text(Self.paneB)]))
+        defer { h.tearDown() }
+        try h.drag(divider: 0, by: -2000)
+        #expect(h.length(Self.paneA) < 1, "the drag closed pane A: \(h.length(Self.paneA))")
+        let remembered = try #require(h.renderer.controlFactory.splitProportionMemory[Self.splitID]?[Self.paneA])
+        #expect(remembered < 0.001, "a zero length is remembered: \(remembered)")
+        h.place(size: NSSize(width: 1240, height: 640))
+        #expect(h.length(Self.paneA) < 1, "a resize keeps it closed: \(h.length(Self.paneA))")
+        _ = try h.commit([
+            .createNode(id: 40, nodeType: .text, parentID: Self.surfaceID, properties: [(.text, .string("status"))]),
+        ])
+        #expect(h.length(Self.paneA) < 1, "a remount keeps it closed: \(h.length(Self.paneA))")
+        #expect(h.sent == 0)
+    }
+
+    @Test
     func aWindowResizeScalesThePanesAndKeepsTheUsersProportions() throws {
         let h = try Harness(Self.base(panes: [Self.text(Self.paneA), Self.text(Self.paneB)]))
         defer { h.tearDown() }

@@ -1,0 +1,320 @@
+{
+  "fixture": "05-window-bounds",
+  "profile": "io.github.aizlabs.srui.metrics/1",
+  "purpose": "Bounds: 18 series per graph, 900 samples per series at every operation boundary, exact age retention against window_ms, append-only / front-evict-only / full-reset replace, offsets below 2^40, immutable graph identity, 16 graphs per session.",
+  "rules": [
+    "G1",
+    "S3",
+    "S4",
+    "D1",
+    "T1",
+    "T5",
+    "T6",
+    "F2"
+  ],
+  "setup": [
+    {
+      "ops": [
+        {"op": "create_node", "id": 1, "parent": null, "type": "std:Surface", "props": {"std:label": {"string": "srtop"}}},
+        {"op": "create_model", "model": 100, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [101, 118], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 119, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 10, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "CPU history"}, "std:value_description": {"string": "CPU busy: 1.0%"}, "std:model_ref": {"uint": 100}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "percent"}, "m:axis_intent": {"string": "share"}, "m:range_min": {"float": 0.0}, "m:range_max": {"float": 100.0}}}}, "m:sample_models": {"uint_range": [101, 118]}}},
+        {"op": "create_node", "id": 11, "parent": 10, "type": "std:Table", "props": {"std:label": {"string": "CPU history samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 119}}},
+        {"op": "model_insert", "model": 100, "index": 0, "items": [{"id": 1, "value": {"null": true}, "props": {"m:series_key": {"string": "host/cpu/busy"}, "m:series_label": {"string": "CPU busy"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 101}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "percent"}}}]},
+        {"op": "create_model", "model": 200, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [201, 218], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 219, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 20, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Disk history"}, "std:value_description": {"string": "18 devices"}, "std:model_ref": {"uint": 200}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "bytes_per_second"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [201, 218]}}},
+        {"op": "create_node", "id": 21, "parent": 20, "type": "std:Table", "props": {"std:label": {"string": "Disk history samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 219}}},
+        {"op": "model_insert", "model": 200, "index": 0, "items": [{"id": 200, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev0/read"}, "m:series_label": {"string": "dev0 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 201}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev0"}, "m:subject_label": {"string": "dev0"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 201, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev1/read"}, "m:series_label": {"string": "dev1 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 202}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev1"}, "m:subject_label": {"string": "dev1"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 202, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev2/read"}, "m:series_label": {"string": "dev2 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 203}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev2"}, "m:subject_label": {"string": "dev2"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 203, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev3/read"}, "m:series_label": {"string": "dev3 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 204}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev3"}, "m:subject_label": {"string": "dev3"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 204, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev4/read"}, "m:series_label": {"string": "dev4 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 205}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev4"}, "m:subject_label": {"string": "dev4"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 205, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev5/read"}, "m:series_label": {"string": "dev5 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 206}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev5"}, "m:subject_label": {"string": "dev5"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 206, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev6/read"}, "m:series_label": {"string": "dev6 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 207}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev6"}, "m:subject_label": {"string": "dev6"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 207, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev7/read"}, "m:series_label": {"string": "dev7 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 208}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev7"}, "m:subject_label": {"string": "dev7"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 208, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev8/read"}, "m:series_label": {"string": "dev8 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 209}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev8"}, "m:subject_label": {"string": "dev8"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 209, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev9/read"}, "m:series_label": {"string": "dev9 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 210}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev9"}, "m:subject_label": {"string": "dev9"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 210, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev10/read"}, "m:series_label": {"string": "dev10 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 211}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev10"}, "m:subject_label": {"string": "dev10"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 211, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev11/read"}, "m:series_label": {"string": "dev11 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 212}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev11"}, "m:subject_label": {"string": "dev11"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 212, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev12/read"}, "m:series_label": {"string": "dev12 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 213}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev12"}, "m:subject_label": {"string": "dev12"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 213, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev13/read"}, "m:series_label": {"string": "dev13 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 214}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev13"}, "m:subject_label": {"string": "dev13"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 214, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev14/read"}, "m:series_label": {"string": "dev14 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 215}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev14"}, "m:subject_label": {"string": "dev14"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 215, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev15/read"}, "m:series_label": {"string": "dev15 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 216}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev15"}, "m:subject_label": {"string": "dev15"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 216, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev16/read"}, "m:series_label": {"string": "dev16 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 217}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev16"}, "m:subject_label": {"string": "dev16"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 217, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev17/read"}, "m:series_label": {"string": "dev17 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 218}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:dev17"}, "m:subject_label": {"string": "dev17"}, "m:unit": {"string": "bytes_per_second"}}}]},
+        {"op": "create_model", "model": 400, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [401, 418], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 419, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 30, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "CPU last minute"}, "std:value_description": {"string": "CPU busy: 1.0%"}, "std:model_ref": {"uint": 400}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 60000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "percent"}, "m:axis_intent": {"string": "share"}, "m:range_min": {"float": 0.0}, "m:range_max": {"float": 100.0}}}}, "m:sample_models": {"uint_range": [401, 418]}}},
+        {"op": "create_node", "id": 31, "parent": 30, "type": "std:Table", "props": {"std:label": {"string": "CPU last minute samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 419}}},
+        {"op": "model_insert", "model": 400, "index": 0, "items": [{"id": 2, "value": {"null": true}, "props": {"m:series_key": {"string": "host/cpu/busy"}, "m:series_label": {"string": "CPU busy"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 401}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "percent"}}}]}
+      ]
+    },
+    {
+      "note": "900 samples (the cap) and a 61-sample series in a 60 s window.",
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 0, "items": {"repeat": {"count": 900, "first_id": 1000, "id_step": 1000, "value": {"float": 1.0}}}},
+        {"op": "model_insert", "model": 119, "index": 0, "items": [{"id": 1, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:01"}, {"string": "1.0%"}]}}, {"id": 2, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:02"}, {"string": "1.0%"}]}}, {"id": 3, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:03"}, {"string": "1.0%"}]}}, {"id": 4, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:04"}, {"string": "1.0%"}]}}, {"id": 5, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:05"}, {"string": "1.0%"}]}}, {"id": 6, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:06"}, {"string": "1.0%"}]}}, {"id": 7, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:07"}, {"string": "1.0%"}]}}, {"id": 8, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:08"}, {"string": "1.0%"}]}}, {"id": 9, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:09"}, {"string": "1.0%"}]}}, {"id": 10, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:10"}, {"string": "1.0%"}]}}, {"id": 11, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:11"}, {"string": "1.0%"}]}}, {"id": 12, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:12"}, {"string": "1.0%"}]}}, {"id": 13, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:13"}, {"string": "1.0%"}]}}, {"id": 14, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:14"}, {"string": "1.0%"}]}}, {"id": 15, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:15"}, {"string": "1.0%"}]}}, {"id": 16, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:16"}, {"string": "1.0%"}]}}, {"id": 17, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:17"}, {"string": "1.0%"}]}}, {"id": 18, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:18"}, {"string": "1.0%"}]}}, {"id": 19, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:19"}, {"string": "1.0%"}]}}, {"id": 20, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:20"}, {"string": "1.0%"}]}}, {"id": 21, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:21"}, {"string": "1.0%"}]}}, {"id": 22, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:22"}, {"string": "1.0%"}]}}, {"id": 23, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:23"}, {"string": "1.0%"}]}}, {"id": 24, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:24"}, {"string": "1.0%"}]}}, {"id": 25, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:25"}, {"string": "1.0%"}]}}, {"id": 26, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:26"}, {"string": "1.0%"}]}}, {"id": 27, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:27"}, {"string": "1.0%"}]}}, {"id": 28, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:28"}, {"string": "1.0%"}]}}, {"id": 29, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:29"}, {"string": "1.0%"}]}}, {"id": 30, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:30"}, {"string": "1.0%"}]}}, {"id": 31, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:31"}, {"string": "1.0%"}]}}, {"id": 32, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:32"}, {"string": "1.0%"}]}}, {"id": 33, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:33"}, {"string": "1.0%"}]}}, {"id": 34, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:34"}, {"string": "1.0%"}]}}, {"id": 35, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:35"}, {"string": "1.0%"}]}}, {"id": 36, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:36"}, {"string": "1.0%"}]}}, {"id": 37, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:37"}, {"string": "1.0%"}]}}, {"id": 38, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:38"}, {"string": "1.0%"}]}}, {"id": 39, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:39"}, {"string": "1.0%"}]}}, {"id": 40, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:40"}, {"string": "1.0%"}]}}, {"id": 41, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:41"}, {"string": "1.0%"}]}}, {"id": 42, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:42"}, {"string": "1.0%"}]}}, {"id": 43, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:43"}, {"string": "1.0%"}]}}, {"id": 44, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:44"}, {"string": "1.0%"}]}}, {"id": 45, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:45"}, {"string": "1.0%"}]}}, {"id": 46, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:46"}, {"string": "1.0%"}]}}, {"id": 47, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:47"}, {"string": "1.0%"}]}}, {"id": 48, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:48"}, {"string": "1.0%"}]}}, {"id": 49, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:49"}, {"string": "1.0%"}]}}, {"id": 50, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:50"}, {"string": "1.0%"}]}}, {"id": 51, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:51"}, {"string": "1.0%"}]}}, {"id": 52, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:52"}, {"string": "1.0%"}]}}, {"id": 53, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:53"}, {"string": "1.0%"}]}}, {"id": 54, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:54"}, {"string": "1.0%"}]}}, {"id": 55, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:55"}, {"string": "1.0%"}]}}, {"id": 56, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:56"}, {"string": "1.0%"}]}}, {"id": 57, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:57"}, {"string": "1.0%"}]}}, {"id": 58, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:58"}, {"string": "1.0%"}]}}, {"id": 59, "value": {"list": [{"string": "CPU busy"}, {"string": "08:14:59"}, {"string": "1.0%"}]}}, {"id": 60, "value": {"list": [{"string": "CPU busy"}, {"string": "08:15:00"}, {"string": "1.0%"}]}}]},
+        {"op": "model_insert", "model": 401, "index": 0, "items": {"repeat": {"count": 61, "first_id": 0, "id_step": 1000, "value": {"float": 1.0}}}},
+        {"op": "model_insert", "model": 419, "index": 0, "items": [{"id": 1, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:01"}, {"string": "1.0%"}]}}, {"id": 2, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:02"}, {"string": "1.0%"}]}}, {"id": 3, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:03"}, {"string": "1.0%"}]}}, {"id": 4, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:04"}, {"string": "1.0%"}]}}, {"id": 5, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:05"}, {"string": "1.0%"}]}}, {"id": 6, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:06"}, {"string": "1.0%"}]}}, {"id": 7, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:07"}, {"string": "1.0%"}]}}, {"id": 8, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:08"}, {"string": "1.0%"}]}}, {"id": 9, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:09"}, {"string": "1.0%"}]}}, {"id": 10, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:10"}, {"string": "1.0%"}]}}, {"id": 11, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:11"}, {"string": "1.0%"}]}}, {"id": 12, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:12"}, {"string": "1.0%"}]}}, {"id": 13, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:13"}, {"string": "1.0%"}]}}, {"id": 14, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:14"}, {"string": "1.0%"}]}}, {"id": 15, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:15"}, {"string": "1.0%"}]}}, {"id": 16, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:16"}, {"string": "1.0%"}]}}, {"id": 17, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:17"}, {"string": "1.0%"}]}}, {"id": 18, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:18"}, {"string": "1.0%"}]}}, {"id": 19, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:19"}, {"string": "1.0%"}]}}, {"id": 20, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:20"}, {"string": "1.0%"}]}}, {"id": 21, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:21"}, {"string": "1.0%"}]}}, {"id": 22, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:22"}, {"string": "1.0%"}]}}, {"id": 23, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:23"}, {"string": "1.0%"}]}}, {"id": 24, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:24"}, {"string": "1.0%"}]}}, {"id": 25, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:25"}, {"string": "1.0%"}]}}, {"id": 26, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:26"}, {"string": "1.0%"}]}}, {"id": 27, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:27"}, {"string": "1.0%"}]}}, {"id": 28, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:28"}, {"string": "1.0%"}]}}, {"id": 29, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:29"}, {"string": "1.0%"}]}}, {"id": 30, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:30"}, {"string": "1.0%"}]}}, {"id": 31, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:31"}, {"string": "1.0%"}]}}, {"id": 32, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:32"}, {"string": "1.0%"}]}}, {"id": 33, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:33"}, {"string": "1.0%"}]}}, {"id": 34, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:34"}, {"string": "1.0%"}]}}, {"id": 35, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:35"}, {"string": "1.0%"}]}}, {"id": 36, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:36"}, {"string": "1.0%"}]}}, {"id": 37, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:37"}, {"string": "1.0%"}]}}, {"id": 38, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:38"}, {"string": "1.0%"}]}}, {"id": 39, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:39"}, {"string": "1.0%"}]}}, {"id": 40, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:40"}, {"string": "1.0%"}]}}, {"id": 41, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:41"}, {"string": "1.0%"}]}}, {"id": 42, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:42"}, {"string": "1.0%"}]}}, {"id": 43, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:43"}, {"string": "1.0%"}]}}, {"id": 44, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:44"}, {"string": "1.0%"}]}}, {"id": 45, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:45"}, {"string": "1.0%"}]}}, {"id": 46, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:46"}, {"string": "1.0%"}]}}, {"id": 47, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:47"}, {"string": "1.0%"}]}}, {"id": 48, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:48"}, {"string": "1.0%"}]}}, {"id": 49, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:49"}, {"string": "1.0%"}]}}, {"id": 50, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:50"}, {"string": "1.0%"}]}}, {"id": 51, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:51"}, {"string": "1.0%"}]}}, {"id": 52, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:52"}, {"string": "1.0%"}]}}, {"id": 53, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:53"}, {"string": "1.0%"}]}}, {"id": 54, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:54"}, {"string": "1.0%"}]}}, {"id": 55, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:55"}, {"string": "1.0%"}]}}, {"id": 56, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:56"}, {"string": "1.0%"}]}}, {"id": 57, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:57"}, {"string": "1.0%"}]}}, {"id": 58, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:58"}, {"string": "1.0%"}]}}, {"id": 59, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:59"}, {"string": "1.0%"}]}}, {"id": 60, "value": {"list": [{"string": "CPU busy"}, {"string": "08:01:00"}, {"string": "1.0%"}]}}]}
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "name": "append-at-cap-without-eviction",
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 900, "items": [{"id": 901000, "value": {"float": 1.0}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T6",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "evict-then-append",
+      "ops": [
+        {"op": "model_delete", "model": 101, "index": 0, "count": 1},
+        {"op": "model_insert", "model": 101, "index": 899, "items": [{"id": 901000, "value": {"float": 1.0}}]},
+        {"op": "model_delete", "model": 119, "index": 0, "count": 1},
+        {"op": "model_insert", "model": 119, "index": 59, "items": [{"id": 61, "value": {"list": [{"string": "CPU busy"}, {"string": "08:15:01"}, {"string": "1.0%"}]}}]}
+      ],
+      "expect": {
+        "capable": "accept",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "append-then-evict",
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 900, "items": [{"id": 901000, "value": {"float": 1.0}}]},
+        {"op": "model_delete", "model": 101, "index": 0, "count": 1}
+      ],
+      "expect": {
+        "capable": "refuse:T6",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "insert-in-the-middle",
+      "ops": [
+        {"op": "model_delete", "model": 101, "index": 0, "count": 1},
+        {"op": "model_insert", "model": 101, "index": 10, "items": [{"id": 11500, "value": {"float": 1.0}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T5",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "update-a-published-sample",
+      "ops": [
+        {"op": "model_update", "model": 101, "index": 899, "items": [{"id": 900000, "value": {"float": 2.0}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T5",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "evict-by-item-ids",
+      "ops": [
+        {"op": "model_delete", "model": 101, "item_ids": [1000]}
+      ],
+      "expect": {
+        "capable": "refuse:T5",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "evict-from-the-middle",
+      "ops": [
+        {"op": "model_delete", "model": 101, "index": 5, "count": 1}
+      ],
+      "expect": {
+        "capable": "refuse:T5",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "offset-not-increasing",
+      "ops": [
+        {"op": "model_delete", "model": 101, "index": 0, "count": 1},
+        {"op": "model_insert", "model": 101, "index": 899, "items": [{"id": 900000, "value": {"float": 1.0}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T1",
+        "base": "generic:duplicate item id"
+      }
+    },
+    {
+      "name": "offset-at-2^40",
+      "ops": [
+        {"op": "model_delete", "model": 101, "index": 0, "count": 1},
+        {"op": "model_insert", "model": 101, "index": 899, "items": [{"id": 1099511627776, "value": {"float": 1.0}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T1",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "partial-reset",
+      "ops": [
+        {"op": "model_reset_range", "model": 101, "start_index": 0, "total_count": 900, "items": [{"id": 1000, "value": {"float": 1.0}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T5",
+        "base": "skip"
+      },
+      "note": "A base client applies this as an ordinary sparse range reset (§8); the reference checker models dense models only, so the base outcome is not asserted."
+    },
+    {
+      "name": "full-reset-replaces-history",
+      "ops": [
+        {"op": "model_reset_range", "model": 101, "start_index": 0, "total_count": 2, "items": [{"id": 950000, "value": {"gap": "warming_up"}}, {"id": 951000, "value": {"float": 3.0}}]},
+        {"op": "model_reset_range", "model": 119, "start_index": 0, "total_count": 2, "items": [{"id": 61, "value": {"list": [{"string": "CPU busy"}, {"string": "08:15:50"}, {"string": "warming up 1s"}]}}, {"id": 62, "value": {"list": [{"string": "CPU busy"}, {"string": "08:15:51"}, {"string": "3.0%"}]}}]}
+      ],
+      "expect": {
+        "capable": "accept",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "age-window-without-eviction",
+      "ops": [
+        {"op": "model_insert", "model": 401, "index": 61, "items": [{"id": 61000, "value": {"float": 1.0}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T6",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "age-window-with-eviction",
+      "ops": [
+        {"op": "model_delete", "model": 401, "index": 0, "count": 1},
+        {"op": "model_insert", "model": 401, "index": 60, "items": [{"id": 61000, "value": {"float": 1.0}}]},
+        {"op": "model_delete", "model": 419, "index": 0, "count": 1},
+        {"op": "model_insert", "model": 419, "index": 59, "items": [{"id": 61, "value": {"list": [{"string": "CPU busy"}, {"string": "08:01:01"}, {"string": "1.0%"}]}}]}
+      ],
+      "expect": {
+        "capable": "accept",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "shrinking-the-window-needs-eviction",
+      "ops": [
+        {"op": "set_property", "node": 30, "prop": "m:window_ms", "value": {"uint": 30000}}
+      ],
+      "expect": {
+        "capable": "refuse:T6",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "window-above-15-minutes",
+      "ops": [
+        {"op": "set_property", "node": 10, "prop": "m:window_ms", "value": {"uint": 900001}}
+      ],
+      "expect": {
+        "capable": "refuse:G1",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "window-below-1-second",
+      "ops": [
+        {"op": "set_property", "node": 10, "prop": "m:window_ms", "value": {"uint": 999}}
+      ],
+      "expect": {
+        "capable": "refuse:G1",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "nineteenth-series",
+      "ops": [
+        {"op": "model_insert", "model": 200, "index": 18, "items": [{"id": 230, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev18/read"}, "m:series_label": {"string": "dev18 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 201}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "bytes_per_second"}}}]}
+      ],
+      "expect": {
+        "capable": "refuse:D1",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "series-id-reused",
+      "ops": [
+        {"op": "model_delete", "model": 200, "index": 0, "count": 1},
+        {"op": "model_insert", "model": 200, "index": 17, "items": [{"id": 200, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev99/read"}, "m:series_label": {"string": "dev99 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 201}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "bytes_per_second"}}}]}
+      ],
+      "expect": {
+        "capable": "refuse:D1",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "slot-rebound-to-a-new-series",
+      "ops": [
+        {"op": "model_delete", "model": 200, "index": 0, "count": 1},
+        {"op": "model_insert", "model": 200, "index": 17, "items": [{"id": 231, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/dev99/read"}, "m:series_label": {"string": "dev99 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 201}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "bytes_per_second"}}}]}
+      ],
+      "expect": {
+        "capable": "accept",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "slot-rebound-without-emptying",
+      "ops": [
+        {"op": "model_delete", "model": 100, "index": 0, "count": 1},
+        {"op": "model_insert", "model": 100, "index": 0, "items": [{"id": 3, "value": {"null": true}, "props": {"m:series_key": {"string": "host/cpu/user"}, "m:series_label": {"string": "CPU user"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 101}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "percent"}}}]},
+        {"op": "model_reset_range", "model": 119, "start_index": 0, "total_count": 0, "items": []}
+      ],
+      "expect": {
+        "capable": "refuse:D4",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "unbound-slot-holds-samples",
+      "ops": [
+        {"op": "model_insert", "model": 102, "index": 0, "items": [{"id": 1000, "value": {"float": 1.0}}]}
+      ],
+      "expect": {
+        "capable": "refuse:D4",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "epoch-is-immutable",
+      "ops": [
+        {"op": "set_property", "node": 10, "prop": "m:epoch_unix_ms", "value": {"uint": 1800000000001}}
+      ],
+      "expect": {
+        "capable": "refuse:S3",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "sample-models-are-immutable",
+      "ops": [
+        {"op": "clear_property", "node": 10, "prop": "m:sample_models"}
+      ],
+      "expect": {
+        "capable": "refuse:S3",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "seventeenth-graph-in-a-session",
+      "ops": [
+        {"op": "create_node", "id": 1000, "parent": 1, "type": "m:SeriesGraph", "props": {}},
+        {"op": "create_node", "id": 1001, "parent": 1, "type": "m:SeriesGraph", "props": {}},
+        {"op": "create_node", "id": 1002, "parent": 1, "type": "m:SeriesGraph", "props": {}},
+        {"op": "create_node", "id": 1003, "parent": 1, "type": "m:SeriesGraph", "props": {}},
+        {"op": "create_node", "id": 1004, "parent": 1, "type": "m:SeriesGraph", "props": {}},
+        {"op": "create_node", "id": 1005, "parent": 1, "type": "m:SeriesGraph", "props": {}},
+        {"op": "create_node", "id": 1006, "parent": 1, "type": "m:SeriesGraph", "props": {}},
+        {"op": "create_node", "id": 1007, "parent": 1, "type": "m:SeriesGraph", "props": {}},
+        {"op": "create_node", "id": 1008, "parent": 1, "type": "m:SeriesGraph", "props": {}},
+        {"op": "create_node", "id": 1009, "parent": 1, "type": "m:SeriesGraph", "props": {}},
+        {"op": "create_node", "id": 1010, "parent": 1, "type": "m:SeriesGraph", "props": {}},
+        {"op": "create_node", "id": 1011, "parent": 1, "type": "m:SeriesGraph", "props": {}},
+        {"op": "create_node", "id": 1012, "parent": 1, "type": "m:SeriesGraph", "props": {}},
+        {"op": "create_node", "id": 1013, "parent": 1, "type": "m:SeriesGraph", "props": {}}
+      ],
+      "expect": {
+        "capable": "refuse:S4",
+        "base": "generic:unsupported_extension_without_fallback"
+      }
+    }
+  ]
+}

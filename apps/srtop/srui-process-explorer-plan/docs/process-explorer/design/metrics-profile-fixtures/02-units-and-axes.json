@@ -1,0 +1,153 @@
+{
+  "fixture": "02-units-and-axes",
+  "profile": "io.github.aizlabs.srui.metrics/1",
+  "purpose": "Units, denominators and axis intent: every series names its unit, which must equal its axis's unit; closed unit and intent sets; the normative formatting table.",
+  "rules": [
+    "G2",
+    "D1",
+    "D2",
+    "F3",
+    "8.3"
+  ],
+  "setup": [
+    {
+      "ops": [
+        {"op": "create_node", "id": 1, "parent": null, "type": "std:Surface", "props": {"std:label": {"string": "srtop"}}},
+        {"op": "create_model", "model": 100, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [101, 118], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 119, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 10, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Memory and swap history"}, "std:value_description": {"string": "Memory 5.2 GiB used of 15.5 GiB; swap 0 B used of 2.0 GiB"}, "std:model_ref": {"uint": 100}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "bytes"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [101, 118]}}},
+        {"op": "create_node", "id": 11, "parent": 10, "type": "std:Table", "props": {"std:label": {"string": "Memory and swap history samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 119}}},
+        {"op": "model_insert", "model": 100, "index": 0, "items": [{"id": 1, "value": {"null": true}, "props": {"m:series_key": {"string": "host/memory/used"}, "m:series_label": {"string": "Memory used"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 101}, "m:sample_kind": {"string": "instant"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "bytes"}, "m:denominator": {"string": "of 15.5 GiB"}}}, {"id": 2, "value": {"null": true}, "props": {"m:series_key": {"string": "host/swap/used"}, "m:series_label": {"string": "Swap used"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 102}, "m:sample_kind": {"string": "instant"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "bytes"}, "m:denominator": {"string": "of 2.0 GiB"}}}]}
+      ]
+    },
+    {
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 0, "items": [{"id": 0, "value": {"float": 5583457484.8}}, {"id": 1000, "value": {"float": 5583462400.0}}]},
+        {"op": "model_insert", "model": 102, "index": 0, "items": [{"id": 0, "value": {"float": 0.0}}, {"id": 1000, "value": {"float": 1536.0}}]},
+        {"op": "model_insert", "model": 119, "index": 0, "items": [{"id": 1, "value": {"list": [{"string": "Memory used"}, {"string": "08:00:00"}, {"string": "5.2 GiB"}]}}, {"id": 2, "value": {"list": [{"string": "Memory used"}, {"string": "08:00:01"}, {"string": "5.2 GiB"}]}}, {"id": 3, "value": {"list": [{"string": "Swap used"}, {"string": "08:00:00"}, {"string": "0 B"}]}}, {"id": 4, "value": {"list": [{"string": "Swap used"}, {"string": "08:00:01"}, {"string": "1.5 KiB"}]}}]}
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "name": "series-unit-differs-from-axis",
+      "ops": [
+        {"op": "model_insert", "model": 100, "index": 2, "items": [{"id": 3, "value": {"null": true}, "props": {"m:series_key": {"string": "host/memory/share"}, "m:series_label": {"string": "Memory share"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 103}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "percent"}}}]}
+      ],
+      "expect": {
+        "capable": "refuse:D2",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "unknown-unit-bits",
+      "ops": [
+        {"op": "model_insert", "model": 100, "index": 2, "items": [{"id": 3, "value": {"null": true}, "props": {"m:series_key": {"string": "host/net/eth0/rx"}, "m:series_label": {"string": "eth0 rx"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 103}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "bits_per_second"}}}]}
+      ],
+      "expect": {
+        "capable": "refuse:D2",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "secondary-axis-missing",
+      "ops": [
+        {"op": "model_insert", "model": 100, "index": 2, "items": [{"id": 3, "value": {"null": true}, "props": {"m:series_key": {"string": "host/memory/share"}, "m:series_label": {"string": "Memory share"}, "m:series_axis": {"string": "secondary"}, "m:samples_model": {"uint": 103}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "percent"}}}]}
+      ],
+      "expect": {
+        "capable": "refuse:D2",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "secondary-axis-with-its-own-unit",
+      "ops": [
+        {"op": "set_property", "node": 10, "prop": "m:secondary_axis", "value": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "percent"}, "m:axis_intent": {"string": "share"}, "m:range_min": {"float": 0.0}, "m:range_max": {"float": 100.0}}}}},
+        {"op": "model_insert", "model": 100, "index": 2, "items": [{"id": 3, "value": {"null": true}, "props": {"m:series_key": {"string": "host/memory/share"}, "m:series_label": {"string": "Memory share"}, "m:series_axis": {"string": "secondary"}, "m:samples_model": {"uint": 103}, "m:sample_kind": {"string": "instant"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "percent"}, "m:denominator": {"string": "of total memory"}}}]}
+      ],
+      "expect": {
+        "capable": "accept",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "share-axis-without-range",
+      "ops": [
+        {"op": "set_property", "node": 10, "prop": "m:secondary_axis", "value": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "percent"}, "m:axis_intent": {"string": "share"}}}}}
+      ],
+      "expect": {
+        "capable": "refuse:G2",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "share-axis-not-starting-at-zero",
+      "ops": [
+        {"op": "set_property", "node": 10, "prop": "m:secondary_axis", "value": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "percent"}, "m:axis_intent": {"string": "share"}, "m:range_min": {"float": 5.0}, "m:range_max": {"float": 100.0}}}}}
+      ],
+      "expect": {
+        "capable": "refuse:G2",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "zero-based-axis-with-range",
+      "ops": [
+        {"op": "set_property", "node": 10, "prop": "m:primary_axis", "value": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "bytes"}, "m:axis_intent": {"string": "zero_based"}, "m:range_min": {"float": 0.0}, "m:range_max": {"float": 16642998272.0}}}}}
+      ],
+      "expect": {
+        "capable": "refuse:G2",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "unknown-axis-intent",
+      "ops": [
+        {"op": "set_property", "node": 10, "prop": "m:primary_axis", "value": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "bytes"}, "m:axis_intent": {"string": "logarithmic"}}}}}
+      ],
+      "expect": {
+        "capable": "refuse:G2",
+        "base": "accept"
+      }
+    }
+  ],
+  "formatting": [
+    {"unit": "percent", "value": {"float": 37.44}, "text": "37.4%"},
+    {"unit": "percent", "value": {"float": 0.25}, "text": "0.2%"},
+    {"unit": "percent", "value": {"float": 6400.0}, "text": "6400.0%"},
+    {"unit": "percent", "value": {"float": 12800.0}, "text": "12.8k%"},
+    {"unit": "bytes", "value": {"float": 0.0}, "text": "0 B"},
+    {"unit": "bytes", "value": {"float": 1023.0}, "text": "1023 B"},
+    {"unit": "bytes", "value": {"float": 1023.6}, "text": "1.0 KiB"},
+    {"unit": "bytes", "value": {"float": 5583457484.8}, "text": "5.2 GiB"},
+    {"unit": "bytes", "value": {"float": 1048524.8}, "text": "1.0 MiB"},
+    {"unit": "bytes_per_second", "value": {"float": 1258291.2}, "text": "1.2 MiB/s"},
+    {"unit": "bytes_per_second", "value": {"float": 1e+18}, "text": "888.2 PiB/s"},
+    {"unit": "operations_per_second", "value": {"float": 9999.9}, "text": "9999.9 ops/s"},
+    {"unit": "operations_per_second", "value": {"float": 12345.0}, "text": "12.3k ops/s"},
+    {"unit": "packets_per_second", "value": {"float": 14880952.0}, "text": "14.9M packets/s"},
+    {"unit": "packets_per_second", "value": {"float": 999999.0}, "text": "1.0M packets/s"},
+    {"unit": "packets_per_second", "value": {"float": -9999.9}, "text": "-9999.9 packets/s"},
+    {"unit": "count", "value": {"float": 42.0}, "text": "42"},
+    {"unit": "count", "value": {"float": 25564.0}, "text": "25.6k"},
+    {"unit": "seconds", "value": {"float": 12.34}, "text": "12.3 s"},
+    {"unit": "hertz", "value": {"float": 2400000000.0}, "text": "2.4 GHz"},
+    {"unit": "hertz", "value": {"float": 50.0}, "text": "50.0 Hz"},
+    {"unit": "degrees_celsius", "value": {"float": -3.5}, "text": "-3.5 °C"},
+    {"unit": "degrees_celsius", "value": {"float": "-0.0"}, "text": "0.0 °C"},
+    {"unit": "degrees_celsius", "value": {"float": -0.04}, "text": "0.0 °C"},
+    {"unit": "watts", "value": {"float": 35.25}, "text": "35.2 W"},
+    {"unit": "watts", "value": {"float": 1234.0}, "text": "1.2 kW"}
+  ],
+  "durations": [
+    {"ms": 50, "text": "0s"},
+    {"ms": 3000, "text": "3s"},
+    {"ms": 59999, "text": "59s"},
+    {"ms": 750000, "text": "12m"},
+    {"ms": 1790000, "text": "29m"},
+    {"ms": 3600000, "text": "1h"},
+    {"ms": 359999999, "text": "99h"},
+    {"ms": 360000000, "text": ">99h"}
+  ]
+}

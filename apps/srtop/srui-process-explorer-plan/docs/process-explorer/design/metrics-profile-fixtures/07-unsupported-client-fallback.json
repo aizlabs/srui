@@ -1,0 +1,153 @@
+{
+  "fixture": "07-unsupported-client-fallback",
+  "profile": "io.github.aizlabs.srui.metrics/1",
+  "purpose": "Unsupported-client fallback (§11.1): a base client accepts profile nodes, models and properties opaquely and mounts each node's single standard child; the shapes of that child are fixed so a base client always gets the full meaning in words.",
+  "rules": [
+    "S1",
+    "S2",
+    "D1",
+    "F1",
+    "F3"
+  ],
+  "setup": [
+    {
+      "ops": [
+        {"op": "create_node", "id": 1, "parent": null, "type": "std:Surface", "props": {"std:label": {"string": "srtop"}}},
+        {"op": "create_model", "model": 100, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [101, 118], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 119, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 10, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Network history"}, "std:value_description": {"string": "Receive 1.2 MiB/s"}, "std:model_ref": {"uint": 100}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "bytes_per_second"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [101, 118]}}},
+        {"op": "create_node", "id": 11, "parent": 10, "type": "std:Table", "props": {"std:label": {"string": "Network history samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 119}}},
+        {"op": "model_insert", "model": 100, "index": 0, "items": [{"id": 1, "value": {"null": true}, "props": {"m:series_key": {"string": "host/net/aggregate/rx"}, "m:series_label": {"string": "Receive"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 101}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "net:aggregate"}, "m:subject_label": {"string": "non-loopback interfaces"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 2, "value": {"null": true}, "props": {"m:series_key": {"string": "host/net/br-4f1c2d3e5a6b/rx"}, "m:series_label": {"string": "br-4f1c2d3e5a6b rx"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 102}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "net:br-4f1c2d3e5a6b"}, "m:subject_label": {"string": "br-4f1c2d3e5a6b"}, "m:unit": {"string": "bytes_per_second"}}}]},
+        {"op": "create_node", "id": 40, "parent": 1, "type": "m:Gauge", "props": {"std:label": {"string": "CPU"}, "std:value_description": {"string": "CPU: 37.4% busy of 8 logical CPUs, every 1 s"}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "percent"}, "m:axis_intent": {"string": "share"}, "m:range_min": {"float": 0.0}, "m:range_max": {"float": 100.0}}}}, "m:metric_state": {"string": "ok"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:denominator": {"string": "of 8 logical CPUs"}, "m:metric_value": {"float": 37.4}, "m:sample_unix_ms": {"uint": 1800000001000}}},
+        {"op": "create_node", "id": 41, "parent": 40, "type": "std:Text", "props": {"std:text": {"string": "CPU: 37.4% busy of 8 logical CPUs, every 1 s"}}}
+      ]
+    },
+    {
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 0, "items": [{"id": 1000, "value": {"float": 1258291.2}}]},
+        {"op": "model_insert", "model": 102, "index": 0, "items": [{"id": 1000, "value": {"float": 512.0}}]},
+        {"op": "model_insert", "model": 119, "index": 0, "items": [{"id": 1, "value": {"list": [{"string": "Receive"}, {"string": "08:00:01"}, {"string": "1.2 MiB/s"}]}}, {"id": 2, "value": {"list": [{"string": "br-4f1c…b rx"}, {"string": "08:00:01"}, {"string": "512 B/s"}]}}]}
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "name": "graph-without-fallback",
+      "ops": [
+        {"op": "create_model", "model": 500, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [501, 518], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 519, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 50, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Disk history"}, "std:value_description": {"string": "Disk"}, "std:model_ref": {"uint": 500}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "bytes_per_second"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [501, 518]}}}
+      ],
+      "expect": {
+        "capable": "refuse:S1",
+        "base": "generic:unsupported_extension_without_fallback"
+      }
+    },
+    {
+      "name": "graph-fallback-is-not-a-table",
+      "ops": [
+        {"op": "create_model", "model": 500, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [501, 518], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 519, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 50, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Disk history"}, "std:value_description": {"string": "Disk"}, "std:model_ref": {"uint": 500}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "bytes_per_second"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [501, 518]}}},
+        {"op": "create_node", "id": 51, "parent": 50, "type": "std:Column", "props": {}}
+      ],
+      "expect": {
+        "capable": "refuse:S1",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "graph-fallback-is-a-list",
+      "ops": [
+        {"op": "create_model", "model": 500, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [501, 518], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 519, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 50, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Disk history"}, "std:value_description": {"string": "Disk"}, "std:model_ref": {"uint": 500}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "bytes_per_second"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [501, 518]}}},
+        {"op": "create_node", "id": 51, "parent": 50, "type": "std:List", "props": {"std:model_ref": {"uint": 519}}}
+      ],
+      "expect": {
+        "capable": "refuse:S1",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "fallback-table-on-a-profile-model",
+      "ops": [
+        {"op": "create_model", "model": 500, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [501, 518], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 519, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 50, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Disk history"}, "std:value_description": {"string": "Disk"}, "std:model_ref": {"uint": 500}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "bytes_per_second"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [501, 518]}}},
+        {"op": "create_model", "model": 600, "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_node", "id": 51, "parent": 50, "type": "std:Table", "props": {"std:model_ref": {"uint": 600}}}
+      ],
+      "expect": {
+        "capable": "refuse:S1",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "gauge-inside-a-fallback",
+      "ops": [
+        {"op": "create_node", "id": 60, "parent": 1, "type": "m:Gauge", "props": {"std:label": {"string": "CPU"}, "std:value_description": {"string": "CPU: warming up, every 1 s"}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "percent"}, "m:axis_intent": {"string": "share"}, "m:range_min": {"float": 0.0}, "m:range_max": {"float": 100.0}}}}, "m:metric_state": {"string": "warming_up"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:denominator": {"string": "of 8 logical CPUs"}}},
+        {"op": "create_node", "id": 61, "parent": 60, "type": "std:Row", "props": {}},
+        {"op": "create_node", "id": 62, "parent": 61, "type": "std:Text", "props": {"std:text": {"string": "CPU: warming up, every 1 s"}}},
+        {"op": "create_node", "id": 63, "parent": 61, "type": "m:Gauge", "props": {"std:label": {"string": "CPU"}, "std:value_description": {"string": "CPU: warming up, every 1 s"}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "percent"}, "m:axis_intent": {"string": "share"}, "m:range_min": {"float": 0.0}, "m:range_max": {"float": 100.0}}}}, "m:metric_state": {"string": "warming_up"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:denominator": {"string": "of 8 logical CPUs"}}},
+        {"op": "create_node", "id": 64, "parent": 63, "type": "std:Text", "props": {"std:text": {"string": "CPU: warming up, every 1 s"}}}
+      ],
+      "expect": {
+        "capable": "refuse:S1",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "gauge-fallback-text-and-progress",
+      "ops": [
+        {"op": "create_node", "id": 70, "parent": 1, "type": "m:Gauge", "props": {"std:label": {"string": "CPU"}, "std:value_description": {"string": "CPU: 37.4% busy of 8 logical CPUs, every 1 s"}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "percent"}, "m:axis_intent": {"string": "share"}, "m:range_min": {"float": 0.0}, "m:range_max": {"float": 100.0}}}}, "m:metric_state": {"string": "ok"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:denominator": {"string": "of 8 logical CPUs"}, "m:metric_value": {"float": 37.4}, "m:sample_unix_ms": {"uint": 1800000001000}}},
+        {"op": "create_node", "id": 71, "parent": 70, "type": "std:Row", "props": {}},
+        {"op": "create_node", "id": 72, "parent": 71, "type": "std:Text", "props": {"std:text": {"string": "CPU: 37.4% busy of 8 logical CPUs"}}},
+        {"op": "create_node", "id": 73, "parent": 71, "type": "std:Progress", "props": {"std:value": {"float": 0.374}}}
+      ],
+      "expect": {
+        "capable": "accept",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "profile-property-on-a-standard-node",
+      "ops": [
+        {"op": "set_property", "node": 41, "prop": "m:unit", "value": {"string": "percent"}}
+      ],
+      "expect": {
+        "capable": "refuse:S2",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "standard-property-not-admitted-on-a-graph",
+      "ops": [
+        {"op": "set_property", "node": 10, "prop": "std:columns", "value": {"list": [{"string": "a"}]}}
+      ],
+      "expect": {
+        "capable": "refuse:S2",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "shortened-series-cells-collide",
+      "ops": [
+        {"op": "model_insert", "model": 100, "index": 2, "items": [{"id": 3, "value": {"null": true}, "props": {"m:series_key": {"string": "host/net/enp0s31f6-a1/rx"}, "m:series_label": {"string": "enp0s31f6-a1 rx"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 103}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 4, "value": {"null": true}, "props": {"m:series_key": {"string": "host/net/enp0s31f6-b1/rx"}, "m:series_label": {"string": "enp0s31f6-b1 rx"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 104}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "bytes_per_second"}}}]}
+      ],
+      "expect": {
+        "capable": "refuse:D1",
+        "base": "accept"
+      }
+    }
+  ],
+  "render": {
+    "capable": "Native graph with two series and a native gauge; fallback children suppressed.",
+    "base": "The Table (2 rows, the long interface label shortened to 14 bytes) and the gauge's Text; ExtensionMountResolver returns .fallback(roots:) for both profile nodes."
+  }
+}

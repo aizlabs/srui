@@ -1,0 +1,153 @@
+{
+  "fixture": "03-negative-values",
+  "profile": "io.github.aizlabs.srui.metrics/1",
+  "purpose": "Negative values: only a signed axis admits them; share and zero_based axes refuse any value with the sign bit set (including -0.0); non-finite values are refused everywhere; a counter reset is a warming_up gap, never a negative rate.",
+  "rules": [
+    "T2",
+    "T3",
+    "U2",
+    "8.3"
+  ],
+  "setup": [
+    {
+      "ops": [
+        {"op": "create_node", "id": 1, "parent": null, "type": "std:Surface", "props": {"std:label": {"string": "srtop"}}},
+        {"op": "create_model", "model": 100, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [101, 118], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 119, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 10, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Temperature delta history"}, "std:value_description": {"string": "Zone 0 delta: 21.0 °C"}, "std:model_ref": {"uint": 100}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "degrees_celsius"}, "m:axis_intent": {"string": "signed"}}}}, "m:sample_models": {"uint_range": [101, 118]}}},
+        {"op": "create_node", "id": 11, "parent": 10, "type": "std:Table", "props": {"std:label": {"string": "Temperature delta history samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 119}}},
+        {"op": "model_insert", "model": 100, "index": 0, "items": [{"id": 1, "value": {"null": true}, "props": {"m:series_key": {"string": "host/thermal/zone0/delta"}, "m:series_label": {"string": "Zone 0 delta"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 101}, "m:sample_kind": {"string": "instant"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "thermal:zone0"}, "m:subject_label": {"string": "thermal zone 0"}, "m:unit": {"string": "degrees_celsius"}}}]},
+        {"op": "create_model", "model": 200, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [201, 218], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 219, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 20, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "CPU history"}, "std:value_description": {"string": "CPU busy: 50.0%"}, "std:model_ref": {"uint": 200}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "percent"}, "m:axis_intent": {"string": "share"}, "m:range_min": {"float": 0.0}, "m:range_max": {"float": 100.0}}}}, "m:sample_models": {"uint_range": [201, 218]}}},
+        {"op": "create_node", "id": 21, "parent": 20, "type": "std:Table", "props": {"std:label": {"string": "CPU history samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 219}}},
+        {"op": "model_insert", "model": 200, "index": 0, "items": [{"id": 2, "value": {"null": true}, "props": {"m:series_key": {"string": "host/cpu/busy"}, "m:series_label": {"string": "CPU busy"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 201}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "percent"}, "m:denominator": {"string": "of 8 logical CPUs"}}}]},
+        {"op": "create_model", "model": 300, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [301, 318], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 319, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 30, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Network history"}, "std:value_description": {"string": "eth0 rx: 1.0 KiB/s"}, "std:model_ref": {"uint": 300}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "bytes_per_second"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [301, 318]}}},
+        {"op": "create_node", "id": 31, "parent": 30, "type": "std:Table", "props": {"std:label": {"string": "Network history samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 319}}},
+        {"op": "model_insert", "model": 300, "index": 0, "items": [{"id": 3, "value": {"null": true}, "props": {"m:series_key": {"string": "host/net/eth0/rx"}, "m:series_label": {"string": "eth0 rx"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 301}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "net:eth0"}, "m:subject_label": {"string": "eth0"}, "m:unit": {"string": "bytes_per_second"}}}]},
+        {"op": "create_node", "id": 40, "parent": 1, "type": "m:Gauge", "props": {"std:label": {"string": "CPU"}, "std:value_description": {"string": "CPU: 50.0% busy of 8 logical CPUs, every 1 s"}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "percent"}, "m:axis_intent": {"string": "share"}, "m:range_min": {"float": 0.0}, "m:range_max": {"float": 100.0}}}}, "m:metric_state": {"string": "ok"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:denominator": {"string": "of 8 logical CPUs"}, "m:metric_value": {"float": 50.0}, "m:sample_unix_ms": {"uint": 1800000001000}}},
+        {"op": "create_node", "id": 41, "parent": 40, "type": "std:Text", "props": {"std:text": {"string": "CPU: 50.0% busy of 8 logical CPUs, every 1 s"}}}
+      ]
+    },
+    {
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 0, "items": [{"id": 1000, "value": {"float": -3.5}}, {"id": 2000, "value": {"float": "-0.0"}}, {"id": 3000, "value": {"float": 21.0}}]},
+        {"op": "model_insert", "model": 119, "index": 0, "items": [{"id": 1, "value": {"list": [{"string": "Zone 0 delta"}, {"string": "08:00:01"}, {"string": "-3.5 °C"}]}}, {"id": 2, "value": {"list": [{"string": "Zone 0 delta"}, {"string": "08:00:02"}, {"string": "0.0 °C"}]}}, {"id": 3, "value": {"list": [{"string": "Zone 0 delta"}, {"string": "08:00:03"}, {"string": "21.0 °C"}]}}]},
+        {"op": "model_insert", "model": 201, "index": 0, "items": [{"id": 1000, "value": {"float": 50.0}}]},
+        {"op": "model_insert", "model": 219, "index": 0, "items": [{"id": 1, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:01"}, {"string": "50.0%"}]}}]},
+        {"op": "model_insert", "model": 301, "index": 0, "items": [{"id": 1000, "value": {"float": 1024.0}}]},
+        {"op": "model_insert", "model": 319, "index": 0, "items": [{"id": 1, "value": {"list": [{"string": "eth0 rx"}, {"string": "08:00:01"}, {"string": "1.0 KiB/s"}]}}]}
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "name": "signed-axis-accepts-negative",
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 3, "items": [{"id": 4000, "value": {"float": -1e+18}}]},
+        {"op": "model_insert", "model": 119, "index": 3, "items": [{"id": 4, "value": {"list": [{"string": "Zone 0 delta"}, {"string": "08:00:04"}, {"string": "-1.0E °C"}]}}]}
+      ],
+      "expect": {
+        "capable": "accept",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "share-above-range-max",
+      "ops": [
+        {"op": "model_insert", "model": 201, "index": 1, "items": [{"id": 2000, "value": {"float": 100.5}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T3",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "share-at-range-max",
+      "ops": [
+        {"op": "model_insert", "model": 201, "index": 1, "items": [{"id": 2000, "value": {"float": 100.0}}]},
+        {"op": "model_insert", "model": 219, "index": 1, "items": [{"id": 2, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:02"}, {"string": "100.0%"}]}}]}
+      ],
+      "expect": {
+        "capable": "accept",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "zero-based-negative",
+      "ops": [
+        {"op": "model_insert", "model": 301, "index": 1, "items": [{"id": 2000, "value": {"float": -0.0001}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T3",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "zero-based-negative-zero",
+      "ops": [
+        {"op": "model_insert", "model": 301, "index": 1, "items": [{"id": 2000, "value": {"float": "-0.0"}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T3",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "nan",
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 3, "items": [{"id": 4000, "value": {"float": "NaN"}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T2",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "infinity",
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 3, "items": [{"id": 4000, "value": {"float": "-Infinity"}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T2",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "magnitude-above-1e18",
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 3, "items": [{"id": 4000, "value": {"float": 1.5e+18}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T2",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "gauge-negative-on-share",
+      "ops": [
+        {"op": "set_property", "node": 40, "prop": "m:metric_value", "value": {"float": -1.0}}
+      ],
+      "expect": {
+        "capable": "refuse:U2",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "counter-reset-is-a-warming-up-gap",
+      "ops": [
+        {"op": "model_insert", "model": 301, "index": 1, "items": [{"id": 2000, "value": {"gap": "warming_up"}}, {"id": 3000, "value": {"float": 2048.0}}]},
+        {"op": "model_insert", "model": 319, "index": 1, "items": [{"id": 2, "value": {"list": [{"string": "eth0 rx"}, {"string": "08:00:02"}, {"string": "warming up 1s"}]}}, {"id": 3, "value": {"list": [{"string": "eth0 rx"}, {"string": "08:00:03"}, {"string": "2.0 KiB/s"}]}}]}
+      ],
+      "expect": {
+        "capable": "accept",
+        "base": "accept"
+      }
+    }
+  ]
+}

@@ -9,6 +9,40 @@
     "F1",
     "F3"
   ],
+  "series_cells": [
+    {
+      "label": "CPU busy",
+      "cell": "CPU busy"
+    },
+    {
+      "label": "Réseau émis",
+      "cell": "Réseau émis"
+    },
+    {
+      "label": "br-4f1c2d3e5a6b rx",
+      "cell": "br-4f1c…b rx"
+    },
+    {
+      "label": "网络流量接收速率",
+      "cell": "网络…率"
+    },
+    {
+      "label": "Netzwerk Empfang über",
+      "cell": "Netzwer…ber"
+    },
+    {
+      "label": "Taux d’écriture",
+      "cell": "Taux d…ture"
+    },
+    {
+      "label": "receive wlan0 📶",
+      "cell": "receive…📶"
+    },
+    {
+      "label": "wlan0 📶 receive",
+      "cell": "wlan0 …eive"
+    }
+  ],
   "setup": [
     {
       "ops": [
@@ -139,6 +173,30 @@
       "name": "shortened-series-cells-collide",
       "ops": [
         {"op": "model_insert", "model": 100, "index": 2, "items": [{"id": 3, "value": {"null": true}, "props": {"m:series_key": {"string": "host/net/enp0s31f6-a1/rx"}, "m:series_label": {"string": "enp0s31f6-a1 rx"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 103}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 4, "value": {"null": true}, "props": {"m:series_key": {"string": "host/net/enp0s31f6-b1/rx"}, "m:series_label": {"string": "enp0s31f6-b1 rx"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 104}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "bytes_per_second"}}}]}
+      ],
+      "expect": {
+        "capable": "refuse:D1",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "multilingual-series-cells",
+      "ops": [
+        {"op": "model_insert", "model": 100, "index": 2, "items": [{"id": 5, "value": {"null": true}, "props": {"m:series_key": {"string": "host/net/cjk/rx"}, "m:series_label": {"string": "网络流量接收速率"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 103}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 6, "value": {"null": true}, "props": {"m:series_key": {"string": "host/net/de/rx"}, "m:series_label": {"string": "Netzwerk Empfang über"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 104}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 7, "value": {"null": true}, "props": {"m:series_key": {"string": "host/net/wlan0/rx"}, "m:series_label": {"string": "receive wlan0 📶"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 105}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "bytes_per_second"}}}]},
+        {"op": "model_insert", "model": 103, "index": 0, "items": [{"id": 1000, "value": {"float": 2048.0}}]},
+        {"op": "model_insert", "model": 104, "index": 0, "items": [{"id": 1000, "value": {"float": 4096.0}}]},
+        {"op": "model_insert", "model": 105, "index": 0, "items": [{"id": 1000, "value": {"float": 0.0}}]},
+        {"op": "model_insert", "model": 119, "index": 2, "items": [{"id": 3, "value": {"list": [{"string": "网络…率"}, {"string": "08:00:01"}, {"string": "2.0 KiB/s"}]}}, {"id": 4, "value": {"list": [{"string": "Netzwer…ber"}, {"string": "08:00:01"}, {"string": "4.0 KiB/s"}]}}, {"id": 5, "value": {"list": [{"string": "receive…📶"}, {"string": "08:00:01"}, {"string": "0 B/s"}]}}]}
+      ],
+      "expect": {
+        "capable": "accept",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "cjk-series-cells-collide",
+      "ops": [
+        {"op": "model_insert", "model": 100, "index": 2, "items": [{"id": 5, "value": {"null": true}, "props": {"m:series_key": {"string": "host/net/cjk/rx"}, "m:series_label": {"string": "网络流量接收速率"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 103}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 6, "value": {"null": true}, "props": {"m:series_key": {"string": "host/net/cjk/tx"}, "m:series_label": {"string": "网络流量发送速率"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 104}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "bytes_per_second"}}}]}
       ],
       "expect": {
         "capable": "refuse:D1",

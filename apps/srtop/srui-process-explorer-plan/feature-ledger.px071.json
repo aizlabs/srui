@@ -45,7 +45,7 @@
     },
     {
       "feature_id": "SRUI-PX071-003",
-      "feature": "Series semantics are specified: one immutable graph epoch and sample offsets (the item id) taken at the source read on the server's monotonic clock; independent per-graph, per-series and per-gauge timestamps with no implied atomic host snapshot; samples are finite float64 and gaps are reason codes lasting until the next item, never zero, null or interpolated; append-only, front-evict-only and full-reset-only operations; exact retention of at most 900 samples within window_ms (1 s to 15 min); closed units, at most two axes with share/zero_based/signed intent, server-worded denominators; negative values only on signed axes by the sign bit; staleness is a server-published gap; gauge state/value coupling never turns an unknown figure into zero",
+      "feature": "Series semantics are specified: one immutable graph epoch and sample offsets (the item id) taken at the source read on the server's monotonic clock; independent per-graph, per-series and per-gauge timestamps with no implied atomic host snapshot; samples are finite float64 and gaps are reason codes lasting until the next item, never zero, null or interpolated; append-only and front-evict-only operations, MODEL_RESET_RANGE only in the snapshot fill form, replace as MODEL_DELETE of the whole count then MODEL_INSERT so base clients reach the same state under the existing generic model semantics, and dense profile models; exact retention of at most 900 samples within window_ms (1 s to 15 min); closed units, at most two axes with share/zero_based/signed intent, server-worded denominators; negative values only on signed axes by the sign bit; staleness is a server-published gap; gauge state/value coupling never turns an unknown figure into zero",
       "scope": "PX-071/docs/process-explorer/design/metrics-profile.md sections 5-6, 10.1; fixtures 02-05, 08",
       "source_refs": [
         "D1",
@@ -61,7 +61,7 @@
     },
     {
       "feature_id": "SRUI-PX071-004",
-      "feature": "The Standard Widget fallback and accessibility summaries are specified: a Gauge falls back to one Text (or Text then Progress); a SeriesGraph falls back to one model-backed Table with columns Series, Time, Value holding the newest 60 samples of every series, series-major, each row at most 64 bytes on the wire with gap words and durations; a normative formatter shared by fallback text and accessibility values; server value_description summaries and per-series accessibility elements on capable clients",
+      "feature": "The Standard Widget fallback and accessibility summaries are specified: a Gauge falls back to one Text (or Text then Progress); a SeriesGraph falls back to one model-backed Table with columns Series, Time, Value holding the newest 60 samples of every series, series-major, each row at most 64 bytes on the wire with gap words and durations and the Series cell cut on Unicode scalar boundaries; a normative formatter shared by fallback text and accessibility values; server value_description summaries and per-series accessibility elements on capable clients",
       "scope": "PX-071/docs/process-explorer/design/metrics-profile.md sections 8-9; fixtures 01, 02, 07",
       "source_refs": [
         "D1",

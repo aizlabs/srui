@@ -300,6 +300,44 @@ struct SplitRenderingTests {
     }
 
     @Test
+    func aChangedSizingHintIsAppliedUntilTheUserMovesADivider() throws {
+        let h = try Harness(Self.base(axis: .splitAxisStacked, panes: [
+            Self.text(Self.paneA, [(.preferredSize, .size(Size(width: 0, height: 150)))]),
+            Self.text(Self.paneB),
+        ]))
+        defer { h.tearDown() }
+        #expect(abs(h.length(Self.paneA) - 150) < 3)
+        _ = try h.commit([.setProperty(id: Self.paneA, property: .preferredSize, value: .size(Size(width: 0, height: 250)))])
+        #expect(abs(h.length(Self.paneA) - 250) < 3, "a new preferred height is applied: \(h.length(Self.paneA))")
+        let rest = h.split.bounds.height - h.split.dividerThickness - 250
+        _ = try h.commit([.setProperty(id: Self.paneA, property: .preferredSize, value: .size(Size(width: 0, height: 0)))])
+        _ = try h.commit([.setProperty(id: Self.paneB, property: .grow, value: .float64(3))])
+        #expect(abs(h.length(Self.paneB) - (rest + 250) * 0.75) < 3, "a new grow weight is applied: \(h.length(Self.paneB))")
+        try h.drag(divider: 0, by: -60)
+        let moved = h.length(Self.paneA)
+        _ = try h.commit([.setProperty(id: Self.paneB, property: .grow, value: .float64(1))])
+        #expect(abs(h.length(Self.paneA) - moved) < 3, "the user's divider wins over a later hint")
+        #expect(h.sent == 0)
+    }
+
+    @Test
+    func aPaddingChangeRefitsTheSplitToItsStack() throws {
+        let h = try Harness(Self.base(panes: [Self.text(Self.paneA), Self.text(Self.paneB)]))
+        defer { h.tearDown() }
+        for role in [EnumToken.paddingRoleRelaxed, .paddingRoleNone, .paddingRoleTight] {
+            _ = try h.commit([.setProperty(id: Self.surfaceID, property: .paddingRole, value: .enumToken(role))])
+            let current = try #require(h.split.superview as? NSStackView)
+            let inset = current.orientation == .vertical
+                ? current.edgeInsets.left + current.edgeInsets.right
+                : current.edgeInsets.top + current.edgeInsets.bottom
+            let cross = current.orientation == .vertical ? h.split.frame.width : h.split.frame.height
+            let stackCross = current.orientation == .vertical ? current.bounds.width : current.bounds.height
+            #expect(abs(cross - (stackCross - inset)) < 1, "\(role): split \(cross) vs stack \(stackCross) - \(inset)")
+        }
+        #expect(h.sent == 0)
+    }
+
+    @Test
     func aWindowResizeScalesThePanesAndKeepsTheUsersProportions() throws {
         let h = try Harness(Self.base(panes: [Self.text(Self.paneA), Self.text(Self.paneB)]))
         defer { h.tearDown() }

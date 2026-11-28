@@ -57,9 +57,14 @@ public final class SplitPaneView: NSView {
     /// The child node this pane holds.
     public let nodeID: NodeId
     /// The child's `preferred_size`, a hint for the pane's first length along the axis only.
-    var preferredSize: Size?
+    /// A change re-applies the hints; proportions the user set by moving a divider still win.
+    var preferredSize: Size? {
+        didSet { if preferredSize != oldValue { owner?.setNeedsProportionRestore() } }
+    }
     /// The child's `grow`, its weight when panes without a preferred length share the rest.
-    var growWeight: Double?
+    var growWeight: Double? {
+        didSet { if growWeight != oldValue { owner?.setNeedsProportionRestore() } }
+    }
     /// Whether the child's `visibility` is `collapsed`, which collapses the pane.
     var isCollapsedPane = false
     weak var owner: SemanticSplitView?

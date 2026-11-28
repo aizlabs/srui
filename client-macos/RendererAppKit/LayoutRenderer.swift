@@ -408,20 +408,6 @@ public final class LayoutRenderer {
             return
         }
         if let stack = parent.view as? NSStackView {
-            if child is SemanticSplitView {
-                stack.addArrangedSubview(child)
-                reconcileFillConstraints(for: parent)
-                // A Split fills its stack's cross axis, below the explicit fill constraints (999).
-                let inset = stack.orientation == .vertical
-                    ? stack.edgeInsets.left + stack.edgeInsets.right
-                    : stack.edgeInsets.top + stack.edgeInsets.bottom
-                let fill = stack.orientation == .vertical
-                    ? child.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -inset)
-                    : child.heightAnchor.constraint(equalTo: stack.heightAnchor, constant: -inset)
-                fill.priority = .defaultHigh
-                fill.isActive = true
-                return
-            }
             if stack.orientation == .vertical,
                let rowStack = child as? NSStackView,
                rowStack.orientation == .horizontal {
@@ -528,6 +514,20 @@ public final class LayoutRenderer {
             shouldFill = handle.layoutMetadata.verticalAlignment == .verticalAlignmentFill
             inset = stack.edgeInsets.top + stack.edgeInsets.bottom
         }
+
+        // A Split fills its stack's cross axis, below the explicit fill constraints (999). The
+        // constant is the stack's inset, so these are rebuilt with them on a padding change; they
+        // are kept under `.paddingRole`, which no other constraint of a stack's handle uses.
+        handle.propertyConstraints[.paddingRole]?.forEach { $0.isActive = false }
+        let splitFills = stack.arrangedSubviews.filter { $0 is SemanticSplitView }.map { child in
+            let fill = stack.orientation == .vertical
+                ? child.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -inset)
+                : child.heightAnchor.constraint(equalTo: stack.heightAnchor, constant: -inset)
+            fill.priority = .defaultHigh
+            return fill
+        }
+        NSLayoutConstraint.activate(splitFills)
+        handle.propertyConstraints[.paddingRole] = splitFills
 
         handle.propertyConstraints[property]?.forEach { $0.isActive = false }
         guard shouldFill else {

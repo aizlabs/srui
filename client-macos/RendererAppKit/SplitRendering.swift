@@ -281,7 +281,9 @@ public final class SemanticSplitView: NSSplitView, NSSplitViewDelegate {
     ///
     /// Panes with a remembered proportion keep their proportions relative to each other; a pane
     /// without one takes an equal share. With nothing remembered, a pane's `preferred_size`
-    /// along the axis claims that length and the others share the rest by `grow`.
+    /// along the axis claims that length and the others share the rest by `grow`. Panes without a
+    /// preferred size always keep at least half an equal share between them: preferred lengths
+    /// that would consume the axis are scaled down rather than squeezing those panes to nothing.
     private func targetFractions(for visible: [SplitPaneView], available: CGFloat) -> [Double] {
         let remembered = loadProportions()
         let known = visible.compactMap { remembered[$0.nodeID] }.filter { $0 > 0 }
@@ -305,12 +307,15 @@ public final class SemanticSplitView: NSSplitView, NSSplitViewDelegate {
         let claimed = preferred.compactMap { $0 }.reduce(0, +)
         let weights = visible.map { pane in (pane.growWeight ?? 0) > 0 ? pane.growWeight! : 1 }
         let openWeight = zip(preferred, weights).filter { $0.0 == nil }.map(\.1).reduce(0, +)
-        if claimed >= 1 || openWeight == 0 {
+        guard openWeight > 0 else {
             let total = claimed > 0 ? claimed : 1
             return preferred.map { ($0 ?? 0) / total }
         }
+        let openCount = Double(preferred.filter { $0 == nil }.count)
+        let openShare = max(1 - claimed, openCount / count / 2)
+        let scale = claimed > 0 ? min(1, (1 - openShare) / claimed) : 1
         return zip(preferred, weights).map { preferred, weight in
-            preferred ?? (1 - claimed) * weight / openWeight
+            preferred.map { $0 * scale } ?? openShare * weight / openWeight
         }
     }
 

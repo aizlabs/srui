@@ -282,6 +282,24 @@ struct SplitRenderingTests {
     }
 
     @Test
+    func preferredSizesThatFillTheAxisStillLeaveRoomForTheOtherPanes() throws {
+        let h = try Harness(Self.base(panes: [
+            Self.text(Self.paneA, [(.preferredSize, .size(Size(width: 500, height: 0)))]),
+            Self.text(Self.paneB, [(.preferredSize, .size(Size(width: 500, height: 0)))]),
+            Self.text(Self.paneC, [(.grow, .float64(1))]),
+        ]))
+        defer { h.tearDown() }
+        for width in [CGFloat(840), 640] {
+            h.place(size: NSSize(width: width, height: 640))
+            let available = h.split.bounds.width - 2 * h.split.dividerThickness
+            // Half an equal share is reserved for the pane without a preferred size.
+            #expect(h.length(Self.paneC) >= available / 6 - 3, "pane C keeps its share at \(width): \(h.length(Self.paneC))")
+            #expect(abs(h.length(Self.paneA) - h.length(Self.paneB)) < 3, "equal preferences scale down equally")
+        }
+        #expect(h.sent == 0)
+    }
+
+    @Test
     func aWindowResizeScalesThePanesAndKeepsTheUsersProportions() throws {
         let h = try Harness(Self.base(panes: [Self.text(Self.paneA), Self.text(Self.paneB)]))
         defer { h.tearDown() }

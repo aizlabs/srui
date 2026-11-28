@@ -56,3 +56,8 @@ Apply the standing completion contract. Record evidence in `docs/process-explore
 ### Reference lookup
 
 Read [BASELINE.md](../BASELINE.md) and [SOURCES.md](../SOURCES.md). External reference IDs: BT1. Verify version-specific OS/API details at implementation time and record exact references in the completion note.
+
+### Recorded follow-ups
+
+- **PX071-F1 — steady-state traffic bound ([aizlabs/srui#128](https://github.com/aizlabs/srui/issues/128)).** PX-071 measured that, with every panel expanded and 8 devices and 8 interfaces showing series, the series appends and evictions plus the mandatory fallback rows alone come to about 4,446 B/s. That is above the 4 KiB/s steady-state bound in `docs/process-explorer/design/dashboard.md` section 7, which PX-073-G02 uses as a pass/fail threshold. The arithmetic is in `docs/process-explorer/design/metrics-profile.md` section 7.3.
+- Under the user's decision of 2026-11-28 (option (a): a recorded follow-up), this ticket owns the fix. Recompute the figure from the real encoding and amend dashboard.md section 7's bound (likely to 8 KiB/s), with the reason, before PX-073-G02 measures.

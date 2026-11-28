@@ -1,0 +1,75 @@
+{
+  "fixture": "08-independent-panels",
+  "profile": "io.github.aizlabs.srui.metrics/1",
+  "purpose": "Independent timestamps: each graph has its own epoch, each series its own sample offsets and each gauge its own sample time; one transaction carrying samples of several panels implies no common host snapshot.",
+  "rules": [
+    "5.1",
+    "5.7",
+    "T1",
+    "U1"
+  ],
+  "setup": [
+    {
+      "ops": [
+        {"op": "create_node", "id": 1, "parent": null, "type": "std:Surface", "props": {"std:label": {"string": "srtop"}}},
+        {"op": "create_model", "model": 100, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [101, 118], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 119, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 10, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "CPU history"}, "std:value_description": {"string": "CPU busy 12.5%, sampled 08:00:04"}, "std:model_ref": {"uint": 100}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "percent"}, "m:axis_intent": {"string": "share"}, "m:range_min": {"float": 0.0}, "m:range_max": {"float": 100.0}}}}, "m:sample_models": {"uint_range": [101, 118]}}},
+        {"op": "create_node", "id": 11, "parent": 10, "type": "std:Table", "props": {"std:label": {"string": "CPU history samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 119}}},
+        {"op": "model_insert", "model": 100, "index": 0, "items": [{"id": 1, "value": {"null": true}, "props": {"m:series_key": {"string": "host/cpu/busy"}, "m:series_label": {"string": "CPU busy"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 101}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:unit": {"string": "percent"}, "m:denominator": {"string": "of 8 logical CPUs"}}}]},
+        {"op": "create_model", "model": 200, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [201, 218], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 219, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 20, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Disk history"}, "std:value_description": {"string": "Disk read 1.0 MiB/s, sampled 08:00:04"}, "std:model_ref": {"uint": 200}, "m:epoch_unix_ms": {"uint": 1800000000250}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "bytes_per_second"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [201, 218]}}},
+        {"op": "create_node", "id": 21, "parent": 20, "type": "std:Table", "props": {"std:label": {"string": "Disk history samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 219}}},
+        {"op": "model_insert", "model": 200, "index": 0, "items": [{"id": 11, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/nvme0n1/read"}, "m:series_label": {"string": "nvme0n1 read"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 201}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:nvme-eui.0025388b91b2c4a1"}, "m:subject_label": {"string": "nvme0n1"}, "m:unit": {"string": "bytes_per_second"}}}, {"id": 12, "value": {"null": true}, "props": {"m:series_key": {"string": "host/disk/nvme0n1/write"}, "m:series_label": {"string": "nvme0n1 write"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 202}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "disk:nvme-eui.0025388b91b2c4a1"}, "m:subject_label": {"string": "nvme0n1"}, "m:unit": {"string": "bytes_per_second"}}}]},
+        {"op": "create_node", "id": 40, "parent": 1, "type": "m:Gauge", "props": {"std:label": {"string": "CPU"}, "std:value_description": {"string": "CPU: 12.5% busy of 8 logical CPUs, every 1 s"}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "percent"}, "m:axis_intent": {"string": "share"}, "m:range_min": {"float": 0.0}, "m:range_max": {"float": 100.0}}}}, "m:metric_state": {"string": "ok"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:denominator": {"string": "of 8 logical CPUs"}, "m:metric_value": {"float": 12.5}, "m:sample_unix_ms": {"uint": 1800000004000}}},
+        {"op": "create_node", "id": 41, "parent": 40, "type": "std:Text", "props": {"std:text": {"string": "CPU: 12.5% busy of 8 logical CPUs, every 1 s"}}}
+      ]
+    },
+    {
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 0, "items": [{"id": 4000, "value": {"float": 12.5}}]},
+        {"op": "model_insert", "model": 119, "index": 0, "items": [{"id": 1, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:04"}, {"string": "12.5%"}]}}]},
+        {"op": "model_insert", "model": 201, "index": 0, "items": [{"id": 3990, "value": {"float": 1048576.0}}]},
+        {"op": "model_insert", "model": 202, "index": 0, "items": [{"id": 3900, "value": {"float": 0.0}}]},
+        {"op": "model_insert", "model": 219, "index": 0, "items": [{"id": 1, "value": {"list": [{"string": "nvme0n1 read"}, {"string": "08:00:04"}, {"string": "1.0 MiB/s"}]}}, {"id": 2, "value": {"list": [{"string": "nvme0n1 write"}, {"string": "08:00:04"}, {"string": "0 B/s"}]}}]}
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "name": "one-commit-three-sample-times",
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 1, "items": [{"id": 5000, "value": {"float": 25.0}}]},
+        {"op": "model_insert", "model": 201, "index": 1, "items": [{"id": 4985, "value": {"float": 2097152.0}}]},
+        {"op": "model_insert", "model": 202, "index": 1, "items": [{"id": 4960, "value": {"float": 4096.0}}]},
+        {"op": "set_property", "node": 40, "prop": "m:metric_value", "value": {"float": 25.0}},
+        {"op": "set_property", "node": 40, "prop": "m:sample_unix_ms", "value": {"uint": 1800000005000}},
+        {"op": "model_insert", "model": 119, "index": 1, "items": [{"id": 2, "value": {"list": [{"string": "CPU busy"}, {"string": "08:00:05"}, {"string": "25.0%"}]}}]},
+        {"op": "model_insert", "model": 219, "index": 1, "items": [{"id": 3, "value": {"list": [{"string": "nvme0n1 read"}, {"string": "08:00:05"}, {"string": "2.0 MiB/s"}]}}]},
+        {"op": "model_insert", "model": 219, "index": 3, "items": [{"id": 4, "value": {"list": [{"string": "nvme0n1 write"}, {"string": "08:00:05"}, {"string": "4.0 KiB/s"}]}}]}
+      ],
+      "expect": {
+        "capable": "accept",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "disk-series-without-a-cpu-sample",
+      "ops": [
+        {"op": "model_insert", "model": 201, "index": 1, "items": [{"id": 5990, "value": {"float": 0.0}}]},
+        {"op": "model_insert", "model": 219, "index": 1, "items": [{"id": 3, "value": {"list": [{"string": "nvme0n1 read"}, {"string": "08:00:06"}, {"string": "0 B/s"}]}}]}
+      ],
+      "expect": {
+        "capable": "accept",
+        "base": "accept"
+      }
+    }
+  ],
+  "render": {
+    "capable": "Each graph's right edge is its own newest offset; no host-wide time is drawn or announced; the disk series are positioned by their own offsets.",
+    "base": "Each fallback row names its own sample time."
+  }
+}

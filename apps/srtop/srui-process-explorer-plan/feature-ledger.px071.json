@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-071",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Metrics-profile gate (D1 §§6.4, 11, 15, 26; D2 T20, T31; T36 not assumed): a specification-only, separately versioned optional extension profile io.github.aizlabs.srui.metrics/1 for numeric gauges and bounded time series, with Standard Widget fallbacks, eight documentation golden fixtures and a schema review; no registry, proto, generated, SDK, runtime, client or srtop change; no production graph enabled",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md",
+      "DASH": "docs/process-explorer/design/dashboard.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX071-001",
+      "feature": "The profile is named io.github.aizlabs.srui.metrics/1 (reverse-DNS of the project's GitHub organization, not org.srui; name approved by the user on 2026-11-28), advertised only as optional, at most one major per session, registered through the existing register_optional_extension_profile so the server assigns its namespace in extension_namespaces; activation is §15's exact intersection; any change is a new major; a client that does not implement the advertised major is a base client that renders fallbacks and refuses nothing; resume and resync reuse §15/§18 unchanged; it is a domain extension rather than a Standard Widget type, T36 VectorScene or graphs in Image resources, with no paths, shaders, scripts or expressions",
+      "scope": "PX-071/docs/process-explorer/design/metrics-profile.md sections 2-3; fixture 06",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-071",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-071.md",
+        "docs/process-explorer/design/metrics-profile.md",
+        "docs/process-explorer/design/metrics-profile-fixtures/06-profile-version-mismatch.json"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX071-002",
+      "feature": "The object model uses only existing wire facilities: node types Gauge and SeriesGraph, model types SeriesSet and SampleSeries, record type AxisSpec and 21 profile properties in the session-assigned namespace, standard label/value_description/visibility/model_ref with their standard meaning; one SeriesGraph carries up to 18 series, each with a stable series id, series_key, subject identity, unit and its own gaps; 18 fixed sample-model slots per graph are reused because the wire has no model deletion, bounding a session at 16 graphs and 320 profile models",
+      "scope": "PX-071/docs/process-explorer/design/metrics-profile.md sections 4, 5.6, 7.1",
+      "source_refs": [
+        "D1",
+        "DASH"
+      ],
+      "owner": "PX-071",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-071.md",
+        "docs/process-explorer/design/metrics-profile.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX071-003",
+      "feature": "Series semantics are specified: one immutable graph epoch and sample offsets (the item id) taken at the source read on the server's monotonic clock; independent per-graph, per-series and per-gauge timestamps with no implied atomic host snapshot; samples are finite float64 and gaps are reason codes lasting until the next item, never zero, null or interpolated; append-only and front-evict-only operations, MODEL_RESET_RANGE only in the snapshot fill form, replace as MODEL_DELETE of the whole count then MODEL_INSERT so base clients reach the same state under the existing generic model semantics, and dense profile models; exact retention of at most 900 samples within window_ms (1 s to 15 min); closed units, at most two axes with share/zero_based/signed intent, server-worded denominators; negative values only on signed axes by the sign bit; staleness is a server-published gap; gauge state/value coupling never turns an unknown figure into zero",
+      "scope": "PX-071/docs/process-explorer/design/metrics-profile.md sections 5-6, 10.1; fixtures 02-05, 08",
+      "source_refs": [
+        "D1",
+        "DASH"
+      ],
+      "owner": "PX-071",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-071.md",
+        "docs/process-explorer/design/metrics-profile.md",
+        "docs/process-explorer/design/metrics-profile-fixtures/05-window-bounds.json"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX071-004",
+      "feature": "The Standard Widget fallback and accessibility summaries are specified: a Gauge falls back to one Text (or Text then Progress); a SeriesGraph falls back to one model-backed Table with columns Series, Time, Value holding the newest 60 samples of every series, series-major, each row at most 64 bytes on the wire with gap words and durations and the Series cell cut on Unicode scalar boundaries; a normative formatter shared by fallback text and accessibility values; server value_description summaries and per-series accessibility elements on capable clients",
+      "scope": "PX-071/docs/process-explorer/design/metrics-profile.md sections 8-9; fixtures 01, 02, 07",
+      "source_refs": [
+        "D1",
+        "DASH"
+      ],
+      "owner": "PX-071",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-071.md",
+        "docs/process-explorer/design/metrics-profile.md",
+        "docs/process-explorer/design/metrics-profile-fixtures/07-unsupported-client-fallback.json"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX071-005",
+      "feature": "Limits, encoding and the schema review are recorded: every rule (N, S, G, D, T, U, F) with its enforcement point on the authoritative side, capable clients and base clients, implementable without AppKit; measured protoc sizes (20 bytes per sample, 13 per gap, 64 per fallback row) under which dashboard.md's reserves still hold; the six review cases each decided by fixture cases; a normative evaluation order so Rust and Swift report the same rule ID, with every refusing fixture case breaking exactly one rule; eight documentation fixtures checked by an independent scratch implementation; finding PX071-F1 that the fully expanded dashboard's series and fallback rows need about 4,446 B/s against dashboard.md's 4 KiB/s bound, recorded by the user's decision (2026-11-28, option (a)) as follow-up issue https://github.com/aizlabs/srui/issues/128, owned by PX-073-G01, which amends dashboard.md section 7 before PX-073-G02 measures",
+      "scope": "PX-071/docs/process-explorer/design/metrics-profile.md sections 7, 10-13; docs/process-explorer/design/metrics-profile-fixtures/",
+      "source_refs": [
+        "D1",
+        "DASH"
+      ],
+      "owner": "PX-071",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-071.md",
+        "docs/process-explorer/design/metrics-profile.md"
+      ]
+    }
+  ]
+}

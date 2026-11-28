@@ -1,0 +1,154 @@
+{
+  "fixture": "04-gaps-and-staleness",
+  "profile": "io.github.aizlabs.srui.metrics/1",
+  "purpose": "Explicit gaps: a gap is an item whose value is a reason token; it lasts until the next item; no zero, no interpolation; staleness is a server-detected gap; gauges never carry a value in a state that has none.",
+  "rules": [
+    "T2",
+    "T4",
+    "U1",
+    "F4"
+  ],
+  "setup": [
+    {
+      "ops": [
+        {"op": "create_node", "id": 1, "parent": null, "type": "std:Surface", "props": {"std:label": {"string": "srtop"}}},
+        {"op": "create_model", "model": 100, "type": "m:SeriesSet", "item_count": 0},
+        {"op": "create_model", "model_range": [101, 118], "type": "m:SampleSeries", "item_count": 0},
+        {"op": "create_model", "model": 119, "type": "std:Table", "item_count": 0},
+        {"op": "create_node", "id": 10, "parent": 1, "type": "m:SeriesGraph", "props": {"std:label": {"string": "Network history"}, "std:value_description": {"string": "Receive: collector error"}, "std:model_ref": {"uint": 100}, "m:epoch_unix_ms": {"uint": 1800000000000}, "m:window_ms": {"uint": 900000}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "bytes_per_second"}, "m:axis_intent": {"string": "zero_based"}}}}, "m:sample_models": {"uint_range": [101, 118]}}},
+        {"op": "create_node", "id": 11, "parent": 10, "type": "std:Table", "props": {"std:label": {"string": "Network history samples"}, "std:accessible_description": {"string": "One row per sample, oldest first within each series. A gap row names its state and lasts until the next row of its series; error means collector error and unconfigured means none configured."}, "std:columns": {"list": [{"string": "Series"}, {"string": "Time"}, {"string": "Value"}]}, "std:selection_mode": {"enum": "SelectionMode.none"}, "std:model_ref": {"uint": 119}}},
+        {"op": "model_insert", "model": 100, "index": 0, "items": [{"id": 1, "value": {"null": true}, "props": {"m:series_key": {"string": "host/net/aggregate/rx"}, "m:series_label": {"string": "Receive"}, "m:series_axis": {"string": "primary"}, "m:samples_model": {"uint": 101}, "m:sample_kind": {"string": "interval"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "net:aggregate"}, "m:subject_label": {"string": "non-loopback interfaces"}, "m:unit": {"string": "bytes_per_second"}}}]},
+        {"op": "create_node", "id": 40, "parent": 1, "type": "m:Gauge", "props": {"std:label": {"string": "CPU"}, "std:value_description": {"string": "CPU: warming up, every 1 s"}, "m:primary_axis": {"record": {"type": "m:AxisSpec", "props": {"m:unit": {"string": "percent"}, "m:axis_intent": {"string": "share"}, "m:range_min": {"float": 0.0}, "m:range_max": {"float": 100.0}}}}, "m:metric_state": {"string": "warming_up"}, "m:interval_ms": {"uint": 1000}, "m:subject_key": {"string": "host"}, "m:subject_label": {"string": "host"}, "m:denominator": {"string": "of 8 logical CPUs"}}},
+        {"op": "create_node", "id": 41, "parent": 40, "type": "std:Text", "props": {"std:text": {"string": "CPU: warming up, every 1 s"}}}
+      ]
+    },
+    {
+      "note": "Baseline, one rate, a 3 s pause, a new baseline after Resume, one rate, then an ongoing collector error.",
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 0, "items": [{"id": 0, "value": {"gap": "warming_up"}}, {"id": 1000, "value": {"float": 1258291.2}}, {"id": 2000, "value": {"gap": "paused"}}, {"id": 5000, "value": {"gap": "warming_up"}}, {"id": 6000, "value": {"float": 87040.0}}, {"id": 7000, "value": {"gap": "collector_error"}}]},
+        {"op": "model_insert", "model": 119, "index": 0, "items": [{"id": 1, "value": {"list": [{"string": "Receive"}, {"string": "08:00:00"}, {"string": "warming up 1s"}]}}, {"id": 2, "value": {"list": [{"string": "Receive"}, {"string": "08:00:01"}, {"string": "1.2 MiB/s"}]}}, {"id": 3, "value": {"list": [{"string": "Receive"}, {"string": "08:00:02"}, {"string": "paused 3s"}]}}, {"id": 4, "value": {"list": [{"string": "Receive"}, {"string": "08:00:05"}, {"string": "warming up 1s"}]}}, {"id": 5, "value": {"list": [{"string": "Receive"}, {"string": "08:00:06"}, {"string": "85.0 KiB/s"}]}}, {"id": 6, "value": {"list": [{"string": "Receive"}, {"string": "08:00:07"}, {"string": "error"}]}}]}
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "name": "repeated-gap-reason",
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 6, "items": [{"id": 8000, "value": {"gap": "collector_error"}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T4",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "error-then-stale",
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 6, "items": [{"id": 10000, "value": {"gap": "stale"}}]},
+        {"op": "model_update", "model": 119, "index": 5, "items": [{"id": 6, "value": {"list": [{"string": "Receive"}, {"string": "08:00:07"}, {"string": "error 3s"}]}}]},
+        {"op": "model_insert", "model": 119, "index": 6, "items": [{"id": 7, "value": {"list": [{"string": "Receive"}, {"string": "08:00:10"}, {"string": "stale"}]}}]}
+      ],
+      "expect": {
+        "capable": "accept",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "recovery-after-error",
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 6, "items": [{"id": 8000, "value": {"gap": "warming_up"}}, {"id": 9000, "value": {"float": 2048.0}}]},
+        {"op": "model_update", "model": 119, "index": 5, "items": [{"id": 6, "value": {"list": [{"string": "Receive"}, {"string": "08:00:07"}, {"string": "error 1s"}]}}]},
+        {"op": "model_insert", "model": 119, "index": 6, "items": [{"id": 7, "value": {"list": [{"string": "Receive"}, {"string": "08:00:08"}, {"string": "warming up 1s"}]}}, {"id": 8, "value": {"list": [{"string": "Receive"}, {"string": "08:00:09"}, {"string": "2.0 KiB/s"}]}}]}
+      ],
+      "expect": {
+        "capable": "accept",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "unknown-gap-reason",
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 6, "items": [{"id": 8000, "value": {"uint": 9}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T2",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "string-is-not-a-gap",
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 6, "items": [{"id": 8000, "value": {"string": "paused"}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T2",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "null-is-not-a-gap",
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 6, "items": [{"id": 8000, "value": {"null": true}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T2",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "sample-with-properties",
+      "ops": [
+        {"op": "model_insert", "model": 101, "index": 6, "items": [{"id": 8000, "value": {"float": 1.0}, "props": {"m:sample_unix_ms": {"uint": 1800000008000}}}]}
+      ],
+      "expect": {
+        "capable": "refuse:T2",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "gauge-unavailable-with-value",
+      "ops": [
+        {"op": "set_property", "node": 40, "prop": "m:metric_state", "value": {"string": "unavailable"}},
+        {"op": "set_property", "node": 40, "prop": "m:metric_value", "value": {"float": 0.0}},
+        {"op": "set_property", "node": 40, "prop": "m:sample_unix_ms", "value": {"uint": 1800000008000}}
+      ],
+      "expect": {
+        "capable": "refuse:U1",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "gauge-ok-without-value",
+      "ops": [
+        {"op": "set_property", "node": 40, "prop": "m:metric_state", "value": {"string": "ok"}}
+      ],
+      "expect": {
+        "capable": "refuse:U1",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "gauge-value-without-sample-time",
+      "ops": [
+        {"op": "set_property", "node": 40, "prop": "m:metric_state", "value": {"string": "ok"}},
+        {"op": "set_property", "node": 40, "prop": "m:metric_value", "value": {"float": 12.5}}
+      ],
+      "expect": {
+        "capable": "refuse:U1",
+        "base": "accept"
+      }
+    },
+    {
+      "name": "gauge-stale-keeps-last-good-value",
+      "ops": [
+        {"op": "set_property", "node": 40, "prop": "m:metric_state", "value": {"string": "stale"}},
+        {"op": "set_property", "node": 40, "prop": "m:metric_value", "value": {"float": 12.5}},
+        {"op": "set_property", "node": 40, "prop": "m:sample_unix_ms", "value": {"uint": 1800000004000}}
+      ],
+      "expect": {
+        "capable": "accept",
+        "base": "accept"
+      }
+    }
+  ]
+}
